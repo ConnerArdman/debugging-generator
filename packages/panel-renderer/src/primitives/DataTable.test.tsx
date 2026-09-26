@@ -1,44 +1,34 @@
 /**
- * The virtualization contract of `primitives/DataTable` - the two states in which the grid decides
- * how many rows exist in the DOM, and the one option it hands the virtualizer that React 19 makes
- * mandatory - followed by its ARIA and keyboard contract: where the expanded state lives, and how
- * one Tab stop per grid still reaches every control inside it.
+ * The virtualization, keyboard, ARIA and reveal contracts of `primitives/DataTable`. Each group
+ * pins a behaviour no other suite can see: the row count of a first paint and the options object
+ * of a hook are both invisible to a test that only asks whether the table rendered.
  *
- * Every group below protects a named review finding, and each one is a behaviour that no other
- * suite can see: the row count of a first paint and the options object of a hook are both invisible
- * to a test that only asks whether the table rendered.
+ *   **Bounded unmeasured first paint.** While virtualization is on and no viewport has been
+ *   measured, rows render in normal flow as a window anchored on the active row - never the whole
+ *   5 000-row result the panel-data route can return. Groups pin the bound, the two explicit ways a
+ *   caller asks for every row, and the anchoring that keeps the roving tab stop in the DOM.
  *
- *   **R2-F26 - the unmeasured first paint is bounded.** While virtualization is on but the
- *   virtualizer has measured no viewport, rows render in normal flow. That state used to render
- *   EVERY row, so the 5 000-row result AAP 0.4.2 permits created 5 000 rows and all of their cells
- *   before virtualization engaged. The first group pins the bound, the second pins the two explicit
- *   ways a caller still asks for every row (so the bound cannot be "fixed" by removing them), and
- *   the third pins the anchoring: the window follows the active row, because the row holding the
- *   roving tab stop has to be in the DOM or the grid body is unreachable by Tab.
+ *   **`useFlushSync: false`.** The virtualizer's default of `true` flushes every synchronous
+ *   notification with `flushSync`, which under React 19 lands while React is already rendering or
+ *   committing. The option is invisible in the DOM, so one group asserts the options object the
+ *   component passes, and the measured-path group drives a real virtualized update (mount,
+ *   measure, scroll, re-window) and checks that React logged no `flushSync` warning.
  *
- *   **R3-F03 - `useFlushSync: false`.** `@tanstack/react-virtual` 3.14.13 defaults that option to
- *   `true` and then calls `flushSync` for every synchronous notification, which under React 19.3.0
- *   lands while React is already rendering or committing (both versions are pinned by AAP 0.3.2).
- *   The option is not observable in the DOM, so the last group asserts the options object this
- *   component actually passes - that is the deterministic pin - and the measured-path group drives a
- *   real virtualized update (mount, measure, scroll, re-window) and guards that React logged no
- *   `flushSync` complaint while doing it.
+ *   **One Tab stop per grid.** The active row is the grid's only Tab stop, and the header sort
+ *   controls leave the Tab order while rows exist. Arrow keys, Home/End, Enter, F2 and Escape reach
+ *   the `tabIndex={-1}` controls in cells, in an open detail row and in the header; a text field, a
+ *   scrollable box and a nested grid keep their own keys.
  *
- *   **B2-F16 - no `aria-expanded` on a grid row.** ARIA supports the state on `treegrid` rows only,
- *   so an audit flagged every expandable row. The state now reaches the caller's toggle through
- *   the `DataTableCellMeta` each cell receives; that group pins the absent row attribute, the meta
- *   values, and that `detailRowId` names the rendered detail row exactly while it is rendered.
+ *   **No `aria-expanded` on a grid row.** ARIA supports the state on `treegrid` rows only, so the
+ *   expansion state reaches the caller's toggle through the `DataTableCellMeta` each cell receives,
+ *   and `detailRowId` names the rendered detail row exactly while it is rendered.
  *
- *   **B2-F19 - one Tab stop per grid.** Keys used to be answered only on a row, so every control
- *   inside a cell had to be a Tab stop of its own. Those groups pin the one Tab stop, the header
- *   sort controls leaving the Tab order while rows exist, and the arrow, Home/End, Enter, F2 and
- *   Escape model that reaches `tabIndex={-1}` controls in cells, in an open detail row and in the
- *   header - plus the exceptions a text field, a scrollable box and a nested grid keep.
+ *   **Host-driven selection reveal.** A `selectedRowKey` moved from outside the table scrolls its
+ *   row into the table's own viewport once, below the sticky header, without moving focus - and
+ *   never for the reader's own activation, an unrelated re-render or an environment that measures
+ *   nothing. It coexists with the reveal of a newly expanded row.
  *
- *   **B2-F21 - a host-driven selection is revealed.** A `selectedRowKey` moved from outside the
- *   table scrolls its row into this table's own viewport exactly once, below the sticky header,
- *   without moving focus - and never for the reader's own activation, an unrelated re-render or an
- *   environment that measures nothing. It coexists with the expanded-row reveal pinned above it.
+ * The column width roles and the horizontal-scroll floor they sum to are pinned as well.
  *
  * ## How the measured path is driven under happy-dom
  *
@@ -90,7 +80,7 @@ interface RecordedVirtualizerOptions {
   /** `overscan`: rows rendered beyond each viewport edge. */
   readonly overscan: unknown;
 
-  /** `useFlushSync`: the React 19 opt-out of R3-F03. */
+  /** `useFlushSync`: whether the virtualizer flushes its notifications through `flushSync`. */
   readonly useFlushSync: unknown;
 }
 
@@ -132,8 +122,8 @@ interface SampleRow {
 }
 
 /**
- * The row count AAP 0.4.2 permits a `POST /sessions/:id/panel-data` response to reach - the size of
- * the first paint R2-F26 is about.
+ * The most rows a `POST /sessions/:id/panel-data` response can carry - the result an unbounded
+ * first paint would put in the DOM whole.
  */
 const CAPPED_RESULT_ROWS = 5000;
 
@@ -316,7 +306,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('DataTable unmeasured first paint (R2-F26)', () => {
+describe('DataTable unmeasured first paint', () => {
   it('renders a bounded window of a capped result rather than every row', () => {
     const { container } = render(
       <DataTable
@@ -340,7 +330,7 @@ describe('DataTable unmeasured first paint (R2-F26)', () => {
     expect(indices[indices.length - 1]).toBe(EXPECTED_UNMEASURED_BOUND - 1);
 
     // The first row past the bound - and the last row of the result - are absent. This is the
-    // assertion the finding is about: before the fix, all 5 000 were here.
+    // assertion the bound exists for: an unbounded first paint would put all 5 000 here.
     expect(
       container.querySelector(`[data-row-index="${String(EXPECTED_UNMEASURED_BOUND)}"]`),
     ).toBeNull();
@@ -387,7 +377,7 @@ describe('DataTable unmeasured first paint (R2-F26)', () => {
   });
 });
 
-describe('DataTable explicit all-rows modes (R2-F26)', () => {
+describe('DataTable explicit all-rows modes', () => {
   it('keeps every row when unmeasuredWindowRows is "all"', () => {
     const { container } = render(
       <DataTable
@@ -423,7 +413,7 @@ describe('DataTable explicit all-rows modes (R2-F26)', () => {
   });
 });
 
-describe('DataTable bounded window and the roving tab stop (R2-F26)', () => {
+describe('DataTable bounded window and the roving tab stop', () => {
   it('anchors the window on a selected row far past the bound', () => {
     const selectedIndex = 4000;
     const { container } = render(
@@ -482,7 +472,7 @@ describe('DataTable bounded window and the roving tab stop (R2-F26)', () => {
   });
 });
 
-describe('DataTable unmeasuredWindowRows sizing (R2-F26)', () => {
+describe('DataTable unmeasuredWindowRows sizing', () => {
   it('renders exactly the number of rows the caller asked for', () => {
     const { container } = render(
       <DataTable
@@ -565,7 +555,7 @@ describe('DataTable unmeasuredWindowRows sizing (R2-F26)', () => {
   });
 });
 
-describe('DataTable measured virtualized path (R2-F26, R3-F03)', () => {
+describe('DataTable measured virtualized path', () => {
   beforeEach(() => {
     installLayoutStub();
   });
@@ -621,8 +611,8 @@ describe('DataTable measured virtualized path (R2-F26, R3-F03)', () => {
     const afterScroll = renderedRowIndices(container);
     const firstIndexAfterScroll = afterScroll[0];
 
-    // The notification reached React and the window MOVED - the update path R3-F03 is about, rather
-    // than a render that merely survived the event.
+    // The notification reached React and the window MOVED - the update path `useFlushSync` governs,
+    // rather than a render that merely survived the event.
     expect(afterScroll.length).toBeGreaterThan(0);
     expect(afterScroll.length).toBeLessThan(MODEST_RESULT_ROWS);
     expect(firstIndexBeforeScroll).toBeDefined();
@@ -640,12 +630,12 @@ describe('DataTable measured virtualized path (R2-F26, R3-F03)', () => {
     expect(topRendered?.getAttribute('tabindex')).toBe('0');
     expect(container.querySelector('[data-row-index="0"]')).toBeNull();
 
-    // R3-F03's runtime symptom, asserted negatively across the whole mount-measure-scroll sequence:
-    // React 19 reports a `flushSync` that ran while it was rendering or committing through
-    // `console.error`, and nothing here reported one. This is a regression guard rather than the
-    // proof of the option - whether React notices depends on which phase the notification arrives
-    // in, and `fireEvent` wraps this one in `act` - so the deterministic pin for the option itself
-    // is the options assertion in the group below.
+    // The runtime symptom of `useFlushSync: true`, asserted negatively across the whole
+    // mount-measure-scroll sequence: React 19 reports a `flushSync` that ran while it was rendering
+    // or committing through `console.error`, and nothing here reported one. This is a regression
+    // guard rather than the proof of the option - whether React notices depends on which phase the
+    // notification arrives in, and `fireEvent` wraps this one in `act` - so the deterministic pin
+    // for the option itself is the options assertion in the group below.
     const logged = [...consoleError.mock.calls, ...consoleWarn.mock.calls].map((call) =>
       call.map((argument) => String(argument)).join(' '),
     );
@@ -687,7 +677,7 @@ describe('DataTable measured virtualized path (R2-F26, R3-F03)', () => {
   });
 });
 
-describe('DataTable virtualizer options (R3-F03)', () => {
+describe('DataTable virtualizer options', () => {
   it('opts out of flushSync and passes the resolved count, mode and overscan', () => {
     render(
       <DataTable
@@ -868,7 +858,7 @@ function sampleRow(index: number): SampleRow {
   return row;
 }
 
-describe('DataTable expanded state on the toggle, not the row (B2-F16)', () => {
+describe('DataTable expanded state on the toggle, not the row', () => {
   it('puts aria-expanded on no row, open or closed, and keeps the expanded styling', () => {
     const { container } = render(
       <DataTable
@@ -887,7 +877,7 @@ describe('DataTable expanded state on the toggle, not the row (B2-F16)', () => {
     expect(container.querySelectorAll('[role="row"]')).toHaveLength(1 + SHORT_RESULT_ROWS + 1);
     expect(container.querySelectorAll('[role="row"][aria-expanded]')).toHaveLength(0);
 
-    // The appearance of the open row is unchanged: it is a class, not an ARIA state.
+    // The open row's appearance comes from a class, not an ARIA state.
     expect(
       container.querySelector('[data-row-index="1"]')?.classList.contains('dg-is-expanded'),
     ).toBe(true);
@@ -940,7 +930,8 @@ describe('DataTable expanded state on the toggle, not the row (B2-F16)', () => {
       detailText(sampleRow(2)),
     );
 
-    // The toggle carries what the row used to, and a closed toggle controls nothing yet.
+    // The toggle carries the expansion state; a closed toggle controls nothing, because its detail
+    // row is not rendered.
     const openToggle = toggleOf(container, sampleRow(0));
     const closedToggle = toggleOf(container, sampleRow(1));
 
@@ -1289,7 +1280,7 @@ function overflowInline(element: HTMLElement, overflowX: 'auto' | 'hidden'): voi
   Object.defineProperty(element, 'clientWidth', { configurable: true, value: 100 });
 }
 
-describe('DataTable one Tab stop per grid (B2-F19)', () => {
+describe('DataTable one Tab stop per grid', () => {
   it('takes the header sort controls out of the Tab order only while rows exist', async () => {
     const user = userEvent.setup();
     const { container, rerender } = render(<KeyboardTable />);
@@ -1367,7 +1358,7 @@ describe('DataTable one Tab stop per grid (B2-F19)', () => {
   });
 });
 
-describe('DataTable arrow keys inside a row (B2-F19)', () => {
+describe('DataTable arrow keys inside a row', () => {
   it('moves into a row with ArrowRight and across its controls with ArrowRight and ArrowLeft', async () => {
     const user = userEvent.setup();
     const { container } = render(<KeyboardTable />);
@@ -1659,7 +1650,7 @@ describe('DataTable arrow keys inside a row (B2-F19)', () => {
   });
 });
 
-describe('DataTable header keys (B2-F19)', () => {
+describe('DataTable header keys', () => {
   it('moves between the first row and the header with ArrowUp and ArrowDown', async () => {
     const user = userEvent.setup();
     const onSortChange = vi.fn();
@@ -1721,7 +1712,7 @@ describe('DataTable header keys (B2-F19)', () => {
   });
 });
 
-describe('DataTable controls that keep their own keys (B2-F19)', () => {
+describe('DataTable controls that keep their own keys', () => {
   it('leaves a text field its arrows and Home/End, and gives it only Escape', async () => {
     const user = userEvent.setup();
     const onRowActivate = vi.fn();
@@ -1930,7 +1921,7 @@ function tokenValueOf(reference: string): string {
   return values[key] ?? '';
 }
 
-describe('DataTable column width roles and the horizontal-scroll floor (FE-F46)', () => {
+describe('DataTable column width roles and the horizontal-scroll floor', () => {
   it("publishes each role's token-built track, the sum of the floors and the column count", () => {
     const widths = ['name', 'quantity', undefined, 'ordinal', 'text', 'status'] as const;
     const { container } = render(
@@ -2070,7 +2061,7 @@ const REVEAL_GEOMETRY = {
   rowHeight: 32,
 } as const;
 
-describe('DataTable reveals a newly expanded row (Q4-B2 F03)', () => {
+describe('DataTable reveals a newly expanded row', () => {
   /**
    * Lays out the viewport at {@link REVEAL_GEOMETRY} and the toggled row and its detail wherever
    * the test says, in viewport coordinates.
@@ -2188,7 +2179,7 @@ describe('DataTable reveals a newly expanded row (Q4-B2 F03)', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The host-driven selection reveal (B2-F21)
+ * The host-driven selection reveal
  *
  * When `selectedRowKey` moves to a row because of something outside this table - a selection
  * made in another view, an evidence chip, a host surface driving it - the row is brought into
@@ -2396,7 +2387,7 @@ function SelfSelectingTable(props: { readonly rows: readonly SampleRow[] }): Rea
   );
 }
 
-describe('DataTable host-driven selection reveal (B2-F21)', () => {
+describe('DataTable host-driven selection reveal', () => {
   afterEach(() => {
     removeRevealGeometry();
   });

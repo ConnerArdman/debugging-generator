@@ -44,7 +44,10 @@
  *    the launcher is handed, so what was authorized is what is acted on;
  * 4. the **scope** — `requireProjectScope`: an editor credential acts only on
  *    projects under the workspace folders its connections announced in
- *    `client.hello`. A project outside them is refused with `403`;
+ *    `client.hello`. A project outside them is refused with `403`. A launch
+ *    or a credential request is then refused `400 FS_UNSAFE_PATH` when the
+ *    canonical project root is, contains or lies inside the canonical
+ *    `$DEBUGGEN_HOME` (AAP §0.4.2); a stop is never refused for it;
  * 5. for a launch that names a `sessionId`, the **session** — it must exist
  *    (`404`), belong to exactly the launched project and not have ended
  *    (`409`). Only then is the child tied to it: the launcher stops a child
@@ -150,6 +153,11 @@ import {
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
 
+import {
+  PROJECT_ROOT_UNRESOLVABLE_REASON,
+  STATE_HOME_OVERLAP_REASON,
+  requireProjectOutsideStateHome,
+} from '../../config.js';
 import { toDevServerLaunchResponse } from '../../dev-server/launcher.js';
 import type { DevServerLauncher } from '../../dev-server/launcher.js';
 import { subsystemLogger } from '../../logging.js';
@@ -276,6 +284,19 @@ const DEV_SERVER_UNAVAILABLE_MESSAGE =
 const RESPONSE_DRIFT_MESSAGE =
   'The Debug Generator local service built a dev-server response that does not match its contract. Its log holds the reason.';
 
+/** The status a project root that overlaps the state root is refused with. */
+const STATE_HOME_REFUSAL_STATUS = 400;
+
+/**
+ * The `details.reason` values of the two refusals `requireProjectOutsideStateHome`
+ * raises, both answered {@link STATE_HOME_REFUSAL_STATUS} in their own constant
+ * words.
+ */
+const STATE_HOME_REFUSAL_REASONS: ReadonlySet<string> = new Set([
+  STATE_HOME_OVERLAP_REASON,
+  PROJECT_ROOT_UNRESOLVABLE_REASON,
+]);
+
 /* -------------------------------------------------------------------------------------------------
  * Public types
  * ---------------------------------------------------------------------------------------------- */
@@ -315,6 +336,21 @@ export interface DevServerRoutesDeps {
    * calling the launcher (see the module documentation).
    */
   readonly auth: Pick<AuthService, 'requireLiveCredential'>;
+
+  /**
+   * The state root (`$DEBUGGEN_HOME`) as `realpath` resolved it once at
+   * start-up. `devServer.launch` and `devServer.credential` refuse a project
+   * root that is, contains or lies inside it — canonicalised by
+   * `requireProjectOutsideStateHome` of `../../config.ts` — with
+   * `400 FS_UNSAFE_PATH` before the launcher is called, so no preload is
+   * attached to, and no credential minted for, a project whose working tree
+   * would hold the service's private state (AAP §0.4.2; CWE-200).
+   * `devServer.stop` is not checked: stopping only ends a process and revokes
+   * its credential, and must stay possible. Declared by the same name and type
+   * as `./sessions.ts`'s field, so `../http.ts`'s aggregate carries one value to
+   * both; `main.ts` always supplies it, and without it no check is made.
+   */
+  readonly canonicalStateHome?: string | undefined;
 
   /**
    * The platform whose path grammar a requested project root is read in;
@@ -418,7 +454,11 @@ const STATUS_BY_CODE: ReadonlyMap<DebuggenErrorCode, DevServerFailureStatus> = n
  * the code's status.
  *
  * - Refused request content — a malformed project root, a request naming no
- *   project, a command that cannot be run without a shell: `400`.
+ *   project, a command that cannot be run without a shell, a command the
+ *   launcher's command policy refuses (an environment assignment, `NODE_OPTIONS`
+ *   or `NODE_PATH` off its allowlist, an executable other than a declared
+ *   script run, `next dev` or Node running the project's framework CLI, an
+ *   undeclared script, an unsafe argument, an untrusted framework CLI): `400`.
  * - The project's state conflicts with the request — no dev script, an
  *   undeterminable package manager, a dev server that answers at no address
  *   the service knows, a launch overtaken by a stop: `409`.
@@ -438,6 +478,13 @@ const STATUS_BY_REASON: ReadonlyMap<string, DevServerFailureStatus> = new Map<
   ['trailing-backslash', 400],
   ['shell-operator', 400],
   ['no-executable', 400],
+  ['env-assignment-not-allowed', 400],
+  ['node-options-not-allowed', 400],
+  ['node-path-not-allowed', 400],
+  ['executable-not-allowed', 400],
+  ['script-not-declared', 400],
+  ['argument-not-allowed', 400],
+  ['dev-cli-untrusted', 400],
   ['no-dev-script', 409],
   ['unknown-package-manager', 409],
   ['running-without-address', 409],
@@ -1013,6 +1060,7 @@ interface ResolvedDeps {
   readonly launcher: DevServerRoutesDeps['launcher'];
   readonly manager: DevServerRoutesDeps['manager'];
   readonly auth: DevServerRoutesDeps['auth'];
+  readonly canonicalStateHome: string | undefined;
   readonly platform: NodeJS.Platform;
   readonly log: Logger;
 }
@@ -1210,6 +1258,56 @@ function scopedProjectRoot(
 }
 
 /**
+ * The state-root step of a launch and of a credential request: the project
+ * root must not be, contain or lie inside `$DEBUGGEN_HOME` (see
+ * {@link DevServerRoutesDeps.canonicalStateHome}). Awaits the
+ * canonicalisation, so both handlers run it before their revocation fence.
+ *
+ * A refusal of `requireProjectOutsideStateHome` is answered `400` with its own
+ * constant message and hint — sentences that name no path — through
+ * {@link describedMessageOf}. `FS_UNSAFE_PATH` is deliberately absent from
+ * {@link STATUS_BY_CODE}: the launcher's detector raises it with a message
+ * that quotes a manifest path, which stays opaque. Without a canonical state
+ * root no check is made.
+ *
+ * @param c The request context.
+ * @param projectRoot The normalised, scope-checked project root.
+ * @param label The route, for the log.
+ * @param deps The resolved dependencies.
+ * @returns `ok`, or the response that refuses the request.
+ */
+async function keepApartFromStateHome(
+  c: Context<ServerEnv>,
+  projectRoot: string,
+  label: RouteLabel,
+  deps: ResolvedDeps,
+): Promise<Result<void, Response>> {
+  const stateHome = deps.canonicalStateHome;
+  if (stateHome === undefined) {
+    return ok(undefined);
+  }
+  const checked = await delegate(() => requireProjectOutsideStateHome(stateHome, projectRoot));
+  if (!isErr(checked)) {
+    return ok(undefined);
+  }
+  const { error } = checked;
+  const reason = reasonOf(error);
+  if (
+    error.code !== 'FS_UNSAFE_PATH' ||
+    reason === undefined ||
+    !STATE_HOME_REFUSAL_REASONS.has(reason)
+  ) {
+    return err(answerFailure(c, error, label, deps.log));
+  }
+  logFailure(deps.log, label, STATE_HOME_REFUSAL_STATUS, error);
+  const body: HttpErrorResponse = boundedPayload({
+    code: error.code,
+    message: describedMessageOf(error),
+  });
+  return err(c.json(body, STATE_HOME_REFUSAL_STATUS));
+}
+
+/**
  * The revocation fence of every handler: the credential the principal was
  * resolved from must still be live after the body was read
  * (`AuthService.requireLiveCredential`). Synchronous, and every handler calls
@@ -1314,6 +1412,10 @@ function createLaunchHandler(deps: ResolvedDeps): DevServerRouteHandler {
     );
     if (isErr(projectRoot)) {
       return projectRoot.error;
+    }
+    const apart = await keepApartFromStateHome(c, projectRoot.value, LAUNCH, deps);
+    if (isErr(apart)) {
+      return apart.error;
     }
     const { command, sessionId } = request.value;
     let owner: SessionRecord | undefined;
@@ -1441,9 +1543,17 @@ function createStopHandler(deps: ResolvedDeps): DevServerRouteHandler {
  *
  * The launcher mints it through the `ServerAgentCredentialIssuer` port that
  * `../auth.ts` satisfies — role `server-agent`, scoped to exactly the one
- * normalised project root this handler scope-checked, with an expiry, stored
- * only as a hash. The token appears in this response body and nowhere else:
- * it is not logged, not kept and not repeated.
+ * normalised project root this handler scope-checked, stored only as a hash.
+ * The credential is a lease the launcher supervises: it renews it while the
+ * dev server's preload holds its `server-agent` control connection, and
+ * revokes it 20 seconds after that connection is gone, at the end of the first
+ * lease when no preload connected with it, and when the service shuts down; a
+ * lease nothing renews any more lapses within five minutes. The response's
+ * `expiresAt` is the end of the first lease. The token's plaintext leaves the
+ * service in this response body and nowhere else: it is never logged, written
+ * to the store or repeated. The store keeps only its hash, and the launcher
+ * holds the plaintext in memory, in the lease it supervises, until the
+ * credential is revoked or lapses.
  */
 function createCredentialHandler(deps: ResolvedDeps): DevServerRouteHandler {
   const { launcher, log } = deps;
@@ -1469,6 +1579,10 @@ function createCredentialHandler(deps: ResolvedDeps): DevServerRouteHandler {
     );
     if (isErr(projectRoot)) {
       return projectRoot.error;
+    }
+    const apart = await keepApartFromStateHome(c, projectRoot.value, CREDENTIAL, deps);
+    if (isErr(apart)) {
+      return apart.error;
     }
 
     // The fence, end to end: `delegate` invokes `issueCredential` at once, and
@@ -1517,6 +1631,7 @@ function createCredentialHandler(deps: ResolvedDeps): DevServerRouteHandler {
  * | body too large, declared or as it arrives | `413` | `413` | `413` |
  * | body not arrived within `../http.ts`'s time ceiling | `408` | `408` | `408` |
  * | project outside the editor's workspace folders | `403` | `403` | `403` |
+ * | project root is, contains or lies inside `$DEBUGGEN_HOME`, or cannot be resolved on disk | `400` | — | `400` |
  * | project root is not a directory | `404` | — | — |
  * | running without the preload / no dev script / cancelled | `409` | — | — |
  * | spawn failed / exited before ready | `502` | — | — |
@@ -1539,6 +1654,7 @@ export function createDevServerRoutes(deps: DevServerRoutesDeps): DevServerRoute
     launcher: deps.launcher,
     manager: deps.manager,
     auth: deps.auth,
+    canonicalStateHome: deps.canonicalStateHome,
     platform: deps.platform ?? process.platform,
     log: subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM),
   };

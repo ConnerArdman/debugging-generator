@@ -40,10 +40,8 @@ import styles from './Textarea.module.css';
  * component below is the only route by which it is applied: the caller's classes are merged after
  * the module's `.root`, so a caller adds to the field's appearance instead of replacing it.
  *
- * Kept local and unexported on purpose, exactly as `Input`'s is: the repository's hardcoding guard
- * harvests this workspace's multi-token identifiers into a policy no product file may then contain,
- * so this workspace must not put a `TextareaProps` name into circulation. A consumer that needs the
- * shape writes `React.ComponentProps<typeof Textarea>`.
+ * Kept local and unexported on purpose, exactly as `Input`'s is: a consumer that needs the shape
+ * writes `React.ComponentProps<typeof Textarea>`.
  */
 interface Props extends Omit<ComponentPropsWithRef<'textarea'>, 'className'> {
   /**

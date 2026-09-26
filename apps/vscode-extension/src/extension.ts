@@ -121,6 +121,7 @@ import type {
 } from './service/process';
 import {
   disposeSourceRevealResources,
+  forwardedSourcePin,
   openSourceLocation,
   sourceResultFor,
 } from './source/open-location';
@@ -822,7 +823,7 @@ export function activate(context: vscode.ExtensionContext): void {
  * | `analysis.completed`    | `applyAnalysis(payload.analysis)`                 |
  * | `panel.generated`       | `applyPanelGenerated(payload)` + fallback banner  |
  * | `cleanup.completed`     | `applyCleanupCompleted(payload)`                  |
- * | `source.open`           | `openSourceLocation(payload.location, session root)`, answered with `source.result` (`ref` = the frame's `id`) |
+ * | `source.open`           | `openSourceLocation(payload.location, session root + payload.pinned)`, answered with `source.result` (`ref` = the frame's `id`); a frame without `pinned` is refused unopened |
  * | `error`                 | logged at `warn` + one notice                     |
  *
  * `source.open` is the one row that answers: the service waits for the
@@ -1077,6 +1078,13 @@ async function answerSourceOpen(
  * carried by the frame) inside `openSourceLocation`, which also reports any
  * refusal to the developer itself.
  *
+ * The frame's `pinned` — the canonical file and identity the service proved
+ * before forwarding — travels with the root, so `openSourceLocation` opens
+ * nothing unless what it resolves itself is that same file. The service pins
+ * every frame it forwards, so a frame without a pin is refused first, before
+ * the session lookup and before any filesystem or editor call: answered
+ * `not-opened` with the refusal's code, logged by that code, shown once.
+ *
  * @returns What became of the attempt, for the answer; `undefined` when the
  *   runtime was disposed while the session was being looked up, in which case
  *   nothing was opened and nothing is answered.
@@ -1085,6 +1093,16 @@ async function openSourceFromService(
   rt: ExtensionRuntime,
   payload: MessageByType<'source.open'>['payload'],
 ): Promise<ForwardedSourceOpenOutcome | undefined> {
+  const pin = forwardedSourcePin(payload.pinned);
+  if (isErr(pin)) {
+    rt.logger.warn('Source location refused: the forwarded frame carries no pinned file', {
+      sessionId: payload.sessionId,
+      code: pin.error.code,
+    });
+    surface(rt, { level: 'warning', message: pin.error.message, hint: pin.error.hint });
+    return { kind: 'not-opened', code: pin.error.code };
+  }
+
   const projectRoot = await projectRootOfSession(rt, payload.sessionId);
   if (rt.disposed) {
     return undefined;
@@ -1101,7 +1119,7 @@ async function openSourceFromService(
   }
   const opened = await openSourceLocation(
     payload.location,
-    { projectRoot },
+    { projectRoot, pinned: pin.value },
     { logger: rt.logger.child({ component: 'open-source' }) },
   );
   if (isErr(opened)) {

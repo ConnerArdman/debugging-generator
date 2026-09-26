@@ -17,9 +17,8 @@
  * Presentation lives entirely in `Pill.module.css`, which selects variants by attribute:
  * `data-tone` and `data-size` on both paths, and `data-selected` on the toggle path while it is
  * on. The stylesheet also fixes the box - one border width, one padding pair, one height floor for
- * every state - so a row of a dozen chips does not reflow when one of them is clicked, and it
- * carries the `BLITZY [A11Y]` note about the resulting 32px target height; this file sets no
- * geometry of its own and adds no flag of its own.
+ * every state - so a row of a dozen chips does not reflow when one of them is clicked; this file
+ * sets no geometry of its own.
  *
  * `data-selected` is set to `"true"` or left off altogether rather than being set to `"false"`.
  * React omits an attribute whose value is `undefined`, which is what lets the stylesheet describe
@@ -29,14 +28,6 @@
  * reads no DOM, and nothing in its output varies between a server and a client render, so it
  * renders in either environment; the parent that owns the selection state is the one that needs
  * the directive.
- *
- * One naming constraint worth knowing before editing: `scripts/check-no-hardcoding.mjs` harvests
- * this application's declared names - functions, types and variables among them - into
- * `scripts/no-hardcoding.policy.json`, and no file of the debugging product may then contain one
- * of those literals. Only names with two or more camel-case tokens are harvested, so the two this
- * file declares (`Pill` and `Props`) are outside the policy and the locals below are deliberately
- * single-token. Introducing a `rootClassName` here would put that word into the shared policy and
- * make the committed copy stale, which fails `pnpm check:no-hardcoding`.
  */
 
 import clsx from 'clsx';

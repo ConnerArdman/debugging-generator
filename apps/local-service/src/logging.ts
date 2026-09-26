@@ -836,9 +836,10 @@ export function scrubLogMessage(message: string): string {
  * only whether the redacted diagnostic text — an error's `message` and
  * `stack`, a `DebuggenError`'s `hint` and full `details` — is added to it.
  *
- * @param fields - the caller's bag; left untouched
- * @param options - the exception policy; omitted, the closed shape only
- * @returns a new bag with denied values masked and every string scanned
+ * @param fields The caller's bag, left untouched.
+ * @param options The exception policy; when omitted, errors carry the closed
+ *   shape only.
+ * @returns A new bag with denied values masked and every string scanned.
  *
  * @example
  * ```ts
@@ -930,13 +931,13 @@ function readProperty(source: object, key: string): unknown {
  * much as a value is, so it is emitted under {@link diagnosticKeyOf}; the name
  * rules of {@link scrubValue} still judge the key as the source wrote it.
  *
- * @param source - the record being copied
- * @param depth - the record's own depth; the root bag is 0
- * @param budget - shared node accounting
- * @param seen - containers on the path from the root, for cycle detection
- * @param top - whether this is the record pino merges, where its own keys
+ * @param source The record being copied.
+ * @param depth The record's own depth; the root bag is 0.
+ * @param budget Shared node accounting.
+ * @param seen Containers on the path from the root, for cycle detection.
+ * @param top Whether this is the record pino merges, where its own keys
  *   (`level`, `time`, `msg`) and the prototype-derived names must not be
- *   collided with
+ *   collided with.
  */
 function scrubRecord(
   source: Readonly<Record<string, unknown>>,
@@ -1609,8 +1610,8 @@ function boundDiagnosticText(text: string): string {
  * object or `null` becomes the redaction marker without a property of it being
  * read) and nothing throws.
  *
- * @param text - an exception's `message` or `stack`, or a thrown string
- * @returns the redacted, bounded text
+ * @param text An exception's `message` or `stack`, or a thrown string.
+ * @returns The redacted, bounded text.
  *
  * @example
  * ```ts
@@ -2537,11 +2538,11 @@ export function guardLogger(logger: Logger, policy: LogFailurePolicy = {}): Logg
  * reports `'silent'`, which is what a caller inspecting the threshold expects
  * either way.
  *
- * @param config - the validated service configuration; its `logLevel` is the
- *   threshold unless `options.level` overrides it
- * @param options - test and embedding seams; see {@link ServiceLoggerOptions}
- * @returns a frozen `Logger`, guarded by {@link guardLogger}: neither it nor
- *   any child of it throws from a level method or from `child()`; never `null`
+ * @param config The validated service configuration; its `logLevel` is the
+ *   threshold unless `options.level` overrides it.
+ * @param options Test and embedding seams; see {@link ServiceLoggerOptions}.
+ * @returns A frozen `Logger`, guarded by {@link guardLogger}: neither it nor
+ *   any child of it throws from a level method or from `child()`; never `null`.
  */
 export function createServiceLogger(
   config: ServiceConfig,
@@ -2566,8 +2567,8 @@ export function createServiceLogger(
  * subsystem receives a `Logger` and nothing pino-specific, and so `store`,
  * `pipeline` and `telemetry` cannot spell the same field three ways.
  *
- * @param parent - usually the root from {@link createServiceLogger}
- * @param subsystem - conventionally the module's source folder name
+ * @param parent Usually the root from {@link createServiceLogger}.
+ * @param subsystem Conventionally the module's source folder name.
  */
 export function subsystemLogger(parent: Logger, subsystem: string): Logger {
   return parent.child({ [LOG_BINDING_KEYS.subsystem]: subsystem });

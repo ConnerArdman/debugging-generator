@@ -8,15 +8,15 @@
   "exports": {
     ".": {
       "types": [
-        "./dist/index.d.ts",
-        "./src/index.ts"
+        "./src/index.ts",
+        "./dist/index.d.ts"
       ],
       "import": "./dist/index.js"
     },
     "./schema": {
       "types": [
-        "./dist/schema/index.d.ts",
-        "./src/schema/index.ts"
+        "./src/schema/index.ts",
+        "./dist/schema/index.d.ts"
       ],
       "import": "./dist/schema/index.js"
     }

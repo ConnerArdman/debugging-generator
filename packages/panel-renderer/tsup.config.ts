@@ -354,8 +354,10 @@ export default defineConfig({
    * `PanelHostProps`, `DataProvider`, `PanelActions`,
    * `PanelComponentRegistry`, the per-component `Props` interfaces and the
    * token types are what the DevTools panel and the VS Code webview type-check
-   * against, and `dist/index.d.ts` is the file the `"."` condition points them
-   * at.
+   * against. Inside the repository they read them from this project's
+   * `.tsbuild` declarations (root tsconfig.json, `"// no-aliases"`);
+   * `dist/index.d.ts` is the packed-tarball entry of the `"."` condition's
+   * `types` array.
    *
    * The three overrides are required, not defensive. tsup's declaration step
    * builds its own TypeScript program from the `tsconfig` named below and then

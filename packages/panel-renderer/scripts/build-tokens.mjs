@@ -5,9 +5,9 @@
  *   input   src/tokens/tokens.ts    authored; the single source of truth
  *   output  src/tokens/tokens.css   generated; committed; never hand-edited
  *
- * AAP 0.6.1 makes the token source the only place a visual value may be written
- * and this script the only writer of the stylesheet that projects those values
- * into CSS custom properties. So the generator holds no token name and no token
+ * The token source is the only place a visual value may be written, and this
+ * script is the only writer of the stylesheet that projects those values into
+ * CSS custom properties. So the generator holds no token name and no token
  * value of its own, never reads the stylesheet to decide what to emit, and
  * fails loudly instead of emitting a partial file.
  *
@@ -73,7 +73,8 @@ const EXIT_ERROR = 2;
 /**
  * The selector blocks, in the one order the stylesheet carries them: the
  * default theme as `:root`, then one attribute-scoped block per alternate
- * theme, double-quoted exactly as AAP 0.6.1 states. This table is the
+ * theme, double-quoted exactly as the token test builds each selector from
+ * `PANEL_THEME_ATTRIBUTE_VALUES` in `src/tokens/theme.ts`. This table is the
  * generator's whole notion of "theme".
  *
  * @type {ReadonlyArray<{ readonly set: string, readonly selector: string }>}
@@ -445,7 +446,7 @@ function loadFailureHint(code) {
  * `tokens` export or, failing that, the default export.
  *
  * The module is imported, never parsed as text: a second reader of these values
- * would be a second source of truth, which is the one thing AAP 0.6.1 forbids.
+ * would be a second source of truth, and the token source must be the only one.
  *
  * @param {{ root?: string }} [options] `root` overrides the package directory,
  *   which lets a test drive a temporary tree

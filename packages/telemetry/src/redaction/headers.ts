@@ -169,7 +169,7 @@ const HEADER_OBJECT_ATTRIBUTE_KEY_SET: ReadonlySet<string> = new Set<string>(
  * {@link redactHeaders} keeps the caller's spelling in its result so a panel
  * can display the header as it was sent.
  *
- * @param name - Header name in any spelling.
+ * @param name Header name in any spelling.
  * @returns The trimmed, lower-cased name.
  */
 export function normalizeHeaderName(name: string): string {
@@ -187,7 +187,7 @@ export function normalizeHeaderName(name: string): string {
  * what lets it mean "one of the six positional names the outbound guard also
  * knows", which is the question `./redactor.ts` and that guard both ask.
  *
- * @param name - Header name in any spelling.
+ * @param name Header name in any spelling.
  */
 export function isDeniedHeaderName(name: string): boolean {
   return DENIED_HEADER_NAME_SET.has(normalizeHeaderName(name));
@@ -203,7 +203,7 @@ export function isDeniedHeaderName(name: string): boolean {
  * matching prefix, or one whose trailing segment is empty or blank and
  * therefore names no header, yields `undefined`.
  *
- * @param key - Attribute key as captured.
+ * @param key Attribute key as captured.
  * @returns The header name, or `undefined` when `key` is not a header
  * attribute key.
  */
@@ -226,7 +226,7 @@ export function headerNameFromAttributeKey(key: string): string | undefined {
  * implemented that way so the two can never disagree: a key this predicate
  * accepts always yields a name for the redaction call that follows.
  *
- * @param key - Attribute key as captured.
+ * @param key Attribute key as captured.
  */
 export function isHeaderAttributeKey(key: string): boolean {
   return headerNameFromAttributeKey(key) !== undefined;
@@ -240,7 +240,7 @@ export function isHeaderAttributeKey(key: string): boolean {
  * while a single-value header key such as `http.request.header.authorization`
  * does not — that one is {@link isHeaderAttributeKey}'s business.
  *
- * @param key - Attribute key as captured.
+ * @param key Attribute key as captured.
  */
 export function isHeaderObjectAttributeKey(key: string): boolean {
   return HEADER_OBJECT_ATTRIBUTE_KEY_SET.has(foldAttributeKey(key.trim()));
@@ -373,9 +373,9 @@ function redactUnknownHeaderValue(name: string, value: unknown): HeaderValue {
  * re-marked, no pattern rule matches the marker, and element counts are
  * stable.
  *
- * @param name - Header name in any spelling. For a dotted span-attribute key,
+ * @param name Header name in any spelling. For a dotted span-attribute key,
  * pass `headerNameFromAttributeKey(key) ?? key`.
- * @param value - Value as captured.
+ * @param value Value as captured.
  * @returns The masked value: a string, or an array of masked strings for the
  * multi-value form.
  */
@@ -408,7 +408,7 @@ export function redactHeaderValue(name: string, value: HeaderValue): HeaderValue
  * **Idempotent.** `redactHeaders(redactHeaders(h))` deep-equals
  * `redactHeaders(h)`.
  *
- * @param headers - Header set as captured. Never modified.
+ * @param headers Header set as captured. Never modified.
  * @returns A new record of masked values, `undefined`-valued keys removed.
  */
 export function redactHeaders(headers: HeaderRecord): Record<string, HeaderValue> {

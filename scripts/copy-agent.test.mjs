@@ -36,7 +36,7 @@
  *
  * HARNESS. The root `vitest.config.ts` collects this file into the `tooling` project
  * (`scripts/*.test.mjs`, environment `node`, `globals: false`), which `pnpm test` runs as part of
- * the blocking gate of AAP 0.8.5 and 0.7.1 Group 0. `describe`/`it`/`expect` are imported
+ * the blocking test gate (`pnpm verify`). `describe`/`it`/`expect` are imported
  * explicitly because that project sets no globals. Everything runs in process against the exported
  * `copyAgent`, `parseArgs`, `usage` and `main`: no git, no network, no child process, no shared
  * state, so the suite is fast and order-independent.
@@ -386,8 +386,9 @@ describe('copyAgent: a symbolic link at the target', () => {
   it('fails --check with exit 2 instead of certifying the link as in sync', () => {
     const root = makeRoot();
     const { victim } = plantSymlinkedFile(root, path.basename(TARGET_REL));
-    // Make the link's victim byte-identical to the bundle: this is the case that used to pass the
-    // gate, because the comparison followed the link and found the right bytes on the far side.
+    // Make the link's victim byte-identical to the bundle. Even when the far side holds exactly the
+    // bundle's bytes, `--check` must refuse a symbolic link at the target path with exit 2 rather
+    // than follow it and report the copy as in sync.
     fs.writeFileSync(victim, BUNDLE_BYTES);
 
     const error = expectExitTwo(() => copyAgent({ root, check: true }));

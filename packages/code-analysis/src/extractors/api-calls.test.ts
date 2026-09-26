@@ -1368,12 +1368,14 @@ const CASCADE_MODULES: Readonly<Record<string, string>> = {
  * Setup and teardown
  * ---------------------------------------------------------------------------------------------- */
 
+// A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+// machine can push past the 10 s hook default and so fail every case below.
 beforeAll(async () => {
   corpus = await openAndExtract(FIXTURE_ROOT);
   shapes = await createScratchProject('debuggen-api-calls-shapes-', SHAPE_MODULES);
   torn = await createScratchProject('debuggen-api-calls-torn-', TORN_MODULES);
   cascade = await createScratchProject('debuggen-api-calls-cascade-', CASCADE_MODULES);
-});
+}, 30_000);
 
 afterAll(() => {
   // Only `mkdtemp` directories this suite created are ever removed, and every
@@ -2029,9 +2031,11 @@ const FORWARDING_MODULES: Readonly<Record<string, string>> = Object.freeze({
 let forwarding: ExtractedProject | undefined;
 
 describe('apiCallsExtractor: the forwarding-wrapper rule', () => {
+  // A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+  // machine can push past the 10 s hook default and so fail every case below.
   beforeAll(async () => {
     forwarding = await createScratchProject('debuggen-api-calls-forwarding-', FORWARDING_MODULES);
-  });
+  }, 30_000);
 
   it('records a call through a function that forwards its path into fetch, at the call site', () => {
     const nodes = apiCallsOf(scratchProject(forwarding, 'forwarding'), 'src/client.ts');

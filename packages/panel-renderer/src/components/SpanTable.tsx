@@ -3,9 +3,9 @@
  *
  * A sortable, pageable table of captured span records: what each one was, which
  * tier produced it, when it started, how long it took, and — where the capture
- * resolved one — a chip that opens the code behind it. AAP 0.6.2 maps the
- * catalog's `table` node type to this component and names its job: "the user's
- * 'Slowest Operations' example; sortable via `DataTable`".
+ * resolved one — a chip that opens the code behind it. The catalog's `table`
+ * node type maps to this component, and its job is a "Slowest Operations" view:
+ * a ranking of spans, sortable via `DataTable`.
  *
  * ## This module is the pattern for every query-backed component here
  *
@@ -20,29 +20,31 @@
  *    {@link DATA_QUERY_DEFAULT_OFFSET}). Nothing else constructs a query.
  * 2. **An order the service can apply is a re-query, never an array
  *    operation.** The service applied `filter`, `sort`, `limit` and `offset`
- *    before these rows existed (AAP 0.4.2), so re-ordering them here would show
- *    an order the panel specification never asked for and quietly break the
- *    ranking this node exists to present. A header click that names one of the
- *    data layer's orderings changes the query and the data comes back ordered.
+ *    before these rows existed (`docs/ARCHITECTURE.md`, "Panel data"), so
+ *    re-ordering them here would show an order the panel specification never
+ *    asked for and quietly break the ranking this node exists to present. A
+ *    header click that names one of the data layer's orderings changes the
+ *    query and the data comes back ordered.
  *
  *    This table goes one step further, and says so. The data layer can order a
  *    span list in exactly two ways — longest duration first (`duration_desc`)
- *    and earliest start first (`start_asc`) — and AAP 0.2.3 freezes that
- *    vocabulary. Every other column and direction a reader asks for (Operation,
- *    Kind and Tier either way, Start latest first, Duration shortest first) is
- *    a **view order**: the rows already loaded are re-arranged here, stably,
- *    with the service's own position as the tie-break, and nothing is
- *    re-queried. The rows are never re-arranged inside `primitives/DataTable`,
- *    which stays controlled; this component hands it the arranged rows and the
- *    view order as its `sort`, so the header's indicator and `aria-sort` show
- *    the order on screen. A view order changes only the arrangement, never
- *    which rows are loaded, so "Load more" still requests the next page in the
- *    service's order and the view order is re-applied to every accumulated
- *    row. While the loaded rows are not the whole result, the footer says that
- *    the order covers only those rows — the one thing a local re-arrangement
- *    could otherwise misrepresent. Re-activating a service ordering that is
- *    already applied clears the view order without a re-query, because the
- *    accumulated rows are already in that order.
+ *    and earliest start first (`start_asc`) — and its sort vocabulary for a
+ *    span list is fixed to these two values. Every other column and direction
+ *    a reader asks for (Operation, Kind and Tier either way, Start latest
+ *    first, Duration shortest first) is a **view order**: the rows already
+ *    loaded are re-arranged here, stably, with the service's own position as
+ *    the tie-break, and nothing is re-queried. The rows are never re-arranged
+ *    inside `primitives/DataTable`, which stays controlled; this component
+ *    hands it the arranged rows and the view order as its `sort`, so the
+ *    header's indicator and `aria-sort` show the order on screen. A view order
+ *    changes only the arrangement, never which rows are loaded, so "Load more"
+ *    still requests the next page in the service's order and the view order is
+ *    re-applied to every accumulated row. While the loaded rows are not the
+ *    whole result, the footer says that the order covers only those rows — the
+ *    one thing a local re-arrangement could otherwise misrepresent.
+ *    Re-activating a service ordering that is already applied clears the view
+ *    order without a re-query, because the accumulated rows are already in
+ *    that order.
  * 3. **A page is a page, and the footer says so.** A response carries `total`
  *    and `nextOffset`; this component renders the loaded count against the
  *    total and offers "Load more" only while the service reports a next offset
@@ -59,7 +61,7 @@
  *    is loaded ("Showing 115 of 115 spans."): a count is how a reader knows the
  *    table is complete, and a footer that appeared only for partial results
  *    would make its absence the signal. The node's `limit` is the **page
- *    size**, not a cap on the table (AAP 0.4.2 pages with `limit`/`offset`;
+ *    size**, not a cap on the table (the data layer pages with `limit`/`offset`;
  *    `RenderTable` and `QueryTable` read it the same way), so "Load more"
  *    continues past it for as long as the service reports a next page, and
  *    while a further page is offered or loading the footer states that size so
@@ -85,15 +87,16 @@
  *   query against the `DataProvider` the host provided; interactions leave
  *   through `PanelActions`. There is no `fetch`, no socket and no extension API
  *   in this file, which is what lets the same component render inside the
- *   DevTools panel, the editor webview and a component test (AAP 0.1.2, 0.6.2).
+ *   DevTools panel, the editor webview and a component test
+ *   (`docs/ARCHITECTURE.md`, "The renderer contract").
  * - **No redaction, no reformatting of evidence.** Everything here arrived
- *   already redacted at ingest (AAP 0.5.2). Names, kinds, tiers, durations and
- *   source locations are rendered as given; nothing is re-joined, re-parsed or
- *   "improved", and no attribute is copied anywhere.
+ *   already redacted at ingest (`docs/SECURITY.md`, "Redaction"). Names, kinds,
+ *   tiers, durations and source locations are rendered as given; nothing is
+ *   re-joined, re-parsed or "improved", and no attribute is copied anywhere.
  * - **No visual values.** Not one colour, length or font appears below. Colour
  *   comes from `../utils/color` as `var(--dg-*)` token references, spacing from
  *   `layout/Stack`, and everything else from the class contract
- *   `../styles/components.css` already implements for this block (AAP 0.6.4):
+ *   `../styles/components.css` already implements for this block:
  *
  *     dg-span-table                the block — a column that may shrink
  *     dg-span-table__name-cell     the identity text: monospace, truncating
@@ -111,7 +114,7 @@
  *
  * - **No project knowledge.** Every string below is product vocabulary. No
  *   component name, route or symbol of any inspected application appears in
- *   this file, its copy or its comments (AAP 0.5.4).
+ *   this file, its copy or its comments.
  * - **No toolbar.** The only interaction this node offers is ordering, and the
  *   grid's own sortable headers already offer it — with the applied order shown
  *   where the reader is looking, which a separate control cannot do. A toolbar
@@ -139,8 +142,8 @@
  * requires and is rendered only while the entry grants it, so narrowing the
  * catalog withdraws a column instead of leaving this component reading a field
  * the schema no longer sanctions. The same entry supplies the sources this node
- * may read and the generic label used when the node carries no title of its own
- * (AAP 0.6.2 — "the renderer depends on the schema, never the reverse").
+ * may read and the generic label used when the node carries no title of its own:
+ * the renderer depends on the schema, never the reverse.
  *
  * @packageDocumentation
  */
@@ -322,7 +325,7 @@ function clampOffset(offset: number | undefined): number {
  * (`formatDataQuery`, reached through `queryFailureProps` and
  * `unsupportedQueryProps`), so every node prints a query the same way. A data
  * query holds a source, a narrowing filter, an ordering and two whole numbers;
- * there is nothing sensitive in it to withhold (AAP 0.5.2).
+ * there is nothing sensitive in it to withhold.
  *
  * Deliberately mirrors the serialiser inside `host/useQuery`: this component
  * must be able to tell "the same query, one page further" from "a different
@@ -385,9 +388,9 @@ const DURATION_COLUMN_KEY = 'duration' satisfies keyof TelemetryEvent;
  * `DATA_TABLE_COLUMN_TRACKS` to a grid track built from the `--dg-column-min-*`
  * floor and `--dg-column-share-*` share tokens, so this table agrees with every
  * other table on both extension surfaces about how wide a name or a duration
- * is, and no length is chosen here (AAP 0.6.4). Each column below takes the
- * smallest role whose floor keeps its content readable, in the vocabulary every
- * table shares, and every role's track has two parts:
+ * is, and no length is chosen here. Each column below takes the smallest role
+ * whose floor keeps its content readable, in the vocabulary every table shares,
+ * and every role's track has two parts:
  *
  * - The FLOOR is what the column never shrinks below. `primitives/DataTable`
  *   sums the floors into the grid's own minimum width, so a surface narrower
@@ -525,14 +528,14 @@ function displaySortFor(sort: DataQuerySort | undefined): SpanOrder | null {
  * The data-query ordering that applies a requested order, when the service can
  * apply it.
  *
- * The data layer orders a span list in two ways only (AAP 0.2.3 freezes the
- * vocabulary): longest duration first and earliest start first. Exactly those
- * two column-and-direction pairs are service orders, and re-query; every other
- * pair — including the reverse of either — yields `undefined` and becomes a
- * view order over the rows already loaded (module decision 2). The direction is
- * therefore part of the mapping: re-activating the sorted Duration header, which
- * the primitive proposes as a flip to ascending, is a view order rather than a
- * silent no-op or a re-query that would come back in the same order.
+ * The data layer orders a span list in two ways only, and its sort vocabulary
+ * is fixed to them: longest duration first and earliest start first. Exactly
+ * those two column-and-direction pairs are service orders, and re-query; every
+ * other pair — including the reverse of either — yields `undefined` and becomes
+ * a view order over the rows already loaded (module decision 2). The direction
+ * is therefore part of the mapping: re-activating the sorted Duration header,
+ * which the primitive proposes as a flip to ascending, is a view order rather
+ * than a silent no-op or a re-query that would come back in the same order.
  *
  * @param order The column and direction the reader asked for.
  * @returns The ordering to request, or `undefined` when the service has none.
@@ -644,7 +647,7 @@ const ROW_COMPARATORS: Readonly<Record<SpanColumnKey, RowComparator>> = Object.f
  * Stable by construction rather than by trusting the engine: rows that compare
  * equal keep the position the service gave them, in both directions, so a
  * reversal re-ranks only what differs and the service's own tie-break (its
- * stable secondary key, AAP 0.4.2) still decides among equals. The input is
+ * stable secondary key) still decides among equals. The input is
  * never mutated: it is the accumulated service-ordered sequence that "Load
  * more" appends to.
  *
@@ -669,7 +672,7 @@ function arrangeRows(rows: readonly TelemetryEvent[], order: SpanOrder): readonl
 /*
  * ---------------------------------------------------------------------------
  * Copy. Product vocabulary only - nothing here names anything from an
- * inspected project (AAP 0.5.4).
+ * inspected project.
  * ---------------------------------------------------------------------------
  */
 
@@ -864,7 +867,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
       cell: (event) => (
         <span className="dg-span-table__kind-cell">
           {/* The kind scale is spent on the chip's hairline, never on its label:
-              the scale is held to the non-text contrast ratio (AAP 0.6.3). */}
+              the scale is held to the non-text contrast ratio. */}
           <Badge variant="soft" color={kindColorVar(event.kind)}>
             {formatKindLabel(event.kind)}
           </Badge>
@@ -963,9 +966,9 @@ function spanNoun(count: number): string {
  * Three cases, and the third is the one that matters: a service that reported no
  * total leaves this component unable to know whether more rows exist, and saying
  * so is the only truthful option — a count presented on its own would read as
- * the whole of the capture (AAP 0.4.2). A query that starts part-way through the
- * result also names its starting position, because "12 of 900" would otherwise
- * suggest the first twelve.
+ * the whole of the capture. A query that starts part-way through the result also
+ * names its starting position, because "12 of 900" would otherwise suggest the
+ * first twelve.
  *
  * @param loaded How many rows are on screen.
  * @param total The total the service reported for the whole query, if any.
@@ -1298,7 +1301,7 @@ export interface SpanTableProps {
    *
    * Composition, never an escape hatch for visual values: a class named here is
    * defined in `../styles/components.css` against `--dg-*` tokens like every
-   * other class in this package (AAP 0.6.4).
+   * other class in this package.
    */
   className?: string | undefined;
 }
@@ -1315,7 +1318,7 @@ export interface SpanTableProps {
  * and the pages they have loaded. The selected row is the panel's shared
  * selection, read through `useViewSelection`: under the panel host a selection
  * made in any view or evidence chip marks the row for the same event here, and
- * a row activated here marks the same event everywhere else (AAP 0.7.3).
+ * a row activated here marks the same event everywhere else.
  * Outside a host the hook falls back to the row last activated in this table.
  * A view order re-arranges rows, never which row is selected: the mark follows
  * the event wherever the arrangement places it.

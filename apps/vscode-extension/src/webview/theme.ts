@@ -89,7 +89,7 @@ function currentDocumentRoot(): Element | null {
  * `highContrast`, `vscode-light` to `light`, `vscode-dark` to `dark`, anything else to
  * `DEFAULT_PANEL_THEME`. With no document or no body yet, the answer is `DEFAULT_PANEL_THEME`.
  *
- * @param bodyClassName - A body `className` to translate; omitted, the live body is read.
+ * @param bodyClassName A body `className` to translate; omitted, the live body is read.
  * @returns The theme to apply; never throws.
  */
 export function resolveWebviewTheme(bodyClassName?: string): PanelTheme {
@@ -113,8 +113,8 @@ export function resolveWebviewTheme(bodyClassName?: string): PanelTheme {
  * applies `DEFAULT_PANEL_THEME` rather than writing an attribute no selector can match. With no
  * document, or a document with no root element, nothing is written and nothing is thrown.
  *
- * @param theme - The theme to apply, typically from {@link resolveWebviewTheme}.
- * @param root - The element to theme; omitted or `null`, the current document's root element.
+ * @param theme The theme to apply, typically from {@link resolveWebviewTheme}.
+ * @param root The element to theme; omitted or `null`, the current document's root element.
  */
 export function applyWebviewTheme(theme: PanelTheme, root?: Element | null): void {
   const target = root ?? currentDocumentRoot();
@@ -202,7 +202,7 @@ function stopObserving(): void {
  * cleared) → 1 (a fresh observer), leaving exactly one live observer, as does any number of
  * mounted consumers. The returned function is idempotent: calling it again does nothing.
  *
- * @param onStoreChange - Called whenever the resolved theme changes.
+ * @param onStoreChange Called whenever the resolved theme changes.
  * @returns The unsubscribe function.
  */
 export function subscribeToThemeChanges(onStoreChange: () => void): () => void {

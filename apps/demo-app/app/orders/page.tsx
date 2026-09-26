@@ -69,11 +69,6 @@ import { ordersQuerySchema, type OrdersQueryInput } from '@/server/validation/or
 
 /* ---------------------------------------------------------------------------
  * Copy
- *
- * All-caps by convention, and the convention earns its keep:
- * `scripts/check-no-hardcoding.mjs` harvests this application's camel-case declarations into
- * vocabulary no product file may then mention, and skips a name with no camel boundary. A constant
- * spelled this way costs the product nothing.
  * ------------------------------------------------------------------------- */
 
 /** The page's heading, and the title the root layout's template suffixes. */
@@ -152,8 +147,8 @@ const SIZE_PARAM = 'pageSize';
  * no customer would be every customer's orders - so the identifier has to come from somewhere for
  * the store navigation's plain `/orders` link to answer with a history at all. It is the account
  * `prisma/seed.ts` writes first and attaches its one populated demo cart to, which is the same
- * account the cart drawer, checkout and this list therefore agree on across a freshly seeded
- * database, a storefront opened for the first time and an automated run.
+ * account the cart drawer, checkout and this list therefore agree on for a freshly seeded
+ * database and a storefront opened for the first time.
  *
  * The literal is duplicated from the seed rather than shared with it, exactly as
  * `@/server/validation/cart` and `@/server/services/checkout.service` duplicate the demo cart's
@@ -415,8 +410,8 @@ export default async function OrderHistoryPage({ searchParams }: Props): Promise
          * the statuses, and the list would otherwise have to learn them to say why a nine-order
          * history is showing two. The address beside it is the same listing with the filter
          * dropped, which is where both the filter line's control and an empty filtered listing's
-         * recovery control lead. Both are left out entirely when nothing is filtered, so the list
-         * renders exactly as it did before a filter existed.
+         * recovery control lead. Both are left out entirely when nothing is filtered, so an
+         * unfiltered history renders with no filter line and no control to clear one.
          */
         <OrderHistoryList
           orders={orders}

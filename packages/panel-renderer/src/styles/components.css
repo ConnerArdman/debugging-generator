@@ -43,8 +43,8 @@
  * ## Zero hardcoded values, and the structural-value policy
  *
  * Every colour, spacing, radius, glyph and control size, shadow, font, focus
- * ring and stacking level resolves to a `var(--dg-*)` token (AAP 0.6.3,
- * 0.6.4). The only literals permitted are `0`, `none`, `auto`, `inherit`,
+ * ring and stacking level resolves to a `var(--dg-*)` token generated from
+ * `tokens.ts`. The only literals permitted are `0`, `none`, `auto`, `inherit`,
  * `currentColor` and `transparent`. There is no hexadecimal or functional
  * colour notation, no length literal of any unit — absolute, root-relative or
  * font-relative — and no bare line-height anywhere below. A glyph box and a
@@ -277,11 +277,10 @@
  * takes that block's 24 px target floor, and a chip that is only a label (a
  * badge, a status marker) needs no target size at all.
  *
- * A chip is never wider than the box it sits in (`max-inline-size`), and what
- * does not fit is CLIPPED at the chip's own edge rather than painted over the
- * neighbouring cell: a chip squeezed by a narrow column used to keep drawing
- * its label across the column boundary, so a "Request key" chip read as
- * "Requ200key" over the status beside it. `clip`, not `hidden`: it clips
+ * A chip is never wider than the box it sits in (`max-inline-size: 100%`), and
+ * a label that does not fit is CLIPPED at the chip's own edge rather than
+ * painted over the neighbouring cell, so a chip in a narrow column can never
+ * run its text into the value beside it. `clip`, not `hidden`: it clips
  * without making the chip a scroll container, so the chip keeps its content
  * baseline inside a line of text and keeps its automatic minimum inside a flex
  * row. The columns that hold chips are sized to fit them (see the track notes
@@ -402,8 +401,8 @@
  * ## The target-size floor
  *
  * Every control is at least `--dg-space-7` (24 px) on both axes, the minimum
- * target size of WCAG 2.2 SC 2.5.8 — accessibility outranks density (AAP
- * 0.6.4). The floor lives on the block, so it covers every variant, both
+ * target size of WCAG 2.2 SC 2.5.8 — accessibility outranks density. The
+ * floor lives on the block, so it covers every variant, both
  * densities and every class a caller composes onto a button: the dense `sm`
  * chip (a 16 px line, two `--dg-space-0` paddings and two hairlines, 22 px on
  * its own), the row expand toggles, the evidence and source chips and the
@@ -1552,11 +1551,11 @@
   font-weight: var(--dg-font-weight-medium);
 }
 
-/* Tabular figures. `dg-code` is here because AAP 0.6.3 pairs the mono family
- * with `tabular-nums` for code, SQL, paths and numeric columns, so every Code
- * renders them by default; `dg-code--numeric` still marks numeric content and
- * no longer changes the rendering. `dg-text--numeric` is the opt-in for
- * interface text, whose default figures are proportional. */
+/* Tabular figures. `dg-code` is here because the design system pairs the mono
+ * family with `tabular-nums` for code, SQL, paths and numeric columns, so every
+ * Code renders them by default; `dg-code--numeric` marks numeric content and
+ * renders exactly as a plain `dg-code` does. `dg-text--numeric` is the opt-in
+ * for interface text, whose default figures are proportional. */
 .dg-text--numeric,
 .dg-code,
 .dg-code--numeric {
@@ -1892,7 +1891,7 @@
 
 /* An error is never quiet: an elevated card with a danger-toned edge, the
  * failing query in mono, and a retry affordance. A failure may never look like
- * a successful analysis (AAP 0.5.5). */
+ * a successful analysis. */
 .dg-error-state {
   display: flex;
   flex-direction: column;
@@ -2006,8 +2005,8 @@
  * not stack a second frame inside the first.
  *
  * The component declares no gap between the region's children: they sit in a
- * `layout/Stack`, which is the one place this tier's spacing is spent
- * (AAP 0.6.4). What is declared here is only what separates the header from the
+ * `layout/Stack`, which is the one place this tier's spacing is spent.
+ * What is declared here is only what separates the header from the
  * body — the frame's inset in one variant, a space step in the other — and the
  * tighter step between the heading and its supporting line.
  * ========================================================================== */
@@ -2092,7 +2091,7 @@
  *
  * That basis is also the collapse threshold. `--collapse` — which the component
  * emits for a horizontal division unless the caller opts out — is the whole of
- * the responsive obligation AAP 0.6.4 places on this block: with wrapping
+ * the responsive behaviour a panel takes from this block: with wrapping
  * allowed, two panes that can no longer both reach the basis fall onto separate
  * lines, which IS the single column a docked DevTools panel needs at around
  * four hundred pixels. Without it the panes stay on one line and shrink
@@ -2100,11 +2099,11 @@
  *
  * The basis is therefore the narrowest width a pane is allowed to be while it
  * shares a line, and it is sized for what a pane holds: a multi-column table,
- * a correlated timeline, a request waterfall. A basis of ten units put two
- * panes side by side from a 492 px division, so at a 768 px surface each pane
- * got 366 px — narrower than the single column the same views are given on a
- * 480 px surface, which crushed their columns and overprinted their cells
- * (measured in the browser). At twenty units two equal panes share a line only
+ * a correlated timeline, a request waterfall. A basis of ten units would put
+ * two panes side by side from a 492 px division, so at a 768 px surface each
+ * pane would get 366 px — narrower than the single column the same views are
+ * given on a 480 px surface, which crushes their columns and overprints their
+ * cells. At twenty units two equal panes share a line only
  * from a 972 px division, where each is at least 480 px, and below that the
  * division is one column of full-width panes. The threshold still follows the
  * container, never the viewport, so a division nested in a pane collapses on
@@ -2536,7 +2535,7 @@
  *
  * The title, the observed facts and the likely causes of a generated panel.
  *
- * Observation and inference are kept structurally apart (AAP 0.8.4): two
+ * Observation and inference are kept structurally apart: two
  * separate blocks, each introduced by its own label and marked by its own
  * edge — a neutral one for what was measured, a warning-toned one for what is
  * inferred. The non-evidentiary headline is a third treatment again, so prose
@@ -2724,7 +2723,7 @@
  * ## Colour arrives as a token reference
  *
  * `src/utils/color.ts` folds the seventeen telemetry kinds onto nine kind
- * tokens (the seven AAP 0.6.3 values plus the supplementary service and
+ * tokens (the seven core span-kind tokens plus the supplementary service and
  * external members), pairs each kind fill with the label ink that clears
  * 4.5:1 on it, maps the three tiers onto lane tokens, the six dependency-graph
  * participant classes onto six distinct kind tokens, the five render triggers
@@ -2983,7 +2982,7 @@
  * with a single candidate carries `dg-is-inferred`, a solid connector in the
  * info tone. An orphan attached to the trace root carries `dg-is-orphan`. All
  * are visually distinct from a resolved parent edge and from each other,
- * because a guessed relationship must not read as a measured one (AAP 0.4.2);
+ * because a guessed relationship must not read as a measured one;
  * the dependency graph draws the same two lineage states the same way.
  *
  * SVG paints in document order and `z-index` does not apply to it, so paint
@@ -3456,11 +3455,12 @@
  * as the container holds, with no breakpoint: a narrow webview column and a
  * wide DevTools panel are the same rule.
  *
- * A metric that could not be observed — the transferred-bytes gap of AAP
- * 0.6.6 — renders the not-available label under `dg-is-unavailable`: muted,
- * and on a dashed tile with an italic figure. The shape change is what keeps an
- * unobservable value from reading as a measured zero, because a measured fast
- * duration is muted as well (`--dg-duration-fast` aliases `--dg-text-muted`).
+ * A metric that could not be observed — transferred bytes with no resource
+ * timing behind them — renders the not-available label under
+ * `dg-is-unavailable`: muted, and on a dashed tile with an italic figure. The
+ * shape change is what keeps an unobservable value from reading as a measured
+ * zero, because a measured fast duration is muted as well
+ * (`--dg-duration-fast` aliases `--dg-text-muted`).
  * ========================================================================== */
 
 .dg-metric-cards {
@@ -3551,8 +3551,8 @@
 /* ==========================================================================
  * components/FlameChart.tsx
  *
- * Hierarchical SPAN TIMING in an icicle layout — the recorded gap of AAP
- * 0.6.6. It is not a sampling profile, so there is no sample-count chrome, no
+ * Hierarchical SPAN TIMING in an icicle layout, in place of a CPU-sampled flame
+ * graph. It is not a sampling profile, so there is no sample-count chrome, no
  * self-time colouring and no inverted view.
  *
  * A frame's label is drawn INSIDE the frame, so it is text on a kind fill and
@@ -4300,8 +4300,8 @@
  *
  * The participants of a correlated trace — UI event, function, API, service,
  * database, external — in a STATIC layered left-to-right layout. Hover and
- * click only: the recorded gap of AAP 0.6.6 is that v1 has no drag and no
- * zoom, so there is no grab cursor and no pan affordance anywhere below.
+ * click only: the graph offers no drag and no zoom, so there is no grab
+ * cursor and no pan affordance anywhere below.
  *
  * A node's box keeps the elevated surface and spends its participant colour on
  * the OUTLINE, so the label inside it stays in a text tone at full contrast
@@ -4422,9 +4422,9 @@
  * continuation with a single candidate — is solid in the info tone: not
  * measured, but not in doubt. AMBIGUOUS — at least one of those attributions
  * chose among several candidates — is dashed in the warning tone, the
- * timeline's treatment of the same condition (AAP 0.4.2), so the two views
- * agree. Both tones clear the non-text bar on every surface (they are held to
- * the text ratio), and the chip in the grid names either state in words. */
+ * timeline's treatment of the same condition, so the two views agree. Both
+ * tones clear the non-text bar on every surface (they are held to the text
+ * ratio), and the chip in the grid names either state in words. */
 .dg-dependency-graph__edge.dg-is-inferred {
   stroke: var(--dg-info);
 }
@@ -4634,7 +4634,7 @@
  *   - A specification that arrived as the deterministic fallback
  *     (`spec.meta.fallback`) renders the banner below, above the summary and
  *     across the panel's full width. A failure may never look like a
- *     successful analysis (AAP 0.5.5), so the banner is warning-toned, edged,
+ *     successful analysis, so the banner is warning-toned, edged,
  *     and impossible to mistake for ordinary chrome — while its text stays in
  *     the primary text colour, which holds the AA text ratio on every surface
  *     of every theme, rather than being painted in the warning colour itself.
@@ -4714,7 +4714,7 @@
  * surfaces, not for that fill: in the dark and high-contrast themes the link
  * accent (4.02:1), the secondary text tone (4.31:1), the muted tone (3.12:1)
  * and the danger tone behind a critical duration (3.50:1) all fall under the
- * 4.5:1 text bar on it (AAP 0.6.3). So every text-bearing element painted
+ * 4.5:1 text-contrast minimum on it. So every text-bearing element painted
  * directly on a selected surface takes the primary text colour, which the
  * token test measures on the selection fill in every theme.
  *

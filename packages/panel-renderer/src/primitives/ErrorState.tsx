@@ -4,12 +4,12 @@
  * ## Why this primitive is structural, not decorative
  *
  * Every catalogued visualization component in this package has exactly three
- * structural states, and AAP 0.6.2 names the renderer of each one: empty
- * (`EmptyState`), loading (`LoadingState`) and error — "`ErrorState` with the
- * query and a retry action". This is that third renderer, and it is the only
- * one: all thirteen visualization components and the `host/` layer render it
- * rather than inventing a failure box of their own, so a failure looks and
- * behaves identically wherever in a generated panel it happens.
+ * structural states, each with one renderer: empty (`EmptyState`), loading
+ * (`LoadingState`) and error — this component, showing the query that failed
+ * and a retry action. It is the only error renderer: all thirteen
+ * visualization components and the `host/` layer render it rather than
+ * inventing a failure box of their own, so a failure looks and behaves
+ * identically wherever in a generated panel it happens.
  *
  * It is reached on one path. A node resolves its data query through
  * `host/useQuery` against a `DataProvider`, which crosses two process
@@ -21,9 +21,9 @@
  *
  * ## A failure stays a failure
  *
- * AAP 0.5.5's rule is that "a failure is never presented as a successful
- * analysis", and this component is the visible half of it. Three consequences
- * are requirements here rather than preferences:
+ * A failure is never presented as a successful analysis, and this component
+ * is the visible half of that rule. Three consequences are requirements here
+ * rather than preferences:
  *
  *   1. It reads unmistakably as a failure. The title carries the `danger` text
  *      tone and the box is marked as a failure by the stylesheet, so a reader
@@ -42,36 +42,23 @@
  *      panel, and conflating them would tell a developer their whole panel is
  *      untrustworthy because one node's request timed out.
  *
- * ## Tier 3, and the narrowest possible composition
- *
- * It composes four primitives from this folder and nothing else from the
- * package: `Text` for the copy, `Code` for the query and diagnostics blocks,
- * `Button` for the retry control and `Badge` for the optional machine code.
- * The one import from outside the package is the default glyph,
- * `TriangleAlert` from `lucide-react` — the icon set AAP 0.6.1 sanctions and
- * `Select` already draws from. It imports no layout primitive, no
- * visualization component, no host module, no panel schema, no protocol type,
- * no `@debuggen/*` workspace and no transport, so the only thing above it in
- * the package's dependency order is whoever renders it — which is what lets
- * the whole catalog and the host layer use it with no risk of a cycle
- * (AAP 0.2.2, 0.6.2).
- *
  * ## One contract, one wording
  *
  * Every query-backed node reaches this component through the same path, and a
  * reader comparing two failed nodes must see two instances of one design, not
- * two designs (B1-F16, B2-F14). So the parts are fixed and ordered — glyph,
- * title, message, hint, code, query, technical details, action — and the words
- * that fill them are composed once, in `host/useQuery`
- * (`queryFailureProps`, `formatDataQuery`), rather than by each component:
+ * two designs. So the parts are fixed and ordered — glyph, title, message,
+ * hint, code, query, technical details, action — and the words that fill them
+ * are composed once, in `host/useQuery` (`queryFailureProps`,
+ * `formatDataQuery`), rather than by each component:
  *
  *   - **The message** is for the reader: a generic lead ("The data for this
- *     view could not be loaded.") followed by the cause the provider stated.
+ *     view could not be loaded.") followed, when a typed error states one, by
+ *     its presentable cause — never a foreign exception's text.
  *   - **The hint** is what the reader can do about it, on its own line.
- *   - **The technical details** are for a developer: the error's diagnostic
- *     context, already serialised, behind a native disclosure that starts
- *     closed. Integration instructions ("pass the sessionId …") live there and
- *     never on the hint line a panel user reads first.
+ *   - **The technical details** are for a developer: the error's allowlisted
+ *     diagnostic context, already serialised, behind a native disclosure that
+ *     starts closed. Integration instructions ("pass the sessionId …") live
+ *     there and never on the hint line a panel user reads first.
  *   - **The query** is serialised by one formatter, so every node prints the
  *     same request the same way.
  *
@@ -81,9 +68,10 @@
  * `@debuggen/panel-schema`, and a primitive in this folder must not import it:
  * the primitives layer is schema-agnostic by design, which is what keeps it
  * usable from the DevTools panel, the editor webview and a component test with
- * no panel specification anywhere in sight (AAP 0.6.2 — "the renderer depends
- * on the schema, never the reverse", and this folder does not even depend on
- * the schema).
+ * no panel specification anywhere in sight. The renderer depends on the
+ * schema, never the reverse, and this folder does not depend on it at all:
+ * this primitive imports no schema, host, layout or visualization module, so
+ * every layer of the package can render it without an import cycle.
  *
  * So the caller — `host/useQuery` or `host/NodeRenderer`, which already hold
  * the typed object — serialises it exactly once, in pretty-printed JSON form
@@ -103,16 +91,32 @@
  *
  * ## Privacy
  *
- * Everything this component renders arrives already redacted. Telemetry
- * attributes, request targets and statements pass through the redaction layer
- * at ingest before any of them can reach a panel (AAP 0.5.2), and an error's
- * diagnostic details are restricted by `DebuggenErrorOptions.details` to values
- * that are safe to show in a user interface, so this file performs no
- * redaction of its own and — just as importantly — never reverses,
- * re-parses, reformats, truncates, stores or logs what it is handed. There is
- * no `console` call anywhere in this module: a diagnostic written from here
- * would copy a message and a query into a log this product's privacy model
- * never accounted for.
+ * This component renders every string it is given verbatim and screens none
+ * of them: it never re-parses, reformats, truncates, stores or logs what it is
+ * handed, and there is no `console` call anywhere in this module, because a
+ * diagnostic written from here would copy a message and a query into a log
+ * this product's privacy model never accounted for. Whatever reaches it is
+ * therefore its caller's responsibility, and whatever reaches it is shown.
+ *
+ * On the query path that caller is `queryFailureProps` in `host/useQuery`.
+ * Its message is the scope's fixed lead followed, at most, by the message a
+ * `DebuggenError` of typed provenance states — one whose whole `cause` chain
+ * is typed. A rejection's own text — a plain exception, an HTTP or transport
+ * error, a string, a salvaged error-shaped object, or a typed error built
+ * around such a cause, whether it repeats the cause verbatim or embeds it in
+ * prose of its own — is never shown: renderer-authored fixed text stands in
+ * for it. Typed text and hints that carry an absolute path, a URL, a
+ * credential, SQL or a quoted literal, control characters or an oversize run
+ * are withheld as well. `details` keeps approved diagnostic fields only: a
+ * secret-named key's value is always `[redacted]`, text survives only under
+ * the closed diagnostic vocabulary and when it passes the same screen, counts
+ * and flags survive under any identifier key, and anything nested is
+ * `[redacted]`.
+ *
+ * A caller assembling these props by hand passes approved product copy only,
+ * never an exception's `message`: an arbitrary rejection can carry a private
+ * path, a token or a statement, and this component would put it in front of
+ * whoever reads the panel.
  *
  * ## No heading element, in any form
  *
@@ -123,7 +127,7 @@
  * primitive and `layout/Section` never sanctioned. A skipped or duplicated
  * level is invisible on screen while being exactly what a screen-reader user
  * navigates by, so outline decisions stay with the components that own the
- * surrounding structure (AAP 0.6.4).
+ * surrounding structure.
  *
  * ## Live regions: the division of labour across the three states
  *
@@ -139,8 +143,8 @@
  * Assertive is right for one failure and wrong for twelve. When the service
  * goes away every query-backed node of a panel fails within a few
  * milliseconds, and twelve simultaneous alerts interrupt each other until the
- * reader hears none of them (B2-F14). So the politeness is a prop,
- * `announce`: `"assertive"` renders `role="alert"`, and `"polite"` renders
+ * reader hears none of them. So the politeness is a prop, `announce`:
+ * `"assertive"` renders `role="alert"`, and `"polite"` renders
  * `role="status"`, an implicitly polite live region that is still announced
  * and still reachable, but queued behind the one alert instead of cutting it
  * off. Which failure of a burst gets to be the assertive one is not something
@@ -158,8 +162,8 @@
  * Not one colour, length, font or radius appears in this module, and there is
  * no inline `style` object, no width, no height and no minimum height: the
  * container's geometry and every visual value belong to
- * `../styles/components.css`, which resolves them to `--dg-*` tokens
- * (AAP 0.6.3, 0.6.4). The class contract this file DECLARES, and that
+ * `../styles/components.css`, where each resolves to a `--dg-*` token and no
+ * CSS value is hardcoded. The class contract this file DECLARES, and that
  * `components.css` must implement:
  *
  *   dg-error-state              the block — a column on
@@ -210,10 +214,10 @@
  * expanded/collapsed announcement, none of which a hook-free component could
  * reproduce, and the elements take their spacing from the block's gap, their
  * summary text from the `Text` primitive inside it and their body from the
- * `dg-error-state__query` box. Raw markup is legitimate here: AAP 0.6.4 asks
- * for library primitives over raw buttons, inputs, selects, tables and
- * headings, and this package has no disclosure primitive a raw `<details>`
- * would bypass.
+ * `dg-error-state__query` box. Raw markup is legitimate here: the rule is no
+ * raw markup where a primitive exists — library primitives over raw buttons,
+ * inputs, selects, tables and headings — and this package has no disclosure
+ * primitive a raw `<details>` would bypass.
  *
  * The two global utilities of `../styles/base.css` are reused and never
  * redefined: `dg-icon` is the square on the glyph — the default one below and
@@ -238,8 +242,8 @@ import { Text } from './Text';
  * Generic product vocabulary, and deliberately about the view rather than about
  * the cause: this component cannot see what failed, the `message` is where the
  * cause is stated, and a default that guessed at one would be wrong most of the
- * time. It names nothing from an inspected project and interpolates nothing
- * (AAP 0.5.4).
+ * time. It names nothing from an inspected project and interpolates nothing:
+ * product source carries no vocabulary of any particular application.
  */
 const DEFAULT_TITLE = 'Could not load this view';
 
@@ -259,7 +263,7 @@ const DEFAULT_RETRY_LABEL = 'Retry';
  * or a fresh `ErrorState` takes its place. The button the reader pressed is
  * gone by then, and a focused element that leaves the document hands focus to
  * `<body>` — which, for a keyboard or screen-reader user, is the same as being
- * thrown back to the top of the panel (B1-F14, B2-F12).
+ * thrown back to the top of the panel.
  *
  * The cure cannot live here: this component is pure and holds no reference to
  * anything it rendered before, so it cannot know that it is the successor of a
@@ -322,12 +326,12 @@ const DETAILS_LABEL = 'Technical details';
  * The glyph an error state draws when its caller passes no `icon` at all.
  *
  * One glyph for every failure, so a reader scanning a panel recognises an
- * error box by its shape as well as by its words and its danger edge — before
- * this default, only the nodes whose component happened to pass a glyph had
- * one (B2-F14). It carries the global `dg-icon` class and nothing else: its
- * square and `currentColor` come from `base.css`, the danger tint from the
- * `dg-error-state__icon` box, and no numeric size or colour prop is written
- * (AAP 0.6.4). Hoisted because a React element is an immutable description,
+ * error box by its shape as well as by its words and its danger edge, whether
+ * or not the rendering component passes a glyph of its own. It carries the
+ * global `dg-icon` class and nothing else: its square and `currentColor` come
+ * from `base.css`, the danger tint from the `dg-error-state__icon` box, and no
+ * numeric size or colour prop is written, because such a prop is a hardcoded
+ * visual value. Hoisted because a React element is an immutable description,
  * so one instance serves every render.
  */
 const DEFAULT_ICON = <TriangleAlert className="dg-icon" />;
@@ -373,8 +377,8 @@ const QUERY_ROLE = 'group';
  * string renders no text, so none of them justifies a glyph box: an empty
  * wrapper still carries that wrapper's gap, which shows up as an unexplained
  * blank strip above the copy. `0` is renderable and stays renderable, and no
- * value is ever coerced into visible text — AAP 0.6.4's defensive rule is that
- * "null" and "undefined" must never reach the screen as words.
+ * value is ever coerced into visible text, because "null" and "undefined"
+ * must never reach the screen as words.
  *
  * It is applied to the glyph after the default has been substituted for an
  * omitted `icon`, so `undefined` reaching it means nothing at all, while an
@@ -424,7 +428,7 @@ function hasText(value: string | undefined): value is string {
  * parts of an error state are named props in a fixed order, so arbitrary
  * children would be a second, unordered way to put content in the same box —
  * and an error box whose content a caller can replace is no longer a guarantee
- * about how failures look (AAP 0.5.5).
+ * about how failures look.
  *
  * Every optional member states `| undefined` explicitly:
  * `exactOptionalPropertyTypes` is in force repository-wide
@@ -435,15 +439,18 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
   /**
    * What went wrong, in one sentence, and the only required prop.
    *
-   * The caller owns this wording: it is the failure as the layer that observed
-   * it understands it — a transport error, a rejected request, a source the
-   * capture does not hold — and this file supplies no default for it, because a
-   * default would have to be vague enough to be useless. Write what failed, not
-   * what it might mean: an inference about a cause belongs to a validated
-   * analysis, never to an error box (AAP 0.5.5). A node on the query path takes
-   * it from `queryFailureProps` in `host/useQuery`, which composes one generic
-   * lead and the cause the provider stated, so every node words the same
-   * failure the same way.
+   * The caller owns this wording, and it is rendered verbatim (see this
+   * module's privacy note): approved product copy stating the failure as the
+   * layer that observed it understands it — the connection dropped, the request
+   * was refused, the capture holds no such source — and never an exception's
+   * own `message`. This file supplies no default for it, because a default
+   * would have to be vague enough to be useless. Write what failed, not what it
+   * might mean: an inference about a cause belongs to a validated analysis,
+   * never to an error box, because a failure is never presented as a
+   * successful analysis. A node on the query path takes it from
+   * `queryFailureProps` in `host/useQuery`, which composes the scope's fixed
+   * lead and, at most, a typed error's presentable cause, so every node
+   * words the same failure the same way.
    *
    * Rendered as body text through `Text` at the `--dg-text-sm` role in
    * `--dg-text-secondary`, beneath the title.
@@ -457,9 +464,9 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * Rendered through `Text` at the `--dg-text-md` role, with the raised weight
    * and the `--dg-danger` tone, as a paragraph. It is NOT a heading and no
    * heading element is emitted for it, for the reason this module's header
-   * records. Status colours are text-safe in every theme (AAP 0.6.3), which is
-   * what makes the danger tone legitimate on text here rather than a contrast
-   * regression.
+   * records. Status colours clear the 4.5:1 text-contrast minimum on every
+   * surface of every theme (`tokens.test.ts` enforces it), which is what makes
+   * the danger tone legitimate on text here rather than a contrast regression.
    *
    * Passing the empty string suppresses the line entirely, for a caller that
    * has stated the failure fully in `message` and wants no second line. The
@@ -478,9 +485,10 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    *
    * Written for whoever is reading the panel, never for whoever integrated it:
    * an instruction about how a host or provider must be wired belongs in
-   * `details`, where only the reader who opens the disclosure meets it. Rendered
-   * through `Text` as a second paragraph of the message's register, at the
-   * `--dg-text-sm` role in `--dg-text-secondary`.
+   * `details`, where only the reader who opens the disclosure meets it. Like
+   * `message`, it is approved copy rendered verbatim, never an exception's
+   * text. Rendered through `Text` as a second paragraph of the message's
+   * register, at the `--dg-text-sm` role in `--dg-text-secondary`.
    *
    * Omitted, absent or blank, no line is rendered.
    */
@@ -491,7 +499,7 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * search a log or an issue tracker for.
    *
    * Rendered as a `Badge` with the `danger` tone, never as a bare styled
-   * element (AAP 0.6.4 permits no raw markup where a primitive exists). It is a
+   * element, because no raw markup stands in where a primitive exists. It is a
    * code, not a sentence: the human-readable form of the same failure is
    * `message`, and a code is useless to a reader who is not given both.
    *
@@ -516,7 +524,7 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * check. The block is focusable, so it can be scrolled from the keyboard, and
    * it is named by `aria-label` on a `group` role that accepts that name.
    *
-   * Showing it is what AAP 0.6.2 asks of this component: a failure a developer
+   * Showing it is part of the error state's contract: a failure a developer
    * can act on has to say what was asked for, not only that asking failed.
    *
    * Omitted, absent or blank, no block is rendered.
@@ -536,8 +544,10 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
 
   /**
    * Developer diagnostics for the failure, already serialised to a string by
-   * the caller — the error's details object as pretty-printed JSON is the
-   * expected form, which `queryFailureProps` in `host/useQuery` produces.
+   * the caller — the error's allowlisted details as pretty-printed JSON is the
+   * expected form, which `queryFailureProps` in `host/useQuery` produces. It
+   * is rendered verbatim, so a hand-assembled value must hold no unscreened
+   * error text.
    *
    * Rendered, when present, as a native disclosure that starts **closed**: a
    * `<summary>` reading "Technical details", which the keyboard toggles, over
@@ -581,7 +591,7 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * query, never fetches, never touches a data provider and never disables or
    * rate-limits itself after a click: deciding whether a retry is in flight,
    * whether to back off and what to render next belongs to the host layer that
-   * owns the query (AAP 0.4.2).
+   * owns the query.
    *
    * The control carries {@link FOCUS_KEY_ATTRIBUTE} set to
    * {@link ERROR_STATE_RETRY_FOCUS_KEY}, so that when the retry replaces this
@@ -608,15 +618,16 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    *
    * It is rendered inside a wrapper this component marks `aria-hidden="true"`,
    * so it is never part of the accessible name — the copy and the live-region
-   * role carry the whole meaning, and the glyph reinforces it (AAP 0.6.4:
-   * colour and iconography are never the sole indicator of a state).
+   * role carry the whole meaning, and the glyph reinforces it, because colour
+   * and iconography are never the sole indicator of a state.
    *
    * Pass a replacement already carrying the global `dg-icon` class —
    * `icon={<SomeGlyph className="dg-icon" />}` — so it takes its square and its
    * `currentColor` from `../styles/base.css` and scales with the type role
    * around it; the box tints it with `--dg-danger`. Never pass an icon
-   * library's numeric size or colour prop: those are hardcoded values, which
-   * AAP 0.6.4 forbids. The default is drawn the same way.
+   * library's numeric size or colour prop: those are hardcoded visual values,
+   * and every visual value resolves to a `--dg-*` token. The default is drawn
+   * the same way.
    *
    * `null`, `false` or `''` renders no glyph at all: no wrapper is rendered and
    * the column starts at the title.
@@ -663,9 +674,9 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
  * }
  *
  * @example
- * // A hand-assembled failure with every part present.
+ * // A hand-assembled failure with every part present, worded in product copy.
  * <ErrorState
- *   message={message}
+ *   message="The connection to the local service was lost."
  *   hint="Retry to request the data again."
  *   code="TRANSPORT_DISCONNECTED"
  *   query={formattedQuery}
@@ -675,8 +686,10 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
  * />
  *
  * @example
- * // The minimal form: a failure a second attempt cannot change, with no glyph.
- * <ErrorState message={failure.message} icon={null} />
+ * // The minimal form: a failure a second attempt cannot change, with no glyph,
+ * // stated in fixed product copy rather than a caught error's message.
+ * const UNDRAWABLE_NODE = 'This part of the panel could not be drawn.';
+ * <ErrorState message={UNDRAWABLE_NODE} icon={null} />
  */
 export function ErrorState(props: ErrorStateProps): ReactElement {
   const {

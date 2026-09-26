@@ -2,15 +2,20 @@
  * The observed register of `layout/SummaryHeader` when the summary lists no
  * facts, and the outline it keeps either way.
  *
- * The head is the first thing a reader of a generated panel sees. A summary
- * with neither facts nor causes — the shape a deterministic fallback over an
- * empty capture takes — used to render as a bare title, which reads exactly
- * like a head the analysis never reached. The observed region is therefore
- * always rendered, and with no facts it says so in one muted sentence; the
- * likely-cause region still appears only when there is a cause to list.
+ * The head is the first thing a reader of a generated panel sees, and a
+ * summary with neither facts nor causes is the shape a deterministic fallback
+ * over an empty capture takes. The suite pins how that head presents:
  *
- * The copy below is generic product vocabulary written for this suite; no
- * inspected project's names appear in it (AAP 0.5.4).
+ * - The Observed region always renders. With no facts it holds one muted
+ *   sentence, "No facts were observed.", where the list would be — never a
+ *   list item, and never carrying a citation.
+ * - The Likely cause region renders only when there is a cause to list, and
+ *   is always a sibling of the Observed region, never part of it.
+ * - The outline holds either way: both region headings sit one level below
+ *   the title, whatever level the title takes.
+ *
+ * The copy below is generic product vocabulary written for this suite; it
+ * names nothing of an inspected project.
  */
 
 import type { Fact, Hypothesis, PanelSummary } from '@debuggen/panel-schema';
@@ -22,7 +27,7 @@ import { SummaryHeader } from './SummaryHeader';
 /** The panel title every case renders. */
 const TITLE = 'Where the interaction spent its time';
 
-/** The region names AAP 0.7.3 and 0.8.4 fix. */
+/** The region names the DevTools panel and the editor webview both rely on. */
 const OBSERVED_NAME = 'Observed';
 const LIKELY_CAUSE_NAME = 'Likely cause';
 

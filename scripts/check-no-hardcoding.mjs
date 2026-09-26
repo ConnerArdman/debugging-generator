@@ -3,9 +3,10 @@
  * check-no-hardcoding.mjs
  *
  * Repository gate behind `pnpm check:no-hardcoding`, which `pnpm verify` runs. It is the static
- * half of the "No Hardcoded Behavior" guarantee (AAP 0.5.4): the product must contain no knowledge
- * of the demo application and must never shortcut the pipeline by branching on the developer's
- * question. The behavioural half lives elsewhere and is deliberately not reimplemented here
+ * half of the "No Hardcoded Behavior" guarantee: the product must contain no knowledge of the demo
+ * application and must never shortcut the pipeline by branching on the developer's question
+ * (`docs/ARCHITECTURE.md` section 3, "Workspace layout and dependency layering", describes the
+ * gate). The behavioural half lives elsewhere and is deliberately not reimplemented here
  * (`packages/model-provider/src/providers/deterministic.test.ts` proves wording-invariance and
  * `tests/e2e/generalization.spec.ts` runs the whole flow against an independent fixture app).
  *
@@ -28,11 +29,11 @@
  *                                template chunk (substring, so a prefix or a query suffix matches).
  *      `policy-identifier-text`  the same identifier match against the raw text of structured
  *                                files: prompts, JSON, Markdown, plain text and the deterministic
- *                                provider's templates, "so demo instructions or pre-authored
- *                                output cannot hide in a prompt" (AAP 0.5.4).
+ *                                provider's templates, so demo instructions or pre-authored
+ *                                output cannot hide in a prompt.
  *      `policy-route-text`       the same for route paths.
  *
- *   C. branching on the session question -- the pattern the user wrote out (AAP 0.1.2):
+ *   C. branching on the session question -- the shortcut this gate exists to forbid:
  *      `question-branch`         `if (question.includes("button slow")) return checkoutDemoPanel;`
  *                                and every variant of it: a string search method called on a
  *                                question-derived expression, `RegExp.prototype.test` applied to
@@ -47,7 +48,7 @@
  *                                comments are where tooling records what it knows: a lint
  *                                exception that lists demo files is demo knowledge however it is
  *                                written, and `docs/DEMO.md` is the one place that may say where
- *                                the demo's defects live (AAP 0.7.2, 0.8.5).
+ *                                the demo's defects live.
  *      `tooling-route-text`      the same for route paths.
  *      `tooling-demo-file`       a path in a tooling file that names one concrete file of the demo:
  *                                `apps/demo-app/<dir>/.../<file>` resolving to a regular file, or a
@@ -103,8 +104,9 @@
  * The policy is defined as (demo harvest) minus (fixture harvest) minus (allowlist), so the demo
  * application is the definition of the policy rather than evidence about it. `classifyCorpus()`
  * therefore asks one question only: is `apps/demo-app` in this checkout?
- *   * absent -- a partial clone or an early build. No comparison is possible, the run says so on
- *     its own line, and the committed policy is still enforced against product source.
+ *   * absent -- a partial or sparse checkout without `apps/demo-app`. No comparison is possible,
+ *     the run says so on its own line, and the committed policy is still enforced against product
+ *     source.
  *   * present -- every difference between the committed policy and a fresh harvest is drift. It is
  *     reported as `policy-stale`, it fails the gate, and `--update` writes exactly what it
  *     harvested, dropping entries the demo no longer declares. There is no coverage threshold and
@@ -115,7 +117,7 @@
  * "Every difference" is literal, and the comparison is therefore byte-exact: the committed file is
  * compared with `serializePolicy()` of the fresh harvest, not only with the set of names it lists.
  * A file that lists exactly the right names in the wrong order, repeats one, carries different
- * metadata or was reformatted by hand is stale too, because AAP 0.5.4's contract is that the
+ * metadata or was reformatted by hand is stale too, because the policy's contract is that the
  * committed bytes are what `--update` writes -- the file is prettier-ignored and hand-editing it is
  * forbidden precisely so those bytes mean something. Order-only drift is the case this exists for:
  * it survives a hand-resolved merge conflict or a sort that used `localeCompare` instead of
@@ -148,9 +150,9 @@
  * staleness. A run that scanned no product file at all fails too, because a clean result over an
  * empty set is not evidence. The tooling pass fails closed on the same terms, and so does its demo
  * path resolution: a demo entry that cannot be inspected or listed while resolving a path named
- * in tooling is a scan failure, never a pass. An absent tree is
- * the one benign case and stays an informational note: this script runs on clones where a surface
- * has not landed yet.
+ * in tooling is a scan failure, never a pass. An absent tree is the one benign case: a product or
+ * tooling tree that is not in the checkout contributes no files and is reported as a note, not a
+ * failure, while the "no product file at all" rule above still stops a run that examined nothing.
  *
  * Usage:  node scripts/check-no-hardcoding.mjs [--update] [--json] [--help]
  * Exits:  0 clean | 1 violations found or policy stale | 2 usage error, environment error, or a
@@ -188,23 +190,23 @@ export const POLICY_FILE = 'scripts/no-hardcoding.policy.json';
 export const ALLOWLIST_FILE = 'scripts/no-hardcoding.allowlist.json';
 /** Direct invocation that regenerates the policy. */
 const UPDATE_COMMAND = `node ${SCRIPT_FILE} --update`;
-/** The same regeneration through the workspace script, as the AAP words it. */
+/** The same regeneration through the workspace script, the form the gate's messages recommend. */
 const PNPM_UPDATE_COMMAND = 'pnpm check:no-hardcoding --update';
 
 /** The demo application: the corpus `--update` harvests, and the tree the product may not name. */
 export const DEMO_TREE = 'apps/demo-app';
 /** Package name of the demo application, as declared in `apps/demo-app/package.json`. */
 export const DEMO_PACKAGE = '@debuggen/demo-app';
-/** The independent corpus whose names are subtracted from the policy (AAP 0.5.4). */
+/** The independent corpus whose names are subtracted from the policy. */
 export const FIXTURE_TREE = 'tests/fixtures/sample-next-app';
 
 /**
  * Product trees scanned as source. `tests/e2e/**`, `tests/browser/**`, `tests/fixtures/**`,
  * `docs/**`, `apps/demo-app/**` and `scripts/**` are deliberately absent: the first five
- * legitimately name demo symbols (AAP 0.4.2), and `scripts/` is repository tooling rather than
- * product. Tooling is not exempt, it is scanned differently: {@link TOOLING_TREES} and the
- * repository root are matched as raw text by the class D pass, with the policy file excluded by
- * exact path because it contains every forbidden token by construction.
+ * legitimately name demo symbols, and `scripts/` is repository tooling rather than product.
+ * Tooling is not exempt, it is scanned differently: {@link TOOLING_TREES} and the repository root
+ * are matched as raw text by the class D pass, with the policy file excluded by exact path because
+ * it contains every forbidden token by construction.
  *
  * @type {readonly string[]}
  */
@@ -345,9 +347,9 @@ const MAX_SNIPPET_LENGTH = 100;
 const MAX_TAINT_PASSES = 6;
 
 /**
- * The only file allowed to branch on the question text, and only in its generic tokenizer
- * (AAP 0.5.4). The exemption is by exact repository-relative path and extends nowhere else; class
- * B still applies to it, so the tokenizer cannot smuggle demo vocabulary in.
+ * The only file allowed to branch on the question text, and only in its generic tokenizer. The
+ * exemption is by exact repository-relative path and extends nowhere else; class B still applies
+ * to it, so the tokenizer cannot smuggle demo vocabulary in.
  */
 export const QUESTION_EXEMPT_FILE = 'apps/local-service/src/pipeline/stages/understand.ts';
 
@@ -521,7 +523,7 @@ const RULE_HINTS = Object.freeze({
 /**
  * How the committed policy's *form* differs from the canonical form `--update` writes, once the
  * names it lists are accounted for. Order, repetition and formatting are contract, not cosmetics:
- * the committed artifact has to be reproducible from its corpus byte for byte (AAP 0.5.4).
+ * the committed artifact has to be reproducible from its corpus byte for byte.
  *
  * @typedef {object} SerializationReport
  * @property {boolean} canonical Whether the committed form is the canonical one -- no reason below,
@@ -642,8 +644,8 @@ function describeError(error) {
 
 /**
  * `lstat` with the one distinction this script has to make: a path that is not there (benign -- a
- * surface that has not landed in this clone) versus a path that is there but could not be
- * inspected (a hole in the scan). Symbolic links are not followed.
+ * tree this checkout does not contain) versus a path that is there but could not be inspected (a
+ * hole in the scan). Symbolic links are not followed.
  *
  * @param {string} absolute
  * @returns {{ stat: import('node:fs').Stats }|{ missing: true }|{ error: unknown }}
@@ -661,9 +663,9 @@ function statEntry(absolute) {
 }
 
 /**
- * Classify a tree the scan is about to walk. `absent` is informational -- this script runs on
- * clones where a surface has not landed yet -- while anything else that is not a readable directory
- * is a scan failure.
+ * Classify a tree the scan is about to walk. `absent` is benign -- a tree that is not in the
+ * checkout contributes no files, and the caller decides whether that is worth a note -- while
+ * anything else that is not a readable directory is a scan failure.
  *
  * @param {string} root Absolute repository root.
  * @param {string} absolute Absolute path of the tree.
@@ -957,8 +959,8 @@ function walkFiles(absoluteDir, accept, skippedDirectories, root) {
 /**
  * Whether a file name belongs to a test suite. Tests inside product packages and beside the guard
  * scripts legitimately name demo symbols -- `scripts/check-no-hardcoding.test.mjs` itself asserts
- * on a deliberate cheat -- so every pass excludes them (AAP 0.5.4 scans product source "excluding
- * tests").
+ * on a deliberate cheat -- so every pass excludes them: the gate covers product source excluding
+ * tests.
  *
  * @param {string} name Base name.
  * @returns {boolean}
@@ -1003,9 +1005,9 @@ const TS_MORPH_HOSTS = Object.freeze([
 let tsMorphCache = null;
 
 /**
- * Load ts-morph from a workspace's installed copy. There is no regex fallback on purpose: AAP
- * 0.5.4 requires this scanner to be AST-aware, and a grep-only pass would report a gate that is
- * not the gate the plan specifies.
+ * Load ts-morph from a workspace's installed copy. There is no regex fallback on purpose: the
+ * scanner is AST-aware by contract, and a grep-only pass cannot tell an identifier, an import
+ * specifier and a string literal apart, so its verdict would not be this gate's verdict.
  *
  * The scanned root is tried first, then this script's own repository, which is what lets the tests
  * scan synthetic trees in temporary directories that have no `node_modules` of their own. The
@@ -1593,8 +1595,9 @@ function referencesDemo(specifier, fromFile) {
   if (!specifier.includes('demo-app')) {
     return false;
   }
-  // Both interpretations are tried, as AAP 0.5.4 requires: relative to the containing file, and
-  // relative to the repository root. The second strips leading `./` and `../` segments, so
+  // Both interpretations are tried, because a literal resolving under the demo tree either way is a
+  // reference into it: relative to the containing file, and relative to the repository root. The
+  // second strips leading `./` and `../` segments, so
   // `'../../apps/demo-app/app/api/widgets/route.ts'` is caught from any depth -- a literal that
   // spells the demo tree out is a violation however many levels precede it.
   const fileRelative = path.posix.normalize(
@@ -2904,10 +2907,10 @@ class DemoFileResolver {
  * Tooling is matched as text, never parsed, and comments count. Unlike product source, tooling
  * cannot leak demo knowledge into runtime behaviour, but it can record it: a lint exception keyed
  * on demo files, a CI step naming a demo route, a guard whose comments describe where a defect
- * lives. Any of those puts the demo's internals somewhere other than `docs/DEMO.md` (AAP 0.7.2,
- * 0.8.5), so an exception tooling needs has to be expressed by workspace or by rule instead.
- * `apps/demo-app` itself is not policy vocabulary, which is what lets tooling configure the demo
- * workspace as a whole.
+ * lives. Any of those puts the demo's internals somewhere other than `docs/DEMO.md`, the only
+ * document that locates them, so an exception tooling needs has to be expressed by workspace or by
+ * rule instead. `apps/demo-app` itself is not policy vocabulary, which is what lets tooling
+ * configure the demo workspace as a whole.
  *
  * A path is demo knowledge as much as a name is, so the same text is also searched for paths
  * under `apps/demo-app` (`tooling-demo-file`). The tree itself, a directory in it, an entry at its
@@ -3031,10 +3034,10 @@ export function camelTokens(name) {
 }
 
 /**
- * The filter AAP 0.5.4 specifies for the harvest: keep only identifiers with two or more camel-case
- * tokens, drop anything shorter than four characters, and drop all-caps constants with no camel
- * boundary. `WidgetCard`, `useWidgetSummary` and `apiClient` qualify; `Product`, `Cart` and `GET`
- * do not, which is why the generic ones live in the allowlist instead.
+ * The filter the harvest applies: keep only identifiers with two or more camel-case tokens, drop
+ * anything shorter than four characters, and drop all-caps constants with no camel boundary.
+ * `WidgetCard`, `useWidgetSummary` and `apiClient` qualify; `Product`, `Cart` and `GET` do not,
+ * which is why the generic ones live in the allowlist instead.
  *
  * @param {string} name
  * @returns {boolean}
@@ -3349,7 +3352,7 @@ function sortedUnique(values) {
  * Compute the policy from the demo corpus. Pure: it reads the corpora and the allowlist and returns
  * the object, writing nothing.
  *
- * Inputs, and only these inputs (AAP 0.5.4):
+ * Inputs, and only these inputs:
  *   1. the demo application's own code index (`apps/demo-app`), including its Prisma schema and its
  *      App Router `app/api` layout;
  *   2. minus every name that also occurs in `tests/fixtures/sample-next-app`, an independent corpus
@@ -3420,7 +3423,7 @@ export async function buildPolicy(root = DEFAULT_ROOT, options = {}) {
  * question: is the demo corpus in this checkout?
  *
  * Two states:
- *   `absent` `apps/demo-app` is not here -- a partial clone or an early build. No comparison is
+ *   `absent` `apps/demo-app` is not here -- a partial or sparse checkout. No comparison is
  *            possible, the run says so, and the committed policy is still enforced against product
  *            source.
  *   `ready`  it is here. The corpus *defines* the policy (policy = demo harvest minus fixture
@@ -3428,11 +3431,11 @@ export async function buildPolicy(root = DEFAULT_ROOT, options = {}) {
  *            reported as `policy-stale` and fails the gate, whether the policy lists names the
  *            corpus no longer declares or misses names it does.
  *
- * There is deliberately no third state and no coverage threshold. A partly written demo yields a
- * smaller policy, not an exemption from having one that matches: a committed policy nobody can
- * regenerate is a gate nobody can trust, and AAP 0.5.4 makes regeneration the only way the file is
- * produced. The structural observations below are reported either way, because they explain what
- * the harvest saw.
+ * There is deliberately no third state and no coverage threshold. A smaller demo yields a smaller
+ * policy, not an exemption from having one that matches: a committed policy nobody can regenerate
+ * is a gate nobody can trust, and regeneration is the only way the file is produced. The
+ * structural observations below are reported either way, because they explain what the harvest
+ * saw.
  *
  * @param {string} root
  * @param {{ demoFiles: number, fixtureFiles: number, prismaPresent: boolean }} harvest
@@ -4047,7 +4050,7 @@ function helpText() {
     `Usage: node ${SCRIPT_FILE} [--update] [--json] [--help]`,
     '',
     'Proves that the product contains no knowledge of the demo application and never decides what',
-    "to show from the wording of the developer's question (AAP 0.5.4). This is the static half of",
+    "to show from the wording of the developer's question. This is the static half of",
     'the guarantee; the behavioural half is the deterministic-provider and generalization tests.',
     '',
     'Flags',

@@ -35,6 +35,7 @@
     "check:no-hardcoding": "node scripts/check-no-hardcoding.mjs",
     "check:no-residual-instrumentation": "node scripts/check-no-residual-instrumentation.mjs",
     "check:secrets": "node scripts/check-secrets.mjs",
+    "check:advisories": "node scripts/check-advisories.mjs",
     "verify": "pnpm build && pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm test:integration && pnpm check:no-hardcoding && pnpm check:no-residual-instrumentation && pnpm check:secrets"
   },
   "devDependencies": {

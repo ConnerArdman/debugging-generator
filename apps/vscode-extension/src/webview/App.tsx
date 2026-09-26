@@ -899,6 +899,9 @@ export function App(): ReactElement {
   const launchDevServer = useCallback((): void => {
     send({ type: 'launchDevServer' });
   }, [send]);
+  const loadModifications = useCallback((): void => {
+    send({ type: 'loadModifications' });
+  }, [send]);
   const openRelevantFile = useCallback(
     (file: string): void => {
       send({ type: 'openFile', location: wholeFileLocation(file, 'code-graph') });
@@ -1188,6 +1191,9 @@ export function App(): ReactElement {
                       modifications={state.modifications}
                       onOpenFile={openModifiedFile}
                       pending={phase.instrumenting && state.modifications.length === 0}
+                      total={state.modificationsTotal}
+                      onLoadMore={loadModifications}
+                      loadingMore={isPending(pendingActions, 'loadModifications')}
                     />
                   </Section>
                 </div>

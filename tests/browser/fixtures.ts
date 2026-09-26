@@ -1,5 +1,5 @@
 /**
- * Shared Playwright fixtures for the `browser` project (AAP §0.8.3 "Browser").
+ * Shared Playwright fixtures for the `browser` project.
  *
  * Every spec under `tests/browser/**` that drives the browser imports `test`
  * and `expect` from this module (`fixture-lifecycle.spec.ts`, which exercises
@@ -27,52 +27,48 @@
  * 5. `capture.start` → interact → settle → `capture.stop`;
  * 6. await `analysis.completed` / `panel.generated` as the spec requires.
  *
- * ## Fallbacks chosen where the planned contract and the code disagree
+ * ## Fixture lifecycle and constraints
  *
- * - **Fixture app lifecycle.** The fixture app's `next.config.ts` pins
- *   `turbopack.root` to its own directory, so borrowing another workspace's
- *   `next` binary in place fails ("Could not find the Next.js package") and
- *   Next then runs `pnpm install` against the repository lockfile. The app is
- *   therefore served from a *private per-worker copy* outside the repository:
- *   `<realpath(mkdtemp(<os tmpdir>/debuggen-browser-fixture-))>/sample-next-app`,
+ * - **A private copy per worker.** The fixture app's `next.config.ts` pins
+ *   `turbopack.root` to its own directory, so its dependencies must be
+ *   installed inside it: another workspace's `next` binary cannot serve it in
+ *   place ("Could not find the Next.js package"), and Next would then run
+ *   `pnpm install` against the repository lockfile. Each worker serves a
+ *   private copy outside the repository,
+ *   `<realpath(mkdtemp(<os tmpdir>/debuggen-browser-fixture-))>/sample-next-app`:
  *   a fresh `0700` boundary owned by this account and verified with
- *   `assertSecureDir`, into which {@link copyFixtureTree} copies the tracked
- *   tree without ever following or overwriting anything and without a
- *   check/use window: every directory and file is created through a held,
- *   verified directory descriptor (`pinPrivateFileWithinRoot`), never by
- *   path, so a directory swapped for a link mid-copy cannot redirect a write
- *   (no-follow reads, exclusive no-follow creates, symlinked or special
- *   entries refused, realpath containment checked) before its dependencies
- *   are installed. The tracked fixture tree is only ever read, and nothing is
- *   shared between runs or workers: teardown removes the whole boundary once
- *   the server stopped, and verifies it is gone.
- * - **Who starts the fixture app.** The service learns a dev server's address
- *   only from its own launcher (`apps/local-service/src/server/routes/sessions.ts`,
- *   `resolveDevServerUrl`: the launcher's registry, else an earlier session of
- *   the same root, else `DEV_SERVER_UNAVAILABLE`); `POST /dev-server/launch`
- *   carries no URL, so a server this file started on its own would never be
- *   probed and no session could be created for it. The fixture app is
- *   therefore launched *through the service* with an explicit command pinning
- *   the served origin's port and hostname — which also means the launcher
- *   attaches the telemetry preload, exactly as it does for any project.
- * - **Where the fixture app is served.** A server this worker did not start
- *   can never serve its sessions: the service attributes a dev server only
- *   from its launcher's registry for the project root or from an earlier
- *   session of the same root, and this worker's root is a fresh private copy;
- *   adopting another run's leftover root instead would take over — and stop —
- *   a server this worker does not own. So nothing is reused. The configured
- *   origin (`fixtureAppUrl`) is identified with two bounded `GET`s (`/` and
- *   `/api/ping`) as `none`, `fixture` or `foreign` ({@link identifyFixtureOrigin});
- *   when it is occupied — by the fixture app or anything else — the occupant
- *   is never launched against, stopped or sent anything more, and this worker
- *   serves its copy on an *alternate loopback origin* of its own (a port the
- *   OS reports free, identified as `none` before use, three attempts), noted
- *   once on stderr and in `fixtureApp.displaced`; `fixtureApp.baseUrl` is
- *   always the origin actually served ({@link planFixtureServing},
- *   {@link serveFixtureApp}). When the running service does not serve the
- *   launcher routes at all (`404` to a no-op `devServer.stop`), the copy is
- *   spawned directly without the preload, and `sessions.create()` refuses at
- *   once with the reason, since the service could not attribute that server.
+ *   `assertSecureDir`, which {@link copyFixtureTree} fills before the copy's
+ *   dependencies are installed. Every directory and file is created through a
+ *   held, verified directory descriptor (`pinPrivateFileWithinRoot`), never by
+ *   path — no-follow reads, exclusive no-follow creates, symlinked or special
+ *   entries refused, realpath containment checked — so a directory swapped for
+ *   a link mid-copy cannot redirect a write. The tracked fixture tree is only
+ *   read, nothing is shared between runs or workers, and teardown removes the
+ *   whole boundary once the server has stopped and verifies it is gone.
+ * - **Launched through the service.** The service learns a dev server's
+ *   address only from its own launcher (`resolveDevServerUrl` in
+ *   `apps/local-service/src/server/routes/sessions.ts`: the launcher's
+ *   registry, else an earlier session of the same root, else
+ *   `DEV_SERVER_UNAVAILABLE`), and `POST /dev-server/launch` carries no URL.
+ *   The copy is therefore launched by the service with an explicit command
+ *   pinning the served origin's port and hostname, and the launcher attaches
+ *   the telemetry preload as it does for any project.
+ * - **Served on an origin of its own.** Only a server this worker launched for
+ *   its own fresh root can serve its sessions, and adopting another run's
+ *   leftover root would take over — and stop — a server this worker does not
+ *   own, so nothing is reused. The configured origin (`fixtureAppUrl`) is
+ *   identified with two bounded `GET`s (`/` and `/api/ping`) as `none`,
+ *   `fixture` or `foreign` ({@link identifyFixtureOrigin}). An occupied origin
+ *   — by the fixture app or anything else — is never launched against,
+ *   stopped or sent anything more: the worker serves its copy on an alternate
+ *   loopback origin (a port the OS reports free, identified as `none` before
+ *   use, up to three attempts), noted once on stderr and in
+ *   `fixtureApp.displaced`. `fixtureApp.baseUrl` is always the origin actually
+ *   served ({@link planFixtureServing}, {@link serveFixtureApp}). A service
+ *   without the launcher routes (`404` to a no-op `devServer.stop`) gets a
+ *   copy spawned directly without the preload, and `sessions.create()` then
+ *   refuses at once with the reason, since the service cannot attribute that
+ *   server.
  * - **Diagnostics never quote a server.** Every sentence built from a
  *   response names only its status, its media type and whether the ping
  *   honoured the fixture contract ({@link describeMediaType}); bodies are read,
@@ -97,17 +93,17 @@
  *   (`inspectedWindow.tabId`, callback-form `inspectedWindow.eval`,
  *   `panels.themeName`) and plays the DevTools page's part by opening the
  *   `PORT_DEVTOOLS` port and sending its `devtools.hello` frame; the panel
- *   offers no real affordance (no `?tabId=` parameter) that could replace it.
- * - **Pairing** drives the panel's own `PairDialog` (rung 1 of the plan),
- *   typing only the pairing code: the dialog's service address field is left
- *   at `DEFAULT_SERVICE_BASE_URL`, so pairing is refused with an explanation
- *   when the suite's service listens elsewhere.
+ *   has no other way (such as a `?tabId=` parameter) to learn its tab.
+ * - **Pairing** drives the panel's own `PairDialog`, typing only the pairing
+ *   code: the dialog's service address field stays at
+ *   `DEFAULT_SERVICE_BASE_URL`, so pairing is refused with an explanation when
+ *   the suite's service listens elsewhere.
  * - **Panel accessible names.** `PANEL_NAMES` types the capture button,
- *   session summary, event drawer, live tail and pairing-code field names,
- *   and the renderer's
- *   `.dg-panel` block class is typed too, because their owning modules keep
- *   them private and a React component module cannot be evaluated in Node
- *   without React and its CSS. The connection pill's wording is imported from
+ *   session summary, event drawer, live tail, pairing-code field and
+ *   capture-notice names, and the renderer's `.dg-panel` block class is typed
+ *   too, because their owning modules keep them private and a React component
+ *   module cannot be evaluated in Node without React and its CSS. The
+ *   connection pill's wording is imported from
  *   `@debuggen/chrome-extension/messages` (`PANEL_CONNECTION_LABELS`).
  * - **`auth.json`** is named here because `AUTH_FILE_NAME` lives inside
  *   `apps/local-service`, which this directory cannot import; the service home
@@ -119,12 +115,11 @@
  *   included. `video` is not recorded, because recording is fixed when a
  *   context is created and this one lives for the whole run.
  *
- * Constraints (AAP §0.3.4, §0.5.4, §0.8.4, §0.8.5, §0.9.2): no credential is
- * written, logged or assembled here — tokens are read from `auth.json` or
- * minted by pairing at runtime; only fixture-app vocabulary appears; helpers
- * expose real observations (service messages, worker storage, panel state);
- * the service runs with the deterministic provider and nothing leaves
- * localhost.
+ * Constraints: no credential is written, logged or assembled here — tokens are
+ * read from `auth.json` or minted by pairing at runtime; only fixture-app
+ * vocabulary appears; helpers expose real observations (service messages,
+ * worker storage, panel state); the service runs with the deterministic
+ * provider and nothing leaves localhost.
  */
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
@@ -322,7 +317,7 @@ const DEFAULT_EXTENSION_PATH = path.join(REPO_ROOT, 'apps', 'chrome-extension', 
 /** The panel document, an explicit Rollup input of `apps/chrome-extension/vite.config.ts`, emitted at this path. */
 const PANEL_DOCUMENT_PATH = '/src/panel/panel.html';
 
-/** The product's default service origin (AAP §0.3.4: `DEBUGGEN_HOST`, `DEBUGGEN_PORT`). */
+/** The product's default service origin, used when `DEBUGGEN_HOST` / `DEBUGGEN_PORT` are unset. */
 const DEFAULT_SERVICE_HOST = '127.0.0.1';
 const DEFAULT_SERVICE_PORT = '43117';
 
@@ -353,9 +348,12 @@ const RENDERED_PANEL_BODY_CHILDREN = '.dg-panel__body > *';
  * exported, and their `.tsx` modules cannot be evaluated in Node; see header):
  * `START_CAPTURE_LABEL` / `STOP_CAPTURE_LABEL` in `CaptureControls.tsx`,
  * `SUMMARY_TITLE` in `SessionSummary.tsx`, `DRAWER_LABEL` /
- * `LIVE_TAIL_REGION_LABEL` in `App.tsx`, and `PAIRING_FIELD_LABEL` in
+ * `LIVE_TAIL_REGION_LABEL` in `App.tsx`, `PAIRING_FIELD_LABEL` in
  * `PairDialog.tsx` — the dialog also holds a "Service address" field, so the
- * code field is addressed by its name rather than as the dialog's only textbox.
+ * code field is addressed by its name rather than as the dialog's only textbox —
+ * and `NOTICES_LABEL` / `NOTICE_LABELS['page-reloaded']` in `LiveTail.tsx`: the
+ * name of the live tail's capture-notices list and the badge wording of the
+ * entry a same-origin reload during a capture adds to it.
  */
 const PANEL_NAMES = Object.freeze({
   startCapture: 'Start capture',
@@ -364,6 +362,8 @@ const PANEL_NAMES = Object.freeze({
   eventDetails: 'Selected event',
   liveTail: 'Live event tail',
   pairingCode: 'Pairing code',
+  captureNotices: 'Capture notices, newest first',
+  pageReloadedNotice: 'Page reloaded during capture',
 });
 
 /** Why the stubbed `chrome.devtools.inspectedWindow.eval` refuses, surfaced by the panel's element-selection path. */
@@ -640,6 +640,17 @@ export interface PanelHandle {
   readonly panelView: Locator;
   readonly eventDetails: Locator;
   readonly liveTail: Locator;
+  /**
+   * The live tail's capture-notices list, newest first. The panel renders it
+   * only while the tail is expanded and the capture on screen has a notice.
+   */
+  readonly captureNotices: Locator;
+  /**
+   * The entries of {@link PanelHandle.captureNotices} whose badge reads
+   * "Page reloaded during capture" — one per same-origin reload of the bound
+   * tab while a capture was running, which the same capture continues across.
+   */
+  readonly pageReloadedNotices: Locator;
   readonly pairDialog: Locator;
 }
 
@@ -3303,6 +3314,11 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
   const connectionPill = header.getByRole('status').filter({ hasText: labelPattern });
   const main = page.getByRole('main');
   const panelView = main.locator(RENDERED_PANEL_SELECTOR);
+  const liveTail = page.getByRole('region', { name: PANEL_NAMES.liveTail, exact: true });
+  const captureNotices = liveTail.getByRole('list', {
+    name: PANEL_NAMES.captureNotices,
+    exact: true,
+  });
   const tabId = launch.installDevtoolsStub ? launch.inspectedTabId : undefined;
 
   const readStatus = async (): Promise<PanelConnectionStatus | undefined> => {
@@ -3410,7 +3426,13 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
     sessionSummary: main.getByRole('region', { name: PANEL_NAMES.sessionSummary, exact: true }),
     panelView,
     eventDetails: page.getByRole('complementary', { name: PANEL_NAMES.eventDetails, exact: true }),
-    liveTail: page.getByRole('region', { name: PANEL_NAMES.liveTail, exact: true }),
+    liveTail,
+    captureNotices,
+    // The badge holds the notice's wording exactly; the entry also carries its
+    // time and the new document's path, so the entry is matched by its badge.
+    pageReloadedNotices: captureNotices.getByRole('listitem').filter({
+      has: page.getByText(PANEL_NAMES.pageReloadedNotice, { exact: true }),
+    }),
     pairDialog: page.getByRole('dialog'),
   };
 }
@@ -3425,7 +3447,7 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
  * the service worker then calls `POST /pair/complete` from its
  * `chrome-extension://` origin and stores the devtools credential. This
  * process never calls `/pair/complete` itself — a devtools credential minted
- * from any other origin would be refused (AAP §0.5.6).
+ * from any other origin would be refused (docs/SECURITY.md, section 7.4).
  */
 function createPairing(harness: ExtensionHarness, service: ServiceHandle): PairingHandle {
   let memo: Promise<void> | undefined;

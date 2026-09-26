@@ -5,16 +5,17 @@
  *
  * ## The envelope
  *
- * AAP §0.2.3 fixes the shape, and this module is the only statement of it:
+ * This module is the only statement of the frame shape:
  *
  * ```text
  * { id, type, sessionId?, tabId?, ts, payload }
  * ```
  *
- * The optional acting `tabId` is the one field beyond §0.2.3's list. It is
- * additive — absent on every frame that does not act for a tab, so such a frame
- * is byte-identical to the §0.2.3 shape — and it exists because §0.5.6's
- * DevTools rule cannot be enforced without it (see "One frame, one tab" below).
+ * The optional acting `tabId` is the one field beyond the base shape
+ * `{ id, type, sessionId?, ts, payload }`. It is additive — absent on every
+ * frame that does not act for a tab, so such a frame is byte-identical to the
+ * base shape — and it exists because the DevTools tab rule cannot be enforced
+ * without it (see "One frame, one tab" below).
  *
  * - `id` — a per-frame identifier, minted by {@link createEnvelope}. It exists
  *   because frames are re-sent routinely rather than exceptionally: the MV3
@@ -40,7 +41,7 @@
  *   tab" below).
  * - `ts` — the moment the sender stamped the frame, on the product's one time
  *   base: Unix epoch **milliseconds** as a double, sub-millisecond precision
- *   preserved (AAP §0.2.3). The schema is `epochMsSchema` from `./version.ts`,
+ *   preserved. The schema is `epochMsSchema` from `./version.ts`,
  *   whose bounds come from `@debuggen/telemetry`, so a producer that sent
  *   seconds, microseconds or a relative `performance.now()` reading is refused
  *   here exactly as it would be at the telemetry layer.
@@ -88,7 +89,7 @@
  * A frame can name a session twice: the envelope's `sessionId`, which the
  * service routes and authorizes by, and the payload's own subject — its
  * `sessionId`, or the `session.id` of a `session.created` / `session.updated`
- * record — which is what a handler acts on. AAP §0.5.6 authorizes a devtools
+ * record — which is what a handler acts on. The service authorizes a devtools
  * principal only for the session bound to its tab, so a frame whose two answers
  * differ is a confused-deputy request: one field passes the authorization check
  * and the other names the session that is changed. Neither field may be trusted
@@ -97,7 +98,7 @@
  * - {@link protocolMessageSchema} attaches the rule to every member of the
  *   union: when both are present they must be equal, and the rejection is a
  *   `custom` issue at path `sessionId` with the label
- *   `routing-matches-payload` — never either identifier (AAP §0.5.2).
+ *   `routing-matches-payload` — never either identifier.
  * - {@link createEnvelope} refuses to build such a frame, because every
  *   receiver would refuse it: an explicit routing key that contradicts the
  *   payload's subject throws `PROTOCOL_INVALID_MESSAGE` at the call site that
@@ -112,7 +113,7 @@
  *
  * One paired DevTools credential and one MV3 service-worker WebSocket carry
  * every inspected tab, so neither the credential nor the connection says which
- * tab a frame is for — and AAP §0.5.6 allows a DevTools principal to act only
+ * tab a frame is for — and the service allows a DevTools principal to act only
  * for the session bound to *its* tab. The envelope's acting `tabId` is that
  * missing statement. The service worker fills it from Chrome's own port
  * metadata on every frame it sends for a tab — `telemetry.event`,
@@ -142,7 +143,7 @@
  * ## A rejected frame is never echoed
  *
  * A frame that fails validation is unvalidated data from another process, and it
- * routinely carries exactly what the privacy model protects (AAP §0.5.2):
+ * routinely carries exactly what the privacy model protects:
  * telemetry attributes, a redacted-but-still-sensitive URL, a database
  * statement, a React prop preview, or the bearer credential of a `client.hello`.
  * The service logs parse failures, both user interfaces display them and a
@@ -255,7 +256,7 @@ export const envelopeBaseShape = Object.freeze({
    * a tab (`telemetry.event`, `target.selected`, `source.open`; optionally
    * `agent.ready` and the binding frames), and absent on every other frame. The
    * service authorizes a DevTools frame for a session only when that session's
-   * live binding is this tab's (AAP §0.5.6), so this field is a claim the
+   * live binding is this tab's, so this field is a claim the
    * service verifies, never a capability.
    *
    * The same schema a payload's `tabId` uses (`./messages/binding.ts`):
@@ -310,7 +311,7 @@ export interface Envelope<K extends MessageType, P> {
   /**
    * The inspected Chrome tab a DevTools frame acts for, where it acts for one:
    * set by the service worker, verified by the service against its live
-   * tab-to-session binding (AAP §0.5.6), absent on every other frame.
+   * tab-to-session binding, absent on every other frame.
    */
   readonly tabId?: number | undefined;
   /** When the sender stamped the frame, in epoch milliseconds. */
@@ -445,7 +446,7 @@ const ROUTING_MISMATCH_LABEL = 'routing-matches-payload';
  * The issue message of a routing contradiction.
  *
  * Constant, like every rejection text in this module: it names the two fields
- * and never their values (AAP §0.5.2). `protocolParseError` does not render
+ * and never their values. `protocolParseError` does not render
  * issue messages at all; this one is stated for a caller that inspects the raw
  * `safeParse` result of {@link protocolMessageSchema}.
  */
@@ -466,7 +467,7 @@ const ACTING_TAB_MISMATCH_LABEL = 'acting-tab-matches-payload';
  * The issue message of an acting-tab contradiction.
  *
  * Constant for the reason {@link ROUTING_MISMATCH_RULE} is: it names the two
- * fields and never their values (AAP §0.5.2).
+ * fields and never their values.
  */
 const ACTING_TAB_MISMATCH_RULE = 'expected the acting tabId to equal the tab the payload names';
 
@@ -597,13 +598,13 @@ function actingTabContradictsPayload(actingTab: number, payload: unknown): boole
  *   An acting tab that contradicts it is reported on the `tabId` path with
  *   {@link ACTING_TAB_MISMATCH_LABEL}.
  *
- * AAP §0.5.6 authorizes a devtools principal only for the session bound to its
- * tab, so a frame that satisfied the check with one field while naming another
- * session or tab in the other would make the service a confused deputy.
+ * The service authorizes a devtools principal only for the session bound to
+ * its tab, so a frame that satisfied the check with one field while naming
+ * another session or tab in the other would make the service a confused deputy.
  * Refusing it here, at the one validator every receiver shares, closes that
  * without each handler having to remember which field it authorized. Each issue
  * leaves `input` empty, exactly as `../analysis.ts`'s object check does: the
- * rejection names the rule, never an identifier (AAP §0.5.2).
+ * rejection names the rule, never an identifier.
  *
  * Both comparisons are made only on an otherwise valid frame. Zod skips an
  * object check after an *aborting* issue, but a string-length bound is not one —
@@ -642,7 +643,7 @@ function requireFrameSubjectsAgree(
       message: ROUTING_MISMATCH_RULE,
       params: { label: ROUTING_MISMATCH_LABEL },
       // Left empty on purpose: a failure here never carries the identifiers
-      // that caused it (AAP §0.5.2).
+      // that caused it.
       input: undefined,
     });
   }
@@ -856,7 +857,7 @@ const INVALID_MESSAGE_HINT =
  * the session its payload names.
  *
  * Constant for the reason every rejection text here is: neither identifier is
- * interpolated (AAP §0.5.2). The message type travels in `details`, because it
+ * interpolated. The message type travels in `details`, because it
  * is a name from this package's own vocabulary rather than a value.
  */
 const ROUTING_CONTRADICTION_MESSAGE =
@@ -871,7 +872,7 @@ const ROUTING_CONTRADICTION_HINT =
  * id: a negative number (`-1` is `chrome.tabs.TAB_ID_NONE`), a fraction, a
  * non-finite number, a value beyond the safe-integer range, or not a number.
  *
- * Constant, so the rejected value is never interpolated (AAP §0.5.2); `details`
+ * Constant, so the rejected value is never interpolated; `details`
  * carries only the message type.
  */
 const ACTING_TAB_INVALID_MESSAGE =
@@ -1070,8 +1071,8 @@ export interface CreateEnvelopeOptions {
    *
    * Supplied by the Chrome service worker, from Chrome's own port metadata, on
    * every frame it sends for a tab; the service authorizes a DevTools frame for
-   * a session only when that session's live binding is this tab's
-   * (AAP §0.5.6). When omitted the frame carries no `tabId` key at all —
+   * a session only when that session's live binding is this tab's. When
+   * omitted the frame carries no `tabId` key at all —
    * {@link createEnvelope} **never** lifts one from the payload, so a service
    * push such as `session.bound`, whose payload names a tab, is unchanged.
    *
@@ -1199,7 +1200,7 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  * `apps/chrome-extension/src/background/ws-bridge.ts` — which is also the
  * process that wraps the page agent's raw event batches into `telemetry.event`
  * frames, since `@debuggen/telemetry` sits below this package in the layering
- * (AAP §0.2.2) and the agent bundle never imports protocol.
+ * and the agent bundle never imports protocol.
  *
  * @param type The message being sent.
  * @param payload That message's payload, as its domain module defines it.
@@ -1210,7 +1211,7 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  * `options.sessionId` names a different session than the payload does, when
  * `options.tabId` is not a Chrome tab id, or when it names a different tab than
  * the payload does. Each message and hint is constant and `details` carries
- * only `type`, so no identifier is echoed (AAP §0.5.2). `client/ws-client.ts`
+ * only `type`, so no identifier is echoed. `client/ws-client.ts`
  * calls this inside `tryCatch`, so its `send` answers that error as an `err`
  * rather than throwing.
  *

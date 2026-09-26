@@ -62,6 +62,7 @@ import {
   assertOutboundSafe,
   modelUnavailableMessage,
   type JsonObject,
+  type JsonValue,
   type ModelProvider,
   type ModelRequest,
   type ModelTextResponse,
@@ -100,6 +101,9 @@ import {
   CONTEXT_LIMITS,
   INVESTIGATE_QUERY_BATCH_FIELD,
   STAGE_PLACEHOLDERS,
+  redactEmbeddedUrlsDeep,
+  redactQuestionText,
+  toBoundedJson,
   type ContextBuilder,
   type InvestigateRequestInput,
   type PipelineCodeHandles,
@@ -940,19 +944,31 @@ type InvestigateBuildMode =
   | { readonly kind: 'throw'; readonly thrown: Error };
 
 /**
+ * A structured section as the real builder serialises it: plain JSON, with
+ * every URL embedded in its strings masked by the builder's own
+ * `redactEmbeddedUrlsDeep`.
+ */
+function maskedSection(value: unknown): JsonValue {
+  const plain = toBoundedJson(value, {
+    maxDepth: CONTEXT_LIMITS.maxDepth,
+    maxNodes: CONTEXT_LIMITS.maxSectionNodes,
+  });
+  return redactEmbeddedUrlsDeep(plain.value ?? null);
+}
+
+/**
  * The value of each `{{placeholder}}` of `prompts/investigate/v001.md`, derived
  * from the stage's structured input the way the real builder derives it: one
- * source per key, nothing else.
+ * source per key, nothing else — the question through the builder's
+ * `redactQuestionText`, every serialised section through {@link maskedSection}.
  */
 function placeholderValues(request: InvestigateRequestInput): Readonly<Record<string, string>> {
+  const toolCatalog = maskedSection(request.toolCatalog);
   return {
-    question: request.context.question,
-    understanding: stableStringify(request.understanding),
-    toolCatalog:
-      typeof request.toolCatalog === 'string'
-        ? request.toolCatalog
-        : stableStringify(request.toolCatalog),
-    queryResults: stableStringify(request.queryResults),
+    question: redactQuestionText(request.context.question, CONTEXT_LIMITS.maxQuestionChars).text,
+    understanding: stableStringify(maskedSection(request.understanding)),
+    toolCatalog: typeof toolCatalog === 'string' ? toolCatalog : stableStringify(toolCatalog),
+    queryResults: stableStringify(maskedSection(request.queryResults)),
     remainingQueries: String(request.remainingQueries),
     outputSchema: stableStringify(request.toolNames ?? []),
   };
@@ -1644,11 +1660,26 @@ describe('the harness', () => {
     });
     expect(accepted.ok).toBe(true);
 
-    const refused = new StubContextBuilder().buildInvestigateRequest({
-      context: stageContext({ question: `Why does ${ASSEMBLED_BEARER} fail?` }).context,
+    // A credential in the question is redacted before rendering, as the real builder does, so
+    // it builds; a credential in a source excerpt is never scrubbed, so the guard refuses it.
+    const question = `Why does ${ASSEMBLED_BEARER} fail?`;
+    const redacted = new StubContextBuilder().buildInvestigateRequest({
+      context: stageContext({ question }).context,
       understanding: UNSEEDED_UNDERSTANDING,
       toolCatalog: describeCodeTools(),
       queryResults: [],
+      remainingQueries: CODE_TOOL_LIMITS.maxCallsPerStage,
+    });
+    expect(redacted.ok).toBe(true);
+    expect(redacted.ok ? redacted.value.request.prompt : '').not.toContain(
+      ASSEMBLED_BEARER.slice(ASSEMBLED_BEARER.indexOf(' ') + 1),
+    );
+
+    const refused = new StubContextBuilder().buildInvestigateRequest({
+      context: stageContext().context,
+      understanding: UNSEEDED_UNDERSTANDING,
+      toolCatalog: describeCodeTools(),
+      queryResults: [{ result: { text: `const key = "${ASSEMBLED_BEARER}";` } }],
       remainingQueries: CODE_TOOL_LIMITS.maxCallsPerStage,
     });
     expect(refused.ok).toBe(false);
@@ -3494,6 +3525,16 @@ describe('privacy of log records and errors (AAP §0.5.2)', () => {
     });
     const probe = stageContext({ question: SENTINEL_QUESTION });
     const result = expectOk(await fixture.run(probe.context));
+    // The second turn carries the executed `routeForUrl` request, whose address quotes a query
+    // value: it builds, and what it sends carries the parameter with its value masked.
+    expect(fixture.builder.built).toHaveLength(2);
+    const followUp = at(fixture.builder.built, 1).request;
+    expect(turnPlaceholders(fixture, 2)['queryResults']).toContain(`${ROUTE_PATH}?sensor=?`);
+    expect(followUp.prompt).toContain(`${ROUTE_PATH}?sensor=?`);
+    for (const sent of [followUp.prompt, JSON.stringify(followUp.input)]) {
+      expect(sent).not.toContain(`sensor=${SENTINEL}`);
+    }
+    expect(at(fixture.provider.structuredCalls, 1).request).toBe(followUp);
     // Only the excerpt returned anything: its file is kept without the symbol no result placed
     // there, the unreturned service file is removed, and the prose flow is removed.
     expect(result.investigation).toStrictEqual({

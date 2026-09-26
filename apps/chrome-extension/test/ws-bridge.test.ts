@@ -22,9 +22,10 @@
  * - **The page agent's raw batches become protocol envelopes.** The MAIN-world
  *   agent never imports the protocol, so the bridge wraps its `{ events }` into
  *   `telemetry.event` frames — unchanged, in order, chunked to the receiver's
- *   own per-frame bound — and inbound frames are validated by
- *   `@debuggen/protocol` before one is relayed to a panel or handed to a typed
- *   subscriber (AAP §0.4.2).
+ *   own per-frame bound; an empty batch that reports loss is one loss-only
+ *   frame, and one that reports none sends nothing — and inbound frames are
+ *   validated by `@debuggen/protocol` before one is relayed to a panel or
+ *   handed to a typed subscriber (AAP §0.4.2).
  * - **Every tab-scoped action names the tab it acts for.** One socket and one
  *   credential serve every inspected tab, so the hello announces no tab; each
  *   frame sent for a tab carries it as the envelope's acting `tabId`, each
@@ -92,6 +93,7 @@ import {
   panelDataPath,
   panelPath,
   PROTOCOL_VERSION,
+  READ_PROOF_LENGTH,
   resolveWsUrl,
   sessionPath,
   telemetryEventPayloadSchema,
@@ -159,7 +161,7 @@ import {
   SOCKET_HEARTBEAT_INTERVAL_MS,
   TELEMETRY_ROUTE_WAIT_MS,
 } from '../src/background/ws-bridge';
-import type { WsBridge, WsBridgeDeps } from '../src/background/ws-bridge';
+import type { DiscardedTelemetryFrame, WsBridge, WsBridgeDeps } from '../src/background/ws-bridge';
 import {
   DEFAULT_SERVICE_BASE_URL,
   EXTENSION_CHANNEL,
@@ -616,6 +618,8 @@ interface HarnessOptions {
   readonly httpClientThunk?: boolean;
   /** The sink for telemetry the socket client discarded. Defaults to none. */
   readonly onTelemetryDropped?: WsBridgeDeps['onTelemetryDropped'];
+  /** The sink for every discarded telemetry frame's labels and loss. Defaults to none. */
+  readonly onTelemetryFrameDiscarded?: WsBridgeDeps['onTelemetryFrameDiscarded'];
 }
 
 /** Everything a case drives or inspects. */
@@ -748,6 +752,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
     listBindings,
     serviceBaseUrl,
     onTelemetryDropped: options.onTelemetryDropped,
+    onTelemetryFrameDiscarded: options.onTelemetryFrameDiscarded,
     logger,
   });
 
@@ -1970,7 +1975,8 @@ describe('raw agent batches become telemetry.event envelopes', () => {
         expect(refusal.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
       }
     }
-    // An empty batch is a no-op the protocol would refuse anyway.
+    // An empty batch that reports no loss has nothing the protocol would
+    // accept, so it is answered with zeros — even with no route confirmed.
     expect(okValue(h.bridge.sendTelemetryBatch(TAB_A, []))).toEqual({
       events: 0,
       frames: 0,
@@ -2666,6 +2672,353 @@ describe('a batch carries its delivery context: the armed capture and the report
       expect(Object.values(warnings[0]?.fields ?? {})).not.toContain(armedCaptureId);
     },
   );
+});
+
+/** The log line of one dropped loss-only telemetry frame. */
+const LOSS_REPORT_DROP_LOG =
+  'a queued telemetry loss report was dropped before it reached the service';
+
+describe('a loss-only report: an empty batch that carries a loss', () => {
+  it('sends one frame of no events with the loss and the armed capture, scoped to its tab and session', async () => {
+    // The receiver's schema is the authority: an event-less frame is accepted
+    // only as a loss report.
+    expect(telemetryEventPayloadSchema.safeParse({ events: [] }).success).toBe(false);
+    expect(telemetryEventPayloadSchema.safeParse({ events: [], droppedCount: 0 }).success).toBe(
+      false,
+    );
+    expect(
+      telemetryEventPayloadSchema.safeParse({
+        events: [],
+        armedCaptureId: CAPTURE_1,
+        droppedCount: DROPPED_EVENTS,
+      }).success,
+    ).toBe(true);
+    const h = createHarness();
+    const socket = await connectAndOpen(h);
+    answerBound(socket, TAB_A, SESSION_A);
+
+    const outcome = h.bridge.sendTelemetryBatch(TAB_A, [], SESSION_A, {
+      armedCaptureId: CAPTURE_1,
+      droppedCount: DROPPED_EVENTS,
+    });
+
+    expect(okValue(outcome)).toEqual({ events: 0, frames: 1, sent: 1 });
+    // Decoded through the protocol's own validator, as the service decodes it.
+    const frames = telemetryFramesOf(socket);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.payload).toEqual({
+      events: [],
+      armedCaptureId: CAPTURE_1,
+      droppedCount: DROPPED_EVENTS,
+    });
+    expect([frames[0]?.tabId, frames[0]?.sessionId]).toEqual([TAB_A, SESSION_A]);
+    expect(telemetryWireKeys(socket)).toEqual([['armedCaptureId', 'droppedCount', 'events']]);
+  });
+
+  it('sends exactly { events: [], droppedCount } when no capture is named, along the route the service confirmed', async () => {
+    const h = createHarness();
+    const socket = await connectAndOpen(h);
+    answerBound(socket, TAB_B, SESSION_B);
+
+    expect(okValue(h.bridge.sendTelemetryBatch(TAB_B, [], undefined, { droppedCount: 1 }))).toEqual(
+      { events: 0, frames: 1, sent: 1 },
+    );
+
+    expect(telemetryWireKeys(socket)).toEqual([['droppedCount', 'events']]);
+    expect(telemetryFramesOf(socket)[0]).toMatchObject({
+      tabId: TAB_B,
+      sessionId: SESSION_B,
+      payload: { events: [], droppedCount: 1 },
+    });
+  });
+
+  it('is refused like any batch — not connected, route unconfirmed, a capture id the protocol refuses — and sends nothing', async () => {
+    const loss: BatchContext = { armedCaptureId: CAPTURE_1, droppedCount: DROPPED_EVENTS };
+    const h = createHarness({ bindings: [BINDING_A] });
+
+    // Before any connection.
+    expect(errCode(h.bridge.sendTelemetryBatch(TAB_A, [], SESSION_A, loss))).toBe(
+      'TRANSPORT_DISCONNECTED',
+    );
+    const socket = await connectAndOpen(h);
+    // Open, with the re-announced binding not yet answered.
+    expect(errCode(h.bridge.sendTelemetryBatch(TAB_A, [], SESSION_A, loss))).toBe('TAB_NOT_BOUND');
+    answerBound(socket, TAB_A, SESSION_A);
+    // Another session than the one the service confirmed for the tab.
+    expect(errCode(h.bridge.sendTelemetryBatch(TAB_A, [], SESSION_B, loss))).toBe('TAB_NOT_BOUND');
+    // A capture the protocol would not accept: never filed under the open one.
+    expect(
+      errCode(
+        h.bridge.sendTelemetryBatch(TAB_A, [], SESSION_A, {
+          armedCaptureId: '',
+          droppedCount: DROPPED_EVENTS,
+        }),
+      ),
+    ).toBe('PROTOCOL_INVALID_MESSAGE');
+
+    expect(telemetryFramesOf(socket)).toEqual([]);
+    expect(h.bridge.getStatus().queuedFrameCount).toBe(0);
+  });
+
+  it.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['NaN', Number.NaN],
+  ])(
+    'sends nothing for an empty batch whose loss count is %s: the protocol has no frame for it',
+    async (_label, droppedCount) => {
+      const h = createHarness();
+      const socket = await connectAndOpen(h);
+      answerBound(socket, TAB_A, SESSION_A);
+      const framesBefore = socket.sent.length;
+      const warningsBefore = warningCount(h);
+
+      const outcome = h.bridge.sendTelemetryBatch(TAB_A, [], SESSION_A, {
+        armedCaptureId: CAPTURE_1,
+        droppedCount,
+      });
+
+      expect(okValue(outcome)).toEqual({ events: 0, frames: 0, sent: 0 });
+      expect(socket.sent).toHaveLength(framesBefore);
+      // A zero is no loss at all; a malformed count is a diagnostic, and the
+      // refused value itself is never logged.
+      const warnings = warningsSince(h, warningsBefore);
+      expect(warnings).toHaveLength(droppedCount === 0 ? 0 : 1);
+      for (const warning of warnings) {
+        expect(warning.fields).toMatchObject({ tabId: TAB_A });
+        expect(Object.values(warning.fields).some((value) => Object.is(value, droppedCount))).toBe(
+          false,
+        );
+      }
+    },
+  );
+
+  it('logs a queued loss-only frame the full queue drops, and never reports it as undelivered events', async () => {
+    const onTelemetryDropped = createDropSink();
+    const h = createHarness({ onTelemetryDropped });
+    await openStalled(h);
+    // The write throws on the stalled socket, so the client queues the frame.
+    const report = h.bridge.sendTelemetryBatch(TAB_A, [], undefined, {
+      droppedCount: DROPPED_EVENTS,
+    });
+    expect(errCode(report)).toBe('TRANSPORT_DISCONNECTED');
+    expect(isErr(report) ? report.error.details : undefined).toMatchObject({
+      tabId: TAB_A,
+      framesWritten: 0,
+      framesQueued: 1,
+    });
+
+    // Filling the queue drops its oldest frame first: the loss report.
+    const origins = batchOrigins(DEFAULT_MAX_QUEUED_MESSAGES);
+    queueBatches(h, origins);
+
+    expect(onTelemetryDropped).not.toHaveBeenCalled();
+    expect(h.bridge.getStatus().droppedFrameCount).toBe(1);
+    expect(
+      h.logs
+        .filter((entry) => entry.message === LOSS_REPORT_DROP_LOG)
+        .map((entry) => [entry.level, entry.fields.tabId, entry.fields.droppedCount]),
+    ).toEqual([['warn', TAB_A, DROPPED_EVENTS]]);
+    expect(h.logs.filter((entry) => entry.message === TELEMETRY_DROP_LOG)).toEqual([]);
+
+    // The next overflow drops the oldest event frame, reported as before.
+    queueBatches(h, [[TAB_B, 3]]);
+    expect(onTelemetryDropped.mock.calls).toEqual([origins[0]]);
+  });
+
+  it('reports only the event frames among queued telemetry discarded with the credential', async () => {
+    const onTelemetryDropped = createDropSink();
+    const h = createHarness({ onTelemetryDropped });
+    await openStalled(h);
+    const events = batchOrigins(2);
+    queueBatches(h, events.slice(0, 1));
+    expect(
+      errCode(h.bridge.sendTelemetryBatch(TAB_B, [], undefined, { droppedCount: DROPPED_EVENTS })),
+    ).toBe('TRANSPORT_DISCONNECTED');
+    queueBatches(h, events.slice(1));
+
+    h.state.credentialStored = false;
+    h.bridge.handlePairingState('not-paired');
+    await flush();
+
+    expect(onTelemetryDropped.mock.calls).toEqual(events);
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'closed', queuedFrameCount: 0 });
+  });
+});
+
+/** A recording `WsBridgeDeps.onTelemetryFrameDiscarded`. */
+function createDiscardSink(): Mock<(frame: DiscardedTelemetryFrame) => void> {
+  return vi.fn<(frame: DiscardedTelemetryFrame) => void>();
+}
+
+/** Every frame a discard sink was told of, in order. */
+function discardedFrames(
+  sink: Mock<(frame: DiscardedTelemetryFrame) => void>,
+): DiscardedTelemetryFrame[] {
+  return sink.mock.calls.map(([frame]) => frame);
+}
+
+/**
+ * Queue one batch over a stalled socket ({@link openStalled}) and return the
+ * interrupted write's details — how far the batch got before the client took
+ * its first frame into the queue instead of writing it.
+ */
+function queueWithContext(
+  h: Harness,
+  tabId: TabId,
+  events: number,
+  sessionId: SessionId,
+  context: BatchContext,
+): Record<string, unknown> | undefined {
+  const outcome = h.bridge.sendTelemetryBatch(tabId, makeEvents(events), sessionId, context);
+  expect(errCode(outcome)).toBe('TRANSPORT_DISCONNECTED');
+  return isErr(outcome) ? outcome.error.details : undefined;
+}
+
+describe('every discarded telemetry frame is reported with its labels and loss, for the service ledger', () => {
+  it('reports a queued loss-only frame and an event frame’s carried loss when the full queue drops them, oldest first — the panel sink hears only of events', async () => {
+    const onTelemetryDropped = createDropSink();
+    const onTelemetryFrameDiscarded = createDiscardSink();
+    const h = createHarness({ onTelemetryDropped, onTelemetryFrameDiscarded });
+    await openStalled(h);
+
+    // Queued, oldest first: TAB_A's loss-only report for its armed capture,
+    // then a TAB_B batch whose first frame carries the page's own loss. The
+    // interrupted writes say what the client's queue took.
+    expect(
+      queueWithContext(h, TAB_A, 0, SESSION_A, {
+        armedCaptureId: CAPTURE_1,
+        droppedCount: DROPPED_EVENTS,
+      }),
+    ).toMatchObject({ framesWritten: 0, framesQueued: 1, eventsQueued: 0 });
+    expect(queueWithContext(h, TAB_B, 3, SESSION_B, { droppedCount: 5 })).toMatchObject({
+      framesWritten: 0,
+      eventsWritten: 0,
+      framesQueued: 1,
+      eventsQueued: 3,
+    });
+    // Filling the queue drops exactly those two.
+    const origins = batchOrigins(DEFAULT_MAX_QUEUED_MESSAGES);
+    queueBatches(h, origins);
+
+    expect(discardedFrames(onTelemetryFrameDiscarded)).toStrictEqual([
+      {
+        tabId: TAB_A,
+        sessionId: SESSION_A,
+        armedCaptureId: CAPTURE_1,
+        events: 0,
+        droppedCount: DROPPED_EVENTS,
+      },
+      { tabId: TAB_B, sessionId: SESSION_B, events: 3, droppedCount: 5 },
+    ]);
+    // The panel sink keeps its semantics: events only, never a loss-only frame.
+    expect(onTelemetryDropped.mock.calls).toEqual([[TAB_B, 3]]);
+
+    // The next overflow drops the oldest plain event frame: its labels are the
+    // tab's confirmed route, and it carried no loss.
+    queueBatches(h, [[TAB_B, 1]]);
+    const [first] = origins;
+    expect(discardedFrames(onTelemetryFrameDiscarded).at(-1)).toStrictEqual({
+      tabId: first?.[0],
+      sessionId: first?.[0] === TAB_A ? SESSION_A : SESSION_B,
+      events: first?.[1],
+      droppedCount: 0,
+    });
+    expect(onTelemetryDropped.mock.calls.at(-1)).toEqual(first);
+    // The armed capture id is page-supplied: reported to the sink, never logged.
+    expect(JSON.stringify(h.logs)).not.toContain(CAPTURE_1);
+  });
+
+  it('reports every telemetry frame the credential removal discards, loss-only ones included, with the context each was sent under', async () => {
+    const onTelemetryDropped = createDropSink();
+    const onTelemetryFrameDiscarded = createDiscardSink();
+    const h = createHarness({ onTelemetryDropped, onTelemetryFrameDiscarded });
+    await openStalled(h);
+    queueBatches(h, [[TAB_A, 2]]);
+    queueWithContext(h, TAB_B, 0, SESSION_B, { armedCaptureId: CAPTURE_1, droppedCount: 7 });
+    expect(okValue(h.bridge.send('tab.navigated', { tabId: TAB_A, url: APP_URL }))).toBe('queued');
+    queueWithContext(h, TAB_A, 4, SESSION_A, {
+      armedCaptureId: CAPTURE_1,
+      droppedCount: DROPPED_EVENTS,
+    });
+
+    h.state.credentialStored = false;
+    h.bridge.handlePairingState('not-paired');
+    await flush();
+
+    expect(discardedFrames(onTelemetryFrameDiscarded)).toStrictEqual([
+      { tabId: TAB_A, sessionId: SESSION_A, events: 2, droppedCount: 0 },
+      { tabId: TAB_B, sessionId: SESSION_B, armedCaptureId: CAPTURE_1, events: 0, droppedCount: 7 },
+      {
+        tabId: TAB_A,
+        sessionId: SESSION_A,
+        armedCaptureId: CAPTURE_1,
+        events: 4,
+        droppedCount: DROPPED_EVENTS,
+      },
+    ]);
+    expect(onTelemetryDropped.mock.calls).toEqual([
+      [TAB_A, 2],
+      [TAB_A, 4],
+    ]);
+    const summary = h.logs.find(
+      (entry) =>
+        entry.message === 'queued telemetry was discarded: the devtools credential was removed',
+    );
+    expect(summary?.fields).toMatchObject({
+      frames: 3,
+      events: 6,
+      droppedCount: 7 + DROPPED_EVENTS,
+    });
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'closed', queuedFrameCount: 0 });
+    expect(JSON.stringify(h.logs)).not.toContain(CAPTURE_1);
+  });
+
+  it('reports nothing for frames a reconnect flushes, nor for frames still queued when the bridge is disposed', async () => {
+    const onTelemetryFrameDiscarded = createDiscardSink();
+    const h = createHarness({ onTelemetryFrameDiscarded });
+    await openStalled(h);
+    queueWithContext(h, TAB_A, 0, SESSION_A, { droppedCount: DROPPED_EVENTS });
+    queueBatches(h, batchOrigins(3));
+
+    // Flushed after the next hello: delivered, so never reported.
+    const next = await reopen(h);
+    expect(telemetryFramesOf(next)).toHaveLength(4);
+    await confirmAndStall(next);
+    queueWithContext(h, TAB_B, 2, SESSION_B, { droppedCount: 1 });
+
+    // Disposal is the worker going away, not a loss to report.
+    await h.bridge.close();
+
+    expect(onTelemetryFrameDiscarded).not.toHaveBeenCalled();
+    expect(h.bridge.getStatus()).toMatchObject({ disposed: true, queuedFrameCount: 0 });
+  });
+
+  it('contains a discard sink that throws: every send still answers, and the panel sink is still told', async () => {
+    const onTelemetryDropped = createDropSink();
+    const onTelemetryFrameDiscarded = createDiscardSink();
+    onTelemetryFrameDiscarded.mockImplementation(() => {
+      throw new Error('the discard sink failed');
+    });
+    const h = createHarness({ onTelemetryDropped, onTelemetryFrameDiscarded });
+    await openStalled(h);
+    const overflow = 2;
+    const origins = batchOrigins(DEFAULT_MAX_QUEUED_MESSAGES + overflow);
+
+    // `queueBatches` asserts every send still answers, its frame queued.
+    queueBatches(h, origins);
+
+    expect(onTelemetryFrameDiscarded).toHaveBeenCalledTimes(overflow);
+    expect(onTelemetryDropped.mock.calls).toEqual(origins.slice(0, overflow));
+    const contained = h.logs.filter(
+      (entry) => entry.message === 'the telemetry discard sink threw',
+    );
+    expect(contained.map((entry) => [entry.level, entry.fields.tabId])).toEqual(
+      origins.slice(0, overflow).map(([tabId]) => ['warn', tabId]),
+    );
+    expect(JSON.stringify(h.logs)).not.toContain('the discard sink failed');
+  });
 });
 
 /** A route wait whose settlement a case can observe without awaiting it. */
@@ -3746,6 +4099,12 @@ const TEST_EXTENSION_ID = 'debuggen-test-extension';
 /** The credential `POST /pair/complete` issues in these cases. Obviously fake. */
 const PAIRED_TOKEN = 'test-paired-devtools-token';
 
+/**
+ * The read proof `POST /pair/complete` issues with {@link PAIRED_TOKEN}: the
+ * service answers both together, and a reply without it is not a pairing.
+ */
+const PAIRED_READ_PROOF = 'p'.repeat(READ_PROOF_LENGTH);
+
 /** A well-sized, obviously synthetic pairing code. */
 const PAIRING_CODE = 'TESTCODE';
 
@@ -3919,7 +4278,11 @@ function createWorkerHarness(options: WorkerHarnessOptions = {}): WorkerHarness 
 
   const routes = new Map<string, RouteHandler>([
     [healthPath(), () => Promise.resolve(jsonResponse(200, HEALTH_BODY))],
-    [pairCompletePath(), () => Promise.resolve(jsonResponse(200, { token: PAIRED_TOKEN }))],
+    [
+      pairCompletePath(),
+      () =>
+        Promise.resolve(jsonResponse(200, { token: PAIRED_TOKEN, readProof: PAIRED_READ_PROOF })),
+    ],
   ]);
   const fetch = vi.fn<FetchLike>((url, init) => {
     const route = routes.get(new URL(url).pathname);

@@ -1,50 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 180" width="240" height="180" role="img">
   <title>Your cart is empty</title>
   <!--
-    An open, empty tote seated on a ground line. A cart with nothing in it is a normal state and
-    not a failure, so the drawing stays calm: no warning marks, no alarm colour, nothing spilled.
-    The subject measures 127 x 105 units inside the 240 x 180 box shared by this folder's three
-    illustrations, and the 36 units of clear space under the ground line are deliberate - every
-    consumer sets a caption below the artwork. Intrinsic width and height sit on the root beside
-    the view box, so a consumer that references this file by its string path gets the aspect
-    ratio without a static import. Palette roles: slate #475569 for outlines, mist #CBD5E1 for
-    secondary line work and depth, paper #F8FAFC for the body fill, one amber #F59E0B hang tag
-    echoing the brand core of favicon.svg, and a single ink #0F172A eyelet. Round caps and joins
-    sit on the wrapping group, so every stroke inherits them.
+    Shares its view box and intrinsic size with the other two illustrations here. It stays calm: no
+    warning marks, no alarm colour. The lower margin stays clear for the page's caption; all copy
+    and alt text belong to the page.
   -->
   <defs>
-    <!--
-      The only gradient in the file: paper down to mist along the body, so the tote reads as a
-      solid object rather than an outline on the page. The first stop sits at 0.45 to keep the
-      upper body flat paper, which is what the mist inner-wall strokes are drawn against.
-    -->
     <linearGradient id="tote-face" gradientUnits="userSpaceOnUse" x1="120" y1="69" x2="120" y2="138">
       <stop offset="0.45" stop-color="#F8FAFC" />
       <stop offset="1" stop-color="#CBD5E1" />
     </linearGradient>
   </defs>
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <!-- Ground line, wider than the base so the tote is seated rather than floating. -->
     <path d="M 48 142 L 192 142" stroke="#CBD5E1" stroke-width="3" />
-    <!-- Handle, drawn before the body so its ends disappear behind the front wall. -->
     <path d="M 86 80 C 86 22 154 22 154 80" stroke="#475569" stroke-width="3.5" />
-    <!-- Body: tapered, 124 units across the rim and 100 across the base, filleted at the foot. -->
     <path d="M 58 72 Q 120 66 182 72 L 170 130 Q 168 138 160 138 L 80 138 Q 72 138 70 130 Z" fill="url(#tote-face)" stroke="#475569" stroke-width="3.5" />
-    <!--
-      Opening: the mist lens between the rim bow and its return is the rim band, and the slate
-      arc is the far edge of the mouth. Together they are what makes the tote read as open. The
-      two short mist strokes below are the inner walls catching light. Nothing is drawn inside
-      the container - the emptiness is the entire message.
-    -->
     <path d="M 58 72 Q 120 66 182 72 Q 120 86 58 72 Z" fill="#CBD5E1" />
     <path d="M 58 72 Q 120 86 182 72" stroke="#475569" stroke-width="3" />
     <path d="M 66.5 88 L 70 106" stroke="#CBD5E1" stroke-width="3" />
     <path d="M 173.5 88 L 170 106" stroke="#CBD5E1" stroke-width="3" />
-    <!--
-      Hang tag: the single accent, hanging from the handle apex on a mist string. It stops 4.75
-      units short of the rim, a gap that still reads at half size, so the tag can never be taken
-      for something sitting in the tote.
-    -->
     <path d="M 120 38 L 120 51" stroke="#CBD5E1" stroke-width="3" />
     <rect x="108" y="45" width="24" height="16" rx="4" fill="#F59E0B" stroke="#475569" stroke-width="3" />
     <circle cx="120" cy="51" r="2" fill="#0F172A" />

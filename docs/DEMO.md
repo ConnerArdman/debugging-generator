@@ -132,6 +132,8 @@ Either route works:
 
 `pnpm demo:dev` starts the demo **without** the preload. Browser telemetry is still captured, but no server, route-handler or database span will appear. The session does not fail silently in that case: the progress view reports a `Could not enable Server spans: …` / `Could not enable Database tracing: …` row with the exact relaunch hint. (`node scripts/dev-instrumented.mjs --spawn-local` is the same trade-off: it attaches the preload without a credential, so the preload stays inert.)
 
+The demo's `next.config.ts` deliberately keeps Next.js's default `serverExternalPackages`, so `pg` and `@prisma/client` load from `node_modules` at runtime, where the preload can wrap them; the storefront is otherwise a stock App Router project, so the session exercises the same code paths as one against any other project. A project that bundles those packages into its server build yields no database spans.
+
 You should see: `http://localhost:3000` serve the Lumen Supply storefront — header with search and cart, category chips and a grid of product cards.
 
 ### Step 6 — Pair Chrome with the service

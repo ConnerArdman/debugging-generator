@@ -31,11 +31,8 @@
  * usually as `./VisuallyHidden` text, and this placeholder stays out of the accessibility tree
  * entirely.
  *
- * RENDER BEHAVIOUR
- * A plain function component - no state, no effects - and no client directive, so a server
- * component and a client component render it equally. Nothing is read from the clock,
- * `Math.random()` or `window` while rendering, so the markup the server sends and the markup the
- * browser first produces always agree.
+ * No state, effects or client directive, and nothing read from the clock, `Math.random()` or
+ * `window` while rendering, so it renders on either side and the server and client markup agree.
  */
 
 import clsx from 'clsx';
@@ -47,10 +44,8 @@ import styles from './Skeleton.module.css';
 /**
  * The placeholder's inputs.
  *
- * Local and deliberately not exported. A consumer that needs this shape reads it back with
- * `React.ComponentProps<typeof Skeleton>`; the repository's guard scripts treat an exported demo
- * identifier as vocabulary no product file may then mention, so a second exported name buys a
- * constraint and nothing else.
+ * Local and deliberately not exported: a consumer that needs this shape reads it back with
+ * `React.ComponentProps<typeof Skeleton>`.
  *
  * Every optional member spells `| undefined` out, because this workspace compiles with
  * `exactOptionalPropertyTypes`, under which a bare `className?: string` means "absent or a

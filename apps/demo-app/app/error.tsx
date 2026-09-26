@@ -142,22 +142,15 @@ interface Props {
  * alone. Here the notice IS the page: nothing else on the route declares a title, so rendering the
  * headline as an `h1` is what puts it in the outline, where a reader who arrives after the
  * announcement - or who navigates by heading, or who returns to this page later - can still find
- * what failed. No second heading is added anywhere in this file, so the headline is rendered once
- * and read once, and the announcement is unchanged: the role and politeness still come from
- * `Alert`'s `danger` tone alone, so there is exactly one assertive announcement either way.
+ * what failed. No second heading is rendered anywhere in this file, so the headline is read once,
+ * and the role and politeness come from `Alert`'s `danger` tone alone, so there is exactly one
+ * assertive announcement.
  *
  * The two controls sit in `Alert`'s `actions` slot, which is a wrapping row: the primary control
  * retries, and the anchor leaves. The anchor carries no class because a link's appearance belongs
  * to the module that renders it and this route has none - it inherits the body text colour, and
  * the focus ring every interactive element in the application shares comes from the
- * `:focus-visible` rule in `app/globals.css`, so both controls are reachable and visibly focused
- * from the keyboard (measured: `2px solid #0f766e` at a 2px offset on each).
- *
- * BLITZY [A11Y]: the `sm` control measures 78x23 CSS px, one pixel under the 24x24 px target size
- * of WCAG 2.2 SC 2.5.8, and the anchor beside it is 19 px tall. Implemented at the size the shared
- * control contract specifies - `sm` is what every other retry inside an `Alert` in this
- * application uses, and `Button.module.css` carries the same flag for the step - rather than
- * silently enlarged here. Flagged for design review.
+ * `:focus-visible` rule in `app/globals.css`.
  *
  * The reference code is rendered only when Next.js supplied one, and `.ls-page-lede` is what makes
  * it read as the muted aside it is rather than as part of the message.

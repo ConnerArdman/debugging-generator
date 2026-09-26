@@ -148,12 +148,13 @@ export default defineConfig({
 
   /**
    * Declarations are non-negotiable: `dist/index.d.ts` and
-   * `dist/schema/index.d.ts` are the `types` conditions of the `exports` map and
-   * therefore what the local service and `@debuggen/protocol` respectively
-   * compile against, so a broken declaration step here fails their typecheck
-   * rather than this build. `@debuggen/protocol` in particular re-exports the
-   * schema entry's types inside its message schemas, which every process in the
-   * product parses against.
+   * `dist/schema/index.d.ts` are the packed-tarball entries of the `exports`
+   * map's source-first `types` arrays, the only types a consumer outside the
+   * repository gets. Inside it, the local service and `@debuggen/protocol`
+   * compile against this project's `.tsbuild` declarations (root
+   * tsconfig.json, `"// no-aliases"`). `@debuggen/protocol` in particular
+   * re-exports the schema entry's types inside its message schemas, which
+   * every process in the product parses against.
    *
    * The three overrides below are each required, not defensive, and they are the
    * same block `packages/shared`, `packages/telemetry`, `packages/code-analysis`

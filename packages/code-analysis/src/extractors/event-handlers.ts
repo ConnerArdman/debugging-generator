@@ -879,7 +879,7 @@ function inlineDraft(
  *
  * @param ctx The file being visited and the project it belongs to.
  * @param attribute The binding site, used as the fallback position.
- * @param name The referenced function's name.
+ * @param referenceName The referenced function's name.
  * @param reference What the binding points at, syntactically.
  * @param data The payload, already computed.
  * @param diagnostics Collector for the unresolved-declaration finding.

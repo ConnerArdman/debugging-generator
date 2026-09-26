@@ -24,14 +24,9 @@ import styles from './CatalogPager.module.css';
  * Because a link must never be able to ask for a query the server has already refused. The catalog
  * recovers such an address parameter by parameter: an unparseable one is dropped on its own, every
  * other parameter of that address is applied as it stands, and the reader is told in the page which
- * part did not take effect. A pager that copied the current query string and rewrote `page` in it -
- * which is what this file used to do - would copy the refused parameter into every one of its links
- * and so carry it forward for the rest of the reader's visit, to be stripped and reported again on
- * every page change: the notice above the grid would never clear, and the address the reader
- * copied, bookmarked or shared would keep a parameter this catalog has already said it cannot use.
- * `hrefForPage` is built from the query the server actually validated and answered with, so every
- * destination in this row is a listing the server has already agreed to, stated in the parameters
- * it agreed to - the refused one is left behind at the first page change rather than inherited.
+ * part did not take effect. `hrefForPage` is built from the query the server validated and answered
+ * with, so every link in this row carries only parameters the server accepted, and a refused
+ * parameter is not carried to the next page or into an address the reader copies from it.
  *
  * Why anchors rather than a router call
  * ------------------------------------

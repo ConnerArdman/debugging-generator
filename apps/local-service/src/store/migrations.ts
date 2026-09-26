@@ -793,23 +793,27 @@ const PRODUCER_CLOCK_OFFSET_MIGRATION: StoreMigration = {
  * documents ({@link SESSION_CLEANUP_SUMMARIES_MIGRATION}); version 5 adds the
  * per-producer clock offset column ({@link PRODUCER_CLOCK_OFFSET_MIGRATION}).
  *
- * The shape of a future step, for the record:
+ * Appending a step is two edits in one commit. The step takes the next
+ * version: one above the highest version in this list, which is the current
+ * {@link STORE_SCHEMA_VERSION} plus one, written as an integer literal because
+ * a shipped step keeps its version for ever. {@link STORE_SCHEMA_VERSION} is
+ * then set to that same number. The check this module runs when it loads
+ * refuses either edit without the other.
+ *
+ * The shape of a step, with `NEXT` standing for that next version:
  *
  * @example
  * ```ts
- * {
- *   version: 5,
+ * const CAPTURE_RETENTION_INDEX_MIGRATION: StoreMigration = {
+ *   version: NEXT,
  *   description: 'add the capture retention index',
  *   apply: (db) => {
  *     db.exec(
  *       'CREATE INDEX IF NOT EXISTS idx_captures_stopped_at ON captures (stopped_at);',
  *     );
  *   },
- * }
+ * };
  * ```
- *
- * Its version must be `STORE_SCHEMA_VERSION + 1`, and that constant is bumped
- * in the same commit.
  */
 export const STORE_MIGRATIONS: readonly StoreMigration[] = [
   {

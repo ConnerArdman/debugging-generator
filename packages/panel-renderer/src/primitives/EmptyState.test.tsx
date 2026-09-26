@@ -1,6 +1,6 @@
 /**
  * The contract of `primitives/EmptyState` — the settled "nothing of that kind
- * here" state every visualization component renders (AAP 0.6.2).
+ * here" state every visualization component renders.
  *
  * Four properties are pinned, each because a component suite cannot see it on
  * its own:
@@ -16,7 +16,8 @@
  *     title is body text and no heading element is emitted in any form.
  *
  * The copy below is generic product vocabulary written for this suite; no
- * inspected project's names appear in it (AAP 0.5.4).
+ * inspected project's names appear in it, because the product holds no
+ * knowledge of a target application.
  */
 
 import { render, screen, within } from '@testing-library/react';

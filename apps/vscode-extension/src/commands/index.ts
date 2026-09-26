@@ -219,11 +219,16 @@ export interface CommandUi {
    */
   notify(notice: CommandNotice): Promise<string | undefined>;
   /**
-   * Renders a failure as one error notice: `prefix` (when given), then
-   * `error.message`, with `error.hint` as the actionable detail — the service's
-   * hint carries the relaunch command, the owning session or the conflict
-   * backup path (AAP §0.5.5). Never includes `error.details`, a stack, a
-   * credential or a URL query string.
+   * Renders a failure as one error notice, never as success (AAP §0.5.5):
+   * `prefix: error.message` as the headline (the message alone without a
+   * prefix) and `error.hint`, when set, as the detail. The service's error
+   * payload is `{ code, message, ref? }`, so recovery text it writes, such as
+   * the dev-server relaunch command, arrives in `error.message`; `hint` is set
+   * on this side, by the protocol `HttpClient` from a refusal's code and status
+   * or by the local module that failed. A capture 409's owner
+   * (`error.details.owningSessionId`) is the calling command's to read, and
+   * cleanup backup paths arrive in `cleanup.conflicts[]`, not in an error.
+   * Never includes `error.details`, a stack, a credential or a URL query string.
    */
   notifyFailure(error: DebuggenError, options?: FailureNoticeOptions): Promise<string | undefined>;
   /**

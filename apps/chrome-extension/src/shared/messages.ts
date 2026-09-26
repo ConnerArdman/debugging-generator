@@ -193,6 +193,7 @@ import {
   captureStopResponseSchema,
   dataResultSchema,
   errorPayloadSchema,
+  MESSAGE_TYPE,
   parseMessage,
   sessionRecordSchema,
 } from '@debuggen/protocol';
@@ -776,7 +777,11 @@ export function isPanelReloadState(value: unknown): value is PanelReloadState {
  *   included. `../panel/data-provider.ts` adapts it for
  *   `@debuggen/panel-renderer`.
  * - `source.open` — a `SourceLink` click, forwarded as the protocol's
- *   `source.open` frame; `forwarded` says whether the socket took it.
+ *   `source.open` frame and answered by the service's correlated
+ *   `source.result`: `forwarded: true` when the editor opened the location,
+ *   `forwarded: false` when no VS Code window is connected (the panel then
+ *   falls back to the editor-open URI); a refusal, an editor failure and the
+ *   worker's deadline are `ok: false` answers.
  * - `capture.start` / `capture.stop` — the panel's capture controls; the worker
  *   calls the protocol's two capture routes and answers with their bodies.
  * - `target.pick` — the panel entering (`enabled: true`) or leaving element
@@ -1023,21 +1028,21 @@ export type PortResponse<Kind extends PortRequestKind = PortRequestKind> =
  * failures (AAP §0.4.2, §0.7.3).
  */
 export const RELAYED_MESSAGE_TYPES = [
-  'session.created',
-  'session.updated',
-  'session.progress',
-  'session.bound',
-  'capture.started',
-  'capture.stopped',
-  'instrumentation.plan',
-  'instrumentation.ready',
-  'instrumentation.failed',
-  'telemetry.tail',
-  'analysis.completed',
-  'panel.generated',
-  'cleanup.completed',
-  'target.request',
-  'error',
+  MESSAGE_TYPE.SESSION_CREATED,
+  MESSAGE_TYPE.SESSION_UPDATED,
+  MESSAGE_TYPE.SESSION_PROGRESS,
+  MESSAGE_TYPE.SESSION_BOUND,
+  MESSAGE_TYPE.CAPTURE_STARTED,
+  MESSAGE_TYPE.CAPTURE_STOPPED,
+  MESSAGE_TYPE.INSTRUMENTATION_PLAN,
+  MESSAGE_TYPE.INSTRUMENTATION_READY,
+  MESSAGE_TYPE.INSTRUMENTATION_FAILED,
+  MESSAGE_TYPE.TELEMETRY_TAIL,
+  MESSAGE_TYPE.ANALYSIS_COMPLETED,
+  MESSAGE_TYPE.PANEL_GENERATED,
+  MESSAGE_TYPE.CLEANUP_COMPLETED,
+  MESSAGE_TYPE.TARGET_REQUEST,
+  MESSAGE_TYPE.ERROR,
 ] as const satisfies readonly MessageType[];
 
 /** One of {@link RELAYED_MESSAGE_TYPES}. */
@@ -1833,7 +1838,12 @@ export type PageAgentReadyPayload = Omit<AgentReadyPayload, 'tabId'>;
  * other fields are the agent's delivery bookkeeping.
  */
 export interface PageTelemetryBatchPayload {
-  /** The completed events, as the protocol's ingress batch. */
+  /**
+   * The completed events, as the protocol's ingress batch. Empty only in a
+   * loss-only report — posted by the agent's terminal flush or by the content
+   * bridge when no later batch will carry a loss — whose `droppedCount` is
+   * then above zero.
+   */
   readonly events: MessagePayload<'telemetry.event'>['events'];
   /** The document's producer id, which every event also carries. */
   readonly producerId: ProducerId;

@@ -1,11 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
-  <!-- A ball valve in profile: a body of radius 3.75 about 12 15 interrupting a pipe run on the
-       y 15 centre line, a stub in from 3.25 and one out to 20.75, each inner cap landing on the
-       body's horizontal extreme, so the strokes overlap and the run reads as welded to it. The
-       stem off the apex at 11.25 carries a 7.5 wide lever at 6.5, not a handwheel ring, since
-       the T it makes above the run is what survives a 16 px chip, and the body stays small and
-       unbored: neither the 8.25 flange of cable-reel.svg nor the nut of fastener.svg. Slate is
-       the root colour a file fetched by its own path strokes currentColor against. -->
+  <!-- Ball valve category glyph, used as a CSS mask by the category glyph component, so its alpha
+       is the shape. Keep it fill-free at the family's 1.75 stroke and legible at 16 px. Viewed on
+       its own, currentColor resolves to the slate root colour. -->
   <path d="M3.25 15 H8.25 M15.75 15 H20.75" />
   <circle cx="12" cy="15" r="3.75" />
   <path d="M12 11.25 V6.5 M8.25 6.5 H15.75" />

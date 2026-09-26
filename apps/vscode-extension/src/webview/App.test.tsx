@@ -22,7 +22,9 @@
  *     and notices; only its own result settles it, keeping or clearing the draft accordingly;
  *   - opening a file while a question is pending settles nothing;
  *   - the safety timeout gives a request up at 150 s, not before, and its late result is ignored;
- *   - a request the host channel refused keeps the draft with the retry hint.
+ *   - a request the host channel refused keeps the draft with the retry hint;
+ *   - the snapshot's `modificationsTotal` reaches the modifications list as its shortfall warning,
+ *     whose "Load all modifications" request stays pending until its own result.
  *
  * Fixtures are realistic `SessionRecord`s and `WebviewState`s with neutral, synthetic wording
  * (AAP 0.5.4).
@@ -676,5 +678,54 @@ describe('App — asking a follow-up', () => {
     expect(field(FOLLOW_UP_FIELD).value).toBe('');
     expect(screen.queryByText(FOLLOW_UP_RETRY_HINT)).toBeNull();
     expect(postedOf('askFollowUp')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loading the rest of the modification journal
+// ---------------------------------------------------------------------------
+
+describe('App — loading the rest of the modification journal', () => {
+  const LOAD_ALL = 'Load all modifications';
+  const SHORTFALL = 'Showing 0 of 2 recorded file modifications; the rest have not been loaded.';
+
+  it('states the shortfall the snapshot reports and keeps its load request pending until its own result', () => {
+    mount(sessionState('generated', { modificationsTotal: 2 }));
+
+    expect(screen.getByText(SHORTFALL)).toBeTruthy();
+    expect(screen.queryByText('No files were modified for this session.')).toBeNull();
+
+    fireEvent.click(button(LOAD_ALL));
+    const [request] = postedOf('loadModifications');
+    expect(request).toEqual({
+      type: 'loadModifications',
+      requestId: expect.stringMatching(REQUEST_ID_PATTERN) as unknown,
+    });
+    expect(parseWebviewToHostMessage(request)).toEqual({ ok: true, message: request });
+    expect(button(LOAD_ALL).disabled).toBe(true);
+
+    // Neither a snapshot nor a notice settles it; only its own result does.
+    pushState(sessionState('generated', { modificationsTotal: 2 }));
+    push({
+      type: 'notice',
+      level: 'warning',
+      message: 'Loaded 0 of 2 file modifications recorded for this session.',
+    });
+    expect(button(LOAD_ALL).disabled).toBe(true);
+
+    answer('loadModifications', 'failed');
+    expect(button(LOAD_ALL).disabled).toBe(false);
+    expect(postedOf('loadModifications')).toHaveLength(1);
+  });
+
+  it('drops the warning once the snapshot no longer counts records the list lacks', () => {
+    mount(sessionState('generated', { modificationsTotal: 2 }));
+    expect(screen.getByText(SHORTFALL)).toBeTruthy();
+
+    pushState(sessionState('generated', { modificationsTotal: 0 }));
+
+    expect(screen.queryByText(SHORTFALL)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_ALL })).toBeNull();
+    expect(screen.getByText('No files were modified for this session.')).toBeTruthy();
   });
 });

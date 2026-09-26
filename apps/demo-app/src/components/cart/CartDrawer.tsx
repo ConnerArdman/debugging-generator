@@ -94,10 +94,9 @@ import styles from './CartDrawer.module.css';
  *      2 is what a wheel, a swipe and the paging keys answer to, and it is all they answer to: the
  *      element stays a scroll container, so a *scripted* scroll still moves the page behind the
  *      scrim - find-in-page, an in-page anchor, and this storefront's own `scroll-behavior: smooth`
- *      animating over several frames, measured at 500px of background travel with the lock in
- *      place. The offset is read while it is still the reader's and restored instantly on any
- *      document scroll; the sheet's own list is untouched by this, because a scroll event on an
- *      element does not bubble to `window`.
+ *      animating over several frames. The offset is read while it is still the reader's and
+ *      restored instantly on any document scroll; the sheet's own list is untouched by this,
+ *      because a scroll event on an element does not bubble to `window`.
  *
  * `CartDrawer.module.css` still stops a scroll gesture chaining out of the list with
  * `overscroll-behavior: contain` on `.body`, which is the part of the behaviour that belongs in CSS:
@@ -130,17 +129,9 @@ import styles from './CartDrawer.module.css';
  * itself a control. Every control inside keeps the ring the application draws - the two footer
  * anchors from this module, the close control and the rows' own controls from their components.
  *
- * RENDER BEHAVIOUR, LEFT EXACTLY AS IT IS
- * The cart is published by `@/providers/CartProvider`, which rebuilds its context value on every
- * render while the dispatch countdown ticks, so this subtree re-renders several times a second for
- * as long as it is open. That is the storefront's behaviour and not this component's to correct:
- * there is no `memo`, no `useMemo`, no `useCallback`, no selector layer and no equality guard here,
- * and the only short-circuit is the early return that renders nothing while the drawer is closed. A
- * drawer that quietly held still would hide the very thing this repository's tool is built to find.
- *
+ * NO CLOCK
  * Nothing in this file reads a clock or schedules anything: no interval, no deferred callback and
- * no reading of the current time. The dispatch estimate in the footer is `CartTotalsPanel`'s, read
- * off the cart it is given.
+ * no reading of the current time. The dispatch estimate in the footer is `CartTotalsPanel`'s.
  *
  * CLASS CONTRACT
  * `CartDrawer.module.css` declares nine classes and this component uses all nine - `overlay`,
@@ -266,9 +257,8 @@ function tidy(element: HTMLElement): void {
  * The containment half is the part that is easy to leave out and then get wrong: Next mounts
  * `nextjs-portal` *inside* one of the script elements React streams into the body, so a rule that
  * only looked at each body child's own tag name would put `inert` on that script and take the
- * overlay with it - measured, before this walked the subtree. The scan short-circuits on the first
- * match and runs once per opening, over a document body whose children are the site chrome and a
- * handful of script elements.
+ * overlay with it. The scan short-circuits on the first match and runs once per opening, over a
+ * document body whose children are the site chrome and a handful of script elements.
  */
 function tooling(root: HTMLElement): boolean {
   if (root.tagName.includes('-')) {
@@ -348,12 +338,7 @@ function readOnServer(): boolean {
   return false;
 }
 
-/**
- * The dialog's inputs, kept local to this file: nothing outside needs to name this shape, and the
- * repository's hardcoding guard harvests this workspace's declared names into a policy the debugging
- * product may not then use, so a second exported name for "open, and how to close" would spend that
- * vocabulary for nothing.
- */
+/** The dialog's inputs, kept local to this file: nothing outside needs to name this shape. */
 interface Props {
   /** Whether the sheet is on screen. The caller owns this boolean; this file never sets it. */
   open: boolean;
@@ -397,16 +382,14 @@ export function CartDrawer(props: Props): ReactElement | null {
   const labelId = useId();
 
   // The sheet, so it can be focused as it opens and asked for its focusable contents while Tab is
-  // being pressed, and the element focus came from, so it can be handed back. Single-token names:
-  // the guard described above `Props` harvests every multi-token name this workspace declares, and
-  // "the sheet" is what `CartDrawer.module.css` calls this element throughout.
+  // being pressed, and the element focus came from, so it can be handed back.
   const sheet = useRef<HTMLDivElement | null>(null);
   const origin = useRef<HTMLElement | null>(null);
 
   // The scrim, and the pinned footer inside the sheet. Both are read by the effects below and by
   // nothing else: the scrim is the one child of `document.body` the inert sweep must spare, because
   // it is the dialog, and the footer is the rectangle the notification region is asked to keep
-  // clear of. Single-token names for the reason given above `sheet`.
+  // clear of.
   const scrim = useRef<HTMLDivElement | null>(null);
   const foot = useRef<HTMLDivElement | null>(null);
 
@@ -431,15 +414,13 @@ export function CartDrawer(props: Props): ReactElement | null {
   // One effect rather than one per step, because the order is the behaviour and not an accident of
   // which effect React happens to clean up first. Two of the steps interact directly: `inert` refuses
   // focus, so an `inert` still standing when focus is handed back to the header's cart control would
-  // make that `focus()` call do nothing at all and leave the reader on `<body>` - the exact defect
-  // this effect exists to close, reintroduced by the fix for it. Splitting the environment across
-  // effects would make the outcome depend on declaration order, which is a fact about this file
-  // nobody reading the two halves separately can see.
+  // make that `focus()` call do nothing at all and leave the reader on `<body>`. Splitting the
+  // environment across effects would make the outcome depend on declaration order, which is a fact
+  // about this file nobody reading the two halves separately can see.
   //
-  // Gated on `showing` alone, so it engages once per opening: the cart's contents change several
-  // times a second while the dispatch countdown ticks (see RENDER BEHAVIOUR above), and an effect
-  // that re-ran on those would blur whatever control the reader was using to put focus back on the
-  // sheet. The footer's reservation, which genuinely does depend on the cart, is the effect below.
+  // Gated on `showing` alone, so it engages once per opening: an effect that re-ran whenever the
+  // cart changed would blur whatever control the reader was using to put focus back on the sheet.
+  // The footer's reservation, which genuinely does depend on the cart, is the effect below.
   useEffect(() => {
     if (!showing) {
       return;
@@ -497,8 +478,7 @@ export function CartDrawer(props: Props): ReactElement | null {
     // swipe and the paging keys answer to, and it is the whole of what they answer to: the element
     // stays a scroll container, so anything that scrolls it *by script* still moves the page behind
     // the scrim. Find-in-page does that, an in-page anchor does it, and this storefront's own
-    // `scroll-behavior: smooth` animates it over several frames - measured at 500px of background
-    // travel under a locked page, which is the defect the lock was meant to close.
+    // `scroll-behavior: smooth` animates it over several frames.
     //
     // So the offset is remembered while it is still the reader's, and any scroll of the document is
     // put straight back. Only the document's own scroll reaches this listener: a scroll event on an
@@ -581,8 +561,8 @@ export function CartDrawer(props: Props): ReactElement | null {
 
     publish();
 
-    // Observed rather than measured once: the totals panel re-words its dispatch estimate while the
-    // countdown ticks, and a stale reservation would leave a notice sitting over the footer again.
+    // Observed rather than measured once: the totals panel re-words its dispatch estimate in place,
+    // and a stale reservation would leave a notice sitting over the footer again.
     const observer = new ResizeObserver(publish);
     observer.observe(element);
 
@@ -613,11 +593,6 @@ export function CartDrawer(props: Props): ReactElement | null {
     return () => {
       document.removeEventListener('keydown', dismiss);
     };
-
-    // `onClose` is a fresh function on every render by design - the header builds it inline - so
-    // this effect re-subscribes as often as this subtree renders. That is cheap and correct, and it
-    // is deliberately not "fixed" with a ref or a memo: the identity churn is the storefront's
-    // behaviour, and hiding it here would hide it from the tool built to observe it.
   }, [showing, onClose]);
 
   // Nothing is rendered while the drawer is closed, and nothing is rendered before the browser has

@@ -56,6 +56,13 @@
  * 4. **Error boundary**: `app.onError` and `app.notFound`, plus the Node
  *    listener's own error handler for a request that could not even be parsed.
  *
+ * Around all of it sits the **response-header policy**: every reply — success,
+ * refusal, `404`, `5xx`, the `503` after close and the Node listener's own
+ * fallbacks — carries `Cache-Control: no-store` and
+ * `X-Content-Type-Options: nosniff`, set by a middleware registered ahead of
+ * the origin guard, re-asserted at the dispatch guard's exit and stamped on the
+ * Node response itself, so no writer of a reply can leave it out.
+ *
  * ⚠️ **No `Access-Control-Allow-Origin` header is set anywhere, and no CORS
  * middleware is installed — deliberately.** Its absence is why a web page on
  * the developer's machine cannot read any response of this service even if it
@@ -153,7 +160,7 @@
  *   manager, reopener, orchestrator, sessions: sessionsRepo, panels: panelsRepo,
  *   modifications: modificationsRepo, bindings: clients,
  *   devServers: devServerLookupFromLaunches(launcher),
- *   retention: { purge: () => runRetention(retentionDeps) },
+ *   retention: { purge: (scope) => runRetention(retentionDeps, { scope }) },
  *   resolver: panelData, ingest, launcher,
  *   serviceVersion, isPairingAvailable: () => editorConnected(),
  * });
@@ -253,6 +260,31 @@ const CACHE_CONTROL_HEADER = 'cache-control';
 
 /** The {@link CACHE_CONTROL_HEADER} value on every response this module renders. */
 const NO_STORE = 'no-store';
+
+/**
+ * The response header that forbids a browser from sniffing a body into a
+ * media type other than the declared one (CWE-693).
+ */
+const CONTENT_TYPE_OPTIONS_HEADER = 'x-content-type-options';
+
+/** The {@link CONTENT_TYPE_OPTIONS_HEADER} value on every response this module renders. */
+const NOSNIFF = 'nosniff';
+
+/**
+ * The response-header policy every reply of this service carries — success,
+ * refusal, `404`, `5xx` and the listener's own fallbacks alike: never cached,
+ * never content-sniffed. It is deliberately these two headers and nothing
+ * more: no `Access-Control-Allow-Origin` (AAP §0.5.6 — its absence is what
+ * keeps web pages from reading any reply) and no `Server` banner.
+ *
+ * Applied by {@link withResponsePolicy} at the application's exits and
+ * stamped on the Node response by {@link HttpApp.requestListener}; the error
+ * `Response`s this module builds carry it from construction.
+ */
+const RESPONSE_POLICY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  [CACHE_CONTROL_HEADER]: NO_STORE,
+  [CONTENT_TYPE_OPTIONS_HEADER]: NOSNIFF,
+});
 
 /** The response header a body's media type is read from by the response verifier. */
 const CONTENT_TYPE_HEADER = 'content-type';
@@ -669,13 +701,15 @@ export interface HttpApp {
   /**
    * The Node request listener: `createServer(app.requestListener)`. It never
    * throws and never rejects; a request it cannot parse is answered with
-   * protocol's error body.
+   * protocol's error body. Every reply it writes carries
+   * `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
    */
   readonly requestListener: RequestListener;
 
   /**
    * Dispatches one WHATWG `Request` in-process, through exactly the pipeline
-   * the listener uses, for the unit and integration suites. Never rejects.
+   * the listener uses, for the unit and integration suites. Never rejects;
+   * every reply carries the same two policy headers.
    */
   readonly fetch: (request: Request) => Promise<Response>;
 
@@ -886,7 +920,9 @@ function publicBoundaryError(error: DebuggenError, status: HttpErrorStatus): Deb
  * @param error The failure.
  * @param ref The request's correlation reference, when one was minted.
  * @param serverFailureMessage The fixed sentence a `500` says.
- * @returns The response, with `Cache-Control: no-store`.
+ * @returns The response, carrying {@link RESPONSE_POLICY_HEADERS} from
+ * construction — the listener's error handler hands it to the socket without
+ * passing the dispatch guard.
  */
 function errorResponse(
   error: DebuggenError,
@@ -896,7 +932,61 @@ function errorResponse(
   const status = httpStatusForError(error);
   return Response.json(errorBodyFor(error, status, ref, serverFailureMessage), {
     status,
-    headers: { [CACHE_CONTROL_HEADER]: NO_STORE },
+    headers: RESPONSE_POLICY_HEADERS,
+  });
+}
+
+/**
+ * Applies {@link RESPONSE_POLICY_HEADERS} to a reply about to leave the
+ * application.
+ *
+ * Every `Response` hono and this module build has a mutable header list, so
+ * the policy is set in place. A reply whose header list the platform made
+ * immutable — `Response.redirect`, `Response.error`, a `fetch` reply — cannot
+ * take a header; it is re-wrapped instead: the same body stream (moved, never
+ * read or buffered), status, status text and headers, plus the policy. A reply
+ * that already carries both values is returned untouched.
+ *
+ * @param response The reply.
+ * @returns `response` itself, or its re-wrapped equivalent.
+ * @throws {RangeError} When an immutable reply's status cannot be constructed
+ * (`Response.error()`'s `0`). Thrown inside the middleware chain it reaches
+ * the error boundary, and at the dispatch guard's exit its catch; either
+ * answers a `500` that carries the policy.
+ *
+ * @example
+ * ```ts
+ * withResponsePolicy(Response.json({}, { status: 200 })).headers.get('x-content-type-options');
+ * // 'nosniff' — set in place
+ * withResponsePolicy(Response.redirect('http://127.0.0.1/', 302)).status;
+ * // 302 — re-wrapped, because a redirect's headers are immutable
+ * ```
+ */
+function withResponsePolicy(response: Response): Response {
+  const policy = Object.entries(RESPONSE_POLICY_HEADERS);
+  if (policy.every(([name, value]) => response.headers.get(name) === value)) {
+    return response;
+  }
+  try {
+    for (const [name, value] of policy) {
+      response.headers.set(name, value);
+    }
+    return response;
+  } catch (caught) {
+    // The platform's immutable-headers guard throws a `TypeError`; anything
+    // else is not a header-list refusal and is not this function's to absorb.
+    if (!(caught instanceof TypeError)) {
+      throw caught;
+    }
+  }
+  const headers = new Headers(response.headers);
+  for (const [name, value] of policy) {
+    headers.set(name, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 
@@ -1626,9 +1716,31 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
   };
 
   /*
-   * 1. The origin guard — outermost, for every request including the two
-   * auth-exempt operations and paths no route answers. The decision is
-   * `./auth.ts`'s `isAllowedOrigin`; the answer is its own refusal.
+   * 0. The response-header policy — registered first, so it wraps every other
+   * step and acts on the reply they settled on: a route's, the origin guard's
+   * `403`, the `503` after close, the body guard's and the verifier's
+   * replacements, and the error boundary's and `notFound`'s answers (hono's
+   * composer settles those inside the chain, so `next()` resolves with them
+   * in place). It judges nothing and reads nothing of the request.
+   */
+  const responsePolicy: MiddlewareHandler<ServerEnv> = async (c, next) => {
+    await next();
+    const secured = withResponsePolicy(c.res);
+    if (secured !== c.res) {
+      // Cleared first, as the verifier and the body guard do: hono's `res`
+      // setter would otherwise merge the old reply's headers into a re-wrap
+      // of the new one.
+      c.res = undefined;
+      c.res = secured;
+    }
+    return undefined;
+  };
+
+  /*
+   * 1. The origin guard — the first step to judge a request, for every
+   * request including the two auth-exempt operations and paths no route
+   * answers. The decision is `./auth.ts`'s `isAllowedOrigin`; the answer is
+   * its own refusal.
    */
   const originGuard: MiddlewareHandler<ServerEnv> = async (c, next) => {
     if (!isAllowedOrigin(c.req.header(ORIGIN_HEADER))) {
@@ -1807,13 +1919,14 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
       c.res = undefined;
       c.res = Response.json(errorBodyFor(refusalError(refusal), refusal.status, context?.ref), {
         status: refusal.status,
-        headers: { [CACHE_CONTROL_HEADER]: NO_STORE },
+        headers: RESPONSE_POLICY_HEADERS,
       });
       return undefined;
     };
   };
 
   const app = new Hono<ServerEnv>();
+  app.use(responsePolicy);
   app.use(originGuard);
   app.use(requestContext);
 
@@ -1892,11 +2005,15 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
   /**
    * The dispatch guard: the application's `fetch`, with a failure that
    * escaped hono's boundary (a thrown non-`Error`) answered rather than
-   * rejected.
+   * rejected. It is also the one exit every application reply leaves by, so
+   * the response-header policy is re-asserted here for what hono builds
+   * outside the middleware chain (its `HEAD` re-wrap of a `GET` reply) and
+   * for an immutable reply the chain could not re-wrap; its own `500` carries
+   * the policy from construction.
    */
   const dispatch = async (request: Request): Promise<Response> => {
     try {
-      return await app.fetch(request);
+      return withResponsePolicy(await app.fetch(request));
     } catch (caught) {
       const ref = contexts.get(request)?.ref ?? newRef();
       const fields = exceptionLogFields(caught, ref);
@@ -1944,6 +2061,16 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
     request: IncomingMessage,
     response: ServerResponse,
   ): void => {
+    // The response-header policy, stamped on the Node response before any
+    // writer runs. `writeHead` merges headers set this way into the ones it is
+    // passed, so every reply written here carries the policy — the
+    // application's, the `500` below, and `@hono/node-server`'s own
+    // text/plain `500` for a reply it failed to write, which no `Response`
+    // of this module shapes. Nothing has written yet and the names and values
+    // are constants, so `setHeader` has nothing to refuse.
+    for (const [name, value] of Object.entries(RESPONSE_POLICY_HEADERS)) {
+      response.setHeader(name, value);
+    }
     nodeListener(request, response).catch((caught: unknown) => {
       // No request context reaches this far out, so the ref is minted here and
       // carried by both the record and — when a body can still be written —
@@ -1960,7 +2087,7 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
         );
         response.writeHead(HTTP_ERROR_STATUS_BY_CODE.INTERNAL, {
           [CONTENT_TYPE_HEADER]: JSON_MEDIA_TYPE,
-          [CACHE_CONTROL_HEADER]: NO_STORE,
+          ...RESPONSE_POLICY_HEADERS,
         });
         response.end(JSON.stringify(body));
       } else if (!response.writableEnded) {

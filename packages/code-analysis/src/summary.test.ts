@@ -505,7 +505,7 @@ describe('readTargetManifest', () => {
     expect(Object.keys(view ?? {}).sort()).toEqual(['dependencies', 'name', 'packageManager']);
     expect(view?.name).toBe('fixture-observatory-app');
     expect(view?.packageManager).toBe('npm@10.9.0');
-    expect(view?.dependencies).toEqual({ next: '16.3.5', react: '19.3.0', 'react-dom': '19.3.0' });
+    expect(view?.dependencies).toEqual({ next: '16.3.6', react: '19.3.0', 'react-dom': '19.3.0' });
   });
 
   it('answers undefined for a project that declares no manifest', () => {
@@ -1269,7 +1269,7 @@ describe('summarizeProject over the sample application', () => {
   it('reports the framework and the version string the manifest declares', () => {
     // The declared range verbatim: the corpus is never installed, so a resolved
     // version does not exist for it and must not be invented.
-    expect(corpus().summary.framework).toEqual({ name: 'next', version: '16.3.5' });
+    expect(corpus().summary.framework).toEqual({ name: 'next', version: '16.3.6' });
   });
 
   it('reports the hybrid router style the corpus is built to have', () => {
@@ -1364,7 +1364,7 @@ describe('summarizeProject over the sample application', () => {
 
   it('reports the dependencies it recognises, framework family first', () => {
     expect([...corpus().summary.dependencies]).toEqual([
-      { name: 'next', versionRange: '16.3.5', dev: false },
+      { name: 'next', versionRange: '16.3.6', dev: false },
       { name: 'react', versionRange: '19.3.0', dev: false },
       { name: 'react-dom', versionRange: '19.3.0', dev: false },
     ]);

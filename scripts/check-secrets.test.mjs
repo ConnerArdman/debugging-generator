@@ -2,18 +2,18 @@
  * check-secrets.test.mjs
  *
  * The proof that `scripts/check-secrets.mjs` - the gate behind `pnpm check:secrets`, which
- * `pnpm verify` runs (AAP 0.8.5) - both catches what it claims to catch and lets through the files
- * this repository is required to commit.
+ * `pnpm verify` runs - both catches what it claims to catch and lets through the files this
+ * repository is required to commit.
  *
- * WHAT THIS SUITE OWNS. AAP 0.3.4 states the contract in one sentence: the script's own tests
- * "cover a positive case for each pattern and negative cases for the allowlisted placeholders, so
- * the required example files pass the required gate". Coverage is therefore defined by rule id
- * rather than by count, and the suite is laid out that way - one `describe` per rule id
- * (`env-file`, `provider-key`, `jwt`, `private-key`, `entropy`, `connection-string`), so a rule
- * that loses its coverage is visible in the test report rather than inferable from it. Three more
- * blocks carry the other half of the contract: the reviewed allowlist is the only exemption
- * channel and is narrow in both directions; the two `.env.example` files scan clean; and the
- * false positives that would make a gate inside `pnpm verify` unusable do not occur.
+ * WHAT THIS SUITE OWNS. Its contract is one sentence: a positive case for each pattern, and
+ * negative cases for the allowlisted placeholders, so the required example files pass the required
+ * gate. Coverage is therefore defined by rule id rather than by count, and the suite is laid out
+ * that way - one `describe` per rule id (`env-file`, `provider-key`, `jwt`, `private-key`,
+ * `entropy`, `connection-string`), so a rule that loses its coverage is visible in the test report
+ * rather than inferable from it. Three more blocks carry the other half of the contract: the
+ * reviewed allowlist is the only exemption channel and is narrow in both directions; the two
+ * `.env.example` files scan clean; and the false positives that would make a gate inside
+ * `pnpm verify` unusable do not occur.
  *
  * WHY EVERY FIXTURE IS ASSEMBLED AT RUNTIME. This file is tracked content, and the gate scans
  * tracked content - including this file, whose path no allowlist entry names, and rightly so. A
@@ -32,8 +32,8 @@
  * characters and its length, which is what {@link expectValueNeverPrinted} pins down.
  *
  * HARNESS. The root `vitest.config.ts` collects this file into the `tooling` project
- * (`scripts/*.test.mjs`, environment `node`, `globals: false`), which `pnpm test` runs as part of
- * the blocking gate of AAP 0.8.5 and 0.7.1 Group 0. `describe`/`it`/`expect` are imported
+ * (`scripts/*.test.mjs`, environment `node`, `globals: false`), which `pnpm test` runs inside the
+ * blocking `pnpm verify` gate, locally and in CI. `describe`/`it`/`expect` are imported
  * explicitly because that project sets no globals. Every block but the last drives the exported
  * pure functions in process - `scanContent`, `scanPath`, `isEnvFileViolation`, `isKeyLikeName`,
  * `shannonEntropy`, `normalizeAllowlist` - which need neither git nor a checkout, and that is what
@@ -59,6 +59,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { crc32, deflateRawSync, deflateSync } from 'node:zlib';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
@@ -72,6 +73,7 @@ import {
   EXIT_ERROR,
   EXIT_FINDINGS,
   EXIT_OK,
+  MAX_FIELD_BYTES,
   MAX_SCAN_BYTES,
   RULE_IDS,
   STREAM_CHUNK_BYTES,
@@ -180,8 +182,8 @@ const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.dirname(SCRIPT_DIRECTORY);
 
 /**
- * The development database URL the product must commit (AAP 0.3.4), assembled so this file does
- * not contain it as a literal - its allowlist entry does not name this path.
+ * The development database URL the product must commit, assembled so this file does not contain
+ * it as a literal - its allowlist entry does not name this path.
  */
 const DEV_DATABASE_URL = assemble(
   'postgresql',
@@ -196,7 +198,7 @@ const DEV_DATABASE_URL = assemble(
 /** The Compose password placeholder that is the other half of the same throwaway container. */
 const DEV_COMPOSE_PASSWORD = assemble('POSTGRES_PASSWORD', ': ', 'debuggen');
 
-/** The two literals AAP 0.3.4 permits in tracked files, and the only two. */
+/** The two literals the reviewed allowlist permits in tracked files, and the only two. */
 const REQUIRED_PLACEHOLDERS = [DEV_DATABASE_URL, DEV_COMPOSE_PASSWORD];
 
 /**
@@ -427,7 +429,7 @@ const PRIVATE_KEY_FIXTURES = [
 const DENSE_VALUE = cycle(URLSAFE_CHARS, 40);
 
 /**
- * One fixture per name form AAP 0.3.4 names (`key`, `token`, `secret`, `password`), written in the
+ * One fixture per key-like name form (`key`, `token`, `secret`, `password`), written in the
  * syntax each actually appears in: an environment file, YAML, JSON and a code assignment. The
  * reported `pattern` is the name the value was bound to.
  *
@@ -688,7 +690,7 @@ const FOREIGN_CONNECTION_PASSWORD = 'hunter2';
  * ------------------------------------------------------------------------ */
 
 describe('the enforced contract', () => {
-  it('enforces exactly the six rules AAP 0.3.4 specifies, in reporting order', () => {
+  it('enforces exactly the six rules, in reporting order', () => {
     expect([...RULE_IDS]).toEqual([
       'env-file',
       'provider-key',
@@ -699,11 +701,16 @@ describe('the enforced contract', () => {
     ]);
   });
 
+  it('bounds the in-memory read of one metadata field by the in-memory file limit', () => {
+    // A field's bytes are joined in memory; the byte-for-byte pass still reads everything past it.
+    expect(MAX_FIELD_BYTES).toBe(MAX_SCAN_BYTES);
+  });
+
   it('treats the two required example files as the only committable environment files', () => {
     expect([...ALLOWED_ENV_FILES]).toEqual(['.env.example', 'apps/demo-app/.env.example']);
   });
 
-  it('applies the entropy thresholds the specification states', () => {
+  it('applies the documented entropy thresholds: 32 characters, above 4 bits per character', () => {
     expect(ENTROPY_MIN_LENGTH).toBe(32);
     expect(ENTROPY_MIN_BITS_PER_CHAR).toBe(4);
   });
@@ -820,7 +827,7 @@ describe('the reviewed allowlist', () => {
 });
 
 /* ---------------------------------------------------------------------------
- * One positive case per rule id (AAP 0.3.4)
+ * One positive case per rule id
  * ------------------------------------------------------------------------ */
 
 /**
@@ -1148,7 +1155,7 @@ describe('entropy', () => {
   );
 
   it('measures a value of any length, because the rule states a minimum and no maximum', () => {
-    // AAP 0.3.4 bounds the rule from below at 32 characters and not from above, so a value of
+    // The rule is bounded from below at 32 characters and not from above, so a value of
     // kilobytes is measured rather than exempted. What keeps a long line affordable is the bounded
     // name lookup, which the case below pins.
     const long = cycle(PUNCTUATED_CHARS + URLSAFE_CHARS, 8193);
@@ -1404,9 +1411,9 @@ describe('the reviewed allowlist is the only exemption channel', () => {
     'reports the database placeholder at an allowlisted path when $label',
     ({ value, pattern }) => {
       // Each variant contains the allowlisted literal, and each is a longer connection-string match
-      // that extends past it: the exemption covers the exact placeholder (AAP 0.3.4), never a value
-      // it is a substring of. `.env.example` is a path the entry lists, so the path is not what
-      // reports it - the span is.
+      // that extends past it: the exemption covers the exact placeholder, never a value it is a
+      // substring of. `.env.example` is a path the entry lists, so the path is not what reports
+      // it - the span is.
       expect(DATABASE_URL_PATHS).toContain('.env.example');
       const line = `DATABASE_URL=${value}`;
       const result = scanContentWithSuppressions(
@@ -1616,12 +1623,12 @@ describe('the reviewed allowlist is the only exemption channel', () => {
 });
 
 /* ---------------------------------------------------------------------------
- * The two required example files pass the required gate (AAP 0.3.4)
+ * The two required example files pass the required gate
  * ------------------------------------------------------------------------ */
 
 /**
- * The root example environment, as AAP 0.3.4 enumerates it. Used as written when the committed
- * file is absent, so this assertion is meaningful today and stronger once the file lands.
+ * The canonical content of the root example environment. It is scanned on its own, and it stands
+ * in for the committed file in a checkout that does not have one.
  */
 const ROOT_ENV_EXAMPLE_FIXTURE = [
   '# Debug Generator - example environment. Copy to `.env`, which is git-ignored.',
@@ -1700,7 +1707,7 @@ describe('the required example files pass the gate', () => {
  * ------------------------------------------------------------------------ */
 
 describe('content this repository legitimately commits', () => {
-  /** A 40-character git object name, the shape AAP 0.3.2 pins every action to. */
+  /** A 40-character git object name, the shape the workflow pins every action to. */
   const GIT_OBJECT_NAME = cycle(HEX_CHARS, 40);
 
   /** A base64 subresource digest, the shape `pnpm-lock.yaml` records for every package. */
@@ -1780,9 +1787,10 @@ describe('content this repository legitimately commits', () => {
  *
  * The rule coverage above needs neither git nor a checkout, and keeping it that way is what makes
  * it fast and hermetic. What is left to prove here is the wiring - tracked-file enumeration, the
- * report and the exit codes - and what the gate does with each kind of tracked entry: a binary it
- * may skip only when positively identified, an oversized file it streams, a symbolic link it reads
- * as target text, a submodule it skips, and a file it cannot examine, which fails the run.
+ * report and the exit codes - and what the gate does with each kind of tracked entry: a positively
+ * identified binary it scans byte for byte and by metadata field, an oversized file it streams, a
+ * symbolic link it reads as target text, a submodule it skips, and a file it cannot examine, which
+ * fails the run.
  * ------------------------------------------------------------------------ */
 
 /**
@@ -1921,8 +1929,9 @@ function namesTrackedPath(target, relPath) {
 }
 
 /**
- * One fixture per binary format the gate may skip: the format's extension and the leading bytes
- * that identify it, padded with a few bytes of body so the file is more than its signature.
+ * One fixture per binary format the gate scans in binary mode: the format's extension and the
+ * leading bytes that identify it, padded with a few bytes of body so the file is more than its
+ * signature.
  *
  * @type {readonly { format: string, file: string, bytes: Uint8Array }[]}
  */
@@ -1946,6 +1955,337 @@ const BINARY_FIXTURES = [
   file,
   bytes: Uint8Array.from([...lead, 0x00, 0x01, 0x02, 0xfe, 0xff]),
 }));
+
+/** The eight bytes every PNG file begins with. */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/**
+ * One PNG chunk: the big-endian length of its data, its four-letter type, the data, and the CRC-32
+ * of type and data that a decoder verifies.
+ *
+ * @param {string} type Four ASCII letters.
+ * @param {Uint8Array} data
+ * @returns {Buffer}
+ */
+function pngChunk(type, data) {
+  const typeAndData = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const checksum = Buffer.alloc(4);
+  checksum.writeUInt32BE(crc32(typeAndData));
+  return Buffer.concat([length, typeAndData, checksum]);
+}
+
+/**
+ * A decodable 1x1 truecolour PNG: signature, `IHDR`, the given ancillary chunks, one `IDAT` holding
+ * a deflated scanline, and `IEND`. The binary cases run against the structure a real image has -
+ * lengths and checksums on either side of the metadata - rather than against a bare signature.
+ *
+ * @param {readonly Buffer[]} ancillary Chunks placed between `IHDR` and `IDAT`.
+ * @returns {Buffer}
+ */
+function pngImage(ancillary) {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(1, 0);
+  header.writeUInt32BE(1, 4);
+  // Bit depth 8, colour type 2 (truecolour); compression, filter and interlace methods stay 0.
+  header.writeUInt8(8, 8);
+  header.writeUInt8(2, 9);
+  // One scanline: filter type 0, then one RGB pixel.
+  const scanline = Buffer.from([0x00, 0x2f, 0x6f, 0xaf]);
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    pngChunk('IHDR', header),
+    ...ancillary,
+    pngChunk('IDAT', deflateSync(scanline)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/**
+ * A `tEXt` chunk: a Latin-1 keyword, a NUL separator and the text, stored uncompressed.
+ *
+ * @param {string} keyword
+ * @param {string} text
+ * @returns {Buffer}
+ */
+function pngText(keyword, text) {
+  return pngChunk('tEXt', Buffer.from(`${keyword}\u0000${text}`, 'latin1'));
+}
+
+/**
+ * An uncompressed `iTXt` chunk, which is where an XMP packet lives in a PNG: the keyword, then five
+ * zero bytes - its NUL separator, compression flag 0, compression method 0, and the NUL ending
+ * each of the empty language tag and translated keyword - then the UTF-8 text.
+ *
+ * @param {string} keyword
+ * @param {string} text
+ * @returns {Buffer}
+ */
+function pngInternationalText(keyword, text) {
+  return pngChunk(
+    'iTXt',
+    Buffer.concat([Buffer.from(keyword, 'latin1'), Buffer.alloc(5), Buffer.from(text, 'utf8')]),
+  );
+}
+
+/**
+ * A JPEG holding one comment (`COM`) segment between its start and end markers. The segment
+ * length is big-endian and counts its own two bytes.
+ *
+ * @param {string} comment
+ * @returns {Buffer}
+ */
+function jpegWithComment(comment) {
+  const data = Buffer.from(comment, 'latin1');
+  const length = Buffer.alloc(2);
+  length.writeUInt16BE(data.length + 2);
+  return Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xfe]),
+    length,
+    data,
+    Buffer.from([0xff, 0xd9]),
+  ]);
+}
+
+/**
+ * A PDF whose document information dictionary is an uncompressed object carrying `subject`,
+ * after the customary comment line of high bytes that marks the file as binary.
+ *
+ * @param {string} subject
+ * @returns {Buffer}
+ */
+function pdfWithSubject(subject) {
+  return Buffer.from(
+    [
+      '%PDF-1.7',
+      '%\u00e2\u00e3\u00cf\u00d3',
+      '1 0 obj',
+      `<< /Title (Fixture) /Subject (${subject}) >>`,
+      'endobj',
+      'trailer',
+      '<< /Info 1 0 R >>',
+      '%%EOF',
+      '',
+    ].join('\n'),
+    'latin1',
+  );
+}
+
+/**
+ * A GIF holding a one-sub-block comment extension after a 1x1 logical screen descriptor with no
+ * colour table.
+ *
+ * @param {string} comment At most 255 bytes, the size of one sub-block.
+ * @returns {Buffer}
+ */
+function gifWithComment(comment) {
+  const data = Buffer.from(comment, 'latin1');
+  if (data.length > 255) {
+    throw new RangeError(`a GIF comment sub-block holds at most 255 bytes, not ${data.length}`);
+  }
+  return Buffer.concat([
+    Buffer.from('GIF89a', 'latin1'),
+    Buffer.from([0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]),
+    Buffer.from([0x21, 0xfe, data.length]),
+    data,
+    Buffer.from([0x00, 0x3b]),
+  ]);
+}
+
+/**
+ * A GIF whose comment extension is split into the given sub-blocks, each after its length byte,
+ * followed by an application extension whose identifier sub-block is `application` and whose data
+ * is split into `data`.
+ *
+ * @param {readonly string[]} comment Comment sub-blocks, each at most 255 bytes.
+ * @param {string} application Eleven bytes: the application identifier and authentication code.
+ * @param {readonly string[]} data Application data sub-blocks, each at most 255 bytes.
+ * @returns {Buffer}
+ */
+function gifWithSubBlocks(comment, application, data) {
+  /**
+   * @param {readonly string[]} blocks
+   * @returns {Buffer[]}
+   */
+  const subBlocks = (blocks) => [
+    ...blocks.flatMap((block) => {
+      const bytes = Buffer.from(block, 'latin1');
+      expect(bytes.length).toBeLessThanOrEqual(255);
+      return [Buffer.from([bytes.length]), bytes];
+    }),
+    Buffer.from([0x00]),
+  ];
+  return Buffer.concat([
+    Buffer.from('GIF89a', 'latin1'),
+    Buffer.from([0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]),
+    Buffer.from([0x21, 0xfe]),
+    ...subBlocks(comment),
+    Buffer.from([0x21, 0xff]),
+    ...subBlocks([application, ...data]),
+    Buffer.from([0x3b]),
+  ]);
+}
+
+/**
+ * A ZIP archive laid out as a VSIX package is: each entry's local header and data in turn, the
+ * central directory, then the end record and the archive comment. An entry is stored (method 0)
+ * or, with `deflate`, raw-deflated (method 8); every checksum and size is the real one, and no
+ * entry carries an extra field, so a name runs straight into what follows it.
+ *
+ * @param {readonly { name: string, content: string, deflate?: boolean, comment?: string }[]} entries
+ * @param {string} comment The archive comment, at most 65535 bytes.
+ * @returns {Buffer}
+ */
+function zipArchive(entries, comment) {
+  /** @type {Buffer[]} */
+  const records = [];
+  /** @type {Buffer[]} */
+  const directory = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name, 'latin1');
+    const content = Buffer.from(entry.content, 'latin1');
+    const data = entry.deflate === true ? deflateRawSync(content) : content;
+    const method = entry.deflate === true ? 8 : 0;
+    const entryComment = Buffer.from(entry.comment ?? '', 'latin1');
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(crc32(content), 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(content.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt32LE(crc32(content), 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(content.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(entryComment.length, 32);
+    central.writeUInt32LE(offset, 42);
+    records.push(local, name, data);
+    directory.push(central, name, entryComment);
+    offset += local.length + name.length + data.length;
+  }
+  const directoryBytes = Buffer.concat(directory);
+  const archiveComment = Buffer.from(comment, 'latin1');
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directoryBytes.length, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(archiveComment.length, 20);
+  return Buffer.concat([...records, directoryBytes, end, archiveComment]);
+}
+
+/**
+ * An ICO file whose one 1x1 image is the complete PNG file `png`: the six-byte header, one
+ * sixteen-byte directory entry giving the image's size and offset, little-endian, then the image.
+ *
+ * @param {Buffer} png
+ * @returns {Buffer}
+ */
+function icoWithPng(png) {
+  const header = Buffer.from([0x00, 0x00, 0x01, 0x00, 0x01, 0x00]);
+  const entry = Buffer.alloc(16);
+  entry.writeUInt8(1, 0);
+  entry.writeUInt8(1, 1);
+  entry.writeUInt16LE(1, 4);
+  entry.writeUInt16LE(32, 6);
+  entry.writeUInt32LE(png.length, 8);
+  entry.writeUInt32LE(header.length + entry.length, 12);
+  return Buffer.concat([header, entry, png]);
+}
+
+/**
+ * A WOFF font with one table stored uncompressed and a private data block: the 44-byte header,
+ * one 20-byte table directory entry, the table and the block. `table` is a whole number of
+ * four-byte words, so the block follows its last byte with no padding.
+ *
+ * @param {string} table
+ * @param {string} privateData
+ * @returns {Buffer}
+ */
+function woffWithPrivateData(table, privateData) {
+  const tableBytes = Buffer.from(table, 'latin1');
+  expect(tableBytes.length % 4).toBe(0);
+  const privateBytes = Buffer.from(privateData, 'latin1');
+  const header = Buffer.alloc(44);
+  const entry = Buffer.alloc(20);
+  const privateOffset = header.length + entry.length + tableBytes.length;
+  header.write('wOFF', 0, 'latin1');
+  header.writeUInt32BE(0x00010000, 4);
+  header.writeUInt32BE(privateOffset + privateBytes.length, 8);
+  header.writeUInt16BE(1, 12);
+  header.writeUInt32BE(12 + 16 + tableBytes.length, 16);
+  header.writeUInt16BE(1, 20);
+  header.writeUInt32BE(privateOffset, 36);
+  header.writeUInt32BE(privateBytes.length, 40);
+  entry.write('name', 0, 'latin1');
+  entry.writeUInt32BE(header.length + entry.length, 4);
+  entry.writeUInt32BE(tableBytes.length, 8);
+  entry.writeUInt32BE(tableBytes.length, 12);
+  return Buffer.concat([header, entry, tableBytes, privateBytes]);
+}
+
+/**
+ * A WOFF2 font with one known table and a private data block: the 48-byte header, a two-byte table
+ * directory entry (flags naming the `name` table, then its one-byte length), the font data block
+ * right after it, and the private block. `fontData` ends on a four-byte boundary of the file, so
+ * the private block follows its last byte with no padding.
+ *
+ * @param {string} fontData
+ * @param {string} privateData
+ * @returns {Buffer}
+ */
+function woff2WithPrivateData(fontData, privateData) {
+  const fontBytes = Buffer.from(fontData, 'latin1');
+  const privateBytes = Buffer.from(privateData, 'latin1');
+  const header = Buffer.alloc(48);
+  const directory = Buffer.from([0x05, 0x20]);
+  const privateOffset = header.length + directory.length + fontBytes.length;
+  expect(privateOffset % 4).toBe(0);
+  header.write('wOF2', 0, 'latin1');
+  header.writeUInt32BE(0x00010000, 4);
+  header.writeUInt32BE(privateOffset + privateBytes.length, 8);
+  header.writeUInt16BE(1, 12);
+  header.writeUInt32BE(12 + 16 + 0x20, 16);
+  header.writeUInt32BE(fontBytes.length, 20);
+  header.writeUInt16BE(1, 24);
+  header.writeUInt32BE(privateOffset, 40);
+  header.writeUInt32BE(privateBytes.length, 44);
+  return Buffer.concat([header, directory, fontBytes, privateBytes]);
+}
+
+/**
+ * The 1-based line and column at which `needle` first occurs in `bytes`, counted over the raw
+ * bytes the way binary mode reports them: a line ends at each 0x0A byte, and a column is a byte
+ * offset within its line. It is computed independently of the gate's decoder, so the assertion
+ * checks that decoding rather than repeating it.
+ *
+ * @param {Uint8Array} bytes
+ * @param {string} needle ASCII text.
+ * @returns {{ line: number, column: number }}
+ */
+function bytePosition(bytes, needle) {
+  const offset = Buffer.from(bytes).indexOf(Buffer.from(needle, 'latin1'));
+  expect(offset).toBeGreaterThanOrEqual(0);
+  let line = 1;
+  let lineStart = 0;
+  for (let index = 0; index < offset; index += 1) {
+    if (bytes[index] === 0x0a) {
+      line += 1;
+      lineStart = index + 1;
+    }
+  }
+  return { line, column: offset - lineStart + 1 };
+}
 
 describe('the command line', () => {
   it.skipIf(!GIT_AVAILABLE)(
@@ -1976,7 +2316,7 @@ describe('the command line', () => {
   it.skipIf(!GIT_AVAILABLE)(
     'exits 0 over a checkout carrying both required placeholders, on the committed allowlist',
     async () => {
-      // The end-to-end half of AAP 0.3.4's negative requirement. The rule-level cases above prove
+      // The end-to-end half of the negative cases for the placeholders. The rule-level cases prove
       // `scanContent` exempts the two placeholders; this one drives the whole gate over a
       // repository that really tracks the three files they live in, so a regression in default
       // allowlist loading, in tracked-file enumeration or in repository-level suppression fails
@@ -2103,7 +2443,7 @@ describe('the command line', () => {
   );
 
   it.skipIf(!GIT_AVAILABLE)(
-    'skips only a positively identified binary, and scans a disguised or NUL-laden file as text',
+    'scans an identified binary in binary mode, and a disguised or NUL-laden file as text',
     async () => {
       const directory = createThrowawayRepository();
       for (const fixture of BINARY_FIXTURES) {
@@ -2141,18 +2481,15 @@ describe('the command line', () => {
       const report = JSON.parse(stdout);
       expect(report.unscanned).toEqual([]);
       expect(report.filesTracked).toBe(BINARY_FIXTURES.length + 5);
-      expect(report.filesScanned).toBe(5);
+      // Every entry is scanned, the identified binaries included; nothing is skipped.
+      expect(report.filesScanned).toBe(BINARY_FIXTURES.length + 5);
+      expect(report.skipped).toEqual([]);
       expect(
-        [...report.skipped].sort((left, right) => left.file.localeCompare(right.file)),
+        [...report.binaries].sort((left, right) => left.file.localeCompare(right.file)),
       ).toEqual(
         [...BINARY_FIXTURES]
           .sort((left, right) => left.file.localeCompare(right.file))
-          .map(({ format, file, bytes }) => ({
-            file,
-            reason: 'binary',
-            format,
-            bytes: bytes.length,
-          })),
+          .map(({ format, file, bytes }) => ({ file, format, bytes: bytes.length })),
       );
       expect(
         report.findings.map(
@@ -2172,7 +2509,552 @@ describe('the command line', () => {
       expect(stdout).not.toContain(embedded);
 
       const text = await runCli([], { cwd: directory });
-      expect(text.stdout).toContain(`${BINARY_FIXTURES.length} skipped (binary or submodule)`);
+      expect(text.stdout).toContain(
+        `${BINARY_FIXTURES.length + 5} files scanned (${BINARY_FIXTURES.length} binary)`,
+      );
+      expect(text.stdout).not.toContain('skipped');
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'finds a provider key in the uncompressed text metadata of a valid PNG',
+    async () => {
+      const directory = createThrowawayRepository();
+      const credential = VENDOR_KEY_PREFIX + cycle(URLSAFE_CHARS, 40);
+      const image = pngImage([
+        pngText('Software', 'Fixture asset exporter'),
+        pngText('Comment', `Deploy with ${credential}`),
+      ]);
+      trackFile(directory, 'assets/badge.png', image);
+      // A binary is subject to the path rule like every other entry.
+      const cleanImage = pngImage([]);
+      trackFile(directory, 'assets/.env.png', cleanImage);
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      expect(stderr).toBe('');
+      const report = JSON.parse(stdout);
+      expect(report.filesTracked).toBe(3);
+      expect(report.filesScanned).toBe(3);
+      expect(report.skipped).toEqual([]);
+      expect(report.unscanned).toEqual([]);
+      expect(report.binaries).toEqual([
+        { file: 'assets/.env.png', format: 'png', bytes: cleanImage.length },
+        { file: 'assets/badge.png', format: 'png', bytes: image.length },
+      ]);
+      expect(report.findings).toHaveLength(2);
+      expect(report.findings[0]).toMatchObject({ file: 'assets/.env.png', rule: 'env-file' });
+      const position = bytePosition(image, credential);
+      // The signature's own line feeds are counted, so the credential is not on line 1.
+      expect(position.line).toBeGreaterThan(1);
+      const [, finding] = report.findings;
+      expect(finding).toMatchObject({
+        file: 'assets/badge.png',
+        line: position.line,
+        column: position.column,
+        rule: 'provider-key',
+        pattern: VENDOR_KEY_PREFIX,
+      });
+      expect(finding.hint).not.toBe('');
+      expectValueNeverPrinted(finding, credential);
+      expect(stdout).not.toContain(credential);
+
+      const text = await runCli([], { cwd: directory });
+      expect(text.stdout).toContain(`assets/badge.png:${position.line}: provider-key:`);
+      expect(text.stdout).toContain('3 files scanned (2 binary)');
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'finds a key-file header, a credentialed URI and a token in JPEG, PDF and GIF metadata',
+    async () => {
+      const directory = createThrowawayRepository();
+      const [keyFixture] = PRIVATE_KEY_FIXTURES;
+      const photo = jpegWithComment(`Signing material: ${keyFixture.value}`);
+      const manual = pdfWithSubject(FOREIGN_CONNECTION_STRING);
+      const animation = gifWithComment(`token ${JWT_VALUE}`);
+      trackFile(directory, 'assets/photo.jpg', photo);
+      trackFile(directory, 'docs/manual.pdf', manual);
+      trackFile(directory, 'assets/anim.gif', animation);
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      expect(stderr).toBe('');
+      const report = JSON.parse(stdout);
+      expect(report.filesScanned).toBe(3);
+      expect(report.binaries).toEqual([
+        { file: 'assets/anim.gif', format: 'gif', bytes: animation.length },
+        { file: 'assets/photo.jpg', format: 'jpeg', bytes: photo.length },
+        { file: 'docs/manual.pdf', format: 'pdf', bytes: manual.length },
+      ]);
+      expect(report.findings).toHaveLength(3);
+      expect(report.findings[0]).toMatchObject({
+        file: 'assets/anim.gif',
+        ...bytePosition(animation, JWT_VALUE),
+        rule: 'jwt',
+      });
+      expect(report.findings[1]).toMatchObject({
+        file: 'assets/photo.jpg',
+        ...bytePosition(photo, keyFixture.matched),
+        rule: 'private-key',
+        pattern: keyFixture.pattern,
+      });
+      expect(report.findings[2]).toMatchObject({
+        file: 'docs/manual.pdf',
+        ...bytePosition(manual, FOREIGN_CONNECTION_STRING),
+        rule: 'connection-string',
+        pattern: 'mysql',
+      });
+      expectValueNeverPrinted(report.findings[0], JWT_VALUE);
+      expect(stdout).not.toContain(JWT_VALUE);
+      expect(stdout).not.toContain(keyFixture.value);
+      expect(stdout).not.toContain(FOREIGN_CONNECTION_PASSWORD);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'applies the entropy rule to plaintext metadata exactly as to the same bytes read as text',
+    async () => {
+      // A dense value bound to a key-like name, stored in a PNG text chunk and, as a JPEG comment,
+      // right after the segment's length bytes. The identical PNG bytes under an extension that
+      // names no binary format are text, and every one of the three is reported at the same shape.
+      expect(shannonEntropy(DENSE_VALUE)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+      const image = pngImage([pngText('Comment', `API_KEY=${DENSE_VALUE}\nexported by the build`)]);
+      const photo = jpegWithComment(`api_token=${DENSE_VALUE}`);
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'assets/keyed.png', image);
+      trackFile(directory, 'assets/keyed.dat', image);
+      trackFile(directory, 'assets/keyed.jpg', photo);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.filesScanned).toBe(3);
+      expect(report.binaries).toEqual([
+        { file: 'assets/keyed.jpg', format: 'jpeg', bytes: photo.length },
+        { file: 'assets/keyed.png', format: 'png', bytes: image.length },
+      ]);
+      expect(
+        report.findings.map(
+          (
+            /** @type {{ file: string, line: number, column: number, rule: string, pattern: string }} */ finding,
+          ) => ({
+            file: finding.file,
+            line: finding.line,
+            column: finding.column,
+            rule: finding.rule,
+            pattern: finding.pattern,
+          }),
+        ),
+      ).toEqual([
+        {
+          file: 'assets/keyed.dat',
+          ...bytePosition(image, DENSE_VALUE),
+          rule: 'entropy',
+          pattern: 'API_KEY',
+        },
+        // The comment's two length bytes end in a digit, and the name is reported without it.
+        {
+          file: 'assets/keyed.jpg',
+          ...bytePosition(photo, DENSE_VALUE),
+          rule: 'entropy',
+          pattern: 'api_token',
+        },
+        {
+          file: 'assets/keyed.png',
+          ...bytePosition(image, DENSE_VALUE),
+          rule: 'entropy',
+          pattern: 'API_KEY',
+        },
+      ]);
+      expect(stdout).not.toContain(DENSE_VALUE);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'reads a JPEG comment from its own first byte, so a length byte cannot hide a key after it',
+    async () => {
+      // A 67-byte comment follows the segment length `00 45`, and 0x45 is `E`: read in place, the
+      // key's prefix follows a token character and does not start a token. The same comment in a
+      // file past the in-memory limit is read through the descriptor rather than a buffer.
+      const credential = VENDOR_KEY_PREFIX + cycle(URLSAFE_CHARS, 60);
+      expect(credential.length).toBe(67);
+      const photo = jpegWithComment(credential);
+      expect(photo.subarray(4, 6)).toEqual(Buffer.from([0x00, 0x45]));
+      // Read in place, the rules see the length byte as part of the token and report nothing.
+      expect(scanContent('assets/photo.dat', photo.toString('latin1'))).toEqual([]);
+      const poster = Buffer.concat([
+        photo.subarray(0, photo.length - 2),
+        Buffer.from([0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00]),
+        Buffer.alloc(MAX_SCAN_BYTES),
+        Buffer.from([0xff, 0xd9]),
+      ]);
+      expect(poster.length).toBeGreaterThan(MAX_SCAN_BYTES);
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'assets/photo.jpg', photo);
+      trackFile(directory, 'assets/poster.jpg', poster);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.unscanned).toEqual([]);
+      expect(report.binaries).toEqual([
+        { file: 'assets/photo.jpg', format: 'jpeg', bytes: photo.length },
+        { file: 'assets/poster.jpg', format: 'jpeg', bytes: poster.length },
+      ]);
+      expect(report.findings).toHaveLength(2);
+      expect(report.findings[0]).toMatchObject({
+        file: 'assets/photo.jpg',
+        ...bytePosition(photo, credential),
+        rule: 'provider-key',
+        pattern: VENDOR_KEY_PREFIX,
+      });
+      expect(report.findings[1]).toMatchObject({
+        file: 'assets/poster.jpg',
+        ...bytePosition(poster, credential),
+        rule: 'provider-key',
+        pattern: VENDOR_KEY_PREFIX,
+      });
+      expectValueNeverPrinted(report.findings[0], credential);
+      expect(stdout).not.toContain(credential);
+    },
+    30_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'joins GIF sub-blocks back together, so a length byte cannot split a value it holds',
+    async () => {
+      // The comment's key is split after ten bytes, and the application data's token after
+      // twenty: each fragment alone is too short to match, and the length byte between the two
+      // fragments is part of neither.
+      const credential = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 28);
+      const application = 'XMP DataXMP';
+      const animation = gifWithSubBlocks(
+        [credential.slice(0, 10), credential.slice(10)],
+        application,
+        [`token ${JWT_VALUE}`.slice(0, 20), `token ${JWT_VALUE}`.slice(20)],
+      );
+      expect(scanContent('assets/anim.dat', animation.toString('latin1'))).toEqual([]);
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'assets/anim.gif', animation);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.binaries).toEqual([
+        { file: 'assets/anim.gif', format: 'gif', bytes: animation.length },
+      ]);
+      expect(
+        report.findings.map(
+          (/** @type {{ line: number, column: number, rule: string }} */ finding) => ({
+            line: finding.line,
+            column: finding.column,
+            rule: finding.rule,
+          }),
+        ),
+      ).toEqual([
+        { ...bytePosition(animation, credential.slice(0, 10)), rule: 'provider-key' },
+        { ...bytePosition(animation, JWT_VALUE.slice(0, 14)), rule: 'jwt' },
+      ]);
+      expect(stdout).not.toContain(credential.slice(10));
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'reads ZIP names, comments, stored files and the archive comment from their own first byte',
+    async () => {
+      // No entry has an extra field, so a stored file's content starts right after the last
+      // letter of its name and an entry comment right after the name in the central directory;
+      // the archive comment is 0x4500 bytes long, so the length's high byte, `E`, stands right
+      // before it. Read in place, none of the three values starts a token.
+      const stored = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36);
+      const entryComment = VENDOR_KEY_PREFIX + cycle(URLSAFE_CHARS, 60);
+      const archiveComment = JWT_VALUE + ' '.repeat(0x4500 - JWT_VALUE.length);
+      const archive = zipArchive(
+        [
+          { name: 'extension/notes.txt', content: `${stored}\n` },
+          {
+            name: 'extension/readme.md',
+            content: 'A readme the writer deflated.\n'.repeat(8),
+            deflate: true,
+            comment: entryComment,
+          },
+        ],
+        archiveComment,
+      );
+      const commentStart = archive.length - archiveComment.length;
+      expect(archive.subarray(commentStart - 2, commentStart)).toEqual(Buffer.from([0x00, 0x45]));
+      expect(scanContent('dist/extension.dat', archive.toString('latin1'))).toEqual([]);
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'dist/extension.vsix', archive);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.binaries).toEqual([
+        { file: 'dist/extension.vsix', format: 'vsix', bytes: archive.length },
+      ]);
+      expect(
+        report.findings.map(
+          (/** @type {{ line: number, column: number, rule: string }} */ finding) => ({
+            line: finding.line,
+            column: finding.column,
+            rule: finding.rule,
+          }),
+        ),
+      ).toEqual([
+        { ...bytePosition(archive, stored), rule: 'provider-key' },
+        { ...bytePosition(archive, entryComment), rule: 'provider-key' },
+        { ...bytePosition(archive, JWT_VALUE), rule: 'jwt' },
+      ]);
+      expect(stdout).not.toContain(stored);
+      expect(stdout).not.toContain(entryComment);
+      expect(stdout).not.toContain(JWT_VALUE);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'reads the text chunks of a PNG image inside an ICO file, keywords included',
+    async () => {
+      // A chunk keyword starts right after the four letters of the chunk type, so a keyword that
+      // holds a key does not start a token in place - in a PNG file, or in one an icon embeds.
+      const credential = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36);
+      const image = pngImage([pngText(credential, 'exported by the icon build')]);
+      const icon = icoWithPng(image);
+      expect(scanContent('assets/favicon.dat', icon.toString('latin1'))).toEqual([]);
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'assets/badge.png', image);
+      trackFile(directory, 'assets/favicon.ico', icon);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.binaries).toEqual([
+        { file: 'assets/badge.png', format: 'png', bytes: image.length },
+        { file: 'assets/favicon.ico', format: 'ico', bytes: icon.length },
+      ]);
+      expect(report.findings).toHaveLength(2);
+      expect(report.findings[0]).toMatchObject({
+        file: 'assets/badge.png',
+        ...bytePosition(image, credential),
+        rule: 'provider-key',
+        pattern: FORGE_CLASSIC_PREFIX,
+      });
+      expect(report.findings[1]).toMatchObject({
+        file: 'assets/favicon.ico',
+        ...bytePosition(icon, credential),
+        rule: 'provider-key',
+        pattern: FORGE_CLASSIC_PREFIX,
+      });
+      expect(stdout).not.toContain(credential);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'reads the private data block of a WOFF and a WOFF2 font from its own first byte',
+    async () => {
+      // The block follows the font's last data byte with no separator of its own: a table left
+      // uncompressed that ends in a letter, and a WOFF2 data block that ends on one.
+      const credential = VENDOR_KEY_PREFIX + cycle(URLSAFE_CHARS, 60);
+      const font = woffWithPrivateData('Fixture Sans', `${credential}\n`);
+      const compact = woff2WithPrivateData('Fixture Sans X', `${JWT_VALUE}\n`);
+      expect(scanContent('fonts/body.dat', font.toString('latin1'))).toEqual([]);
+      expect(scanContent('fonts/body2.dat', compact.toString('latin1'))).toEqual([]);
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'fonts/body.woff', font);
+      trackFile(directory, 'fonts/body.woff2', compact);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.binaries).toEqual([
+        { file: 'fonts/body.woff', format: 'woff', bytes: font.length },
+        { file: 'fonts/body.woff2', format: 'woff2', bytes: compact.length },
+      ]);
+      expect(report.findings).toHaveLength(2);
+      expect(report.findings[0]).toMatchObject({
+        file: 'fonts/body.woff',
+        ...bytePosition(font, credential),
+        rule: 'provider-key',
+        pattern: VENDOR_KEY_PREFIX,
+      });
+      expect(report.findings[1]).toMatchObject({
+        file: 'fonts/body.woff2',
+        ...bytePosition(compact, JWT_VALUE),
+        rule: 'jwt',
+      });
+      expect(stdout).not.toContain(credential);
+      expect(stdout).not.toContain(JWT_VALUE);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'keeps prose that merely contains a key prefix quiet in a binary field, as in text',
+    async () => {
+      // A field read from its own first byte keeps the rules' left boundary: `task-` is a word
+      // with `sk-` inside it, in every kind of field the formats store.
+      const prose = 'task-management_dashboard_export_final_revision';
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'assets/notes.png', pngImage([pngText('Comment', prose)]));
+      trackFile(directory, 'assets/notes.ico', icoWithPng(pngImage([pngText(prose, prose)])));
+      trackFile(directory, 'assets/notes.jpg', jpegWithComment(prose));
+      trackFile(directory, 'assets/notes.gif', gifWithComment(prose));
+      trackFile(
+        directory,
+        'dist/notes.vsix',
+        zipArchive([{ name: 'extension/notes.txt', content: prose, comment: prose }], prose),
+      );
+      trackFile(directory, 'fonts/notes.woff', woffWithPrivateData('Fixture Sans', prose));
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_OK);
+      const report = JSON.parse(stdout);
+      expect(report.filesScanned).toBe(6);
+      expect(report.binaries).toHaveLength(6);
+      expect(report.findings).toEqual([]);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'streams an oversized PNG in binary mode and finds a credential across a chunk boundary',
+    async () => {
+      const credential = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36);
+      /**
+       * An image whose `tEXt` value puts `padding` spaces before the credential, followed by a
+       * private ancillary chunk large enough to push the file past the in-memory limit.
+       *
+       * @param {number} padding
+       * @returns {Buffer}
+       */
+      const layout = (padding) =>
+        pngImage([
+          pngText('Comment', `${' '.repeat(padding)}${credential}`),
+          pngChunk('fiLl', Buffer.alloc(MAX_SCAN_BYTES)),
+        ]);
+      // The padding only moves the credential: every length field keeps its width, so the offset
+      // measured with none is the offset the padding shifts.
+      const unpadded = layout(0).indexOf(credential);
+      const image = layout(STREAM_CHUNK_BYTES - Math.floor(credential.length / 2) - unpadded);
+
+      // The layout is asserted, not assumed: the credential starts in the first chunk and ends in
+      // the second, and the file is large enough to be streamed.
+      const start = image.indexOf(credential);
+      expect(start).toBeLessThan(STREAM_CHUNK_BYTES);
+      expect(start + credential.length).toBeGreaterThan(STREAM_CHUNK_BYTES);
+      expect(image.length).toBeGreaterThan(MAX_SCAN_BYTES);
+
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'assets/poster.png', image);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.unscanned).toEqual([]);
+      expect(report.filesScanned).toBe(1);
+      expect(report.binaries).toEqual([
+        { file: 'assets/poster.png', format: 'png', bytes: image.length },
+      ]);
+      expect(report.findings).toHaveLength(1);
+      expect(report.findings[0]).toMatchObject({
+        file: 'assets/poster.png',
+        ...bytePosition(image, credential),
+        rule: 'provider-key',
+        pattern: FORGE_CLASSIC_PREFIX,
+      });
+      expect(stdout).not.toContain(credential);
+    },
+    30_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'applies the allowlist inside a binary exactly as in text, and only at a permitted path',
+    async () => {
+      // An XMP packet in an uncompressed `iTXt` chunk names the development database. The quote
+      // that closes the attribute ends the value, so the literal is the whole value there, as the
+      // allowlist requires.
+      /**
+       * @param {string} source The attribute value.
+       * @returns {Buffer}
+       */
+      const diagram = (source) =>
+        pngImage([
+          pngInternationalText(
+            'XML:com.adobe.xmp',
+            `<x:xmpmeta><rdf:Description dc:source="${source}"/></x:xmpmeta>`,
+          ),
+        ]);
+      const exact = diagram(DEV_DATABASE_URL);
+      const extended = diagram(`${DEV_DATABASE_URL}?password=${cycle(LOWER_LETTERS, 12)}`);
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'docs/images/schema.png', exact);
+      trackFile(directory, 'docs/images/extended.png', extended);
+      trackFile(directory, 'docs/images/copy.png', exact);
+      const allowlist = normalizeAllowlist({
+        literals: [
+          {
+            value: DEV_DATABASE_URL,
+            reason: 'The development database placeholder, shown in the schema diagrams.',
+            files: ['docs/images/schema.png', 'docs/images/extended.png'],
+          },
+        ],
+      });
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory, allowlist });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.filesScanned).toBe(3);
+      expect(report.binaries).toHaveLength(3);
+      // Exempt only where the literal is the whole value and the path is one the entry lists.
+      expect(
+        report.allowlisted.map(
+          (/** @type {{ file: string, rule: string, allowlistValue: string }} */ entry) => ({
+            file: entry.file,
+            rule: entry.rule,
+            allowlistValue: entry.allowlistValue,
+          }),
+        ),
+      ).toEqual([
+        {
+          file: 'docs/images/schema.png',
+          rule: 'connection-string',
+          allowlistValue: DEV_DATABASE_URL,
+        },
+      ]);
+      // A path the entry does not list, and a longer value at one it does, are both findings.
+      expect(report.findings).toHaveLength(2);
+      expect(report.findings[0]).toMatchObject({
+        file: 'docs/images/copy.png',
+        ...bytePosition(exact, DEV_DATABASE_URL),
+        rule: 'connection-string',
+        pattern: 'postgresql',
+      });
+      expect(report.findings[1]).toMatchObject({
+        file: 'docs/images/extended.png',
+        ...bytePosition(extended, DEV_DATABASE_URL),
+        rule: 'connection-string',
+        pattern: 'postgresql',
+      });
     },
     20_000,
   );
@@ -2227,7 +3109,7 @@ describe('the command line', () => {
 
       const directory = createThrowawayRepository();
       trackFile(directory, 'data/dump.sql', content);
-      // An oversized binary is still identified, from the first chunk.
+      // An oversized binary is identified from its first chunk and streamed in binary mode.
       const bigImage = Buffer.alloc(MAX_SCAN_BYTES + 1);
       Buffer.from(BINARY_FIXTURES[0].bytes).copy(bigImage);
       trackFile(directory, 'assets/poster.png', bigImage);
@@ -2237,9 +3119,10 @@ describe('the command line', () => {
       expect(exitCode).toBe(EXIT_FINDINGS);
       const report = JSON.parse(stdout);
       expect(report.unscanned).toEqual([]);
-      expect(report.filesScanned).toBe(1);
-      expect(report.skipped).toEqual([
-        { file: 'assets/poster.png', reason: 'binary', format: 'png', bytes: MAX_SCAN_BYTES + 1 },
+      expect(report.filesScanned).toBe(2);
+      expect(report.skipped).toEqual([]);
+      expect(report.binaries).toEqual([
+        { file: 'assets/poster.png', format: 'png', bytes: MAX_SCAN_BYTES + 1 },
       ]);
 
       const lines = content.split(/\r?\n/);
@@ -2575,8 +3458,14 @@ describe('the command line', () => {
       expect(report.ok).toBe(true);
       expect(report.filesTracked).toBe(2);
       expect(report.filesScanned).toBe(1);
+      expect(report.binaries).toEqual([]);
       expect(report.skipped).toEqual([{ file: 'vendor/sub', reason: 'submodule' }]);
       expect(report.unscanned).toEqual([]);
+
+      const text = await runCli([], { cwd: directory });
+      expect(text.stdout).toContain(
+        '1 file scanned, 0 findings, 0 allowlisted, 1 skipped (submodule)',
+      );
     },
     20_000,
   );
@@ -2638,6 +3527,10 @@ describe('the command line', () => {
     for (const allowed of ALLOWED_ENV_FILES) {
       expect(stdout).toContain(allowed);
     }
+    // What binary mode applies, and what it cannot see, is stated rather than implied.
+    expect(stdout).toContain('is checked against the same rules byte for byte');
+    expect(stdout).toContain('plaintext metadata fields');
+    expect(stdout).toContain('Nothing is decompressed');
   });
 
   it('exits 2 on an unknown option without printing a report', async () => {
@@ -2648,7 +3541,7 @@ describe('the command line', () => {
     expect(stderr).toContain('unknown option');
   });
 
-  it('exits 2 when handed a path, because it scans every tracked file', async () => {
+  it('exits 2 when handed a path, because it scans what git tracks', async () => {
     const { exitCode, stderr } = await runCli(['packages/shared/src/index.ts']);
 
     expect(exitCode).toBe(EXIT_ERROR);

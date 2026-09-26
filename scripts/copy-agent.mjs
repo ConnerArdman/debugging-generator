@@ -287,10 +287,11 @@ function readSourceBundle(root, source) {
  *
  * `lstat`, never `stat`: this function's answers drive every destination
  * guard below, and `stat` follows symbolic links, so it describes the link's
- * *target*. A planted link then answers `isFile()` with `true` and the
- * "not a regular file" guard it exists to trip never fires — which is exactly
- * how a symlinked `agent.iife.js` used to redirect this copy onto an
- * arbitrary file. Reporting the link itself is the whole point.
+ * *target*. A planted link would then answer `isFile()` with `true`, the
+ * "not a regular file" guard would pass, and the copy would overwrite — or
+ * `--check` would certify as in sync — whatever arbitrary file the link points
+ * at. `lstat` reports the link itself, so the guard sees a symbolic link and
+ * refuses it.
  *
  * Any other failure (a permission problem on a parent, an I/O error) is
  * surfaced as exit 2 rather than silently read as "nothing there": a guard

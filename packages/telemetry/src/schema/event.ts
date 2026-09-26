@@ -64,8 +64,8 @@
  * exactly as the producer stamped them.
  *
  * What a producer does record is an informational estimate of its own clock's
- * offset, the optional `clockOffsetMs` field below (AAP 0.2.3: the server's
- * `Date` header against the local clock). `./clock-offset.ts` defines the
+ * offset, the optional `clockOffsetMs` field below: the server's `Date`
+ * header against the local clock. `./clock-offset.ts` defines the
  * estimator both producers run — the browser agent against the dev server's
  * `Date` on the same-origin responses its fetch/XHR hook observes, the preload
  * against the local service's `Date` on the answers to its ingest posts — and
@@ -629,7 +629,8 @@ const telemetryEventCoreShape = {
   /**
    * The producer's informational estimate of its clock offset when it created
    * the event: server clock minus producer clock, in whole milliseconds, so a
-   * positive value means the server's clock is ahead (AAP 0.2.3).
+   * positive value means the server's clock is ahead
+   * (`docs/ARCHITECTURE.md` §5.2).
    *
    * Set by the producer's transport — never by the code that describes the
    * observation — from `./clock-offset.ts`'s `ClockOffsetEstimator`: the browser

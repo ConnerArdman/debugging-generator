@@ -10,7 +10,7 @@
  *   extension from `apps/chrome-extension/dist` loaded into a fresh, temporary
  *   profile, its MV3 service worker, and the extension id derived from the
  *   worker's `chrome-extension://<id>/…` URL. The worker suspends after roughly
- *   30 seconds of idleness (AAP §0.1.1), so the handle re-acquires it on demand
+ *   30 seconds of idleness, so the handle re-acquires it on demand
  *   ({@link ExtensionContextHandle.getServiceWorker}) instead of trusting a
  *   cached `Worker`.
  * - **The DevTools surface** ({@link openPanelPage}): the built `devtools.html`
@@ -23,7 +23,8 @@
  *   own `$0` descriptor expression. The stub's `inspectedWindow.eval` evaluates
  *   the product's expression string inside the inspected application page, with
  *   a test-supplied `$0`.
- * - **Pairing** ({@link ensurePaired}): the product's own flow of AAP §0.5.6 —
+ * - **Pairing** ({@link ensurePaired}): the product's own pairing flow
+ *   (`docs/SECURITY.md`, "Pairing the Chrome extension") —
  *   `POST /pair/start` with the editor credential, the one-time code typed into
  *   the panel's `PairDialog`, and `pair.complete` issued by the service worker
  *   from its `chrome-extension://<id>` origin.
@@ -1879,7 +1880,7 @@ async function answerInspectedEval(
 // The panel page
 // ---------------------------------------------------------------------------
 
-/** The DevTools theme the stub reports; dark is the default (AAP §0.6.3). */
+/** The DevTools theme the stub reports; dark is the default. */
 export type DevtoolsTheme = 'dark' | 'light';
 
 /** Options of {@link openPanelPage}. */
@@ -2520,8 +2521,8 @@ async function pairingFailureReason(
 }
 
 /**
- * Pair the extension with the service through the product's own flow (AAP
- * §0.5.6), unless it is already paired.
+ * Pair the extension with the service through the product's own flow, unless
+ * it is already paired.
  *
  * Idempotent: when the pill settles on "Connected" and the worker holds a
  * credential of the stored shape, it returns `{ paired: 'already' }` at once —
@@ -3057,8 +3058,9 @@ export interface DescribeSelectionOptions {
  * Select an element in the Elements panel *before* any question is asked, and
  * return the `SelectedTarget` the product described it as.
  *
- * This is the developer pointing at something first (AAP §0.1.1: "optionally
- * selects an element, asks a question"). The real DevTools page's
+ * This is the developer pointing at something first, the optional element
+ * selection of the session workflow (`README.md`, "Session workflow"), made
+ * here before the question is asked. The real DevTools page's
  * `onSelectionChanged` handler evaluates the product's own `$0` descriptor
  * expression, answered in the inspected page by the MAIN-world agent's
  * `describeTarget` — a capability the dormant agent arms before any session

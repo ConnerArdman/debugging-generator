@@ -30,6 +30,12 @@
  *   - **The three states** and their precedence: error > pending > empty > table.
  *     The empty state is a neutral outcome — a runtime-only plan modifies no
  *     file — so it is never presented as an alert.
+ *   - **Missing records are stated**: a `total` above the rows given renders
+ *     "Showing ‹N› of ‹M› recorded file modifications" as a polite status above
+ *     the grid — or in place of the empty state, which never claims that no file
+ *     was modified while records are missing — with a "Load all modifications"
+ *     control outside the grid, disabled while its load is in flight. Error and
+ *     loading still outrank it.
  *   - **Nothing reaches the console** in any state, with a diff open included:
  *     diffs carry source code, and the hashes and backup path are local
  *     file-system details (AAP 0.5.2).
@@ -834,6 +840,117 @@ describe('ModificationsList states', () => {
     const { container } = render(<ModificationsList modifications={RECORDS} className="  " />);
 
     expect(container.firstElementChild?.className).toBe('dgv-modifications');
+  });
+});
+
+describe('ModificationsList missing records', () => {
+  /** The warning line for `shown` of `total` records. */
+  function shortfallLine(shown: number, total: number): HTMLElement {
+    const noun = total === 1 ? 'file modification' : 'file modifications';
+    return screen.getByText(
+      `Showing ${String(shown)} of ${String(total)} recorded ${noun}; the rest have not been loaded.`,
+    );
+  }
+
+  it('states how many of the journal’s records are shown, above the full grid, as a polite status', () => {
+    const { container } = render(
+      <ModificationsList modifications={RECORDS} total={RECORDS.length + 2} />,
+    );
+
+    const line = shortfallLine(RECORDS.length, RECORDS.length + 2);
+    expect(line.getAttribute('role')).toBe('status');
+    expect(line.closest('[role="grid"]')).toBeNull();
+    expect(dataRows(container)).toHaveLength(RECORDS.length);
+    const grid = screen.getByRole('grid');
+    expect(line.compareDocumentPosition(grid) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Without a load callback there is nothing to press.
+    expect(screen.queryByRole('button', { name: 'Load all modifications' })).toBeNull();
+  });
+
+  it('offers "Load all modifications" as an ordinary Tab stop that asks for the rest', async () => {
+    const user = userEvent.setup();
+    const onLoadMore = vi.fn<() => void>();
+    render(
+      <ModificationsList
+        modifications={RECORDS}
+        total={RECORDS.length + 1}
+        onLoadMore={onLoadMore}
+      />,
+    );
+
+    const load = screen.getByRole('button', { name: 'Load all modifications' });
+    expect(load.closest('[role="grid"]')).toBeNull();
+    expect(load.getAttribute('tabindex')).not.toBe('-1');
+    expect((load as HTMLButtonElement).disabled).toBe(false);
+
+    await user.click(load);
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables the load control while that load is in flight', async () => {
+    const user = userEvent.setup();
+    const onLoadMore = vi.fn<() => void>();
+    render(
+      <ModificationsList
+        modifications={RECORDS}
+        total={RECORDS.length + 1}
+        onLoadMore={onLoadMore}
+        loadingMore
+      />,
+    );
+
+    const load = screen.getByRole('button', { name: 'Load all modifications' });
+    expect((load as HTMLButtonElement).disabled).toBe(true);
+    expect(load.getAttribute('aria-busy')).toBe('true');
+
+    await user.click(load);
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+
+  it('never claims that no file was modified while the journal holds records the list lacks', async () => {
+    const user = userEvent.setup();
+    const onLoadMore = vi.fn<() => void>();
+    const { container } = render(
+      <ModificationsList modifications={[]} total={1} onLoadMore={onLoadMore} />,
+    );
+
+    expect(shortfallLine(0, 1).getAttribute('role')).toBe('status');
+    expect(container.textContent ?? '').not.toContain('No files were modified for this session.');
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Load all modifications' }));
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows no warning once the list holds every counted record, or more', () => {
+    const { rerender, container } = render(
+      <ModificationsList modifications={RECORDS} total={RECORDS.length} onLoadMore={vi.fn()} />,
+    );
+    expect(container.textContent ?? '').not.toContain('Showing');
+    expect(screen.queryByRole('button', { name: 'Load all modifications' })).toBeNull();
+
+    rerender(
+      <ModificationsList modifications={RECORDS} total={RECORDS.length - 1} onLoadMore={vi.fn()} />,
+    );
+    expect(container.textContent ?? '').not.toContain('Showing');
+
+    rerender(<ModificationsList modifications={[]} total={0} onLoadMore={vi.fn()} />);
+    expect(screen.getByRole('status').textContent).toContain(
+      'No files were modified for this session.',
+    );
+  });
+
+  it('keeps error and loading above the warning', () => {
+    const { rerender, container } = render(
+      <ModificationsList modifications={[]} total={3} error="The service did not answer." />,
+    );
+    expect(screen.getByRole('alert').textContent).toContain('The service did not answer.');
+    expect(container.textContent ?? '').not.toContain('Showing');
+
+    rerender(<ModificationsList modifications={[]} total={3} pending />);
+    expect(screen.getByRole('status').getAttribute('aria-busy')).toBe('true');
+    expect(container.textContent ?? '').not.toContain('Showing');
   });
 });
 

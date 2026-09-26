@@ -11,6 +11,16 @@
  * {@link CreateModelProviderOptions.overrides}, where the host that already
  * validated its own configuration passes them in.
  *
+ * The vendor's client has environment reads of its own, and the two that
+ * decide where a request goes and what is printed about it —
+ * `ANTHROPIC_BASE_URL` and `ANTHROPIC_LOG` — are neutralised rather than
+ * inherited: `./providers/anthropic.js` always constructs its client with an
+ * explicit base URL, an explicit `'off'` log level and a silent logger, so
+ * neither variable is ever consulted and the three documented names are the
+ * whole environment surface that decides the provider's destination and
+ * diagnostics. A base URL remains an explicit host override only, and the
+ * provider validates it against its endpoint policy before building anything.
+ *
  * ## What this module guarantees
  *
  * - **Nothing leaves the machine unless a developer asked for it.**
@@ -463,7 +473,11 @@ function narrowProviderId(value: string, source: SettingSource): Result<Provider
  *   the rules-based path legitimately carries {@link UNCONFIGURED_MODEL}.
  * - No budget, base URL or credential other than `ANTHROPIC_API_KEY` is read
  *   from the environment. The environment surface is exactly the three names
- *   `.env.example` documents (AAP 0.3.4).
+ *   `.env.example` documents (AAP 0.3.4). The vendor client's own reads of
+ *   `ANTHROPIC_BASE_URL` and `ANTHROPIC_LOG` are neutralised too, because
+ *   `./providers/anthropic.js` always passes an explicit base URL and log
+ *   level; `overrides.baseUrl` is the one way to name another endpoint, and
+ *   the provider validates it rather than this function.
  *
  * @param env The environment to read. Defaults to `process.env`; injected in
  * tests so nothing has to mutate the real environment.

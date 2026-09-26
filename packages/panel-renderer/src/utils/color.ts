@@ -1,6 +1,6 @@
 /**
  * Colour, severity and contrast — the single home of every colour *decision*
- * in `@debuggen/panel-renderer` (AAP 0.6.2, 0.6.3).
+ * in `@debuggen/panel-renderer`.
  *
  * A generated panel colours four different vocabularies: the kind of a
  * telemetry event, the tier a lane belongs to, the participant class of a
@@ -13,20 +13,22 @@
  *
  * This module also owns the WCAG contrast arithmetic, because
  * `src/tokens/tokens.test.ts` has to measure every text/surface and
- * status/surface pair of all three themes against the minima AAP 0.6.3 fixes,
- * and `scripts/build-tokens.mjs` — which generates the stylesheet from the same
- * token table — deliberately performs no colour maths at all. Putting the maths
- * beside the mapping keeps one implementation of the formula in the package.
+ * status/surface pair of all three themes against the WCAG AA minima — 4.5:1
+ * for text, 3:1 for the span-kind fills — and `scripts/build-tokens.mjs`, which
+ * generates the stylesheet from the same token table, deliberately performs no
+ * colour maths at all. Putting the maths beside the mapping keeps one
+ * implementation of the formula in the package.
  *
  * ## What this module returns, and what it never returns
  *
  * Every visual answer is either a {@link TokenKey} or a `var(--dg-*)` reference
- * produced through `cssVar`. AAP 0.6.4 permits no hardcoded CSS value anywhere
- * in this package, so no export here yields a hex colour, an `rgb()` string or
- * a length: a caller that wants a value asks the stylesheet for it through the
- * custom property, which is what makes theme switching work at all. The hex
- * strings the contrast helpers parse travel *in*, from the token table the
- * caller already holds; they are never stored here.
+ * produced through `cssVar`. Every CSS value in this package resolves to a
+ * `--dg-*` token and none is hardcoded, so no export here yields a hex colour,
+ * an `rgb()` string or a length: a caller that wants a value asks the
+ * stylesheet for it through the custom property, which is what makes theme
+ * switching work at all. The hex strings the contrast helpers parse travel
+ * *in*, from the token table the caller already holds; they are never stored
+ * here.
  *
  * Text is not this module's business either. A readable label for a kind or a
  * status belongs to `./format`, and a timeline lane's label is already carried
@@ -41,7 +43,7 @@
  *   stripping, so that module carries no relative runtime import and can never
  *   import this one. This module imports it; only `../tokens/tokens.test.ts`
  *   imports back.
- * - `@debuggen/telemetry` is a **type-only** dependency (AAP 0.2.2). Nothing
+ * - `@debuggen/telemetry` is a **type-only** dependency of this package. Nothing
  *   here imports a telemetry runtime value: exhaustiveness comes from typing
  *   each table as a `Record` over the closed union, so a vocabulary that gains
  *   a member upstream fails to compile here until the new member has been given
@@ -92,7 +94,8 @@ export const UNCLASSIFIED_TOKEN_KEY: TokenKey = 'textMuted';
  * ---------------------------------------------------------------------------
  * Telemetry kind → span-kind token
  *
- * AAP 0.6.3 defines seven span-kind tokens, and `../tokens/tokens` adds two
+ * The span-kind scale has seven core tokens (interaction, render, fetch, HTTP,
+ * function, database and error), and `../tokens/tokens` adds two
  * supplementary members of the same scale — `kindService` and
  * `kindExternal` — so that each of the dependency graph's six participant
  * classes owns a colour its spans also carry. The telemetry vocabulary has
@@ -108,9 +111,9 @@ export const UNCLASSIFIED_TOKEN_KEY: TokenKey = 'textMuted';
  *
  * One table, consumed by every visualization that colours a span: the
  * timeline's bars, the flame view's blocks, the waterfall's rows, the event
- * log's kind chips and the span table's kind column (AAP 0.6.2). The key type
- * is the closed kind union, so the table is total by construction and a kind
- * added upstream is a compile error here rather than a silently uncoloured bar.
+ * log's kind chips and the span table's kind column. The key type is the
+ * closed kind union, so the table is total by construction and a kind added
+ * upstream is a compile error here rather than a silently uncoloured bar.
  *
  * The families, and why each kind sits where it does:
  *
@@ -124,10 +127,10 @@ export const UNCLASSIFIED_TOKEN_KEY: TokenKey = 'textMuted';
  * - `kindFetch` — `fetch`, `xhr`, `navigation` and `perf.entry`. Transfers the
  *   *page* initiated: the two request kinds, the document's own navigation, and
  *   the performance-timeline entries, which are dominated by resource timings
- *   and are the only place a transferred size is observable at all
- *   (AAP 0.6.6). Kept apart from the server-side HTTP family below, because the
- *   client end and the server end of one request are the two rows a reader
- *   compares to see where the time went.
+ *   and are the only place a transferred size is observable at all. Kept
+ *   apart from the server-side HTTP family below, because the client end and
+ *   the server end of one request are the two rows a reader compares to see
+ *   where the time went.
  * - `kindHttp` — `http.server`, the request the server answered: the incoming
  *   boundary, not the work behind it.
  * - `kindService` — `route.handler`, the server's own work behind that
@@ -193,7 +196,7 @@ export function kindTokenKey(kind: TelemetryKind): TokenKey {
  *
  * The convenience matters for the SVG views — a timeline bar, a flame block, a
  * waterfall segment — which style per element rather than per class, and it is
- * the reason none of them ever writes a colour of its own (AAP 0.6.4).
+ * the reason none of them ever writes a colour of its own.
  */
 export function kindColorVar(kind: TelemetryKind): string {
   return cssVar(kindTokenKey(kind));
@@ -203,9 +206,9 @@ export function kindColorVar(kind: TelemetryKind): string {
  * The label ink for text drawn *on* each fill {@link kindTokenKey} can return.
  *
  * A span-kind fill is held to the 3:1 non-text bar, but a label printed on it
- * is text and needs 4.5:1 (AAP 0.6.3). No one ink reaches that on every fill:
- * the light scale has fills that need a light ink and one — fetch — that needs
- * a dark one. So each fill is paired with its own `…Ink` token, whose value
+ * is text and needs 4.5:1. No one ink reaches that on every fill: the light
+ * scale has fills that need a light ink and one — fetch — that needs a dark
+ * one. So each fill is paired with its own `…Ink` token, whose value
  * `../tokens/tokens` chooses per theme by contrast, and a view that labels a
  * fill asks for the fill's ink rather than writing a colour of its own.
  *
@@ -233,8 +236,8 @@ export const KIND_FILL_INK_TOKEN_KEYS: Readonly<Partial<Record<TokenKey, TokenKe
 
 /**
  * The ink a label drawn on `kind`'s fill is written in — the pair of
- * {@link kindTokenKey} for text. Falls back to the base surface for a fill the
- * table does not list, which is the ink every fill used before the pairing.
+ * {@link kindTokenKey} for text. Falls back to the base surface, the ink the
+ * unclassified fill is paired with, for a fill the table does not list.
  * Never throws, for the reason given on {@link kindTokenKey}.
  */
 export function kindInkTokenKey(kind: TelemetryKind): TokenKey {
@@ -253,12 +256,12 @@ export function kindInkColorVar(kind: TelemetryKind): string {
  * ---------------------------------------------------------------------------
  * Tier → lane token
  *
- * The timeline draws one lane per tier (AAP 0.6.2). A lane's *label* is not
- * decided here: the aggregate that builds the view already carries it on the
- * lane, from the one table that owns tier names in `@debuggen/telemetry`. This
- * module supplies the lane's accent token and nothing else, so there is exactly
- * one spelling of "Browser" in the product and it is data, not a duplicate
- * constant in the renderer.
+ * The timeline draws one lane per tier. A lane's *label* is not decided here:
+ * the aggregate that builds the view already carries it on the lane, from the
+ * one table that owns tier names in `@debuggen/telemetry`. This module supplies
+ * the lane's accent token and nothing else, so there is exactly one spelling of
+ * "Browser" in the product and it is data, not a duplicate constant in the
+ * renderer.
  * ---------------------------------------------------------------------------
  */
 
@@ -302,12 +305,12 @@ export function tierColorVar(tier: TelemetryTier): string {
  * Dependency-graph participant class → span-kind token
  *
  * The dependency graph collapses a correlated trace into participants: what
- * took part in the interaction, and who called whom (AAP 0.6.2). Its
- * vocabulary is coarser than the kind vocabulary — several kinds collapse into
- * one class — so a node is coloured in two steps: by the span kinds it
- * collapsed when those agree on one colour, and by its class otherwise. The
- * first step is what keeps a participant in the colour its spans have in every
- * other view; the second is the class's own, distinct colour.
+ * took part in the interaction, and who called whom. Its vocabulary is coarser
+ * than the kind vocabulary — several kinds collapse into one class — so a node
+ * is coloured in two steps: by the span kinds it collapsed when those agree on
+ * one colour, and by its class otherwise. The first step is what keeps a
+ * participant in the colour its spans have in every other view; the second is
+ * the class's own, distinct colour.
  * ---------------------------------------------------------------------------
  */
 
@@ -375,7 +378,7 @@ export function dependencyNodeColorVar(kind: DependencyGraphNode['kind']): strin
  * no kinds (one contributed without captured records), falls back to its class
  * token, {@link dependencyNodeTokenKey}.
  *
- * @param node - The participant's class and, when it has them, its span kinds.
+ * @param node The participant's class and, when it has them, its span kinds.
  * @returns The token to stroke and label the participant with.
  */
 export function dependencyParticipantTokenKey(
@@ -427,8 +430,9 @@ export function dependencyParticipantColorVar(
  * - `unknown` → `textMuted`. At least one input could not be evaluated, so
  *   nothing is claimed. This must never be drawn as `unchanged`: "we checked
  *   and nothing changed" and "we could not check" support opposite
- *   conclusions, and the capture counts them as separate metrics for exactly
- *   that reason (AAP 0.2.3).
+ *   conclusions, and the capture counts them as separate metrics —
+ *   `unchanged_render_count` and `render_trigger_unknown_count` — for exactly
+ *   that reason.
  *
  * Total by construction over the closed trigger union, and frozen.
  */
@@ -506,12 +510,12 @@ export function statusColorVar(status: TelemetryStatus): string {
  * ---------------------------------------------------------------------------
  * Duration severity
  *
- * AAP 0.6.3 fixes four buckets and three boundaries, and every duration the
- * product prints is coloured by them: a table cell, a metric card, an
- * emphasised slow span. The boundaries are named constants rather than inline
- * numbers so that no consumer re-types one, and the classifier is kept
- * separate from the token table so a caller can label a severity and colour it
- * independently.
+ * Durations fall into four buckets split at three fixed boundaries — 50, 200
+ * and 500 milliseconds — and every duration the product prints is coloured by
+ * them: a table cell, a metric card, an emphasised slow span. The boundaries
+ * are named constants rather than inline numbers so that no consumer re-types
+ * one, and the classifier is kept separate from the token table so a caller
+ * can label a severity and colour it independently.
  * ---------------------------------------------------------------------------
  */
 
@@ -524,7 +528,7 @@ export function statusColorVar(status: TelemetryStatus): string {
  */
 const DURATION_SEVERITY_TUPLE = Object.freeze(['fast', 'normal', 'slow', 'critical'] as const);
 
-/** One of the four duration severity steps of AAP 0.6.3. */
+/** One of the four duration severity steps, `fast` through `critical`. */
 export type DurationSeverity = (typeof DURATION_SEVERITY_TUPLE)[number];
 
 /**
@@ -534,20 +538,20 @@ export type DurationSeverity = (typeof DURATION_SEVERITY_TUPLE)[number];
 export const DURATION_SEVERITIES: readonly DurationSeverity[] = DURATION_SEVERITY_TUPLE;
 
 /**
- * Milliseconds at which a duration stops being `fast` and becomes `normal`
- * (AAP 0.6.3). Inclusive: exactly this value classifies as `normal`.
+ * Milliseconds at which a duration stops being `fast` and becomes `normal`.
+ * Inclusive: exactly this value classifies as `normal`.
  */
 export const DURATION_NORMAL_THRESHOLD_MS = 50;
 
 /**
- * Milliseconds at which a duration stops being `normal` and becomes `slow`
- * (AAP 0.6.3). Inclusive: exactly this value classifies as `slow`.
+ * Milliseconds at which a duration stops being `normal` and becomes `slow`.
+ * Inclusive: exactly this value classifies as `slow`.
  */
 export const DURATION_SLOW_THRESHOLD_MS = 200;
 
 /**
- * Milliseconds at which a duration stops being `slow` and becomes `critical`
- * (AAP 0.6.3). Inclusive: exactly this value classifies as `critical`.
+ * Milliseconds at which a duration stops being `slow` and becomes `critical`.
+ * Inclusive: exactly this value classifies as `critical`.
  */
 export const DURATION_CRITICAL_THRESHOLD_MS = 500;
 
@@ -555,8 +559,8 @@ export const DURATION_CRITICAL_THRESHOLD_MS = 500;
  * Classifies a duration in milliseconds into one of the four severity steps.
  *
  * The intervals are half-open and the boundary belongs to the *slower* bucket,
- * which is the behaviour AAP 0.6.3 states and the one an off-by-one here would
- * silently invert in every table in the product:
+ * which is the contract every duration colour follows; an off-by-one here would
+ * silently invert it in every table in the product:
  *
  * - `[0, 50)` → `fast` — so `49.9` is fast and `50` is not;
  * - `[50, 200)` → `normal` — so `199.9` is normal and `200` is not;
@@ -579,7 +583,7 @@ export const DURATION_CRITICAL_THRESHOLD_MS = 500;
  * - `Infinity` is greater than every threshold and reads as `critical`.
  *
  * @param durationMs A duration in milliseconds, the canonical unit of every
- * telemetry event (AAP 0.2.3).
+ * telemetry event.
  */
 export function durationSeverity(durationMs: number): DurationSeverity {
   const ms = clampNonNegative(durationMs);
@@ -597,7 +601,7 @@ export function durationSeverity(durationMs: number): DurationSeverity {
 }
 
 /**
- * The token each severity step is drawn in (AAP 0.6.3).
+ * The token each severity step is drawn in.
  *
  * The four duration tokens are theme-level aliases of the muted text, primary
  * text, warning and danger colours, and that aliasing lives in
@@ -658,8 +662,9 @@ export function durationColorVar(durationMs: number): string {
  * The one place in this package where colour *values* are parsed, and the only
  * place the contrast formula is implemented. `../tokens/tokens.test.ts`
  * measures every text/surface and status/surface pair of all three themes with
- * these helpers and fails below the minima AAP 0.6.3 fixes, which is what turns
- * "the palette is accessible" into something a gate can check.
+ * these helpers and fails below the WCAG AA minima — 4.5:1 for text, 3:1 for
+ * the span-kind fills — which is what turns "the palette is accessible" into
+ * something a gate can check.
  *
  * Values travel in from the caller. This module holds no colour table of its
  * own: the token table owns the values, the helpers own the arithmetic, and the
@@ -800,12 +805,13 @@ export function relativeLuminance(color: string | RgbColor): number {
  * {@link meetsContrast}, so a pair that misses a minimum in the fourth decimal
  * cannot be rounded into compliance.
  *
- * Reference figures from AAP 0.6.3, reproduced by this implementation to two
- * decimals: the muted text colour on the darkest surface the dark theme permits
- * measures `5.09:1`, and the light theme's muted text on its overlay surface
- * measures `4.82:1`. `../tokens/tokens.test.ts` asserts the whole matrix; those
- * two are the worst pairs in each theme, and a change here that does not
- * reproduce them is an error in the arithmetic rather than in the palette.
+ * Reference figures for the palette, reproduced by this implementation to two
+ * decimals: the dark theme's muted text `#8a92a6` on its overlay surface
+ * `#1d2230` measures `5.09:1`, and the light theme's muted text `#5f677a` on
+ * its overlay surface `#e9edf3` measures `4.82:1`. `../tokens/tokens.test.ts`
+ * asserts the whole matrix; those two are the worst pairs in each theme, and a
+ * change here that does not reproduce them is an error in the arithmetic
+ * rather than in the palette.
  */
 export function contrastRatio(
   foreground: string | RgbColor,
@@ -819,9 +825,9 @@ export function contrastRatio(
 }
 
 /**
- * A contrast ratio rounded to two decimals — the precision AAP 0.6.3 quotes
- * its figures in, and therefore the form an assertion or a diagnostic message
- * states.
+ * A contrast ratio rounded to two decimals — the precision the palette's
+ * reference figures on {@link contrastRatio} are quoted in, and therefore the
+ * form an assertion or a diagnostic message states.
  *
  * For reporting only. Compare the raw ratio with {@link meetsContrast}.
  */
@@ -842,15 +848,15 @@ export function meetsContrast(ratio: number, minimum: number): boolean {
 
 /**
  * The contrast a text colour must reach against the surface behind it: WCAG AA
- * for normal-size text, the bar AAP 0.6.3 holds every text and status colour of
- * every theme to.
+ * for normal-size text, the bar every text and status colour of every theme is
+ * held to.
  */
 export const WCAG_AA_TEXT_CONTRAST = 4.5;
 
 /**
  * The contrast a non-text visual must reach: WCAG AA for large text, user
- * interface components and graphical objects. AAP 0.6.3 holds the span-kind
- * scale to this bar rather than the text bar, because those tokens are used as
- * fills that carry their own labels.
+ * interface components and graphical objects. The span-kind scale is held to
+ * this bar rather than the text bar, because those tokens are used as fills
+ * that carry their own labels.
  */
 export const WCAG_AA_NON_TEXT_CONTRAST = 3;

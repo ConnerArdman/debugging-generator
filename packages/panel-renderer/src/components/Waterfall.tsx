@@ -1,14 +1,14 @@
 /**
  * `components/Waterfall` — the request and dependency view of the node catalog's
  * `waterfall` type, and one of the four components the slow-interaction
- * acceptance panel is built from (AAP 0.6.5, 0.8.3).
+ * acceptance panel is built from.
  *
  * ## What it answers, and why offset and nesting carry the answer
  *
  * A timeline answers "which tier held the time"; a waterfall answers "what was
- * waiting on what" (AAP 0.6.2). The story it exists to tell is that a slow
- * interaction spent its time in a *dependency* — a statement that ran long, an
- * external call that ran after another instead of beside it — rather than in the
+ * waiting on what". The story it exists to tell is that a slow interaction
+ * spent its time in a *dependency* — a statement that ran long, an external
+ * call that ran after another instead of beside it — rather than in the
  * handler the developer clicked. Exactly two properties make that story legible,
  * and they are the two this module treats as load-bearing:
  *
@@ -28,14 +28,15 @@
  * arrived, or its parent links were malformed — is a different statement from a
  * parent that is merely off this page, and it is drawn flagged rather than as an
  * ordinary top-level row: a "Re-attached" badge, the `dg-is-orphan` state, and a
- * sentence in its description naming the parent that could not be resolved
- * (AAP 0.4.2: orphans are evidence, never dropped and never disguised). The
- * verdict is the flag the service persisted on the flat record, honoured only
- * while the parent the record names is absent from what is held, because a
- * parent that resolves proves the flag stale. A call lifted to the top level
- * through an undrawn re-attached call carries that call's verdict, stated as
- * inherited. The grouped `requests` result carries no correlation verdict, so
- * none of its rows is ever flagged.
+ * sentence in its description naming the parent that could not be resolved:
+ * orphans are evidence, never dropped and never disguised
+ * (`docs/ARCHITECTURE.md`, "Attribution, joining and orphans"). The verdict is
+ * the flag the service persisted on the flat record, honoured only while the
+ * parent the record names is absent from what is held, because a parent that
+ * resolves proves the flag stale. A call lifted to the top level through an
+ * undrawn re-attached call carries that call's verdict, stated as inherited.
+ * The grouped `requests` result carries no correlation verdict, so none of its
+ * rows is ever flagged.
  *
  * ## The sources it draws
  *
@@ -57,7 +58,8 @@
  *     group with more than one occurrence becomes a parent row spanning the
  *     occurrences, expandable into them. Grouping is **not** recomputed here:
  *     duplicate detection already happened in the service, on the pre-redaction
- *     request key (AAP 0.5.2), and this view only draws what it grouped.
+ *     request key (`docs/SECURITY.md`, "The pre-redaction request key"), and
+ *     this view only draws what it grouped.
  *
  * ## Paging a source it filters
  *
@@ -115,7 +117,7 @@
  * more than one was in flight, and judges its own outcome over its settled
  * calls only — the rules the request aggregate itself applies.
  *
- * ## Privacy: render what arrived, and nothing more (AAP 0.5.2)
+ * ## Privacy: render what arrived, and nothing more
  *
  * URLs arrive with every query-parameter *value* already replaced per key, and
  * statements arrive parameterized with their literals replaced. Both are the
@@ -125,13 +127,15 @@
  * one, and row contents never exist — which is exactly why `db.rowCount` is
  * shown as a count. A transferred-byte figure is genuinely unavailable for some
  * calls; it renders as {@link NOT_AVAILABLE_LABEL}, never as a zero that would
- * read as "nothing was transferred".
+ * read as "nothing was transferred". What is redacted, and what is never
+ * captured, is stated in `docs/SECURITY.md` ("Redaction", "Never captured").
  *
  * ## Constraints this module works under
  *
  *   - **Data only through the node's query.** One `useQuery` per source family,
  *     resolved by the ambient `DataProvider`. No socket, no `fetch`, no message
- *     name, no knowledge of a transport (AAP 0.1.2, 0.6.2).
+ *     name, no knowledge of a transport (`docs/ARCHITECTURE.md`, "The renderer
+ *     contract").
  *   - **Interactions only through `PanelActions`.** Selection, source opening and
  *     disclosure are reported through the ambient actions, which may be absent —
  *     every call site chains optionally and an affordance that would lead nowhere
@@ -513,8 +517,9 @@ const WATERFALL_ROW_BUDGET = 200;
  * it, which is where the parent of a call on the newest page usually is. What
  * was released is stated, never presented as not captured: the footer says
  * which positions of the result are held and how many were loaded before them
- * (see {@link describeRetention}), and a persisted re-attachment flag whose
- * parent is not held is no longer described as a parent that never arrived.
+ * (see {@link describeRetention}), and, once pages are released, a persisted
+ * re-attachment flag whose parent is not held says only that, never that the
+ * parent never arrived.
  */
 const RETAINED_ITEM_BUDGET = 2 * DATA_QUERY_MAX_LIMIT;
 
@@ -530,8 +535,8 @@ const TOOLTIP_PREVIEW_LENGTH = 400;
 
 /**
  * `PANEL_NODE_CATALOG.waterfall` — the single registry entry for the node type
- * this component renders (AAP 0.6.2: "the renderer depends on the schema, never
- * the reverse").
+ * this component renders. The renderer depends on the schema, never the
+ * reverse (`docs/ARCHITECTURE.md`, "Workspace layout and dependency layering").
  *
  * Read once at module scope because it is frozen data. The sources a waterfall
  * node may query (see {@link narrowSpanListQuery}) and the record kinds it
@@ -604,8 +609,7 @@ const REQUEST_LIKE_KINDS: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>([
  * PRESENTATION ONLY: the kinds for which a transferred-byte figure is
  * meaningful, so that its absence can be reported as unavailable rather than
  * passed over. A server-side span has no resource timing behind it, so the
- * figure is not expected there and is not claimed to be missing either
- * (AAP 0.6.6).
+ * figure is not expected there and is not claimed to be missing either.
  *
  * The same two browser request kinds are the ones whose producer — the page's
  * patched `fetch` and `XMLHttpRequest` — writes the in-flight marker, so
@@ -647,9 +651,10 @@ function resolveIncludedKinds(
  * nothing outside this file constructs or consumes it, and it is not a second
  * definition of any wire or storage shape. Every cross-process shape has exactly
  * one definition in `@debuggen/telemetry`, `@debuggen/panel-schema` or
- * `@debuggen/shared` (AAP 0.2.3), and the fields below are *derived* from those:
- * the names mirror `TimelineRow` so that the offset convention is the same one
- * the correlated timeline uses.
+ * `@debuggen/shared` (`docs/ARCHITECTURE.md`, "Workspace layout and dependency
+ * layering"), and the fields below are *derived* from those: the names mirror
+ * `TimelineRow` so that the offset convention is the same one the correlated
+ * timeline uses.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -658,7 +663,7 @@ function resolveIncludedKinds(
  * not draw, lifting this one with it — because that parent could not be
  * resolved. Real captured work with real timings, drawn and flagged rather than
  * dropped, so the structure around it is never mistaken for the shape the
- * application had (AAP 0.4.2).
+ * application had.
  *
  * The provenance is the flag the service persisted on a flat record, which
  * records only THAT the parent was unresolvable — never which of the
@@ -1560,7 +1565,7 @@ function rowFromEvent(
  * is NOT done here: any grouping, matching or comparison of requests. That
  * happened in the service, on the pre-redaction request key, and a second
  * attempt over the redacted URLs on this side would answer differently and be
- * wrong (AAP 0.5.2).
+ * wrong (`docs/SECURITY.md`, "The pre-redaction request key").
  *
  * Groups do not nest under one another, so a fold only files the page's
  * drawable groups into drawing order and drops the released ones. A group
@@ -2201,8 +2206,8 @@ type CustomPropertyStyle = CSSProperties & Record<`--${string}`, string>;
  * hundred pixels wide keeps a readable prefix while the source chip beside it —
  * the one item the stylesheet allows to shrink to nothing, through the
  * `min-inline-size: 0` on `.dg-source-link` that suits it to a table cell — is
- * squeezed to a couple of pixels. That is a control the developer can no longer
- * read, aim at, or recognise when the keyboard reaches it.
+ * squeezed to a couple of pixels. That is a control the developer cannot read,
+ * aim at, or recognise when the keyboard reaches it.
  *
  * A zero basis inverts the order: the chips are laid out at their content width
  * and the label takes what is left. The zero minimum is what makes that true
@@ -2213,7 +2218,8 @@ type CustomPropertyStyle = CSSProperties & Record<`--${string}`, string>;
  * the shrinking lands back on the source chip. Both declarations are structural
  * and carry no design value: `0` is a permitted literal and the two flex factors
  * are unitless. Together they are the counterpart of the `flex: none` the
- * stylesheet puts on `.dg-waterfall__status`, the one row chip it knew about.
+ * stylesheet puts on `.dg-waterfall__status`, the one row chip the stylesheet
+ * itself keeps from shrinking.
  *
  * The order this sets is deliberate where the row genuinely holds more than the
  * panel is wide: a narrow panel leaves a long statement only a few characters,
@@ -2250,11 +2256,11 @@ function statusCodeTone(statusCode: number): BadgeTone {
  * Whether a row needs the word "Error" to say that its call failed.
  *
  * A failure the telemetry reported is otherwise only a state class and a tint,
- * and colour is never the only signal (AAP 0.6.4). A response status code of
- * 400 or above already says it in a danger-toned chip, so the word is added
- * only where no such code does: a failed statement or outgoing call that
- * carries no HTTP status at all, or a request whose code does not read as a
- * failure although the call itself did.
+ * and colour is never the only signal. A response status code of 400 or above
+ * already says it in a danger-toned chip, so the word is added only where no
+ * such code does: a failed statement or outgoing call that carries no HTTP
+ * status at all, or a request whose code does not read as a failure although
+ * the call itself did.
  */
 function showsErrorBadge(row: WaterfallRow): boolean {
   return row.status === 'error' && (row.statusCode === undefined || row.statusCode < 400);
@@ -2268,7 +2274,7 @@ function showsErrorBadge(row: WaterfallRow): boolean {
  * record's own name. The kind check is what keeps a stray `url` attribute on a
  * non-request record from hijacking its label. Nothing is assembled, decoded or
  * rebuilt: a URL whose query values are already replaced per key is the correct
- * display form (AAP 0.5.2).
+ * display form.
  */
 function rowLabel(row: WaterfallRow): string {
   if (row.statement !== undefined) {
@@ -3695,8 +3701,8 @@ function WaterfallBlocks(props: WaterfallBlocksProps): ReactElement {
 /* ---------------------------------------------------------------------------
  * The states that are not a chart
  *
- * Product vocabulary only (AAP 0.5.4): the kinds are named through the shared
- * formatter, and nothing below names anything from an inspected project.
+ * Product vocabulary only: the kinds are named through the shared formatter,
+ * and nothing below names anything from an inspected project.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -3880,9 +3886,9 @@ function describeRowWindow(mounted: RowWindow): string {
  * the end is an empty page rather than an error, and a page whose records were
  * all removed by this view's kind filter still holds captured evidence. Each is
  * stated as what it is, with the total the service reported, so an empty page
- * never reads as an empty capture (AAP 0.5.5). The copy is chosen by a pure
- * function of the paging counters, outside the component, so every branch is a
- * plain value a test can name.
+ * never reads as an empty capture. The copy is chosen by a pure function of
+ * the paging counters, outside the component, so every branch is a plain value
+ * a test can name.
  * ------------------------------------------------------------------------- */
 
 /** The empty-capture sentence: nothing matched the query at all. */
@@ -4076,10 +4082,10 @@ type AnyQueryResult = UseQueryResult<unknown>;
  * nothing has been loaded yet, held pages with nothing drawable after pages
  * holding calls were released, pages searched with nothing drawable while more
  * remain (with "Load more"), the empty result, and the chart. A page that
- * arrived while rows are already on screen degrades
- * to a footer notice rather than replacing the view, so paging never blanks a
- * chart the developer is reading — and a failure is still reported as a
- * failure, with a retry, never as a successful empty result (AAP 0.5.5).
+ * arrived while rows are already on screen degrades to a footer notice rather
+ * than replacing the view, so paging never blanks a chart the developer is
+ * reading — and a failure is still reported as a failure, with a retry, never
+ * as a successful empty result.
  *
  * @param props The node to draw and an optional class name.
  */

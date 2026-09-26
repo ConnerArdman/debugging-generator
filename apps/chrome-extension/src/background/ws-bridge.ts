@@ -15,20 +15,25 @@
  *   inspected tab — reconnecting on the AAP §0.5.5 curve (0.5 s → 10 s), and
  *   never retrying a credential the service refused with
  *   `WS_CLOSE_UNAUTHORIZED`;
- * - the `chrome.alarms` keepalive that stops the Manifest V3 worker from being
- *   evicted while a session is live — the part of recovery the platform-neutral
- *   client deliberately leaves to this module — and, while the socket is open,
- *   the heartbeat below the worker's idle window that re-creates that alarm and
- *   probes the service, retiring a socket whose peer stopped answering onto
- *   the backoff curve ({@link SOCKET_HEARTBEAT_INTERVAL_MS});
+ * - the worker-lifetime half of recovery, which the platform-neutral client
+ *   deliberately leaves to this module: while the socket is open, a heartbeat
+ *   every {@link SOCKET_HEARTBEAT_INTERVAL_MS} re-creates the `chrome.alarms`
+ *   keepalive — an extension API call, which refreshes the worker's idle timer
+ *   while it is active — and probes the service, retiring a socket whose peer
+ *   stopped answering onto the backoff curve. The alarm does not prevent
+ *   Manifest V3 suspension: once the worker is suspended it fires within one
+ *   period, and its tick revives the worker and reconnects
+ *   ({@link WsBridge.handleKeepaliveAlarm});
  * - the envelope wrap of the page agent's **raw** event batches: the MAIN-world
  *   agent has no socket and never imports the protocol, so the worker turns its
  *   `{ events }` into `telemetry.event` frames, chunked to the protocol's bound
  *   and in the order they were produced, each scoped to its tab and that tab's
  *   session — a batch whose session is unknown is refused, never sent
  *   unscoped — each carrying the capture the agent was armed for and the
- *   first carrying its reported loss ({@link TelemetryBatchContext})
- *   (AAP §0.4.2, §0.5.6);
+ *   first carrying its reported loss ({@link TelemetryBatchContext}); an
+ *   event-less batch that reports loss becomes one loss-only frame, so a
+ *   capture's final loss reaches the service when no later batch will carry
+ *   it (AAP §0.4.2, §0.5.6);
  * - the **service-confirmed route** of each tab: which tab ↔ session pairs the
  *   service has answered with `session.bound` on the *current* connection.
  *   Telemetry is written only along a confirmed route and only to an open
@@ -65,10 +70,15 @@
  *
  * Telemetry the socket client took and then discarded — a queued
  * `telemetry.event` frame dropped from the head of the full queue, or still
- * queued when the credential was removed — is also reported, by tab and event
- * count, through {@link WsBridgeDeps.onTelemetryDropped}; `service-worker.ts`
- * shows it on the tab's panels as undelivered telemetry. The accounting that
- * names such a frame is the queue mirror documented in {@link createWsBridge}.
+ * queued when the credential was removed — is also reported, twice over: by
+ * tab and event count through {@link WsBridgeDeps.onTelemetryDropped}, which
+ * `service-worker.ts` shows on the tab's panels as undelivered telemetry, and
+ * — every such frame, a loss-only one included — with its session, armed
+ * capture, event count and carried `droppedCount` through
+ * {@link WsBridgeDeps.onTelemetryFrameDiscarded}, which the worker holds as
+ * loss the service's producer-loss ledger has not yet been told of. The
+ * accounting that names such a frame is the queue mirror documented in
+ * {@link createWsBridge}.
  *
  * Both protocol clients return a `Result` and never throw for an expected
  * condition, and this module keeps that discipline: no exported function
@@ -131,6 +141,7 @@
  *   webSocketConstructor: WebSocket,
  *   httpClient,
  *   tokenProvider: store.getToken,
+ *   readProofProvider: store.getReadProof,
  *   onUnauthorized: store.handleUnauthorized,
  *   hasCredential: store.hasToken,
  *   alarms: chrome.alarms,
@@ -532,6 +543,20 @@ export interface WsBridgeDeps {
   readonly tokenProvider: TokenProvider;
 
   /**
+   * The read proof issued with the credential at pairing — the credential
+   * store's `getReadProof`. Asked once per DevTools read (`session.get`,
+   * `panel.get`, `panel.getById`, `modifications.list`), whose `HttpClient`
+   * call sends it as `READ_PROOF_HEADER`: the service refuses every DevTools
+   * read without it, `Origin` or not, because Chrome sends no `Origin` on
+   * these `GET`s and an `Origin` alone is only a claim. Omitted, or answering
+   * `undefined`, a read is sent without one, and the service's `UNAUTHORIZED`
+   * reaches {@link WsBridgeDeps.onUnauthorized} like any refused credential,
+   * so the developer pairs again. ⚠️ As secret as the credential: never
+   * logged, and never placed in the `client.hello`.
+   */
+  readonly readProofProvider?: (() => Promise<string | undefined>) | undefined;
+
+  /**
    * How a refused credential is reported — the credential store's
    * `handleUnauthorized`. Called with the socket client's 4401 detail, or with
    * an HTTP failure carrying the `UNAUTHORIZED` code. When it answers
@@ -623,15 +648,18 @@ export interface WsBridgeDeps {
    *   removed (`handlePairingState('not-paired')`), whose close clears the
    *   queue.
    *
-   * Called once per discarded frame, with the tab the batch came from and how
-   * many events the frame carried — never the events themselves.
-   * `service-worker.ts` shows them as undelivered telemetry.
+   * Called once per discarded frame that carried events, with the tab the
+   * batch came from and how many events the frame carried — never the events
+   * themselves. `service-worker.ts` shows them as undelivered telemetry.
    *
    * Not called for a frame that was flushed to a socket, for a frame
    * {@link WsBridge.sendTelemetryBatch} could not hand over at all (its `Err`
-   * reports that), for non-telemetry frames, or when {@link WsBridge.close}
-   * disposes of the bridge. A callback that throws is logged by code and
-   * contained, since it runs inside the socket client's `send`.
+   * reports that), for a loss-only frame (it names no undelivered event, and
+   * its loss was shown when the page reported it; its drop is logged), for
+   * non-telemetry frames, or when {@link WsBridge.close} disposes of the
+   * bridge. A callback that throws is logged by code and contained, since it
+   * runs inside the socket client's `send`. What the discarded frame meant for
+   * the service's ledger is {@link WsBridgeDeps.onTelemetryFrameDiscarded}'s.
    *
    * @example
    * ```ts
@@ -639,6 +667,31 @@ export interface WsBridgeDeps {
    * ```
    */
   readonly onTelemetryDropped?: ((tabId: TabId, events: number) => void) | undefined;
+
+  /**
+   * Told of every `telemetry.event` frame the socket client accepted into its
+   * outbound queue and then discarded — on the same two occasions as
+   * {@link WsBridgeDeps.onTelemetryDropped}, oldest frame first — **loss-only
+   * frames included**, so the capture loss the frame stood for can still reach
+   * the service's producer-loss ledger: its events, and the `droppedCount` it
+   * carried (a batch's first frame, or a loss-only report).
+   *
+   * Called once per discarded frame, before `onTelemetryDropped` for the same
+   * frame, with the frame's labels as they were sent — the routing session and
+   * the armed capture — so the receiver can hold the loss under exactly that
+   * context and never relabel it. Counts and ids only, never an event. Not
+   * called for a flushed frame, a refused send, a non-telemetry frame or on
+   * {@link WsBridge.close}. A callback that throws is logged by code and
+   * contained.
+   *
+   * @example
+   * ```ts
+   * onTelemetryFrameDiscarded: (frame) =>
+   *   holdPendingLoss(frame.tabId, { sessionId: frame.sessionId, captureId: frame.armedCaptureId },
+   *     frame.events + frame.droppedCount),
+   * ```
+   */
+  readonly onTelemetryFrameDiscarded?: ((frame: DiscardedTelemetryFrame) => void) | undefined;
 
   /**
    * Where lifecycle records go. Defaults to `noopLogger`. Records carry message
@@ -732,7 +785,9 @@ export type WsBridgeStatus = {
  *
  * Counts only — never an event, so the value is safe to log. Telemetry is
  * never queued for a later connection, so on success every frame was written
- * to the open socket and `sent` equals `frames`.
+ * to the open socket and `sent` equals `frames`. A loss-only report is one
+ * frame without events, `{ events: 0, frames: 1, sent: 1 }`; an empty batch
+ * with no loss to report is `{ events: 0, frames: 0, sent: 0 }`.
  */
 export interface TelemetryBatchOutcome {
   /** How many events the batch held and were written to the socket. */
@@ -741,6 +796,25 @@ export interface TelemetryBatchOutcome {
   readonly frames: number;
   /** How many of those frames were written to the open socket. */
   readonly sent: number;
+}
+
+/**
+ * One `telemetry.event` frame the socket client queued and then discarded, as
+ * {@link WsBridgeDeps.onTelemetryFrameDiscarded} reports it: the labels it was
+ * sent under and the loss it stood for. Counts and ids only — never an event —
+ * so it is safe to hold and to log by count.
+ */
+export interface DiscardedTelemetryFrame {
+  /** The tab whose page agent produced the batch — the frame's acting tab. */
+  readonly tabId: TabId;
+  /** The session the frame was scoped to: the tab's confirmed route. */
+  readonly sessionId: SessionId;
+  /** The capture the agent was armed for, when the batch named one. */
+  readonly armedCaptureId?: CaptureId | undefined;
+  /** How many events the frame carried; zero for a loss-only report. */
+  readonly events: number;
+  /** The loss the frame reported — its batch's first frame, or a loss-only report; else zero. */
+  readonly droppedCount: number;
 }
 
 /**
@@ -796,7 +870,9 @@ export interface TelemetryBatchContext {
    * loss (its buffer is bounded at 5 000 events while the bridge is away,
    * AAP §0.5.5). Carried on the first frame only, and only when above zero, so
    * a batch split into several frames reports its loss exactly once. A value
-   * that is not a whole number from zero is not forwarded.
+   * that is not a whole number from zero is not forwarded. Beside an empty
+   * batch, a count above zero is the whole frame: the loss-only report
+   * `{ events: [], armedCaptureId?, droppedCount }`.
    */
   readonly droppedCount?: number | undefined;
 }
@@ -913,9 +989,16 @@ export interface WsBridge {
    *
    * With a {@link TelemetryBatchContext}, every frame carries its
    * `armedCaptureId` and the first frame its `droppedCount` above zero;
-   * without one, each frame's payload is exactly `{ events }`. An empty batch
-   * sends nothing, its context included: the protocol has no frame for a loss
-   * report without events, and the agent posts only non-empty batches.
+   * without one, each frame's payload is exactly `{ events }`.
+   *
+   * An empty batch whose context reports a loss above zero is a **loss-only
+   * report** — what the page agent's terminal flush and the content bridge post
+   * when no later batch will carry a loss — and is sent as exactly one frame,
+   * `{ events: [], armedCaptureId?, droppedCount }`, held to every refusal
+   * above and to the `armedCaptureId` check below; it answers
+   * `{ events: 0, frames: 1, sent: 1 }`. An empty batch without such a loss
+   * (none, zero or a malformed count) sends nothing and answers zeros: the
+   * protocol refuses an event-less frame that reports no loss.
    *
    * @param tabId The tab the batch came from (the bridge port's sender).
    * @param rawEvents The agent's `events` array, exactly as it arrived.
@@ -1112,6 +1195,13 @@ export type StoreHasTokenFitsBridge = AssertTrue<
 /** `store.getToken` fits {@link WsBridgeDeps.tokenProvider}. */
 export type StoreGetTokenFitsBridge = AssertTrue<
   DevtoolsCredentialStore['getToken'] extends WsBridgeDeps['tokenProvider'] ? true : false
+>;
+
+/** `store.getReadProof` fits {@link WsBridgeDeps.readProofProvider}. */
+export type StoreGetReadProofFitsBridge = AssertTrue<
+  DevtoolsCredentialStore['getReadProof'] extends NonNullable<WsBridgeDeps['readProofProvider']>
+    ? true
+    : false
 >;
 
 /*
@@ -1486,14 +1576,21 @@ function resolveRouteTimeout(timeoutMs: number | undefined): number {
 
 /**
  * Where one `telemetry.event` frame came from: what a later drop of it
- * reports through {@link WsBridgeDeps.onTelemetryDropped}. Numbers and a tab
- * id only, so it is safe to log.
+ * reports through {@link WsBridgeDeps.onTelemetryDropped} and
+ * {@link WsBridgeDeps.onTelemetryFrameDiscarded}. Numbers and ids only; the
+ * armed capture id is page-supplied and is never logged.
  */
 interface TelemetryFrameOrigin {
   /** The tab whose page agent produced the batch. */
   readonly tabId: TabId;
-  /** How many events the frame carries. */
+  /** The session the frame was scoped to. */
+  readonly sessionId: SessionId;
+  /** The capture the frame names, when it names one. */
+  readonly armedCaptureId?: CaptureId | undefined;
+  /** How many events the frame carries; zero for a loss-only report. */
   readonly events: number;
+  /** The loss the frame reports, when it reports one: a batch's first frame, or a loss-only report. */
+  readonly droppedCount?: number | undefined;
 }
 
 /**
@@ -1627,8 +1724,10 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
   /**
    * The queue mirror: this module's record of the frames the socket client
    * holds in its outbound queue, oldest first, so that a frame the client
-   * discards can be named — a `telemetry.event` frame by its tab and event
-   * count, which {@link WsBridgeDeps.onTelemetryDropped} reports.
+   * discards can be named — a `telemetry.event` frame by its tab, session,
+   * armed capture, event count and carried loss, which
+   * {@link WsBridgeDeps.onTelemetryFrameDiscarded} and
+   * {@link WsBridgeDeps.onTelemetryDropped} report.
    *
    * The invariant it relies on: the client's queue is FIFO, and a frame
    * leaves it in exactly three ways —
@@ -2095,9 +2194,9 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
   /**
    * The outbound queue overflowed while the socket was down: count it and put
    * the count on the snapshot, and — when the dropped frame carried telemetry
-   * — report its tab and event count through
-   * {@link WsBridgeDeps.onTelemetryDropped}, so the developer is shown that
-   * the capture is incomplete.
+   * — report it ({@link reportTelemetryDiscarded}): its labels and loss for the
+   * service's ledger, and its events to the developer, who is shown that the
+   * capture is incomplete.
    */
   function handleQueueDrop(detail: WsQueueDropDetail): void {
     droppedFrameCount += 1;
@@ -2107,12 +2206,27 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       droppedFrameCount,
     });
     const dropped = takeDroppedRecord(detail);
-    if (dropped?.telemetry !== undefined) {
-      log.warn('a queued telemetry frame was dropped before it reached the service', {
-        tabId: dropped.telemetry.tabId,
-        events: dropped.telemetry.events,
-      });
-      reportTelemetryDropped(dropped.telemetry);
+    const origin = dropped?.telemetry;
+    if (origin !== undefined) {
+      const lostLoss =
+        origin.droppedCount === undefined ? {} : { droppedCount: origin.droppedCount };
+      if (origin.events === 0) {
+        // A loss-only report: no event is lost with it, only the count's way
+        // to the service's ledger — which the discard sink is told of, so the
+        // worker can carry it again. The panels were told of that loss when
+        // the page reported it, so the drop sink is not told again.
+        log.warn('a queued telemetry loss report was dropped before it reached the service', {
+          tabId: origin.tabId,
+          ...lostLoss,
+        });
+      } else {
+        log.warn('a queued telemetry frame was dropped before it reached the service', {
+          tabId: origin.tabId,
+          events: origin.events,
+          ...lostLoss,
+        });
+      }
+      reportTelemetryDiscarded(origin);
     }
     publish();
   }
@@ -2155,14 +2269,41 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
   }
 
   /**
-   * Hand one discarded telemetry frame's origin to
-   * {@link WsBridgeDeps.onTelemetryDropped}. A callback that throws is logged
-   * by code and contained: this runs inside the socket client's `send` or
-   * ahead of this module's own `close`, neither of which it may unwind.
+   * Hand one discarded telemetry frame's origin to both sinks, in order:
+   *
+   * 1. {@link WsBridgeDeps.onTelemetryFrameDiscarded} — every frame, a
+   *    loss-only one included, with its labels, events and carried loss: what
+   *    the service's producer-loss ledger was not told of;
+   * 2. {@link WsBridgeDeps.onTelemetryDropped} — only a frame that carried
+   *    events: a loss-only frame names no event the developer could be told
+   *    is undelivered, and the loss it reported was shown when the page
+   *    reported it.
+   *
+   * Each callback that throws is logged by code and contained on its own, so
+   * one failing sink never keeps the other uninformed: this runs inside the
+   * socket client's `send` or ahead of this module's own `close`, neither of
+   * which it may unwind.
    */
-  function reportTelemetryDropped(origin: TelemetryFrameOrigin): void {
+  function reportTelemetryDiscarded(origin: TelemetryFrameOrigin): void {
+    const discarded = deps.onTelemetryFrameDiscarded;
+    if (discarded !== undefined) {
+      try {
+        discarded({
+          tabId: origin.tabId,
+          sessionId: origin.sessionId,
+          ...(origin.armedCaptureId === undefined ? {} : { armedCaptureId: origin.armedCaptureId }),
+          events: origin.events,
+          droppedCount: origin.droppedCount ?? 0,
+        });
+      } catch (thrown) {
+        log.warn('the telemetry discard sink threw', {
+          tabId: origin.tabId,
+          code: DebuggenError.from(thrown).code,
+        });
+      }
+    }
     const report = deps.onTelemetryDropped;
-    if (report === undefined) {
+    if (report === undefined || origin.events === 0) {
       return;
     }
     try {
@@ -2191,27 +2332,31 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
 
   /**
    * The credential was removed and the queue is about to be cleared with the
-   * socket: report every telemetry frame still queued as discarded, then
-   * forget the mirror. Frames flushed before now are settled away first, so
-   * only what the clear really discards is reported.
+   * socket: report every telemetry frame still queued as discarded
+   * ({@link reportTelemetryDiscarded}), loss-only frames included, then forget
+   * the mirror. Frames flushed before now are settled away first, so only what
+   * the clear really discards is reported.
    */
   function discardQueuedTelemetry(): void {
     settleQueueMirror();
     const discarded = queueMirror.splice(0);
     let frames = 0;
     let events = 0;
+    let dropped = 0;
     for (const record of discarded) {
       if (record.telemetry === undefined) {
         continue;
       }
       frames += 1;
       events += record.telemetry.events;
-      reportTelemetryDropped(record.telemetry);
+      dropped += record.telemetry.droppedCount ?? 0;
+      reportTelemetryDiscarded(record.telemetry);
     }
     if (frames > 0) {
       log.warn('queued telemetry was discarded: the devtools credential was removed', {
         frames,
         events,
+        ...(dropped > 0 ? { droppedCount: dropped } : {}),
       });
     }
   }
@@ -2695,8 +2840,8 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * extended by the frame when the client queued it. The outcome is the
    * client's, unchanged.
    *
-   * @param telemetry For a `telemetry.event` frame: the tab and event count a
-   * later drop of it reports. Omitted for every other frame.
+   * @param telemetry For a `telemetry.event` frame: the labels, event count
+   * and loss a later drop of it reports. Omitted for every other frame.
    */
   function sendTracked<K extends MessageType>(
     type: K,
@@ -2740,8 +2885,10 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * The writability check is repeated before every chunk; should the client
    * still take one into its queue (a platform socket whose write threw), the
    * batch stops there and is reported as interrupted, the counts naming how
-   * far it got. A resend of the whole batch is then safe: the service stores
-   * events idempotently by id.
+   * far it got — `framesWritten` and `eventsWritten` on the socket,
+   * `framesQueued` and `eventsQueued` in the client's queue, which reports a
+   * later discard of them itself. A resend of the whole batch is then safe:
+   * the service stores events idempotently by id.
    *
    * The batch's {@link TelemetryBatchContext} rides in the payload beside
    * `events`, checked against the receiver's own schema first because that
@@ -2753,6 +2900,13 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * field exists to prevent. A malformed `droppedCount` is only a diagnostic,
    * so it is left out and the events still travel. A refused value is never
    * logged; the records name the tab and counts only.
+   *
+   * An empty batch is decided before anything else about its context: with a
+   * loss above zero it is a loss-only report, and the chunk loop below — a
+   * `do … while`, so it runs once for zero events — sends it as one frame
+   * through the same checks, the queue mirror recording it with no events;
+   * without one there is nothing the protocol would accept, and nothing is
+   * sent.
    */
   function sendTelemetryBatch(
     tabId: TabId,
@@ -2787,8 +2941,22 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       );
     }
     const total = rawEvents.length;
-    if (total === 0) {
-      // The protocol refuses an empty batch as a no-op; there is nothing to send.
+    const reportedDrop = context?.droppedCount;
+    const droppedValid = reportedDrop === undefined || isDroppedCount(reportedDrop);
+    // Absent means no loss was reported, so a zero is omitted rather than sent.
+    const droppedCount =
+      droppedValid && reportedDrop !== undefined && reportedDrop > 0 ? reportedDrop : undefined;
+    if (total === 0 && droppedCount === undefined) {
+      // An event-less frame can only report a loss, and the protocol refuses
+      // one that reports none: there is nothing to send.
+      if (!droppedValid) {
+        log.warn(
+          'a telemetry loss report was not sent: its count is not a whole number of events',
+          {
+            tabId,
+          },
+        );
+      }
       return ok({ events: 0, frames: 0, sent: 0 });
     }
     const armedCaptureId = context?.armedCaptureId;
@@ -2805,8 +2973,6 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
         ),
       );
     }
-    const reportedDrop = context?.droppedCount;
-    const droppedValid = reportedDrop === undefined || isDroppedCount(reportedDrop);
     if (!droppedValid) {
       log.warn(
         'a telemetry batch loss count is not a whole number of events; it was not forwarded',
@@ -2816,9 +2982,6 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
         },
       );
     }
-    // Absent means no loss was reported, so a zero is omitted rather than sent.
-    const droppedCount =
-      droppedValid && reportedDrop !== undefined && reportedDrop > 0 ? reportedDrop : undefined;
     if (!socketWritable()) {
       log.debug('a telemetry batch was not sent: the socket is not open', {
         tabId,
@@ -2853,8 +3016,15 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
     const options = { sessionId: routingSession, tabId };
     let events = 0;
     let frames = 0;
-    /** Stop the batch where the socket stopped taking writes, and say how far it got. */
-    const interrupted = (framesQueued: number): Result<TelemetryBatchOutcome, DebuggenError> => {
+    /**
+     * Stop the batch where the socket stopped taking writes, and say how far
+     * it got: on the socket, and in the client's queue (`eventsQueued`, the
+     * events of the one frame the client took instead of writing).
+     */
+    const interrupted = (
+      framesQueued: number,
+      eventsQueued: number,
+    ): Result<TelemetryBatchOutcome, DebuggenError> => {
       log.warn('a telemetry batch was interrupted: the socket stopped accepting writes', {
         tabId,
         sessionId: routingSession,
@@ -2865,15 +3035,24 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       });
       return err(
         workerError('TRANSPORT_DISCONNECTED', TELEMETRY_WRITE_INTERRUPTED_MESSAGE, {
-          details: { tabId, framesWritten: frames, eventsWritten: events, framesQueued },
+          details: {
+            tabId,
+            framesWritten: frames,
+            eventsWritten: events,
+            framesQueued,
+            eventsQueued,
+          },
         }),
       );
     };
-    for (let start = 0; start < total; start += frameEventLimit) {
+    // `do … while` rather than `for`: a loss-only report has no events and is
+    // still one frame. A non-empty batch runs exactly the chunks it did before.
+    let start = 0;
+    do {
       // Re-checked per chunk: a frame is handed to the client only when the
       // client will write it rather than queue it.
       if (!socketWritable()) {
-        return interrupted(0);
+        return interrupted(0, 0);
       }
       const chunk = rawEvents.slice(start, start + frameEventLimit);
       // Each frame is attributed on its own, so each names the armed capture;
@@ -2884,9 +3063,14 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
         ...(armedCaptureId === undefined ? {} : { armedCaptureId }),
         ...(reportsLoss ? { droppedCount } : {}),
       };
+      // The frame's labels travel with its queue record, so a later discard
+      // of it is reported under exactly the context it was sent under.
       const outcome = sendTracked(MESSAGE_TYPE.TELEMETRY_EVENT, payload, options, {
         tabId,
+        sessionId: routingSession,
+        ...(armedCaptureId === undefined ? {} : { armedCaptureId }),
         events: chunk.length,
+        ...(reportsLoss ? { droppedCount } : {}),
       });
       if (isErr(outcome)) {
         log.warn('a telemetry frame was not sent', {
@@ -2904,11 +3088,12 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       if (outcome.value !== 'sent') {
         // The write itself threw on an open socket and the client queued the
         // frame; nothing more of this batch is handed over.
-        return interrupted(1);
+        return interrupted(1, chunk.length);
       }
       frames += 1;
       events += chunk.length;
-    }
+      start += frameEventLimit;
+    } while (start < total);
     log.debug('forwarded a telemetry batch', {
       tabId,
       sessionId: routingSession,
@@ -3181,24 +3366,48 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       http.request('capture.stop', { params: { id: sessionId }, body: {}, ...options }),
     );
 
+  // The four reads also carry the read proof pairing issued with the
+  // credential, asked for at the moment of each read — after a new pairing,
+  // the proof issued with the new credential. It is read inside `callHttp`'s
+  // containment, so a provider that throws is an `INTERNAL` failure, never a
+  // rejection, and the value goes only to `HttpClient`.
+  const currentReadProof = (): Promise<string | undefined> =>
+    deps.readProofProvider === undefined ? Promise.resolve(undefined) : deps.readProofProvider();
+
   const getSession: WsBridge['getSession'] = (sessionId, options) =>
-    callHttp('session.get', (http) =>
-      http.request('session.get', { params: { id: sessionId }, ...options }),
+    callHttp('session.get', async (http) =>
+      http.request('session.get', {
+        params: { id: sessionId },
+        ...options,
+        readProof: await currentReadProof(),
+      }),
     );
 
   const getCurrentPanel: WsBridge['getCurrentPanel'] = (sessionId, options) =>
-    callHttp('panel.get', (http) =>
-      http.request('panel.get', { params: { id: sessionId }, ...options }),
+    callHttp('panel.get', async (http) =>
+      http.request('panel.get', {
+        params: { id: sessionId },
+        ...options,
+        readProof: await currentReadProof(),
+      }),
     );
 
   const getPanel: WsBridge['getPanel'] = (sessionId, panelId, options) =>
-    callHttp('panel.getById', (http) =>
-      http.request('panel.getById', { params: { id: sessionId, panelId }, ...options }),
+    callHttp('panel.getById', async (http) =>
+      http.request('panel.getById', {
+        params: { id: sessionId, panelId },
+        ...options,
+        readProof: await currentReadProof(),
+      }),
     );
 
   const getModifications: WsBridge['getModifications'] = (sessionId, options) =>
-    callHttp('modifications.list', (http) =>
-      http.request('modifications.list', { params: { id: sessionId }, ...options }),
+    callHttp('modifications.list', async (http) =>
+      http.request('modifications.list', {
+        params: { id: sessionId },
+        ...options,
+        readProof: await currentReadProof(),
+      }),
     );
 
   // -------------------------------------------------------------------------

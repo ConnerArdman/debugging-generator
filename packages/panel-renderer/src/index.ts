@@ -7,7 +7,7 @@
  * alone by following its imports, so a symbol that is not re-exported below
  * does not exist for a consumer. This file therefore *is* the library's public
  * surface, and the lists in it are meant to be read against the node catalogue
- * and the component inventory of the design system (AAP 0.6.1, 0.6.2) by eye.
+ * and the component inventory of the design system by eye.
  *
  * Two surfaces read it, and they are the reason the package has the shape it
  * has: the Chrome DevTools panel, which mounts the whole {@link PanelHost} to
@@ -40,23 +40,23 @@
  * Re-exported below in five sections, in this order:
  *
  * 1. **Tokens and theme.** `./tokens/tokens` is the single source of truth for
- *    every visual value in the product (AAP 0.6.1, 0.6.3): the three complete
- *    token sets — `dark`, the default, plus `light` and `highContrast` — the
- *    `TokenKey` union they define, and `cssVarName`/`cssVar`, which is how
- *    geometry computed in TypeScript names a `--dg-*` custom property instead
- *    of inlining a colour or a length. `./tokens/theme` carries theme identity
+ *    every visual value in the product: the three complete token sets —
+ *    `dark`, the default, plus `light` and `highContrast` — the `TokenKey`
+ *    union they define, and `cssVarName`/`cssVar`, which is how geometry
+ *    computed in TypeScript names a `--dg-*` custom property instead of
+ *    inlining a colour or a length. `./tokens/theme` carries theme identity
  *    rather than token values: the `PanelTheme` union locked to that table, the
  *    `data-theme` attribute and its per-theme value, and the two mappers that
  *    translate a browser devtools theme name and an editor body class into a
  *    theme. Host detection belongs to the two consumers, which own those host
  *    APIs; only the translation lives here, so the surfaces cannot disagree
  *    about what a host signal means.
- * 2. **The fourteen UI primitives**, `Button` through `ErrorState`. AAP 0.6.2
- *    names them and AAP 0.6.4 makes them mandatory: no raw `<button>`,
- *    `<input>`, `<select>`, `<table>` or heading element is permitted above
- *    this layer. Each is exported with its own `Props` interface and its option
- *    types, so a consumer composes them in typed code rather than re-deriving a
- *    variant union — and never has to reach for the element they stand in for.
+ * 2. **The fourteen UI primitives**, `Button` through `ErrorState`. They are
+ *    mandatory: no raw `<button>`, `<input>`, `<select>`, `<table>` or heading
+ *    element is permitted above this layer. Each is exported with its own
+ *    `Props` interface and its option types, so a consumer composes them in
+ *    typed code rather than re-deriving a variant union — and never has to
+ *    reach for the element they stand in for.
  *    The sortable, virtualized, keyboard-navigable `DataTable` and the
  *    `EmptyState`/`LoadingState`/`ErrorState` trio that every data-backed view
  *    needs for its three states are part of that set. `Badge` also publishes
@@ -71,7 +71,7 @@
  *    spacing and alignment are expressed; `Toolbar`, the filter, sort and search
  *    row a view composes instead of hand-rolling one; and `SummaryHeader`,
  *    where the separation between observed facts and inferred likely causes is
- *    rendered (AAP 0.8.4).
+ *    rendered.
  * 4. **The thirteen visualization components** of the node catalogue, from the
  *    correlated trace views through the render, request, query and state
  *    tables to the `SourceLink` chip. Twelve are query-backed and draw whatever
@@ -83,7 +83,8 @@
  *    specification; `NodeRenderer` and `renderPanelNodes` dispatch its nodes
  *    recursively; `PANEL_COMPONENT_REGISTRY` is the reviewed allow-list pairing
  *    each catalogued node type with the component that draws it, so nothing a
- *    specification says can put an uncatalogued thing on screen (AAP 0.6.4);
+ *    specification says can put an uncatalogued thing on screen — generated
+ *    panels compose catalogued components only;
  *    `DataProvider` and `PanelActions` are the two seams a host implements —
  *    evidence in, interactions out. A surface implements the actions' host
  *    form, `PanelHostActions` (`selectEvent(eventId)`, `openSource(location)`);
@@ -101,7 +102,7 @@
  *    key it identifies a request by, is published beside it so that a host's
  *    provider coalescing identical in-flight requests uses the same definition
  *    of "the same request". No component here opens a socket, calls `fetch` or
- *    knows a message name (AAP 0.4.2).
+ *    knows a message name.
  *
  * ## What is deliberately not re-exported
  *
@@ -123,7 +124,7 @@
  *   `@debuggen/shared`. Panel specifications, the node catalogue and data
  *   queries; telemetry events and the aggregate result shapes the views render;
  *   the source-location contract — each has exactly one definition and one
- *   import path (AAP 0.2.3), and a second spelling reached through this barrel
+ *   import path, and a second spelling reached through this barrel
  *   is how two surfaces end up disagreeing about one shape. The three paging
  *   limits below are not an exception to that rule but an application of it:
  *   they are re-exported by `./host/DataProvider` from the schema package

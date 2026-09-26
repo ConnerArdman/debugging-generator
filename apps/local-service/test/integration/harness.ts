@@ -83,7 +83,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { readFileSync, realpathSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { access, cp, mkdtemp, readdir, readlink, rm, stat } from 'node:fs/promises';
 import { connect as connectTcp } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -2031,6 +2031,13 @@ export interface HarnessCallOptions {
    * refuses from any other credential. Omitted, no header is sent.
    */
   readonly tabId?: number | undefined;
+  /**
+   * The read proof a DevTools read presents as protocol's read-proof header —
+   * {@link DevtoolsCredential.readProof}, which the service requires on every
+   * DevTools read. Used only by the flows that read (`waitForSession`).
+   * Omitted, no header is sent.
+   */
+  readonly readProof?: string | undefined;
   /** Overrides the `request` timeout for this call. */
   readonly timeoutMs?: number | undefined;
 }
@@ -2043,6 +2050,12 @@ export interface DevtoolsCredential {
   readonly origin: string;
   /** The plaintext credential. */
   readonly token: string;
+  /**
+   * The read proof issued with the credential, which every DevTools read
+   * (`session.get`, `panel.get`, `panel.getById`, `modifications.list`) must
+   * present as protocol's read-proof header, `Origin` or not.
+   */
+  readonly readProof: string;
   /** When the credential stops being accepted, where it expires at all. */
   readonly expiresAt?: number | undefined;
 }
@@ -2301,10 +2314,70 @@ export function owningSessionIdOf(error: DebuggenError): string | undefined {
 }
 
 /**
- * A `devServer.launch` command line that starts a **stand-in** dev server: a
- * few lines of Node run with `-e` by this very interpreter (`process.execPath`,
- * so no `PATH` lookup happens in the child's injected environment), listening on
- * an ephemeral loopback port and printing its address the way `next dev` does —
+ * The stand-in dev server's source: listen on an ephemeral loopback port,
+ * print the address the way `next dev` does (which is what the launcher waits
+ * for), answer every request `200`, and exit on `SIGTERM`.
+ */
+const STAND_IN_DEV_SERVER_SOURCE = [
+  'const server = require("node:http").createServer((request, response) => {',
+  ' response.end("ok"); });',
+  'server.listen(0, "127.0.0.1", () => {',
+  ' console.log("Local: http://127.0.0.1:" + String(server.address().port)); });',
+  'process.on("SIGTERM", () => { server.close(() => process.exit(0)); });',
+  '',
+].join('\n');
+
+/** The framework CLI's path under a `node_modules` directory, as the launcher accepts it. */
+const STAND_IN_DEV_CLI_SEGMENTS = ['node_modules', 'next', 'dist', 'bin', 'next'] as const;
+
+/**
+ * The stand-in package's own manifest. The CLI has no extension, so Node takes
+ * its module format from the nearest `package.json`; writing one beside it
+ * keeps the CommonJS source above CommonJS whatever lies above the temp dir.
+ */
+const STAND_IN_DEV_CLI_MANIFEST = `${JSON.stringify({ name: 'next', private: true, type: 'commonjs' })}\n`;
+
+/** The prefix of the private directory the stand-in CLI is written into. */
+const STAND_IN_DEV_CLI_PREFIX = 'debuggen-stand-in-dev-cli-';
+
+/** Where this process wrote the stand-in CLI, once written. */
+let standInDevCliPath: string | undefined;
+
+/**
+ * The stand-in CLI's path, writing it on first use — synchronously, once per
+ * process — into a private `mkdtemp` directory as
+ * `<dir>/node_modules/next/dist/bin/next`, mode `0o644` (owned by this user
+ * and writable by nobody else, which is what the launcher's trust check
+ * requires of a framework CLI), beside the package's own `package.json`. The
+ * directory is removed when the process exits.
+ */
+function standInDevCli(): string {
+  if (standInDevCliPath !== undefined) {
+    return standInDevCliPath;
+  }
+  const root = mkdtempSync(join(realpathSync(tmpdir()), STAND_IN_DEV_CLI_PREFIX));
+  process.once('exit', () => {
+    rmSync(root, { recursive: true, force: true });
+  });
+  const path = join(root, ...STAND_IN_DEV_CLI_SEGMENTS);
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeFileSync(join(root, 'node_modules', 'next', 'package.json'), STAND_IN_DEV_CLI_MANIFEST, {
+    mode: 0o644,
+  });
+  writeFileSync(path, STAND_IN_DEV_SERVER_SOURCE, { mode: 0o644 });
+  standInDevCliPath = path;
+  return path;
+}
+
+/**
+ * A `devServer.launch` command line that starts a **stand-in** dev server:
+ * this very interpreter (`process.execPath`, so no `PATH` lookup happens in
+ * the child's injected environment, and the service's own Node, which the
+ * launcher's command policy accepts) running a few lines of Node that play
+ * the framework's dev CLI — written once per process to a private
+ * `node_modules/next/dist/bin/next` and run with `dev`, exactly as the
+ * end-to-end sample app borrows a real `next` bin. They listen on an
+ * ephemeral loopback port and print the address the way `next dev` does,
  * which is what the launcher waits for.
  *
  * `session.create` needs a dev-server URL (`DEV_SERVER_UNAVAILABLE` otherwise),
@@ -2313,22 +2386,20 @@ export function owningSessionIdOf(error: DebuggenError): string | undefined {
  * attached, without running a byte of the fixture. The child answers every
  * request `200` and exits on `SIGTERM`, which the launcher sends at teardown.
  *
- * @throws Error When the interpreter's path contains a single quote, which the
- * launcher's POSIX-style tokenizer could not carry inside `'…'`.
+ * @throws Error When the interpreter's path or the stand-in CLI's path
+ * contains a single quote, which the launcher's POSIX-style tokenizer could
+ * not carry inside `'…'`.
  */
 export function standInDevServerCommand(): string {
   const executable = process.execPath;
   if (executable.includes("'")) {
     throw new Error('The Node executable path contains a single quote.');
   }
-  const script = [
-    'const server = require("node:http").createServer((request, response) => {',
-    ' response.end("ok"); });',
-    'server.listen(0, "127.0.0.1", () => {',
-    ' console.log("Local: http://127.0.0.1:" + String(server.address().port)); });',
-    'process.on("SIGTERM", () => { server.close(() => process.exit(0)); });',
-  ].join('');
-  return `'${executable}' -e '${script}'`;
+  const cli = standInDevCli();
+  if (cli.includes("'")) {
+    throw new Error('The stand-in dev CLI path contains a single quote.');
+  }
+  return `'${executable}' '${cli}' dev`;
 }
 
 /** The base environment record, with the suite's entries merged over it. */
@@ -3160,6 +3231,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
         extensionId,
         origin: chromeExtensionOrigin(extensionId),
         token: issued.value.token,
+        readProof: issued.value.readProof,
         expiresAt: issued.value.expiresAt,
       });
     };
@@ -3303,7 +3375,12 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
             { cause: completed.error },
           );
         }
-        return Object.freeze({ extensionId, origin, token: completed.value.token });
+        return Object.freeze({
+          extensionId,
+          origin,
+          token: completed.value.token,
+          readProof: completed.value.readProof,
+        });
       },
       rotateAll: () => {
         const rotated = service.auth.rotateAll();
@@ -3357,6 +3434,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
               const fetched = await client.request('session.get', {
                 params: { id: sessionId },
                 tabId: callOptions?.tabId,
+                readProof: callOptions?.readProof,
               });
               if (isErr(fetched)) {
                 throw new Error(

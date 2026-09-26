@@ -28,13 +28,39 @@
  *
  * **Upgrade.** Only a request for protocol's `WS_PATH` is upgraded (a query
  * string is ignored). The upgrade is refused with a bare HTTP response and the
- * TCP socket destroyed — no WebSocket is ever created — when:
+ * TCP socket destroyed — no WebSocket is ever created — when (checked in this
+ * order):
  *
  * | Condition | HTTP status |
  * | --- | --- |
+ * | the server is closing | 503 |
  * | the path is not `WS_PATH` | 404 |
  * | the `Origin` header is refused by `./auth.ts`'s `isAllowedOrigin` (every `http:`/`https:` web origin, `file:`, `data:`, `null`, anything unparseable) | 403 |
- * | the server is closing | 503 |
+ * | this peer already holds its share of unauthenticated sockets (`maxPendingHandshakesPerPeer`) | 429, with `Retry-After` |
+ * | every peer together already holds the unauthenticated share (`maxPendingHandshakes`) | 429, with `Retry-After` |
+ * | the service already holds its most sockets in any phase (`maxOpenConnections`) | 503, with `Retry-After` |
+ *
+ * Every refusal carries `Connection: close`, `Content-Length: 0`,
+ * `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, and nothing
+ * the client sent. A client answered 429 or 503 with `Retry-After` retries no
+ * sooner than that many seconds, with its usual backoff.
+ *
+ * **Admission.** An upgrade that passes the path and origin checks reserves a
+ * slot *before* `ws` allocates anything for it: one of the service's open
+ * sockets, and one pending handshake counted both globally and against its
+ * peer (the TCP remote address, IPv4-mapped IPv6 folded to IPv4; a socket with
+ * no readable address shares one bucket). The pending share is given back the
+ * moment the hello authenticates the connection; the whole slot is given back
+ * when the TCP socket closes — whatever phase it closed in, including a
+ * handshake `ws` aborted without ever creating a WebSocket. A pending share
+ * therefore lasts at most the hello window plus the closing grace period,
+ * which is the `Retry-After` of both refusals. The defaults
+ * ({@link DEFAULT_MAX_PENDING_HANDSHAKES},
+ * {@link DEFAULT_MAX_PENDING_HANDSHAKES_PER_PEER},
+ * {@link DEFAULT_MAX_OPEN_CONNECTIONS}) are far above what a few editors, a
+ * service worker and a few dev servers hold, and bound what an unauthenticated
+ * local process can make the service keep for it. The authenticated
+ * population is bounded separately, after the hello, by the client registry.
  *
  * **Handshake.** The first frame on a new socket must be a `client.hello`
  * carrying the credential, and it must arrive within protocol's
@@ -216,9 +242,11 @@
  * server it was attached to, stops the heartbeat, closes every socket (both
  * authenticated ones and ones still awaiting their hello), terminates any that
  * do not finish the closing handshake within a short grace period, waits for
- * in-flight frame handlers to settle, and unregisters every connection still
- * retained offline — so `startService(...).close()` leaves no open socket, no
- * live timer and no registration of this server's between integration suites.
+ * in-flight frame handlers to settle, destroys any socket still inside the
+ * `ws` handshake, and unregisters every connection still retained offline — so
+ * `startService(...).close()` leaves no open socket, no live timer, no
+ * admission reservation and no registration of this server's between
+ * integration suites.
  * Before any socket is closed it closes the {@link SourceOpenPort}, which
  * settles every forward still awaiting an editor, and gives those answers the
  * same grace period to reach their senders, so no editor deadline outlives the
@@ -242,6 +270,7 @@
  */
 
 import { STATUS_CODES, type IncomingMessage } from 'node:http';
+import { isIPv4 } from 'node:net';
 import type { Duplex } from 'node:stream';
 
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
@@ -300,6 +329,7 @@ import type {
   WorkspaceAnnouncement,
 } from './auth.js';
 import {
+  DEFAULT_MAX_CLIENTS,
   DEFAULT_OFFLINE_GRACE_MS,
   MAX_CLOSE_REASON_BYTES,
   WS_CLOSE_GOING_AWAY,
@@ -346,6 +376,64 @@ export const DEFAULT_MAX_PENDING_FRAMES = 256;
  * for in-flight frame handlers.
  */
 export const CLOSE_HANDSHAKE_GRACE_MS = 1_000;
+
+/**
+ * The most sockets admitted but not yet authenticated at once, across every
+ * peer: upgrades inside the `ws` handshake, sockets awaiting their hello, and
+ * refused ones still finishing their closing handshake.
+ *
+ * Every legitimate client authenticates in its first frame, within protocol's
+ * `CLIENT_HELLO_TIMEOUT_MS`, so this population is a handful at a time even
+ * when every editor window, the MV3 service worker and several dev servers
+ * reconnect together after a service restart. 64 leaves an order of magnitude
+ * of headroom for that burst while bounding what an unauthenticated local
+ * process can hold open to 64 sockets (and their timers) for one hello window.
+ * Past it an upgrade is answered 429.
+ */
+export const DEFAULT_MAX_PENDING_HANDSHAKES = 64;
+
+/**
+ * The most admitted-but-unauthenticated sockets one peer — one TCP remote
+ * address — may hold at once. Past it that peer's upgrade is answered 429
+ * while other peers are still admitted.
+ *
+ * On the loopback interface the service binds, the peers are the IPv4 and IPv6
+ * loopback addresses, so half of {@link DEFAULT_MAX_PENDING_HANDSHAKES} keeps
+ * one address family from starving the other.
+ */
+export const DEFAULT_MAX_PENDING_HANDSHAKES_PER_PEER = 32;
+
+/**
+ * The most WebSocket sockets the service keeps open at once, in any phase:
+ * every connection the client registry may hold after its hello
+ * (`DEFAULT_MAX_CLIENTS`) plus the unauthenticated share
+ * ({@link DEFAULT_MAX_PENDING_HANDSHAKES}), 320 in all. Past it an upgrade is
+ * answered 503.
+ *
+ * It is also the ceiling of the `maxOpenConnections` option — the value may be
+ * lowered but never raised — so the composition root can size the HTTP
+ * server's own connection limit above it and keep sockets free for HTTP
+ * requests however many WebSockets are open.
+ */
+export const DEFAULT_MAX_OPEN_CONNECTIONS = DEFAULT_MAX_CLIENTS + DEFAULT_MAX_PENDING_HANDSHAKES;
+
+/**
+ * The shortest interval between two `warn` records of refused upgrades, in
+ * milliseconds. A refusal inside the interval is filed at `debug` and counted,
+ * and the next `warn` carries that count, so a flood of upgrades cannot turn
+ * into a flood of log records at the operating levels.
+ */
+const ADMISSION_WARN_INTERVAL_MS = 60_000;
+
+/**
+ * The admission bucket of a socket whose remote address cannot be read (it
+ * closed before the gate ran, or the transport has none): every such socket
+ * shares it, so an unreadable address never escapes the per-peer quota.
+ */
+const UNKNOWN_PEER = 'unknown';
+
+/** The prefix of an IPv4 address written as an IPv4-mapped IPv6 address. */
+const IPV4_MAPPED_PREFIX = '::ffff:';
 
 /**
  * RFC 6455 close code 1011, "Internal Error": the credential could not be
@@ -533,6 +621,13 @@ const UNREPORTABLE_FAILURE_MESSAGE =
   'The Debug Generator local service could not describe this failure. Its log holds the reason under this ref.';
 const SERVER_CLOSED_MESSAGE = 'The WebSocket server is closed.';
 const ALREADY_ATTACHED_MESSAGE = 'The WebSocket server is already attached to this HTTP server.';
+
+/**
+ * The record message of an upgrade refused by the admission quotas. Constant,
+ * like every record message of this module; the record's fields are counts,
+ * limits and the closed refusal category, never the peer's address.
+ */
+const ADMISSION_REFUSED_LOG = 'refused a WebSocket upgrade past its admission quota';
 
 /**
  * The record message of each socket or timer callback {@link createWsServer}
@@ -812,6 +907,27 @@ export interface WsServerDeps {
    * how long a suspended service worker may stay away.
    */
   readonly offlineGraceMs?: number | undefined;
+  /**
+   * The most sockets open at once in any phase; the next upgrade is answered
+   * 503. An integer from 1 to {@link DEFAULT_MAX_OPEN_CONNECTIONS}, which is
+   * also the default: it may be lowered (a test does) but never raised.
+   */
+  readonly maxOpenConnections?: number | undefined;
+  /**
+   * The most sockets admitted but not yet authenticated at once, across every
+   * peer; the next upgrade is answered 429. An integer from 1 to
+   * `maxOpenConnections`; defaults to {@link DEFAULT_MAX_PENDING_HANDSHAKES},
+   * or `maxOpenConnections` when that is smaller.
+   */
+  readonly maxPendingHandshakes?: number | undefined;
+  /**
+   * The most sockets one peer (TCP remote address) may hold admitted but not
+   * yet authenticated at once; that peer's next upgrade is answered 429. An
+   * integer from 1 to `maxPendingHandshakes`; defaults to
+   * {@link DEFAULT_MAX_PENDING_HANDSHAKES_PER_PEER}, or `maxPendingHandshakes`
+   * when that is smaller.
+   */
+  readonly maxPendingHandshakesPerPeer?: number | undefined;
 }
 
 /** Counters for diagnostics and for the shutdown audit of the integration suites. */
@@ -826,6 +942,23 @@ export interface WsServerStats {
   readonly pendingFrames: number;
   /** Closed connections still registered (offline) within their grace period. */
   readonly offlineRetained: number;
+  /**
+   * Sockets holding an admission slot: every upgrade the gate admitted whose
+   * TCP socket has not closed yet, whether it is inside the `ws` handshake,
+   * awaiting its hello, authenticated or closing. Bounded by
+   * `maxOpenConnections`.
+   */
+  readonly admitted: number;
+  /**
+   * Admitted sockets that have not authenticated: inside the `ws` handshake,
+   * awaiting their hello, or closing after a refused one. Bounded by
+   * `maxPendingHandshakes`.
+   */
+  readonly pendingHandshakes: number;
+  /** Distinct peers holding at least one of {@link pendingHandshakes}. */
+  readonly pendingPeers: number;
+  /** Upgrades refused by the admission quotas (429 or 503) since the server was created. */
+  readonly refusedUpgrades: number;
   /** HTTP servers the upgrade listener is attached to. */
   readonly attached: number;
   /** Whether a live heartbeat timer exists. */
@@ -846,8 +979,10 @@ export interface WsServer {
   attach(server: UpgradeSource): Result<void, DebuggenError>;
   /**
    * The upgrade gate, for a caller that wires the `upgrade` event itself:
-   * path, then origin, then the `ws` handshake. Never throws; a refused upgrade
-   * is answered with an HTTP status and the TCP socket destroyed.
+   * path, then origin, then admission (the per-peer and global pending-handshake
+   * quotas and the open-socket cap), then the `ws` handshake. Never throws; a
+   * refused upgrade is answered with an HTTP status and the TCP socket
+   * destroyed.
    */
   handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void;
   /** Current counters. */
@@ -879,6 +1014,68 @@ type ConnectionPhase = 'awaiting-hello' | 'authenticated' | 'closing' | 'closed'
 type TimerHandle = ReturnType<typeof setTimeout>;
 
 /**
+ * Why the upgrade gate refused to admit a socket, in the order the gate checks:
+ * the peer's pending share, the global pending share, the open-socket cap.
+ */
+type AdmissionRefusal = 'peer-quota' | 'pending-quota' | 'capacity';
+
+/**
+ * The HTTP status each admission refusal is answered with: 429 when the
+ * unauthenticated share is exhausted — the caller, or the crowd of callers that
+ * have not authenticated, is asking too often — and 503 when the service is at
+ * its socket capacity whoever is asking.
+ */
+const ADMISSION_REFUSAL_STATUS = Object.freeze({
+  'peer-quota': 429,
+  'pending-quota': 429,
+  capacity: 503,
+} as const satisfies Readonly<Record<AdmissionRefusal, number>>);
+
+/** The validated admission bounds of one server. */
+interface AdmissionLimits {
+  readonly maxOpenConnections: number;
+  readonly maxPendingHandshakes: number;
+  readonly maxPendingHandshakesPerPeer: number;
+}
+
+/**
+ * One admitted socket's reservation. Each method gives back its share at most
+ * once however often, and in whatever order, it is called, so every path that
+ * can end a handshake or a socket may call it without coordinating.
+ */
+interface AdmissionTicket {
+  /** Gives back the pending-handshake share: the hello authenticated the connection. */
+  authenticated(): void;
+  /** Gives back everything the ticket still holds: the socket closed. */
+  release(): void;
+}
+
+/** The gate's answer to one upgrade. */
+type AdmissionDecision =
+  | { readonly admitted: true; readonly ticket: AdmissionTicket }
+  | {
+      readonly admitted: false;
+      readonly refusal: AdmissionRefusal;
+      /** The refused peer's pending handshakes at the time — a count, never the address. */
+      readonly peerPending: number;
+    };
+
+/** The ledger's counters, as {@link WsServerStats} reports them. */
+interface AdmissionSnapshot {
+  readonly admitted: number;
+  readonly pendingHandshakes: number;
+  readonly pendingPeers: number;
+}
+
+/** The admission counters of one server; see {@link createAdmissionLedger}. */
+interface AdmissionLedger {
+  /** Reserves a slot for `peer`, or says which bound refuses it. */
+  admit(peer: string): AdmissionDecision;
+  /** The current counters. */
+  snapshot(): AdmissionSnapshot;
+}
+
+/**
  * Everything this module keeps about one socket. No field holds the credential:
  * the hello's token lives only in the local variables of the handshake.
  */
@@ -886,6 +1083,8 @@ interface ConnectionState {
   readonly socket: WebSocket;
   /** The upgrade request's raw `Origin` header, for the hello's origin check. Never logged. */
   readonly origin: string | undefined;
+  /** The admission slot the upgrade gate reserved for this socket. */
+  readonly admission: AdmissionTicket;
   phase: ConnectionPhase;
   /** The hello deadline, while awaiting the hello. */
   helloTimer: TimerHandle | undefined;
@@ -1001,6 +1200,107 @@ function requestPathOf(url: string | undefined): string {
   }
   const end = url.search(/[?#]/);
   return end === -1 ? url : url.slice(0, end);
+}
+
+/**
+ * The admission bucket of an upgrade: its TCP remote address, lower-cased, with
+ * an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`, what a dual-stack listener
+ * reports for an IPv4 peer) folded to the IPv4 address it maps, so one peer is
+ * one bucket whichever way the listener was bound. An absent or empty address
+ * is {@link UNKNOWN_PEER}, one bucket every such socket shares.
+ *
+ * The key is used for counting only: it is never logged or sent anywhere.
+ *
+ * @example
+ * ```ts
+ * peerKeyOf('::ffff:127.0.0.1'); // → '127.0.0.1'
+ * peerKeyOf('::1');              // → '::1'
+ * peerKeyOf(undefined);          // → 'unknown'
+ * ```
+ */
+function peerKeyOf(address: string | undefined): string {
+  if (address === undefined || address.length === 0) {
+    return UNKNOWN_PEER;
+  }
+  const normalized = address.toLowerCase();
+  if (normalized.startsWith(IPV4_MAPPED_PREFIX)) {
+    const mapped = normalized.slice(IPV4_MAPPED_PREFIX.length);
+    if (isIPv4(mapped)) {
+      return mapped;
+    }
+  }
+  return normalized;
+}
+
+/**
+ * The admission counters of one server: how many sockets hold a slot, how many
+ * of those have not authenticated, and how many of those each peer holds.
+ *
+ * {@link AdmissionLedger.admit} checks the three bounds in the order the
+ * contract table states — the peer's pending share, the global pending share,
+ * then the open-socket cap — so a refusal that a hello window will clear is
+ * reported as the 429 whose `Retry-After` is exact, and only a service full of
+ * authenticated sockets as the 503. An admitted socket's counts are held by its
+ * {@link AdmissionTicket}, whose methods are idempotent. A peer's entry exists
+ * only while it holds a pending share, so the map never outgrows
+ * `maxPendingHandshakes` entries.
+ *
+ * Node runs every caller on one thread, so the counters need no locking; each
+ * `admit` checks and reserves in one synchronous step.
+ */
+function createAdmissionLedger(limits: AdmissionLimits): AdmissionLedger {
+  let admitted = 0;
+  let pending = 0;
+  const pendingByPeer = new Map<string, number>();
+
+  function admit(peer: string): AdmissionDecision {
+    const peerPending = pendingByPeer.get(peer) ?? 0;
+    if (peerPending >= limits.maxPendingHandshakesPerPeer) {
+      return { admitted: false, refusal: 'peer-quota', peerPending };
+    }
+    if (pending >= limits.maxPendingHandshakes) {
+      return { admitted: false, refusal: 'pending-quota', peerPending };
+    }
+    if (admitted >= limits.maxOpenConnections) {
+      return { admitted: false, refusal: 'capacity', peerPending };
+    }
+    admitted += 1;
+    pending += 1;
+    pendingByPeer.set(peer, peerPending + 1);
+
+    let holdsPending = true;
+    let holdsSlot = true;
+    const releasePending = (): void => {
+      if (!holdsPending) {
+        return;
+      }
+      holdsPending = false;
+      pending -= 1;
+      const left = (pendingByPeer.get(peer) ?? 0) - 1;
+      if (left > 0) {
+        pendingByPeer.set(peer, left);
+      } else {
+        pendingByPeer.delete(peer);
+      }
+    };
+    const ticket: AdmissionTicket = Object.freeze({
+      authenticated: releasePending,
+      release: (): void => {
+        releasePending();
+        if (holdsSlot) {
+          holdsSlot = false;
+          admitted -= 1;
+        }
+      },
+    });
+    return { admitted: true, ticket };
+  }
+
+  function snapshot(): AdmissionSnapshot {
+    return { admitted, pendingHandshakes: pending, pendingPeers: pendingByPeer.size };
+  }
+
+  return Object.freeze({ admit, snapshot });
 }
 
 /**
@@ -1354,10 +1654,59 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   if (isErr(graceOption)) {
     return graceOption;
   }
+  // The three admission bounds nest — per peer ≤ global pending ≤ open — so
+  // each is validated against the one above it, and a default larger than an
+  // injected smaller bound follows that bound down.
+  const openOption = integerOption(
+    'maxOpenConnections',
+    deps.maxOpenConnections,
+    DEFAULT_MAX_OPEN_CONNECTIONS,
+    1,
+    DEFAULT_MAX_OPEN_CONNECTIONS,
+  );
+  if (isErr(openOption)) {
+    return openOption;
+  }
+  const pendingOption = integerOption(
+    'maxPendingHandshakes',
+    deps.maxPendingHandshakes,
+    Math.min(DEFAULT_MAX_PENDING_HANDSHAKES, openOption.value),
+    1,
+    openOption.value,
+  );
+  if (isErr(pendingOption)) {
+    return pendingOption;
+  }
+  const peerOption = integerOption(
+    'maxPendingHandshakesPerPeer',
+    deps.maxPendingHandshakesPerPeer,
+    Math.min(DEFAULT_MAX_PENDING_HANDSHAKES_PER_PEER, pendingOption.value),
+    1,
+    pendingOption.value,
+  );
+  if (isErr(peerOption)) {
+    return peerOption;
+  }
   const heartbeatIntervalMs = heartbeatOption.value;
   const helloTimeoutMs = helloOption.value;
   const maxPendingFrames = backlogOption.value;
   const offlineGraceMs = graceOption.value;
+  const limits: AdmissionLimits = Object.freeze({
+    maxOpenConnections: openOption.value,
+    maxPendingHandshakes: pendingOption.value,
+    maxPendingHandshakesPerPeer: peerOption.value,
+  });
+  /**
+   * The `Retry-After` of an admission refusal, in whole seconds: the longest a
+   * pending share can be held — the hello window, then the closing grace
+   * period after which a refused socket is terminated — rounded up. A 429 is
+   * therefore always clearable by the time it names; a 503 is a hint, since
+   * authenticated sockets close when their clients choose.
+   */
+  const admissionRetryAfterSeconds = Math.max(
+    1,
+    Math.ceil((helloTimeoutMs + CLOSE_HANDSHAKE_GRACE_MS) / 1_000),
+  );
 
   const { auth, clients, binding, telemetry, readiness, targets, sourceOpen } = deps;
   // Guarded before the child is derived, so no record this module writes —
@@ -1390,6 +1739,21 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * closing grace period, after closing the {@link SourceOpenPort}.
    */
   const sourceRelays = new Set<Promise<void>>();
+  /** The admission counters the upgrade gate reserves against. */
+  const admissions = createAdmissionLedger(limits);
+  /**
+   * Every TCP socket holding an admission slot, until it emits `close`, with a
+   * promise that settles then. {@link WsServer.close} destroys the ones no
+   * connection state owns — a handshake `ws` has not finished or has aborted —
+   * and waits for them, so no reservation outlives the server.
+   */
+  const admittedSockets = new Map<Duplex, Promise<void>>();
+  /** Upgrades refused by the admission quotas since the server was created. */
+  let refusedUpgrades = 0;
+  /** When the last `warn` record of a refused upgrade was written (`performance.now()`). */
+  let lastRefusalWarnAt: number | undefined;
+  /** Refused upgrades filed at `debug` since that record, reported by the next one. */
+  let refusalsSinceWarn = 0;
   let closed = false;
   let closePromise: Promise<void> | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -1478,8 +1842,14 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
 
   /* ---- the upgrade gate ---- */
 
-  /** Answers a refused upgrade with a bare HTTP status and destroys the TCP socket. */
-  function rejectUpgrade(socket: Duplex, status: number): void {
+  /**
+   * Answers a refused upgrade with a bare HTTP status and destroys the TCP
+   * socket. The response holds nothing the client sent: the status line,
+   * `Connection: close`, an empty body, `Cache-Control: no-store` and
+   * `X-Content-Type-Options: nosniff` on every status, and — for an admission
+   * refusal — the `Retry-After` the client is to wait, in seconds.
+   */
+  function rejectUpgrade(socket: Duplex, status: number, retryAfterSeconds?: number): void {
     socket.on('error', (cause) => {
       log.debug(
         'a refused upgrade socket failed while closing',
@@ -1493,9 +1863,71 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     socket.once('finish', () => {
       socket.destroy();
     });
-    socket.end(
-      `HTTP/1.1 ${String(status)} ${STATUS_CODES[status] ?? ''}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
-    );
+    const head = [
+      `HTTP/1.1 ${String(status)} ${STATUS_CODES[status] ?? ''}`,
+      'Connection: close',
+      'Content-Length: 0',
+      'Cache-Control: no-store',
+      'X-Content-Type-Options: nosniff',
+      ...(retryAfterSeconds === undefined ? [] : [`Retry-After: ${String(retryAfterSeconds)}`]),
+    ];
+    socket.end(`${head.join('\r\n')}\r\n\r\n`);
+  }
+
+  /**
+   * Answers an upgrade the admission quotas refused — 429 or 503, with
+   * `Retry-After` — and files it with counts and limits only: never the
+   * peer's address, the origin or the request target. The first refusal of
+   * each {@link ADMISSION_WARN_INTERVAL_MS} is filed at `warn` with the number
+   * of refusals filed at `debug` since the one before it; the others at
+   * `debug`.
+   */
+  function refuseAdmission(
+    socket: Duplex,
+    decision: Extract<AdmissionDecision, { readonly admitted: false }>,
+  ): void {
+    refusedUpgrades += 1;
+    const status = ADMISSION_REFUSAL_STATUS[decision.refusal];
+    const counts = admissions.snapshot();
+    const fields: LogFields = {
+      status,
+      refusal: decision.refusal,
+      admitted: counts.admitted,
+      pendingHandshakes: counts.pendingHandshakes,
+      peerPendingHandshakes: decision.peerPending,
+      maxOpenConnections: limits.maxOpenConnections,
+      maxPendingHandshakes: limits.maxPendingHandshakes,
+      maxPendingHandshakesPerPeer: limits.maxPendingHandshakesPerPeer,
+    };
+    const now = performance.now();
+    if (lastRefusalWarnAt === undefined || now - lastRefusalWarnAt >= ADMISSION_WARN_INTERVAL_MS) {
+      log.warn(ADMISSION_REFUSED_LOG, { ...fields, suppressed: refusalsSinceWarn });
+      lastRefusalWarnAt = now;
+      refusalsSinceWarn = 0;
+    } else {
+      refusalsSinceWarn += 1;
+      log.debug(ADMISSION_REFUSED_LOG, fields);
+    }
+    rejectUpgrade(socket, status, admissionRetryAfterSeconds);
+  }
+
+  /**
+   * Ties an admitted socket's reservation to its TCP socket: the ticket is
+   * released when the socket emits `close`, whichever phase it closed in —
+   * including a handshake `ws` refused or never finished, which leaves no
+   * connection state behind to release it. Registered before `ws` sees the
+   * socket, so this listener runs before `ws`'s own and the slot is free by
+   * the time the connection's `close` is handled.
+   */
+  function holdAdmission(socket: Duplex, ticket: AdmissionTicket): void {
+    const released = new Promise<void>((resolve) => {
+      socket.once('close', () => {
+        ticket.release();
+        admittedSockets.delete(socket);
+        resolve();
+      });
+    });
+    admittedSockets.set(socket, released);
   }
 
   function handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -1517,9 +1949,29 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
         rejectUpgrade(socket, 403);
         return;
       }
+      // A socket already gone has nobody to answer, and it may already have
+      // emitted the `close` that would give a reservation back.
+      if (socket.destroyed) {
+        return;
+      }
+      // The slot is reserved before `ws` allocates anything for the socket.
+      const decision = admissions.admit(peerKeyOf(request.socket.remoteAddress));
+      if (!decision.admitted) {
+        refuseAdmission(socket, decision);
+        return;
+      }
+      const ticket = decision.ticket;
+      holdAdmission(socket, ticket);
       wss.handleUpgrade(request, socket, head, (ws) => {
         guarded('accept', undefined, () => {
-          accept(ws, origin);
+          try {
+            accept(ws, origin, ticket);
+          } catch (cause) {
+            // Without its state and hello deadline the socket would keep its
+            // slot for as long as the peer kept it open.
+            ws.terminate();
+            throw cause;
+          }
         });
       });
     } catch (cause) {
@@ -1530,8 +1982,13 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
 
   /* ---- connection lifecycle ---- */
 
-  /** Starts tracking a freshly upgraded socket and arms its hello deadline. */
-  function accept(socket: WebSocket, origin: string | undefined): void {
+  /**
+   * Starts tracking a freshly upgraded socket and arms its hello deadline.
+   *
+   * @param admission The slot the upgrade gate reserved for the socket, given
+   * back in part when the hello authenticates and in full when it closes.
+   */
+  function accept(socket: WebSocket, origin: string | undefined, admission: AdmissionTicket): void {
     let settleClosed: () => void = () => undefined;
     const closedSignal = new Promise<void>((resolve) => {
       settleClosed = resolve;
@@ -1539,6 +1996,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     const state: ConnectionState = {
       socket,
       origin,
+      admission,
       phase: 'awaiting-hello',
       helloTimer: undefined,
       closeTimer: undefined,
@@ -1673,6 +2131,10 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * once when the grace period is zero or the server is closing. A rotation
    * that closed the socket has already cleared every announcement, and a lease
    * on a cleared announcement is a no-op.
+   *
+   * The admission slot is released here too, whatever phase the socket closed
+   * in. The TCP socket's own `close` normally released it a moment earlier;
+   * the ticket gives its share back once, whichever of the two comes first.
    */
   function onClose(state: ConnectionState, code: number): void {
     if (state.phase === 'closed') {
@@ -1681,6 +2143,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     state.phase = 'closed';
     clearHelloTimer(state);
     clearCloseTimer(state);
+    state.admission.release();
     connections.delete(state.socket);
     const announcement = state.announcement;
     state.announcement = undefined;
@@ -1842,6 +2305,10 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     state.clientId = registered.value.id;
     state.kind = registered.value.kind;
     state.announcement = announcement;
+    // Authenticated, the connection no longer counts against the
+    // unauthenticated share; it keeps its slot among the open sockets, and
+    // the client registry bounds the authenticated population from here on.
+    state.admission.authenticated();
     log.debug('authenticated a WebSocket connection', fieldsOf(state));
 
     if (PRODUCER_ROLES.includes(principal.role)) {
@@ -2505,12 +2972,17 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       }
       pendingFrames += state.pending;
     }
+    const admission = admissions.snapshot();
     return Object.freeze({
       open: connections.size,
       awaitingHello,
       authenticated,
       pendingFrames,
       offlineRetained: retained.size,
+      admitted: admission.admitted,
+      pendingHandshakes: admission.pendingHandshakes,
+      pendingPeers: admission.pendingPeers,
+      refusedUpgrades,
       attached: attached.size,
       heartbeatActive: heartbeat !== undefined,
       closed,
@@ -2549,6 +3021,18 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     // Each socket settles on its own `close` event, which the terminate
     // fallback of `closeConnection` guarantees within the grace period.
     await Promise.all(states.map((state) => state.closed));
+    // What still holds an admission slot now has no connection state: a
+    // handshake `ws` has not finished, or one it aborted whose TCP `close` is
+    // still to come. Destroying it (a no-op for a socket already destroyed)
+    // gives the slot back, so the counters read zero once this resolves.
+    const handshaking = [...admittedSockets];
+    for (const [socket] of handshaking) {
+      socket.destroy();
+    }
+    await settleWithin(
+      Promise.all(handshaking.map(([, released]) => released)),
+      CLOSE_HANDSHAKE_GRACE_MS,
+    );
     await settleWithin(Promise.all(states.map((state) => state.tail)), CLOSE_HANDSHAKE_GRACE_MS);
 
     // Connections that closed earlier and are still within their grace period

@@ -1,7 +1,7 @@
 /**
  * Tests for `../client/http-client.ts`, the HTTP half of this package's
  * transport SDK, in the directory `packages/protocol/tsconfig.json` names for
- * this package's suites (AAP §0.8.3).
+ * this package's suites.
  *
  * What is on trial is the **client**, not the route table: `./http.test.ts`
  * already pins every route, schema and exemption. Here a fake `fetch` — a
@@ -20,10 +20,10 @@
  *   must then fail locally: the transport is never called, the credential
  *   provider is never asked, no `authorization` header exists, and the raw value
  *   (seeded with a unique marker) appears nowhere, because it may carry a pasted
- *   credential (CWE-200, CWE-918, AAP §0.5.2).
+ *   credential (CWE-200, CWE-918).
  * - **The credential itself.** Sixteen operations carry
  *   `authorization: Bearer <token>`; `health` and `pair.complete` never do, even
- *   when a credential is configured (AAP §0.5.6). A credential may be a string,
+ *   when a credential is configured. A credential may be a string,
  *   a synchronous or asynchronous provider, may throw, reject or be absent, and
  *   may be rotated between calls — each of those has a case.
  * - **What goes on the wire.** Method and URL come from `HTTP_ROUTES` and
@@ -33,9 +33,9 @@
  *   header ever. A missing path parameter or a body the route's schema refuses
  *   fails before anything is sent.
  * - **The acting tab.** One paired DevTools credential serves every inspected
- *   tab, so a call's `tabId` becomes the acting-tab header the service holds a
- *   DevTools request to (AAP §0.5.6) — through `request` and through a named
- *   method's options alike. No `tabId`, no header; a `tabId` that is not a tab
+ *   tab, so a call's `tabId` becomes the acting-tab header by which the service
+ *   scopes a DevTools request — through `request` and through a named method's
+ *   options alike. No `tabId`, no header; a `tabId` that is not a tab
  *   id, or one given for an auth-exempt operation, fails locally with neither
  *   the credential provider nor the transport reached.
  * - **What comes back.** A valid reply parses; invalid JSON, a schema-violating
@@ -85,6 +85,7 @@ import {
   CAPTURE_CONFLICT_ERROR_CODE,
   HTTP_OPERATIONS,
   HTTP_ROUTES,
+  READ_PROOF_LENGTH,
   WS_PATH,
   buildPath,
   formatBearer,
@@ -1304,17 +1305,24 @@ describe('HttpClient — replies', () => {
       baseUrl: ORIGIN,
       fetch: fetchReplying(reply(200, HEALTH_REPLY)),
     });
+    // A low-entropy stand-in for the read proof the service issues at pairing.
+    const readProof = 'p'.repeat(READ_PROOF_LENGTH);
     const pairing = new HttpClient({
       baseUrl: ORIGIN,
-      fetch: fetchReplying(reply(200, { token: 'tok-devtools-1' })),
+      fetch: fetchReplying(reply(200, { token: 'tok-devtools-1', readProof })),
     });
 
     expect(valueOf(await health.health())).toEqual(HEALTH_REPLY);
-    expect(valueOf(await pairing.pairComplete(PAIRING_CODE))).toEqual({ token: 'tok-devtools-1' });
+    expect(valueOf(await pairing.pairComplete(PAIRING_CODE))).toEqual({
+      token: 'tok-devtools-1',
+      readProof,
+    });
   });
 
   it('sends the pairing code as the pair.complete body and nowhere else', async () => {
-    const fetch = fetchReplying(reply(200, { token: 'tok-devtools-1' }));
+    const fetch = fetchReplying(
+      reply(200, { token: 'tok-devtools-1', readProof: 'p'.repeat(READ_PROOF_LENGTH) }),
+    );
     const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
 
     await client.pairComplete(PAIRING_CODE);

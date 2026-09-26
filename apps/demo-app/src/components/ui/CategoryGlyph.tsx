@@ -1,81 +1,26 @@
 /*
- * Lumen Supply - the category glyph.
+ * Lumen Supply - the category glyph: a small mark before a category's name in the catalog's
+ * filter chips and the dashboard's category grouping headers.
  *
- * A small mark that sits immediately before a category's name: in the catalog's filter chips
- * (`catalog/CategoryFilterChips`, each chip a `ui/Pill`) and in the dashboard's category grouping
- * headers (`dashboard/InventoryLevelsTable`). It lives in `ui/` rather than in either of those
- * folders because both need it and, more importantly, because of the asymmetry it exists to
- * absorb - which has exactly one home, this file.
+ * Only the six slugs with a drawing in `public/categories/` render; any other slug renders
+ * nothing - no element, no request, no fallback icon - so a chip for a category without art is
+ * simply a chip with a word in it. Matching is exact, with no lowercasing or trimming: `'Valve'`
+ * and `' valve'` render nothing rather than a guess about the spelling. `slug` is a plain
+ * `string` narrowed here, once, so no caller can skip the check with a cast.
  *
- * THE ASYMMETRY
- * `apps/demo-app/public/categories/` holds six drawings; the seed creates roughly twice as many
- * categories. Most categories therefore have no art, and every caller passes a slug that came
- * from the API without knowing which kind it is. The rule is absolute: a slug that matches one of
- * the six renders its glyph, and anything else renders NOTHING - no element, no request, no
- * broken-image frame, no `onError` handler, no generic "other" icon, no letter avatar. A chip for
- * a category without art is simply a chip with a word in it, which is a rendering every surface
- * here already supports.
+ * The element is an empty `<span>`. `CategoryGlyph.module.css` uses the asset as a `mask-image`
+ * and paints `background-color: currentColor` through it, so the glyph follows the chip's text
+ * colour into a selected chip's inversion, which an image element cannot do. `.root` declares no
+ * mask and a transparent fill, so an unmatched slug that reached the DOM would still paint
+ * nothing. There is no static asset import: those are typed only by the generated, git-ignored
+ * `next-env.d.ts`, so the asset paths belong to the stylesheet.
  *
- * `CategoryGlyph.module.css` reaches the same answer independently, and deliberately: `.root`
- * declares no mask image and a transparent fill, and only the six slug rules turn the paint on.
- * Neither half is redundant. A masked element whose mask image is missing is not masked at all and
- * would paint its fill across the whole box, so an unmatched slug that ever reached the DOM would
- * render as a solid square - the broken icon the rule forbids. The component keeps it out of the
- * DOM; the stylesheet makes sure it would show nothing even if it got there.
+ * Size and artwork are data attributes, not classes looked up in `styles`, so the prop unions
+ * constrain them and no computed key is typed `string | undefined` under
+ * `noUncheckedIndexedAccess`.
  *
- * WHY THE PROP IS A `string` AND NOT THE SIX-MEMBER UNION
- * Narrowing happens here, once, in `isKnown`. Typing `slug` to the union would push that decision
- * onto every caller - each holding a `string` from `/api/products` or a Prisma row - and the first
- * one to reach for a cast instead of a check would ship the broken icon this component exists to
- * prevent. A plain `string` in, a guard inside, and the degradation cannot be bypassed by accident.
- *
- * Near misses are rejected rather than repaired: no lowercasing, no trimming, no punctuation
- * fixing. `'Valve'` and `' valve'` are not `'valve'` and render nothing. Coercion would make the
- * mapping dishonest - it would claim a category has art on the strength of a guess about its
- * spelling - and it would hide a real data problem behind an icon that happens to appear. A
- * category either has a drawing under that exact name or it does not.
- *
- * WHY AN EMPTY `<span>` AND NOT AN IMAGE
- * The assets are stroke-only, with `stroke="currentColor"`. Fetched through an image element - the
- * one Next's image component renders included - each becomes an independent document, so that
- * keyword resolves against the file's own root `color` and no rule on this page can reach it. The
- * chips need the opposite: `Pill.module.css` turns a selected chip's `color` white and the glyph
- * has to follow the label into that inversion. So the stylesheet uses the asset as a `mask-image`
- * and paints `background-color: currentColor` through it, which reproduces the drawing in whatever
- * colour the element inherits. This component's whole job on that front is to render an empty box
- * and name its artwork in an attribute; it references no asset in TypeScript at all.
- *
- * That is also why there is no static asset import here. Importing a drawing as a module is typed
- * by the generated, git-ignored `next-env.d.ts`, so a clean clone that has never run a build would
- * fail `pnpm typecheck` on it. The asset paths belong to the stylesheet, which needs no typings.
- *
- * THE VARIANTS ARE ATTRIBUTES, NOT LOOKED-UP CLASSES
- * `CategoryGlyph.module.css` exports one class, `root`, and selects both the size and the artwork
- * with attribute rules. So both props are written straight to the DOM and the styles object is
- * never indexed: a computed key is typed `string | undefined` under this repository's
- * `noUncheckedIndexedAccess` and would hide a typo until the glyph rendered blank in a browser,
- * whereas an attribute is constrained by the types below, cannot apply without the base rule, and
- * is legible in the elements tree beside the class it qualifies.
- *
- * DECORATIVE BY CONTRACT
- * `aria-hidden="true"`, and no `role`, `aria-label`, `title` or children. The category name is
- * always adjacent text supplied by the caller, so the glyph carries no information of its own and
- * announcing it would only make a reader hear the category twice. It is never the sole carrier of
- * meaning either - which is what makes it safe for the stylesheet to let forced-colours mode drop
- * the mark entirely, and safe for two thirds of the categories to have no mark at all.
- *
- * RENDER BEHAVIOUR
- * A plain function component: no state, no effects, no `"use client"` directive - so a server
- * component and a client component render it equally. The output depends only on the props, with
- * nothing read from `window`, `Date.now()` or `Math.random()` during render, so the server's
- * markup and the browser's first markup always agree.
- *
- * NAMING: `scripts/check-no-hardcoding.mjs` harvests this application's declared names into
- * `scripts/no-hardcoding.policy.json`, and no file of the debugging product may then contain one
- * of those literals. Only names of two or more camel-case tokens are harvested, so everything
- * declared here is deliberately single-token (`SLUGS`, `Slug`, `Props`, `isKnown`) or the already
- * policy-bound component name. A `CategorySlug` or `KNOWN_SLUGS` would enter the shared policy,
- * make the committed copy stale and fail `pnpm check:no-hardcoding`.
+ * Decorative: `aria-hidden="true"`, with no role, label or text; the category name is always the
+ * caller's adjacent text. No state, effects or client directive, so it renders on either side.
  */
 
 import clsx from 'clsx';

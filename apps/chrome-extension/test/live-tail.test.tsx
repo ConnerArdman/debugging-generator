@@ -30,10 +30,6 @@ import {
 } from '../src/panel/state/session-store';
 import type { PanelTailNotice } from '../src/panel/state/session-store';
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
 /** The entry's wording, as AAP §0.5.5 states it. */
 const RELOAD_LABEL = 'Page reloaded during capture';
 
@@ -117,10 +113,6 @@ afterEach(() => {
   cleanup();
   resetPanelStore({ includeConnection: true });
 });
-
-// ---------------------------------------------------------------------------
-// Cases
-// ---------------------------------------------------------------------------
 
 describe('LiveTail capture notices', () => {
   it('renders the store notices, newest first, when the root passes none', () => {

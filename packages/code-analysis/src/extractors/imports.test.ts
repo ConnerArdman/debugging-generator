@@ -1123,6 +1123,8 @@ function scratchSourceLines(file: string | undefined): readonly string[] {
     .filter((line) => line.length >= 8);
 }
 
+// A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+// machine can push past the 10 s hook default and so fail every case below.
 beforeAll(async () => {
   // The corpus snapshot is taken before anything opens it, so the comparison at
   // the end of this file covers the whole run rather than only extraction.
@@ -1174,7 +1176,7 @@ beforeAll(async () => {
     snapshotBefore: scratchSnapshotBefore,
     snapshotAfter: snapshotTree(root),
   };
-});
+}, 30_000);
 
 afterAll(() => {
   if (scratchHarness !== undefined) {

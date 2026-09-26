@@ -309,6 +309,7 @@ function fullState(): WebviewState {
     ],
     relevantFiles: session.relevantFiles,
     modifications: session.modifications,
+    modificationsTotal: session.modifications.length + 2,
     analysis: validAnalysis(),
     latestPanel: { id: PANEL_ID, title: 'Where the time goes', panelVersion: 2, fallback: true },
     target: validTarget(),
@@ -360,6 +361,7 @@ function webviewSamples(): Record<WebviewToHostMessageType, WebviewToHostMessage
     dismissPairing: { type: 'dismissPairing', requestId: REQUEST_ID },
     launchDevServer: { type: 'launchDevServer', requestId: REQUEST_ID },
     retryStage: { type: 'retryStage', requestId: REQUEST_ID, stage: 'capture' },
+    loadModifications: { type: 'loadModifications', requestId: REQUEST_ID },
   };
 }
 
@@ -457,6 +459,19 @@ describe('parseHostToWebviewMessage', () => {
     expect(analysisResultSchema.safeParse(validAnalysis()).success).toBe(true);
     const parsed = parseHostToWebviewMessage({ type: 'state', state: fullState() });
     expect(parsed.ok).toBe(true);
+  });
+
+  it('carries modificationsTotal as sent: zero, or a count above the list’s length', () => {
+    for (const modificationsTotal of [0, 1, 256, Number.MAX_SAFE_INTEGER]) {
+      const state: WebviewState = { ...minimalState(), modificationsTotal };
+      expect(
+        parseHostToWebviewMessage({ type: 'state', state }),
+        String(modificationsTotal),
+      ).toStrictEqual({
+        ok: true,
+        message: { type: 'state', state },
+      });
+    }
   });
 
   it('refuses a state frame without a whole snapshot', () => {
@@ -585,6 +600,21 @@ describe('parseHostToWebviewMessage', () => {
       },
       'modifications[] unknown key': (state) => {
         element(state, 'modifications', 0)['extra'] = 1;
+      },
+      'modificationsTotal negative': (state) => {
+        state['modificationsTotal'] = -1;
+      },
+      'modificationsTotal fractional': (state) => {
+        state['modificationsTotal'] = 2.5;
+      },
+      'modificationsTotal unsafe': (state) => {
+        state['modificationsTotal'] = Number.MAX_SAFE_INTEGER + 1;
+      },
+      'modificationsTotal not a number': (state) => {
+        state['modificationsTotal'] = '3';
+      },
+      'modificationsTotal null': (state) => {
+        state['modificationsTotal'] = null;
       },
       'session invalid': (state) => {
         field(state, 'session')['projectRoot'] = 'relative/root';
@@ -840,7 +870,8 @@ describe('parseWebviewToHostMessage', () => {
   });
 
   it('accepts an id-only request only as exactly { type, requestId }', () => {
-    expect(idOnlyRequestTypes).toHaveLength(7);
+    expect(idOnlyRequestTypes).toHaveLength(8);
+    expect(idOnlyRequestTypes).toContain('loadModifications');
     for (const type of idOnlyRequestTypes) {
       expect(parseWebviewToHostMessage({ type, requestId: REQUEST_ID }), type).toStrictEqual({
         ok: true,
@@ -1092,6 +1123,8 @@ describe('ExtensionState snapshots pass the webview parser unchanged', () => {
       target: validTarget(),
     });
     store.applyCleanupCompleted({ sessionId: SESSION_ID, status: 'clean', conflicts: [] });
+    const journal = validSessionRecord().modifications;
+    store.applyModificationJournal(SESSION_ID, journal, journal.length + 3);
     store.setPairing({ code: 'ABCD2345', expiresAt: NOW + 300_000 });
     store.setStageFailure({
       stage: 'analyze',
@@ -1109,6 +1142,7 @@ describe('ExtensionState snapshots pass the webview parser unchanged', () => {
         'failure',
         'latestPanel',
         'modifications',
+        'modificationsTotal',
         'pairing',
         'progress',
         'relevantFiles',
@@ -1116,6 +1150,7 @@ describe('ExtensionState snapshots pass the webview parser unchanged', () => {
         'target',
       ].sort(),
     );
+    expect(snapshot.modificationsTotal).toBe(journal.length + 3);
     expectAccepted(snapshot);
   });
 

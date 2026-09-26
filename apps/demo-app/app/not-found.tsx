@@ -45,12 +45,6 @@ import { BlankSlate } from '@/components/ui/BlankSlate';
 /**
  * The page's one-line answer to "what happened", used twice and therefore declared once: as the
  * block's heading, and as the accessible name of the region that holds it.
- *
- * The copy constants here are deliberately upper-case, like every other block of storefront
- * wording in this application. `scripts/check-no-hardcoding.mjs` harvests this workspace's
- * declared names with two or more camel-case tokens into the policy no product file may then
- * contain, and drops all-caps constants; a `headingText` here would put an entirely generic word
- * into that shared vocabulary for the whole repository.
  */
 const HEADING = 'Page not found';
 
@@ -100,10 +94,10 @@ export const metadata: Metadata = {
  * CSS-module class outranks the element rules in `app/globals.css` - and there is still exactly
  * one heading on the route, because the title is rendered once, in one place.
  *
- * The labelled `<section>` is kept alongside that heading. It is not what exposes the title any
- * more, but it is what gives this page's single block a named region a reader can jump to, and its
- * name is the heading's own words: entering the region announces those three words and the heading
- * inside it reads the same three, which is a repeated label rather than a second sentence of copy.
+ * The labelled `<section>` sits alongside that heading. The heading exposes the title; the section
+ * gives this page's single block a named region a reader can jump to, and its name is the
+ * heading's own words: entering the region announces those three words and the heading inside it
+ * reads the same three, which is a repeated label rather than a second sentence of copy.
  * `aria-label` adds no text to the page, so the title is visible exactly once. Naming the region
  * from the heading's id instead would read identically and cost a second `BlankSlate` prop plus
  * an id this page has no other use for, which is not a trade worth making for one route.
@@ -112,9 +106,9 @@ export const metadata: Metadata = {
  * `<button>` with no link mode by design. It carries no class of its own - the utility set in
  * `app/globals.css` is closed and holds none for a link - so it inherits the block's primary ink
  * against the muted sentence above it and the one focus ring the application draws for keyboard
- * use. `.ls-actions` is the row it sits in, which is what keeps a second destination, added later,
- * beside it rather than under it. Everything else this page might offer - the cart, orders, the
- * dashboard - is already one click away in the navigation row the layout renders above.
+ * use. `.ls-actions` is the row it sits in, which would place any second destination beside it
+ * rather than under it. Everything else this page might offer - the cart, orders, the dashboard -
+ * is already one click away in the navigation row the layout renders above.
  */
 export default function NotFoundPage() {
   return (

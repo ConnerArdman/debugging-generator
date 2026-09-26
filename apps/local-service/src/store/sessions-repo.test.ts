@@ -1,8 +1,9 @@
 /**
- * Tests for the two bounded capture lookups of `./sessions-repo.ts`:
- * `getLatestCapture` and `getPanelCapture`.
+ * Tests for the two bounded capture lookups of `./sessions-repo.ts` —
+ * `getLatestCapture` and `getPanelCapture` — and for its rewrite of a
+ * follow-up that carries no attempt id, `replaceLatestFollowUp`.
  *
- * Both exist for the panel-data resolver (`../panels/data.ts`) and the
+ * Both lookups exist for the panel-data resolver (`../panels/data.ts`) and the
  * panel-data route, and each replaces a read that answered correctly only by
  * reading too much or by reading the wrong thing:
  *
@@ -25,13 +26,24 @@
  *    capture was purged — and refuses, as corrupt, a link the store's own
  *    writers can never produce.
  *
+ * **`replaceLatestFollowUp` stamps only the entry it can prove it is.** The
+ * session manager writes a follow-up's outcome links to its `followups` row in
+ * the transaction that writes them to the record; for an entry stored before
+ * attempts carried an identity there is no attempt id to find the row by, so
+ * the session's newest row is rewritten in place — its id, its order and every
+ * other row kept — and only when it carries no attempt id either and the same
+ * `askedAt`. A missing or disagreeing row, or a record that does carry an
+ * attempt id, is refused with nothing written. The question is never compared,
+ * and never reaches a log line or an error.
+ *
  * The store is the real one: `openStore` against a file in an `mkdtemp`
  * sandbox — never `:memory:` — so the real DDL, the migration ladder and the
  * `foreign_keys` pragma (which is what performs the `SET NULL`) are exercised.
  * Sessions and captures are written through the repository under test, and
  * panels through the real `createPanelsRepo`, which validates every document
  * with `parsePanelSpec`, so no fixture is a shape the service never writes. Raw
- * SQL is used only to damage a row on purpose. Nothing under `$DEBUGGEN_HOME`
+ * SQL is used only to damage a row on purpose or to read the `followups` row
+ * ids the repository does not expose. Nothing under `$DEBUGGEN_HOME`
  * is touched, no environment variable is read and no socket is opened, which
  * is the contract of the `local-service` Vitest project; each test owns its
  * sandbox, store and clock.
@@ -44,9 +56,17 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { PanelSpec } from '@debuggen/panel-schema';
-import { parseSessionRecord } from '@debuggen/protocol';
-import type { SessionRecord } from '@debuggen/protocol';
-import { isErr, newCaptureId, newPanelId, newSessionId, unwrap } from '@debuggen/shared';
+import { FOLLOW_UP_ATTEMPT_ID_PREFIX, parseSessionRecord } from '@debuggen/protocol';
+import type { FollowUpRecord, SessionRecord } from '@debuggen/protocol';
+import {
+  isErr,
+  newAnalysisId,
+  newCaptureId,
+  newId,
+  newPanelId,
+  newSessionId,
+  unwrap,
+} from '@debuggen/shared';
 import type {
   CaptureId,
   DebuggenError,
@@ -555,5 +575,119 @@ describe('getPanelCapture', () => {
     expect(plan).toMatch(/SEARCH c USING (?:COVERING )?INDEX \S+ \(id=\?\) LEFT-JOIN/u);
     expect(plan).not.toContain('SCAN');
     expect(plan).not.toContain('TEMP B-TREE');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * replaceLatestFollowUp
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('replaceLatestFollowUp', () => {
+  /** A follow-up stored before attempts carried an identity; its question carries the sentinel. */
+  function legacyFollowUp(askedAt: number): FollowUpRecord {
+    return { question: `Which request waits longest? ${SENTINEL}`, askedAt };
+  }
+
+  /** The outcome links an answer stamps, freshly minted. */
+  function answered(followUp: FollowUpRecord): FollowUpRecord {
+    return {
+      ...followUp,
+      needsNewCapture: false,
+      captureId: newCaptureId(),
+      analysisId: newAnalysisId(),
+      panelId: newPanelId(),
+    };
+  }
+
+  /** The row ids of a session's follow-ups, in the order they were asked. */
+  function followUpRowIds(sessionId: SessionId): unknown[] {
+    return store
+      .statement('SELECT id FROM followups WHERE session_id = ? ORDER BY id ASC')
+      .all(sessionId)
+      .map((row) => row['id']);
+  }
+
+  it('rewrites the newest unidentified row in place, leaving every other row as it was', () => {
+    const older = legacyFollowUp(CLOCK_START);
+    const newest = legacyFollowUp(CLOCK_START + 10);
+    const otherSession = legacyFollowUp(CLOCK_START + 10);
+    unwrap(sessions.appendFollowUp(sessionA, older));
+    unwrap(sessions.appendFollowUp(sessionA, newest));
+    unwrap(sessions.appendFollowUp(sessionB, otherSession));
+    const ids = followUpRowIds(sessionA);
+    const stamped = answered(newest);
+
+    expect(unwrap(sessions.replaceLatestFollowUp(sessionA, stamped))).toEqual(stamped);
+
+    expect(unwrap(sessions.listFollowUps(sessionA))).toEqual([older, stamped]);
+    expect(followUpRowIds(sessionA)).toEqual(ids);
+    expect(unwrap(sessions.listFollowUps(sessionB))).toEqual([otherSession]);
+    expect(JSON.stringify(logs)).not.toContain(SENTINEL);
+  });
+
+  it('refuses a session that logs no follow-up, writing nothing', () => {
+    const refusal = refusalOf(
+      sessions.replaceLatestFollowUp(sessionA, answered(legacyFollowUp(CLOCK_START))),
+    );
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(refusal.details?.['reason']).toBe('follow-up-not-found');
+    expect(unwrap(sessions.listFollowUps(sessionA))).toEqual([]);
+    expect(errorText(refusal)).not.toContain(SENTINEL);
+  });
+
+  it.each([
+    {
+      newest: 'carries an attempt id',
+      logged: (entry: FollowUpRecord): FollowUpRecord => ({
+        ...entry,
+        attemptId: newId(FOLLOW_UP_ATTEMPT_ID_PREFIX),
+        attempt: 1,
+      }),
+    },
+    {
+      newest: 'was asked at another instant',
+      logged: (entry: FollowUpRecord): FollowUpRecord => ({
+        ...entry,
+        askedAt: entry.askedAt + 1,
+      }),
+    },
+  ])('refuses the rewrite when the newest row $newest, writing nothing', ({ logged }) => {
+    const entry = legacyFollowUp(CLOCK_START + 10);
+    // An older row that would match is not the newest, so it is never taken.
+    unwrap(sessions.appendFollowUp(sessionA, entry));
+    unwrap(sessions.appendFollowUp(sessionA, logged(entry)));
+    const rowsBefore = unwrap(sessions.listFollowUps(sessionA));
+
+    const refusal = refusalOf(sessions.replaceLatestFollowUp(sessionA, answered(entry)));
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(refusal.details?.['reason']).toBe('follow-up-log-disagrees');
+    expect(unwrap(sessions.listFollowUps(sessionA))).toEqual(rowsBefore);
+    expect(errorText(refusal)).not.toContain(SENTINEL);
+    expect(JSON.stringify(logs)).not.toContain(SENTINEL);
+    expect(
+      logs.some(
+        (record) =>
+          record.level === 'warn' && record.fields['reason'] === 'follow-up-log-disagrees',
+      ),
+    ).toBe(true);
+  });
+
+  it('refuses a record carrying an attempt id, which is rewritten by that id instead', () => {
+    unwrap(sessions.appendFollowUp(sessionA, legacyFollowUp(CLOCK_START)));
+    const rowsBefore = unwrap(sessions.listFollowUps(sessionA));
+
+    const refusal = refusalOf(
+      sessions.replaceLatestFollowUp(sessionA, {
+        ...answered(legacyFollowUp(CLOCK_START)),
+        attemptId: newId(FOLLOW_UP_ATTEMPT_ID_PREFIX),
+        attempt: 1,
+      }),
+    );
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(refusal.details?.['reason']).toBe('invalid-follow-up');
+    expect(unwrap(sessions.listFollowUps(sessionA))).toEqual(rowsBefore);
   });
 });

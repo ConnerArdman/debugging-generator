@@ -172,16 +172,12 @@ import type { Context, Handler } from 'hono';
 
 import {
   HTTP_ROUTES,
+  MESSAGE_TYPE,
   parseHttpRequest,
   parseHttpResponse,
   toErrorPayload,
 } from '@debuggen/protocol';
-import type {
-  HttpErrorResponse,
-  MessageByType,
-  MessageType,
-  TelemetryIngestRequest,
-} from '@debuggen/protocol';
+import type { HttpErrorResponse, MessageByType, TelemetryIngestRequest } from '@debuggen/protocol';
 import { DebuggenError, err, isErr, noopLogger, nowEpochMs, ok } from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
 
@@ -228,13 +224,15 @@ import type { ClientRegistry, RegisteredClient } from '../clients.js';
  * verbatim): the HTTP operation of `POST /telemetry/ingest` and the WebSocket
  * message type of a relayed batch.
  *
- * `satisfies AuthenticatedOperation & MessageType` is the compile-time proof of
- * both halves: protocol still requires a bearer credential for the HTTP
- * operation (were it flagged exempt, the handler below would run without a
- * principal), and the name is still a WebSocket message type. A rename on
- * either side stops this line compiling.
+ * The value is protocol's own `MESSAGE_TYPE.TELEMETRY_EVENT` constant, not a
+ * literal restated here, so it is a WebSocket message type by derivation and
+ * its spelling lives in protocol alone. `satisfies AuthenticatedOperation` is
+ * the compile-time proof of the other half: the same name is still an HTTP
+ * operation that protocol requires a bearer credential for — were it flagged
+ * exempt, the handler below would run without a principal — so a change on
+ * that side stops this line compiling.
  */
-const TELEMETRY_EVENT = 'telemetry.event' satisfies AuthenticatedOperation & MessageType;
+const TELEMETRY_EVENT = MESSAGE_TYPE.TELEMETRY_EVENT satisfies AuthenticatedOperation;
 
 /**
  * The protocol operations this module answers over HTTP, in the route table's

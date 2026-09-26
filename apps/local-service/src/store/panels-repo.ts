@@ -48,14 +48,26 @@
  * - a panel that supersedes itself, or that supersedes anything while claiming
  *   to be its session's first version (`validatePanelSpec` rejects both too; the
  *   store must not depend on a caller having run it);
- * - a document whose predecessor is still stored but belongs to another session
- *   or does not carry a lower version.
+ * - a document that names a predecessor the ladder does not hold, one of
+ *   another session, or one that does not carry a lower version;
+ * - a document whose predecessor is no longer its session's **latest** rung —
+ *   another version was stored after the caller read it, which is how two
+ *   follow-ups deciding against the same answer collide — or that does not sit
+ *   exactly one version above it;
+ * - a document above its ladder's first version that names no predecessor.
  *
- * A predecessor that is **absent** is accepted. The `supersedes` column is
+ * Every one of these is judged inside the insert's `BEGIN IMMEDIATE`
+ * transaction, so the rows the rules read are the rows the write lands beside:
+ * every ladder this module writes is one unbroken chain, each rung superseding
+ * the one directly below it.
+ *
+ * The rule is enforced **at insert only**. The `supersedes` column is
  * deliberately not a foreign key (`./schema.sql`), so a superseded panel can be
- * purged on its own without cascading into its successor or nulling the
- * successor's pointer; a dangling `supersedes` is therefore history, not
- * corruption.
+ * purged on its own later without cascading into its successor or nulling the
+ * successor's pointer. A `supersedes` that dangles because its predecessor was
+ * purged after the successor was stored is therefore history, not corruption:
+ * every read still returns the successor, and
+ * {@link PanelsRepo.listSupersededBy} still finds it by the purged id.
  *
  * ## Columns and fields
  *
@@ -183,13 +195,24 @@ const FIRST_PANEL_VERSION = 1;
  * - `unknown-session` — no `sessions` row holds the document's session id.
  * - `unknown-capture` — no `captures` row holds the capture id to associate.
  * - `capture-session-mismatch` — the capture belongs to a different session.
+ * - `supersedes-unknown` — no row of the document's ladder holds the id it names
+ *   as its predecessor.
  * - `supersedes-other-session` — the stored predecessor belongs to a different
  *   session.
  * - `supersedes-not-earlier` — the stored predecessor does not carry a lower
  *   version than the document.
+ * - `supersedes-stale` — the stored predecessor is no longer its session's
+ *   latest document on the ladder: another version was stored after the caller
+ *   read it, so the caller re-reads the latest and decides again.
+ * - `supersedes-not-adjacent` — the document's version is not exactly one above
+ *   its predecessor's; take it from `nextPanelVersion` / `nextAnalysisVersion`.
+ * - `supersedes-missing` — the document sits above its ladder's first version
+ *   but names no predecessor.
  * - `duplicate-id` — a row with the document's id is already stored.
  * - `version-taken` — the session already holds this version; take the next one
- *   from `nextPanelVersion` / `nextAnalysisVersion`.
+ *   from `nextPanelVersion` / `nextAnalysisVersion`. On a healthy store only a
+ *   first version reaches it: a later version racing another writer is refused
+ *   as `supersedes-stale` first.
  * - `corrupt-row` — a stored row is not a document this build can read.
  * - `store-failed` — anything else the store refused: a closed handle, a disk
  *   failure, a lock that could not be taken.
@@ -202,8 +225,12 @@ export const PANELS_REPO_FAILURE_REASONS = Object.freeze([
   'unknown-session',
   'unknown-capture',
   'capture-session-mismatch',
+  'supersedes-unknown',
   'supersedes-other-session',
   'supersedes-not-earlier',
+  'supersedes-stale',
+  'supersedes-not-adjacent',
+  'supersedes-missing',
   'duplicate-id',
   'version-taken',
   'corrupt-row',
@@ -303,6 +330,21 @@ ORDER BY panel_version ASC, created_at ASC, id ASC`;
 const SELECT_PANEL_LINEAGE_SQL =
   'SELECT session_id, panel_version AS version FROM panels WHERE id = ?';
 
+/**
+ * The id and version of a session's newest panel, for the predecessor check: a
+ * regenerated panel may only supersede the rung that is the session's latest
+ * when its insert commits.
+ *
+ * The filter and order of {@link SELECT_LATEST_PANEL_SQL}, so it is the same one
+ * seek on the index behind `UNIQUE (session_id, panel_version)`, but it reads no
+ * document — the check compares an id and a version. The version is aliased to
+ * `version`, as in {@link SELECT_PANEL_LINEAGE_SQL}.
+ */
+const SELECT_LATEST_PANEL_RUNG_SQL = `SELECT id, panel_version AS version FROM panels
+WHERE session_id = ?
+ORDER BY panel_version DESC, created_at DESC, id DESC
+LIMIT 1`;
+
 /** Counts one session's panels. */
 const COUNT_PANELS_BY_SESSION_SQL = 'SELECT COUNT(*) AS total FROM panels WHERE session_id = ?';
 
@@ -344,6 +386,16 @@ const SELECT_MAX_ANALYSIS_VERSION_SQL =
 
 /** The session and version of a stored analysis, for the predecessor check. */
 const SELECT_ANALYSIS_LINEAGE_SQL = 'SELECT session_id, version FROM analyses WHERE id = ?';
+
+/**
+ * The id and version of a session's newest analysis, for the predecessor
+ * check: one seek on the index behind `UNIQUE (session_id, version)`, exactly
+ * as {@link SELECT_LATEST_PANEL_RUNG_SQL}.
+ */
+const SELECT_LATEST_ANALYSIS_RUNG_SQL = `SELECT id, version FROM analyses
+WHERE session_id = ?
+ORDER BY version DESC, created_at DESC, id DESC
+LIMIT 1`;
 
 /** Counts one session's analyses. */
 const COUNT_ANALYSES_BY_SESSION_SQL = 'SELECT COUNT(*) AS total FROM analyses WHERE session_id = ?';
@@ -421,6 +473,33 @@ interface LadderLabels {
 }
 
 /**
+ * The read statements of one of the two tables.
+ *
+ * Named on its own, like {@link LadderLabels}, so the predecessor check — which
+ * reads the lineage and the latest rung but never a document — takes either
+ * ladder's statements without a type parameter.
+ */
+interface LadderStatements {
+  /** One document by its id. */
+  readonly selectById: string;
+
+  /** A session's newest document. */
+  readonly selectLatest: string;
+
+  /** A session's documents, oldest version first. */
+  readonly selectBySession: string;
+
+  /** A session's highest version, `NULL` when it holds none. */
+  readonly selectMaxVersion: string;
+
+  /** The session and version (aliased `version`) of the row holding an id. */
+  readonly selectLineage: string;
+
+  /** The id and version (aliased `version`) of a session's newest row. */
+  readonly selectLatestRung: string;
+}
+
+/**
  * Everything the shared read, insert and version logic needs to know about one
  * of the two tables.
  *
@@ -453,13 +532,7 @@ interface Ladder<T> extends LadderLabels {
   readonly insertValues: (row: InsertRow) => readonly BoundValue[];
 
   /** The table's read statements. */
-  readonly sql: {
-    readonly selectById: string;
-    readonly selectLatest: string;
-    readonly selectBySession: string;
-    readonly selectMaxVersion: string;
-    readonly selectLineage: string;
-  };
+  readonly sql: LadderStatements;
 }
 
 /** A value `node:sqlite` binds: text, a number, or `NULL`. */
@@ -524,6 +597,7 @@ const PANEL_LADDER: Ladder<PanelSpec> = Object.freeze({
     selectBySession: SELECT_PANELS_BY_SESSION_SQL,
     selectMaxVersion: SELECT_MAX_PANEL_VERSION_SQL,
     selectLineage: SELECT_PANEL_LINEAGE_SQL,
+    selectLatestRung: SELECT_LATEST_PANEL_RUNG_SQL,
   }),
 });
 
@@ -572,6 +646,7 @@ const ANALYSIS_LADDER: Ladder<AnalysisResult> = Object.freeze({
     selectBySession: SELECT_ANALYSES_BY_SESSION_SQL,
     selectMaxVersion: SELECT_MAX_ANALYSIS_VERSION_SQL,
     selectLineage: SELECT_ANALYSIS_LINEAGE_SQL,
+    selectLatestRung: SELECT_LATEST_ANALYSIS_RUNG_SQL,
   }),
 });
 
@@ -663,10 +738,21 @@ export interface PanelsRepo {
    * predecessor at its session's first version (`supersedes-on-first-version`),
    * both `PANEL_INVALID`; and, inside one `BEGIN IMMEDIATE` transaction, when its
    * session is unknown, when `options.captureId` names an unknown capture or
-   * another session's, when a stored predecessor belongs to another session or
-   * is not an earlier version, when its id is already stored (`duplicate-id`),
-   * or when its session already holds its `panelVersion` (`version-taken`, whose
-   * hint points at {@link PanelsRepo.nextPanelVersion}) — all `STORE_ERROR`.
+   * another session's, when its id is already stored (`duplicate-id`), or when
+   * its session already holds its `panelVersion` (`version-taken`, whose hint
+   * points at {@link PanelsRepo.nextPanelVersion}) — all `STORE_ERROR`.
+   *
+   * In the same transaction the panel must extend the ladder as it stands when
+   * the write commits. A panel that names a predecessor is refused when no
+   * stored panel holds that id (`supersedes-unknown`), when the predecessor
+   * belongs to another session (`supersedes-other-session`) or is not an
+   * earlier version (`supersedes-not-earlier`), when it is no longer the
+   * session's latest panel (`supersedes-stale` — another panel was stored after
+   * the caller read the latest; re-read it and decide again), or when
+   * `panelVersion` is not exactly one above it (`supersedes-not-adjacent`). A
+   * panel above the first version that names no predecessor is refused as
+   * `supersedes-missing`. All of these are `STORE_ERROR`, and none writes
+   * anything.
    *
    * Column mapping: `id` ← `spec.id`, `session_id` ← `spec.sessionId`,
    * `panel_version` ← `spec.panelVersion`, `supersedes` ← `spec.supersedes` or
@@ -717,9 +803,11 @@ export interface PanelsRepo {
    * The `panelVersion` the session's next panel must carry: the highest stored
    * version plus one, or the first version when the session holds none.
    *
-   * Read it in the same synchronous turn as the insert it feeds. Two writers
-   * that read the same value race, and the loser's insert comes back as
-   * `version-taken` rather than overwriting the winner.
+   * Read it together with {@link PanelsRepo.getLatestPanel}, whose id the next
+   * panel names in `supersedes`. Two writers that read the same pair race, and
+   * the loser's insert is refused rather than overwriting the winner: as
+   * `supersedes-stale` when the version is above the first, since the panel it
+   * names is no longer the latest, and as `version-taken` for a first version.
    *
    * @param sessionId The session the next panel belongs to.
    * @returns The next version, or `corrupt-row` when a stored version is not a
@@ -750,11 +838,20 @@ export interface PanelsRepo {
    * `PROTOCOL_INVALID_MESSAGE` code; that parser also refuses an analysis that
    * supersedes itself). Inside one `BEGIN IMMEDIATE` transaction it is then
    * refused, as `STORE_ERROR`, when its session is unknown, when its
-   * `captureId` names an unknown capture or another session's, when a stored
-   * predecessor belongs to another session or is not an earlier version, when
-   * its id is already stored, or when its session already holds its
-   * `analysisVersion` (`version-taken`, whose hint points at
+   * `captureId` names an unknown capture or another session's, when it breaks
+   * the ladder, when its id is already stored, or when its session already
+   * holds its `analysisVersion` (`version-taken`, whose hint points at
    * {@link PanelsRepo.nextAnalysisVersion}).
+   *
+   * The ladder rules are the ones {@link PanelsRepo.insertPanel} applies, judged
+   * against the analyses the session holds when the write commits: a named
+   * predecessor must be a stored analysis (`supersedes-unknown`) of the same
+   * session (`supersedes-other-session`) at a lower version
+   * (`supersedes-not-earlier`) that is still the session's latest
+   * (`supersedes-stale` — re-read the latest and decide again), exactly one
+   * version below this one (`supersedes-not-adjacent`); and an analysis above
+   * `ANALYSIS_VERSION_START` must name one (`supersedes-missing`). None of them
+   * writes anything.
    *
    * Column mapping: `id` ← `result.id`, `session_id` ← `result.sessionId`,
    * `capture_id` ← `result.captureId`, **`version` ← `result.analysisVersion`**
@@ -1153,8 +1250,11 @@ function storeFailedError(
  * Classifies what an insert's transaction threw.
  *
  * The three constraint codes get their own reasons — above all `version-taken`,
- * whose hint is what keeps a follow-up that guessed its version from ever
- * overwriting a stored answer. Everything else is `store-failed`.
+ * the database's own guarantee that no stored answer is ever overwritten. The
+ * ladder checks that run before the write refuse a later version that guessed
+ * its version or its predecessor, so on a healthy store `version-taken` is
+ * reached by a first version the session already holds. Everything else is
+ * `store-failed`.
  *
  * @param labels The ladder written to.
  * @param operation The repository method.
@@ -1281,8 +1381,10 @@ function documentFromRow<T>(ladder: Ladder<T>, operation: string, row: StoredRow
  *     { ...regenerated, panelVersion: version.value, supersedes: previous.value.id },
  *     { captureId },
  *   );
- *   // stored.ok === false with details.reason 'version-taken' means another
- *   // writer took the version first: re-read and retry, never overwrite.
+ *   // stored.ok === false with details.reason 'supersedes-stale' means another
+ *   // writer stored a newer panel after `previous` was read: the answer this
+ *   // one was decided against is no longer the latest, so re-read the latest
+ *   // and decide again. Nothing is ever overwritten.
  * }
  * ```
  */
@@ -1433,14 +1535,154 @@ export function createPanelsRepo(deps: PanelsRepoDeps): PanelsRepo {
   }
 
   /**
+   * Whether a document extends its session's ladder as the ladder stands inside
+   * the insert's transaction, checked in the order
+   * {@link PANELS_REPO_FAILURE_REASONS} lists the rules.
+   *
+   * A document that names a predecessor must name a row of its own ladder
+   * (`supersedes-unknown`) of its own session (`supersedes-other-session`) at a
+   * lower version (`supersedes-not-earlier`) that is the session's latest row
+   * (`supersedes-stale`) and exactly one version below it
+   * (`supersedes-not-adjacent`). A document that names none must be its
+   * ladder's first version (`supersedes-missing`); whether the session already
+   * holds a first version is left to the `UNIQUE` constraint, which reports it
+   * as `version-taken`.
+   *
+   * The latest rung is read by one index seek, and the check runs inside the
+   * `BEGIN IMMEDIATE` transaction the write commits in: no other writer can
+   * store a rung between the read and the write, so two follow-ups that decided
+   * against the same answer cannot both extend it — the second is refused as
+   * `supersedes-stale`. A `supersedes` that later dangles because its
+   * predecessor was purged is never judged again: this runs on insert only.
+   *
+   * @param labels The ladder written to.
+   * @param statements The ladder's read statements.
+   * @param operation The repository method.
+   * @param identity The document's identity.
+   * @param details The document's identifying details.
+   * @returns The refusal, or `undefined` when the document may be written.
+   */
+  function checkLadderPosition(
+    labels: LadderLabels,
+    statements: LadderStatements,
+    operation: string,
+    identity: DocumentIdentity,
+    details: LogFields,
+  ): DebuggenError | undefined {
+    if (identity.supersedes === undefined) {
+      if (identity.version > labels.firstVersion) {
+        return refusalError(
+          'STORE_ERROR',
+          operation,
+          'supersedes-missing',
+          `A ${labels.noun} above its session's first version names no ${labels.noun} it supersedes.`,
+          `Every version after the first supersedes the latest stored ${labels.noun} of its session. Read the latest ${labels.noun}, name it as the one superseded, and take the version from ${labels.nextVersionMethod}. Nothing was written.`,
+          details,
+        );
+      }
+
+      return undefined;
+    }
+
+    const predecessor = { ...details, supersedes: identity.supersedes };
+    const lineage = store.statement(statements.selectLineage).get(identity.supersedes);
+
+    if (lineage === undefined) {
+      return refusalError(
+        'STORE_ERROR',
+        operation,
+        'supersedes-unknown',
+        `A ${labels.noun} supersedes a ${labels.noun} the store does not hold.`,
+        `A new version supersedes a stored ${labels.noun} of its own session. Read the latest ${labels.noun} of the session and name it as the one superseded. Nothing was written.`,
+        predecessor,
+      );
+    }
+
+    if (lineage['session_id'] !== identity.sessionId) {
+      return refusalError(
+        'STORE_ERROR',
+        operation,
+        'supersedes-other-session',
+        `A ${labels.noun} supersedes a ${labels.noun} of a different session.`,
+        `A follow-up supersedes the previous ${labels.noun} of its own session. Nothing was written.`,
+        predecessor,
+      );
+    }
+
+    const predecessorVersion = toColumnNumber(lineage['version']);
+
+    if (typeof predecessorVersion !== 'number' || predecessorVersion >= identity.version) {
+      return refusalError(
+        'STORE_ERROR',
+        operation,
+        'supersedes-not-earlier',
+        `A ${labels.noun} supersedes a ${labels.noun} that is not an earlier version.`,
+        `A new version supersedes an earlier one. Take the version from ${labels.nextVersionMethod} and supersede the latest stored ${labels.noun}. Nothing was written.`,
+        predecessor,
+      );
+    }
+
+    const latest = store.statement(statements.selectLatestRung).get(identity.sessionId);
+    const latestId = latest?.['id'];
+
+    // The document itself is already the session's latest row: this is a
+    // repeated insert of a stored document, not a decision taken against an
+    // answer another writer has since superseded, so it is not reported as
+    // `supersedes-stale`. The write that follows breaks the primary key — and
+    // the version ladder too when the version is the stored one — and the
+    // constraint SQLite reports (`duplicate-id` or `version-taken`) refuses it
+    // with nothing written.
+    if (latestId === identity.id) {
+      return undefined;
+    }
+
+    if (latestId !== identity.supersedes) {
+      const latestVersion = latest === undefined ? undefined : rowVersionOf(latest, 'version');
+
+      return refusalError(
+        'STORE_ERROR',
+        operation,
+        'supersedes-stale',
+        `A ${labels.noun} supersedes a ${labels.noun} that is no longer the latest of its session.`,
+        `The ${labels.noun} this version was decided against is no longer the latest: another ${labels.noun} was stored after it was read. Re-read the latest ${labels.noun} and decide again. Nothing was written.`,
+        {
+          ...predecessor,
+          ...(typeof latestId === 'string' ? { latestId } : {}),
+          ...(latestVersion === undefined ? {} : { latestVersion }),
+        },
+      );
+    }
+
+    if (identity.version !== predecessorVersion + 1) {
+      return refusalError(
+        'STORE_ERROR',
+        operation,
+        'supersedes-not-adjacent',
+        `A ${labels.noun} does not sit exactly one version above the ${labels.noun} it supersedes.`,
+        `A new version is the one directly above the latest stored ${labels.noun}. Take the version from ${labels.nextVersionMethod} and store the ${labels.noun} as that version. Nothing was written.`,
+        { ...predecessor, supersededVersion: predecessorVersion },
+      );
+    }
+
+    return undefined;
+  }
+
+  /**
    * The checks that need the stored rows, run inside the insert's transaction
    * so they and the write see one state: the session exists, the capture (when
-   * there is one) exists and belongs to it, and a stored predecessor belongs to
-   * it and sits lower on the ladder.
+   * there is one) exists and belongs to it, and the document extends the
+   * session's ladder exactly as it stands ({@link checkLadderPosition}).
+   *
+   * @param labels The ladder written to.
+   * @param statements The ladder's read statements.
+   * @param operation The repository method.
+   * @param identity The document's identity.
+   * @param captureId The capture to associate, when there is one.
+   * @returns The refusal, or `undefined` when the document may be written.
    */
   function checkAgainstStore(
     labels: LadderLabels,
-    selectLineage: string,
+    statements: LadderStatements,
     operation: string,
     identity: DocumentIdentity,
     captureId: string | undefined,
@@ -1484,42 +1726,7 @@ export function createPanelsRepo(deps: PanelsRepoDeps): PanelsRepo {
       }
     }
 
-    if (identity.supersedes !== undefined) {
-      const lineage = store.statement(selectLineage).get(identity.supersedes);
-
-      // An absent predecessor is history rather than corruption: `supersedes`
-      // is deliberately not a foreign key, so the panel or analysis it names
-      // may have been purged on its own.
-      if (lineage !== undefined) {
-        const predecessor = { ...details, supersedes: identity.supersedes };
-
-        if (lineage['session_id'] !== identity.sessionId) {
-          return refusalError(
-            'STORE_ERROR',
-            operation,
-            'supersedes-other-session',
-            `A ${labels.noun} supersedes a ${labels.noun} of a different session.`,
-            `A follow-up supersedes the previous ${labels.noun} of its own session. Nothing was written.`,
-            predecessor,
-          );
-        }
-
-        const version = toColumnNumber(lineage['version']);
-
-        if (typeof version !== 'number' || version >= identity.version) {
-          return refusalError(
-            'STORE_ERROR',
-            operation,
-            'supersedes-not-earlier',
-            `A ${labels.noun} supersedes a ${labels.noun} that is not an earlier version.`,
-            `A new version supersedes an earlier one. Take the version from ${labels.nextVersionMethod} and supersede the latest stored ${labels.noun}. Nothing was written.`,
-            predecessor,
-          );
-        }
-      }
-    }
-
-    return undefined;
+    return checkLadderPosition(labels, statements, operation, identity, details);
   }
 
   /**
@@ -1578,13 +1785,7 @@ export function createPanelsRepo(deps: PanelsRepoDeps): PanelsRepo {
 
       try {
         const fault = store.transaction((): DebuggenError | undefined => {
-          const refused = checkAgainstStore(
-            ladder,
-            ladder.sql.selectLineage,
-            operation,
-            identity,
-            captureId,
-          );
+          const refused = checkAgainstStore(ladder, ladder.sql, operation, identity, captureId);
 
           if (refused !== undefined) {
             return refused;

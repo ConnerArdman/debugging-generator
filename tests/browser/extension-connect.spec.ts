@@ -1,15 +1,17 @@
 /**
- * `extension-connect` — the browser project's connection spec (AAP §0.8.3:
- * "SW connects, `client.hello` received, tab bound").
+ * `extension-connect` — the browser project's connection spec: the service
+ * worker connects, its `client.hello` is received, and the inspected tab is
+ * bound.
  *
- * Pairing is the prerequisite of every connection (AAP §0.5.6): the service
- * refuses a socket that carries no devtools credential, and that credential
- * exists only after `POST /pair/start` (editor credential) and
- * `POST /pair/complete { code }` (from the extension's own origin). The spec
- * therefore proves the prerequisite rather than assuming it: first that an
- * unpaired extension is refused visibly and binds nothing, then that pairing
- * makes the worker connect, and finally that the connected worker binds the
- * inspected tab to the session and releases it when DevTools closes.
+ * Pairing is the prerequisite of every connection (docs/SECURITY.md, section
+ * 7.4 "Pairing the Chrome extension"): the service refuses a socket that
+ * carries no devtools credential, and that credential exists only after
+ * `POST /pair/start` (editor credential) and `POST /pair/complete { code }`
+ * (from the extension's own origin). The spec therefore proves the
+ * prerequisite rather than assuming it: first that an unpaired extension is
+ * refused visibly and binds nothing, then that pairing makes the worker
+ * connect, and finally that the connected worker binds the inspected tab to
+ * the session and releases it when DevTools closes.
  *
  * What this spec deliberately does NOT assert, and who does:
  *
@@ -29,12 +31,11 @@
  * Each test establishes its own pairing state, so the file has no ordering
  * dependency between its tests.
  *
- * Constraints (AAP §0.3.4, §0.5.4, §0.8.4, §0.9.2): no credential is written,
- * printed or attached — the stored token is only ever measured inside the
- * extension page; only the generic fixture app (`tests/fixtures/sample-next-app`)
- * is driven; every assertion names identifiers and fields rather than mere
- * existence; the service runs the deterministic provider and nothing leaves
- * localhost.
+ * Constraints: no credential is written, printed or attached — the stored
+ * token is only ever measured inside the extension page; only the generic
+ * fixture app (`tests/fixtures/sample-next-app`) is driven; every assertion
+ * names identifiers and fields rather than mere existence; the service runs
+ * the deterministic provider and nothing leaves localhost.
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -87,7 +88,7 @@ const UNPAIRED_QUIET_WINDOW_MS = CLIENT_HELLO_TIMEOUT_MS + 2_000;
  */
 const CONNECTED_SETTLE_WINDOW_MS = CLIENT_HELLO_TIMEOUT_MS + 1_500;
 
-/** The questions the binding tests ask; generic vocabulary only (AAP §0.5.4). */
+/** The questions the binding tests ask: generic vocabulary, naming nothing of any application. */
 const UNPAIRED_QUESTION = 'Why does this button take so long to respond?';
 const BOUND_QUESTION = 'Why is this button slow?';
 
@@ -448,7 +449,7 @@ test.describe('extension-connect', () => {
       // session or of this tab reaches the editor, and the pill never claims a
       // connection. Pairing-code reuse, expiry and the rate limit are the
       // service's rules and are asserted by
-      // apps/local-service/test/integration/auth.test.ts (AAP §0.5.6).
+      // apps/local-service/test/integration/auth.test.ts.
       await Promise.all([
         editorClient.expectNoMessage(
           'session.bound',
@@ -484,7 +485,7 @@ test.describe('extension-connect', () => {
     // into the panel's PairDialog, and POST /pair/complete from the
     // chrome-extension:// origin by the worker. This process never calls
     // /pair/complete: a devtools credential minted from another origin is
-    // refused by design (AAP §0.5.6).
+    // refused by design (docs/SECURITY.md, section 7.4).
     await pairing.ensurePaired();
 
     // No chrome.devtools stub: this panel inspects no tab, so nothing binds.

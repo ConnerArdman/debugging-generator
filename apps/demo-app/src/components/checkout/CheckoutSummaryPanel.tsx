@@ -401,8 +401,7 @@ export function CheckoutSummaryPanel({
    * omitting them and letting the closing figure look complete.
    *
    * Built on each render and handed straight down. There is no `useMemo` here and none is wanted:
-   * the block below holds no `memo`, so a stable array identity would buy nothing, and the cart
-   * this column quotes re-renders it several times a second anyway (AAP 0.8.2 defect 2).
+   * the block below holds no `memo`, so a stable array identity would buy nothing.
    */
   const charges: readonly CartCharge[] = [
     freight === null

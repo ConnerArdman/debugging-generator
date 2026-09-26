@@ -1,15 +1,15 @@
 /*
  * RecommendationTile - one recommended product inside the recommendations rail.
  *
- * The rail is mounted twice on a product page: full size in the detail body and compact inside
- * the site header. Both mounts render the same component with the same props, so this stylesheet
- * is the only place the two differ: the detail tile is a vertical card, and the compact tile is a
- * short row - thumbnail beside a one-line name and its price - sized for the header's fixed 64px
- * row. The arithmetic for that is stated above the `[data-variant]` rules at the foot of the
- * file. Nothing here changes what the tile does.
+ * The tile has two styling variants, selected by the `data-variant` attribute the component
+ * writes, and the component renders the same markup from the same props in both, so this
+ * stylesheet is the only place the two differ: the `detail` tile is a vertical card, and the
+ * `compact` tile is a short row - thumbnail beside a one-line name and its price - sized to fit a
+ * single row 63px high. The arithmetic for that is stated above the `[data-variant]` rules at the
+ * foot of the file. Nothing here changes what the tile does.
  *
  * The tile is intentionally independent of the catalog card's module: it borrows no rule from it
- * and imports nothing, so the strip in the site header carries none of the catalog's chrome.
+ * and imports nothing, so a tile carries none of the catalog's chrome.
  *
  * Values read the `--ls-*` tokens declared in `app/globals.css` and each states the literal its
  * token contract gives, so the tile still reads correctly if it is ever mounted without that
@@ -32,9 +32,9 @@
   background: var(--ls-surface, #ffffff);
   color: inherit;
   text-decoration: none;
-  /* BLITZY [MOTION]: the shared token set carries no duration or easing token, so these two are
-   * literals rather than `var()` reads. They are deliberately short, affect the hover treatment
-   * alone, and the reduced-motion rule below removes them. Flagged for design review. */
+  /* The shared token set carries no duration or easing token, so the 160ms ease-out values are
+   * literals rather than `var()` reads. They affect the hover treatment alone, and the
+   * reduced-motion rule below removes them. */
   transition:
     border-color 160ms ease-out,
     box-shadow 160ms ease-out;
@@ -43,10 +43,8 @@
 /* A restrained lift: the hairline takes the interactive tint and the surface gains one step of
  * elevation. Nothing moves and nothing resizes, so a hovered tile never nudges its neighbours.
  *
- * BLITZY [A11Y]: the tinted hairline measures 2.15:1 against the tile surface, below the 3:1
- * non-text recommendation - the value the shared token contract fixes, kept rather than darkened.
- * It is never the only signal: the elevation changes with it and the pointer already indicates a
- * link. Flagged for design review. */
+ * The accent hairline is a supplementary hover cue that changes together with the elevation; the
+ * tile's resting border and its focus ring are what identify it. */
 .root:hover {
   border-color: var(--ls-accent, #0f766e);
   box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.08));
@@ -57,9 +55,8 @@
  *
  * The offset is inward because a tile lives in a horizontally scrolling strip, whose box clips
  * whatever is drawn outside it: an outward ring loses its top edge on every tile and its leading
- * edge on the first one, and a tile at the top of the page would draw that edge off-screen
- * altogether. Drawn just inside the border the whole ring survives, in both mounts and wherever
- * else the tile is placed. */
+ * edge on the first one. Drawn just inside the border the whole ring survives, in either variant
+ * and wherever the tile is placed. */
 .root:focus-visible {
   outline: 2px solid var(--ls-focus, #1d4ed8);
   outline-offset: -2px;
@@ -142,29 +139,26 @@
   font-size: var(--ls-text-xs, 12px);
 }
 
-/* The two mounts, told apart by the attribute the component sets. Each rule below states sizes
- * and arrangement and nothing else, so a tile in the header behaves exactly like a tile in the
- * page - same markup, same link, same text.
+/* The two variants, told apart by the attribute the component sets. Each rule below states sizes
+ * and arrangement and nothing else, so a compact tile behaves exactly like a detail tile - same
+ * markup, same link, same text.
  *
- * The detail mount is the card above, in the arrangement it has always had: a 4:3 thumbnail over
- * a two-line name, the price on the tile's bottom edge and the unclamped footnote under it, 277px
- * tall in a page that has the room for it. The footnote settles on three 18px lines whether the
- * sentence names the catalog's shortest product or its longest, so the row does not change height
- * from one product to the next.
+ * The detail variant is the card above: a 4:3 thumbnail over a two-line name, the price on the
+ * tile's bottom edge and the unclamped footnote under it, 277px tall. The footnote settles on
+ * three 18px lines whether the sentence names the catalog's shortest product or its longest, so
+ * the row does not change height from one product to the next.
  *
- * The compact mount is a genuinely different arrangement rather than that card made narrower,
- * because the site header is a fixed row - `--ls-header-height` is 64px, 63px once its bottom
- * hairline is taken off. The card at this width stood 174px tall, so the strip it made was cut
- * off top and bottom by the slot: its heading and both prices had no visible pixels at all. So
- * the compact tile lays the thumbnail beside the text instead of above it and spends one line
+ * The compact variant is a genuinely different arrangement rather than that card made narrower,
+ * because it is sized to fit a single row 63px high, and a card does not fit a row that short.
+ * So the compact tile lays the thumbnail beside the text instead of above it and spends one line
  * each on the name and the price:
  *
  *   2 x 1px border + 2 x 4px padding + 12px x 1.15 name + 12px x 1.15 price = 37.6px
  *
  * The thumbnail is 30px wide, so the 4:3 frame it inherits stands 22.5px tall - shorter than the
- * text column beside it, which is therefore what decides the tile's height. Both mounts keep the
- * widths stated below, so the strip still scrolls by whole tiles and the header's two tiles plus
- * the strip's 8px gap still measure the 296px its slot is. */
+ * text column beside it, which is therefore what decides the tile's height. Both variants keep
+ * the widths stated below, so the strip still scrolls by whole tiles, and two compact tiles plus
+ * the strip's 8px gap measure 296px. */
 .root[data-variant='detail'] {
   width: 12rem;
 }
@@ -177,7 +171,7 @@
   padding: var(--ls-space-1, 4px);
 }
 
-/* The mini tile's thumbnail: a fixed box that neither grows nor shrinks, so the text beside it
+/* The compact tile's thumbnail: a fixed box that neither grows nor shrinks, so the text beside it
  * takes the rest of the row rather than competing with it for width. Stated in rem like the tile
  * widths above, and for the same reason - it is tile geometry rather than a spacing step, so no
  * `--ls-space-*` token expresses it. */
@@ -193,10 +187,10 @@
   gap: 0;
 }
 
-/* One line, then an ellipsis, at the smallest type step. The header has room for a single line of
- * name, and the full wording stays selectable on the product page this tile links to. The leading
- * is stated because the inherited 1.5 of body copy would add 6px to every line here and put the
- * tile outside the header's row; the shared token set carries no leading token, so 1.15 is a
+/* One line, then an ellipsis, at the smallest type step. The compact row has room for a single
+ * line of name, and the full wording stays selectable on the product page this tile links to. The
+ * leading is stated because the inherited 1.5 of body copy would add 6px to every line here and
+ * put the tile past the row's 63px; the shared token set carries no leading token, so 1.15 is a
  * literal, exactly as the 1.25 on headings in app/globals.css is. */
 .root[data-variant='compact'] .name {
   -webkit-line-clamp: 1;
@@ -205,7 +199,7 @@
 }
 
 /* The figure sits under the name rather than on the tile's bottom edge: a 37.6px tile has no
- * spare height for the automatic margin above to distribute, and two mini tiles side by side both
+ * spare height for the automatic margin above to distribute, and compact tiles side by side each
  * have a one-line name, so their prices line up regardless. The size and leading are restated
  * here because ui/Price declares its own `sm` step (13px) on a class and an attribute - two
  * classes and an attribute outrank that however the two modules are ordered. */
@@ -215,12 +209,12 @@
   line-height: 1.15;
 }
 
-/* No footnote in the header. All 37.6px of a compact tile are spent on one line of name and one
- * of price; two more lines of reason would be some 36px the 63px bar does not have, and the slot
- * clips rather than scrolls in the block axis, so the footnote would be cut in half instead of
- * read. It is left out of the layout rather than hidden from readers alone - the wording is on
- * the product page this tile links to, so nothing is announced that a buyer cannot then reach,
- * and the strip in the page body carries it in full. */
+/* No footnote in the compact variant. All 37.6px of a compact tile are spent on one line of name
+ * and one of price; two more lines of reason would be some 36px a row 63px high does not have,
+ * and that row clips rather than scrolls in the block axis, so the footnote would be cut in half
+ * instead of read. It is left out of the layout rather than hidden from sighted readers alone, so
+ * a compact tile announces exactly what it shows - the name and the price - and the reason is
+ * displayed in the detail variant only. */
 .root[data-variant='compact'] .reason {
   display: none;
 }

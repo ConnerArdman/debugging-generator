@@ -97,20 +97,12 @@
  * `sm` carries a height floor as well as its padding pair, and it is the shared control floor
  * (`--ls-control-sm`) rather than a number of this file's own: a compact button, a compact field
  * and a chip stand side by side in the dashboard's filter row and in the catalog toolbar, and
- * while each of them sized itself from its own padding that row mixed a 23px button with a 29.5px
- * field and a 32px chip. The floor is a `min-block-size`, so it raises the box and changes nothing
- * else - the padding, border width and type step below are untouched, and a label taller than the
- * floor still grows the control rather than being clipped by it.
+ * sharing one floor is what lines the three up. The floor is a `min-block-size`, so it raises the
+ * box and changes nothing else - the padding, border width and type step below are untouched, and
+ * a label taller than the floor still grows the control rather than being clipped by it.
  *
- * BLITZY [A11Y]: at the default 16px root the rendered heights are now about 32px, 33px and 44px
- * including the border. `sm` clears the 24x24px minimum of WCAG 2.2 SC 2.5.8 with 8px of margin
- * and `lg` meets the 44x44px enhanced target of SC 2.5.5, but `sm` and `md` remain under 44px.
- * That much is implemented as the shared size contract specifies rather than silently enlarged:
- * these are pointer- and keyboard-first surfaces of a desktop storefront, every control carries a
- * visible text label, and the focus outline with its 2px offset extends the visible target. The
- * surfaces that can carry a full 44px target without becoming something else - a history row's
- * link, a pager chip, a radio row's label - read `--ls-target-min` in their own modules instead.
- * Flagged for design review. */
+ * Surfaces that carry a full 44px pointer target - the order-history pager's links, the shipping
+ * picker's radio-row labels - read `--ls-target-min` in their own modules. */
 
 .root[data-size='sm'] {
   min-block-size: var(--ls-control-sm, 32px);

@@ -709,12 +709,12 @@ describe('save and load', () => {
   itPosix(
     'refuses a cache directory left over-permissive, and leaves its mode and contents alone',
     async () => {
-      // AAP 0.4.2: every directory of the state tree must already be private,
-      // and the write refuses to proceed otherwise. A cache directory another
-      // account could read is refused as it stands, never tightened, because
-      // the developer is the one who has to judge what it may have exposed.
-      // The mode is set with `chmod` so the fixture does not depend on the
-      // process umask.
+      // Every directory of the state tree must already be private, and the
+      // write refuses to proceed otherwise. A cache directory another account
+      // could read is refused as it stands, never tightened, because the
+      // developer is the one who has to judge what it may have exposed. The
+      // mode is set with `chmod` so the fixture does not depend on the process
+      // umask.
       mkdirSync(cacheDir, { recursive: true });
       chmodSync(cacheDir, OVER_PERMISSIVE_DIR_MODE);
       expect(modeOf(cacheDir)).toBe(OVER_PERMISSIVE_DIR_MODE);

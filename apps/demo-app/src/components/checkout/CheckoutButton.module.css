@@ -70,13 +70,12 @@
  * reads as occupied rather than inviting, and the cursor says the same thing. Declared after the
  * accent above, at the specificity that also carries it past the primitive's own cursor rules.
  * No motion is introduced here: the indicator inside the primitive is the only moving part.
+ *
+ * The control is also disabled while pending, so the primitive's own `:disabled` treatment draws
+ * it at 55% opacity; that dimming belongs to the primitive and is not restated here. The caption
+ * underneath carries the same message at full strength and `aria-busy` carries it to assistive
+ * technology, so the state is never announced by colour alone.
  */
-/* BLITZY [A11Y]: in this state the primitive draws the whole control at 55% opacity, its own
- * `:disabled` treatment, which composites the ink label to 2.83:1 against the fill below even
- * though the two colours pair at 9.5:1 on their own. That opacity belongs to the primitive and
- * this module deliberately does not restate it; the caption underneath carries the same message
- * at full strength (7.6:1) and `aria-busy` carries it to assistive technology, so the state is
- * never announced by colour alone. Flagged for design review. */
 .root .action.pending {
   border-color: color-mix(in srgb, var(--ls-amber, #f59e0b) 82%, var(--ls-white, #ffffff));
   background-color: color-mix(in srgb, var(--ls-amber, #f59e0b) 82%, var(--ls-white, #ffffff));

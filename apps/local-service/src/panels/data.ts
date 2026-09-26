@@ -50,21 +50,28 @@
  *   `null` — never an absent key — otherwise. A page that returned nothing is
  *   therefore always the last one, which is what makes a loop that follows
  *   `nextOffset` terminate.
- * - {@link SOURCE_SORT_KEYS} states, for every sortable source and every sort
- *   that applies to it, the full comparator chain, and every chain ends in `id`
- *   ascending. The type makes that final key mandatory. Without it two rows
- *   that tie on the sort key could trade places between two reads, and a
- *   multi-page walk would repeat one and never show the other.
- * - A sort that does not apply to a source — `count_desc` on a flat record
- *   list, `duration_desc` on instants — falls back to that source's entry in
- *   {@link DEFAULT_SORT_BY_SOURCE}, deterministically and without an error, and
- *   an omitted sort means the same default. The order is never unspecified.
+ * - {@link SOURCE_SORT_KEYS} states, for **every** paged source and **every**
+ *   `DataQuerySort`, the full comparator chain, and every chain ends in `id`
+ *   ascending. The table's type is total, so a sort or a paged source added to
+ *   either vocabulary fails compilation until it says what it orders by, and it
+ *   makes that final key mandatory. Without it two rows that tie on the sort
+ *   key could trade places between two reads, and a multi-page walk would
+ *   repeat one and never show the other.
+ * - A requested sort is always the order answered, applied to the whole
+ *   filtered source **before** the page is cut, so the page echo never claims a
+ *   query it did not honour; no named sort is ever replaced by another. An
+ *   omitted sort means the source's entry in {@link DEFAULT_SORT_BY_SOURCE}.
+ *   Where a row carries no field a sort names — a flat record has no count, a
+ *   state transition no duration, a metric value no start — the chain ranks it
+ *   by a value derived for exactly that sort (see {@link SOURCE_SORT_KEYS}), so
+ *   the order is never unspecified and never silently another one.
  * - The three single-value sources (`trace`, `componentTree`, `graph`) carry no
- *   page. `metrics` is fixed-length and fixed-order: its values are always in
- *   `METRIC_IDS` order, whatever `sort` says, and a default-sized page returns
- *   every one of them. The protocol validates a metrics page by the same window
- *   arithmetic as any other page, so an explicit `limit` or `offset` is honoured
- *   as a window over that fixed order rather than ignored.
+ *   page and ignore `sort`. `metrics` is a paged source like the others: its
+ *   values are ordered by the requested sort, and with none in `METRIC_IDS`
+ *   order, and a default-sized page returns every one of them. The protocol
+ *   validates a metrics page by the same window arithmetic as any other page,
+ *   so an explicit `limit` or `offset` is honoured as a window over that order
+ *   rather than ignored.
  *
  * ## Capture scoping
  *
@@ -201,6 +208,8 @@
  * ```
  */
 
+import { Buffer } from 'node:buffer';
+
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
@@ -215,7 +224,7 @@ import type {
 } from '@debuggen/panel-schema';
 import type { DataPage, DataResult, DataResultFor } from '@debuggen/protocol';
 import { DebuggenError, assertNever, err, noopLogger, ok } from '@debuggen/shared';
-import type { CaptureId, Logger, PanelId, Result, SessionId } from '@debuggen/shared';
+import type { CaptureId, EventId, Logger, PanelId, Result, SessionId } from '@debuggen/shared';
 import {
   COMPONENT_TREE_ATTRIBUTE_KEYS,
   ERROR_KINDS,
@@ -239,6 +248,8 @@ import {
 } from '@debuggen/telemetry';
 import type {
   CaptureSummary,
+  MetricId,
+  MetricUnit,
   MetricValue,
   TelemetryEvent,
   TelemetryKind,
@@ -252,6 +263,7 @@ import type { SessionsRepo, StoredCapture } from '../store/sessions-repo.js';
 import type {
   CaptureEventStamp,
   CaptureGeneration,
+  TelemetryGroupKey,
   TelemetryPage,
   TelemetryRepo,
   TelemetryScan,
@@ -280,13 +292,15 @@ export type PagedDataSource = Extract<DataResult, { readonly nextOffset: unknown
 export type SingleValueDataSource = Exclude<DataQuerySource, PagedDataSource>;
 
 /**
- * The paged sources whose order a query may choose.
+ * The paged sources whose order a query may choose: **every** paged source.
  *
- * Every paged source except `metrics`, whose order is fixed to `METRIC_IDS`
- * (see the module notes): a metric card addresses a value by id, and a
- * vocabulary-ordered list is what lets two reads of one capture agree.
+ * `metrics` included. A metric card addresses a value by id, so the order of
+ * the list never changes what a card shows, but a panel that pages the values
+ * or ranks them — the longest durations, the largest counts — reads that order,
+ * and the shared `DataQuery` schema accepts every sort on it. Kept as its own
+ * name because it is what every ordering table is keyed by.
  */
-export type SortedDataSource = Exclude<PagedDataSource, 'metrics'>;
+export type SortedDataSource = PagedDataSource;
 
 /**
  * The payload field of one source's result — `DataResultFor<'renders'>['renders']`
@@ -317,26 +331,131 @@ export type DataRowOf<S extends PagedDataSource> =
 /** Which way one key of a comparator chain orders. */
 export type SortDirection = 'asc' | 'desc';
 
+/** A value one key of a comparator chain ranks by. */
+export type SortValue = number | string;
+
+/**
+ * How a key compares two strings.
+ *
+ * - `utf16` — by UTF-16 code unit, JavaScript's own `<`: the default, and the
+ *   order of every chain this module evaluates in memory.
+ * - `utf8` — by the strings' UTF-8 bytes, which is SQLite's default `BINARY`
+ *   collation: the order of a chain the store executes, stated here as data.
+ *
+ * The two disagree only for a character above U+FFFF against one in
+ * U+E000–U+FFFF. Neither is `localeCompare`, whose answer depends on the host's
+ * locale and would let two machines page one capture differently.
+ */
+export type StringCollation = 'utf16' | 'utf8';
+
 /**
  * The fields of `Row` a comparator can read: the required ones holding a
  * number or a string.
  *
  * An optional field is excluded by construction — `string | undefined` does
- * not extend `string` — so no chain can rank rows by a value some of them lack,
- * which is the one way a declared order could still leave two rows unordered.
+ * not extend `string` — so no field key can rank rows by a value some of them
+ * lack. A value some rows lack is ranked only through a {@link DerivedSortKey},
+ * whose rule for the rows without one is part of its definition.
  */
 type ComparableField<Row> = {
-  [K in keyof Row]-?: Row[K] extends number | string ? K : never;
+  [K in keyof Row]-?: Row[K] extends SortValue ? K : never;
 }[keyof Row] &
   string;
 
-/** One key of a comparator chain: a comparable field and a direction. */
-export interface SortKey<Row> {
+/** One key of a comparator chain that reads a required field of the row. */
+export interface FieldSortKey<Row> {
   /** The row field compared. */
   readonly field: ComparableField<Row>;
   /** The direction the field orders in. */
   readonly direction: SortDirection;
+  /** How a string value compares; `'utf16'` when absent. Numbers compare numerically. */
+  readonly collation?: StringCollation;
 }
+
+/**
+ * The values a chain may rank by that no row carries as a required field of
+ * its own, each derived for exactly the sort that needs it (see
+ * {@link SOURCE_SORT_KEYS}):
+ *
+ * - `nameGroupSize` — how many records of the ordered set share the record's
+ *   operation `name`;
+ * - `hookGroupSize` — how many transitions of the ordered set share the
+ *   transition's hook, the pair (`component`, `hookIndex`); none for a row that
+ *   names neither half;
+ * - `hookComponent`, `hookIndex` — the two halves of that hook identity, none
+ *   where the row lacks one;
+ * - `eventDuration` — the measured duration of the event a row projects, none
+ *   where it is unknown;
+ * - `metricPosition` — a metric value's position in `METRIC_IDS`;
+ * - `measuredMilliseconds`, `measuredCount` — a metric's value when it was
+ *   measured and its unit is `milliseconds` (respectively `count`), none
+ *   otherwise.
+ *
+ * A closed vocabulary, so a suite can hold every derived key to a derivation of
+ * its own, written independently of the ones below.
+ */
+export type DerivedSortKeyName =
+  | 'nameGroupSize'
+  | 'hookGroupSize'
+  | 'hookComponent'
+  | 'hookIndex'
+  | 'eventDuration'
+  | 'metricPosition'
+  | 'measuredMilliseconds'
+  | 'measuredCount';
+
+/** What a derived key may read besides the rows it orders. */
+export interface SortContext {
+  /**
+   * The measured duration of each event a row projects, by event id: what
+   * ranks a state transition — whose row carries no duration — by the `state`
+   * event it was built from. Empty for every source that has none to offer.
+   */
+  readonly eventDurations: ReadonlyMap<EventId, number>;
+}
+
+/** The context of an ordering with nothing to offer beyond its rows. */
+const EMPTY_SORT_CONTEXT: SortContext = Object.freeze({
+  eventDurations: new Map<EventId, number>(),
+});
+
+/**
+ * One key of a comparator chain whose value is derived rather than read.
+ *
+ * `evaluate` runs **once per ordering**, over the whole set being ordered —
+ * never per comparison and never per page — and answers one value per row,
+ * aligned with the rows. That is what lets a value depend on the set (a
+ * group's size) or on the context (an event's duration) while a sort of `n`
+ * rows stays one derivation plus `O(n log n)` comparisons. A row the key has no
+ * value for — `undefined`, or a number that is not finite — ranks **after every
+ * row with one, in either direction**, the store's rule for a row that belongs
+ * to no group; rows without a value tie on the key and are ordered by the rest
+ * of the chain.
+ *
+ * @typeParam Row The row type the key ranks.
+ */
+export interface DerivedSortKey<Row> {
+  /** What the key ranks by. */
+  readonly derived: DerivedSortKeyName;
+  /** The direction the value orders in. */
+  readonly direction: SortDirection;
+  /** How a string value compares; `'utf16'` when absent. Numbers compare numerically. */
+  readonly collation?: StringCollation;
+  /**
+   * Every row's value, in row order.
+   *
+   * @param rows The whole set being ordered.
+   * @param context What the source offers beyond its rows.
+   * @returns One value per row, `undefined` where the row has none.
+   */
+  readonly evaluate: (
+    rows: readonly Row[],
+    context: SortContext,
+  ) => readonly (SortValue | undefined)[];
+}
+
+/** One key of a comparator chain: a field of the row, or a value derived for the sort. */
+export type SortKey<Row> = FieldSortKey<Row> | DerivedSortKey<Row>;
 
 /**
  * A complete comparator chain: any number of keys, then **`id` ascending**.
@@ -345,38 +464,172 @@ export interface SortKey<Row> {
  * secondary key AAP 0.4.2 requires — or that names a row without an `id` — does
  * not compile. `id` is unique within every paged source (an event id, a
  * `render:` or request-group id derived from the group key, a state-transition
- * row's event id), which is what makes each chain a total order and each page
- * boundary exact.
+ * row's event id, a metric id), which is what makes each chain a total order
+ * and each page boundary exact.
  *
  * @typeParam Row The row type the chain orders.
  */
 export type SortChain<Row> = readonly [
   ...SortKey<Row>[],
-  SortKey<Row> & { readonly field: 'id'; readonly direction: 'asc' },
+  FieldSortKey<Row> & { readonly field: 'id'; readonly direction: 'asc' },
+];
+
+/** Whether a key is derived rather than read from a field. */
+function isDerivedKey<Row>(key: SortKey<Row>): key is DerivedSortKey<Row> {
+  return 'derived' in key;
+}
+
+/** A finite number, or `undefined`: the only numbers a derived key ranks by. */
+function finiteOrAbsent(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * How many of `keys` equal each one, aligned with `keys`; an `undefined` key
+ * belongs to no group and has no size.
+ *
+ * The keys are held in memory for the count only — never logged, never
+ * returned — because a key is built from captured names.
+ */
+function groupSizes(keys: readonly (string | undefined)[]): (number | undefined)[] {
+  const sizes = new Map<string, number>();
+  for (const key of keys) {
+    if (key !== undefined) {
+      sizes.set(key, (sizes.get(key) ?? 0) + 1);
+    }
+  }
+  return keys.map((key) => (key === undefined ? undefined : sizes.get(key)));
+}
+
+/** One row of the `stateTransitions` source. */
+type StateTransitionRow = DataRowOf<'stateTransitions'>;
+
+/** One row of the `metrics` source. */
+type MetricRow = DataRowOf<'metrics'>;
+
+/**
+ * The identity of a transition's hook — the pair (`component`, `hookIndex`) —
+ * as a collision-free text, or `undefined` for a row that names neither half
+ * (the truncation sentinel), which belongs to no hook.
+ *
+ * A JSON pair rather than a joined string, so no component name can collide
+ * with another pair. Used only to count rows per hook; the order between hooks
+ * is decided by the `hookComponent` and `hookIndex` keys themselves.
+ */
+function hookIdentity(row: StateTransitionRow): string | undefined {
+  if (row.component === undefined && row.hookIndex === undefined) {
+    return undefined;
+  }
+  return JSON.stringify([row.component ?? null, row.hookIndex ?? null]);
+}
+
+/** `nameGroupSize`: each record's operation-name group size within the ordered set. */
+function nameGroupSizes(rows: readonly TelemetryEvent[]): readonly (SortValue | undefined)[] {
+  return groupSizes(rows.map((row) => row.name));
+}
+
+/** `hookGroupSize`: each transition's hook group size within the ordered set. */
+function hookGroupSizes(rows: readonly StateTransitionRow[]): readonly (SortValue | undefined)[] {
+  return groupSizes(rows.map(hookIdentity));
+}
+
+/** `hookComponent`: each transition's component, where it names one. */
+function hookComponents(rows: readonly StateTransitionRow[]): readonly (SortValue | undefined)[] {
+  return rows.map((row) => row.component);
+}
+
+/** `hookIndex`: each transition's hook index, where it names one. */
+function hookIndexes(rows: readonly StateTransitionRow[]): readonly (SortValue | undefined)[] {
+  return rows.map((row) => finiteOrAbsent(row.hookIndex));
+}
+
+/** `eventDuration`: the measured duration of the `state` event each transition projects. */
+function transitionEventDurations(
+  rows: readonly StateTransitionRow[],
+  context: SortContext,
+): readonly (SortValue | undefined)[] {
+  return rows.map((row) => finiteOrAbsent(context.eventDurations.get(row.eventId)));
+}
+
+/** Each metric id's position in `METRIC_IDS`, the vocabulary order. */
+const METRIC_POSITIONS: ReadonlyMap<MetricId, number> = new Map(
+  METRIC_IDS.map((id, position) => [id, position] as const),
+);
+
+/** `metricPosition`: each value's position in `METRIC_IDS`. */
+function metricPositions(rows: readonly MetricRow[]): readonly (SortValue | undefined)[] {
+  return rows.map((row) => METRIC_POSITIONS.get(row.id));
+}
+
+/** The unit whose measured values `duration_desc` ranks first among the metrics. */
+const DURATION_METRIC_UNIT = 'milliseconds' satisfies MetricUnit;
+
+/** The unit whose measured values `count_desc` ranks first among the metrics. */
+const COUNT_METRIC_UNIT = 'count' satisfies MetricUnit;
+
+/**
+ * The derivation of a metric measure key: each value's measured number when
+ * the capture measured it (`available`) and its unit is `unit`, and none
+ * otherwise — so every other value ranks after the measured ones.
+ */
+function measuredIn(
+  unit: MetricUnit,
+): (rows: readonly MetricRow[]) => readonly (SortValue | undefined)[] {
+  return (rows) =>
+    rows.map((row) => (row.available && row.unit === unit ? finiteOrAbsent(row.value) : undefined));
+}
+
+/** `measuredMilliseconds`: the measured durations. */
+const measuredMilliseconds = measuredIn(DURATION_METRIC_UNIT);
+
+/** `measuredCount`: the measured counts. */
+const measuredCounts = measuredIn(COUNT_METRIC_UNIT);
+
+/**
+ * The group key the flat sources' `count_desc` ranks records by, sent with
+ * every page read: the operation `name`, the one key every stored row carries,
+ * so no record falls into the ungrouped tail. Named explicitly rather than
+ * left to the store's default, so the statement the store runs and the
+ * `nameGroupSize` key of {@link SOURCE_SORT_KEYS} can only describe one
+ * grouping.
+ */
+const FLAT_SOURCE_GROUP_KEY = 'name' satisfies TelemetryGroupKey;
+
+/** The flat sources' `count_desc` chain: the store's ranking by operation-name group. */
+const FLAT_COUNT_DESC_CHAIN: SortChain<TelemetryEvent> = [
+  { derived: 'nameGroupSize', direction: 'desc', evaluate: nameGroupSizes },
+  { field: FLAT_SOURCE_GROUP_KEY, direction: 'asc', collation: 'utf8' },
+  { field: 'id', direction: 'asc' },
 ];
 
 /**
- * For every sortable source, the chain each applicable sort orders by.
+ * For every sortable source, the chain **every** sort orders it by.
  *
- * A sort absent from a source's entry does not apply to it and falls back to
- * {@link DEFAULT_SORT_BY_SOURCE}.
+ * Total by type — a `Record` over the whole `DataQuerySort` vocabulary for each
+ * source — so no requested sort can find a source without an ordering, and a
+ * sort added to the vocabulary fails compilation here until every source says
+ * what it means.
  */
 export type SourceSortKeys = {
-  readonly [S in SortedDataSource]: Readonly<
-    Partial<Record<DataQuerySort, SortChain<DataRowOf<S>>>>
-  >;
+  readonly [S in SortedDataSource]: Readonly<Record<DataQuerySort, SortChain<DataRowOf<S>>>>;
 };
 
 /**
- * The comparator chains of every sortable source — the stable ordering half of
- * the paging contract.
+ * The comparator chains of every sortable source under every sort — the stable
+ * ordering half of the paging contract. Each chain is applied to the whole
+ * filtered source before a page is cut.
  *
  * - **`spans`, `events`** — ordered by the store, which is where filtering and
- *   paging of those sources happen. The chains are the store's panel orderings
- *   (`PANEL_DURATION_DESC_ORDER_BY` and `PANEL_START_ASC_ORDER_BY` in
- *   `../store/telemetry-repo.ts`) stated as data: duration descending or start
- *   ascending, then the event id. `count_desc` does not apply to a flat record
- *   list and is not offered.
+ *   paging of those sources happen; the chains state its orderings as data.
+ *   `duration_desc` and `start_asc` are `PANEL_DURATION_DESC_ORDER_BY` and
+ *   `PANEL_START_ASC_ORDER_BY` (`../store/telemetry-repo.ts`): duration
+ *   descending or start ascending, then the event id. `count_desc` is the
+ *   store's row ranking under the group key the resolver sends with the read
+ *   (`name`): each record ranked by how many records of the filtered source
+ *   share its operation name — `COUNT(name) OVER (PARTITION BY name) DESC` —
+ *   the most frequent operation first; then the name itself in UTF-8 byte
+ *   order (SQLite's `BINARY` collation), which keeps one operation's records
+ *   together and separates two equally frequent ones; then the event id.
  * - **`renders`** — most renders, most total render time, or earliest first
  *   render, then the `render:` id.
  * - **`requests`** — largest group first, with the more redundant of two
@@ -385,8 +638,29 @@ export type SourceSortKeys = {
  *   group id.
  * - **`queries`** — most executions, most total time, or earliest first
  *   execution, then the group id.
- * - **`stateTransitions`** — chronological only: a transition is an instant, so
- *   neither a duration nor a count ranks it.
+ * - **`stateTransitions`** — `start_asc` in the order the transitions happened.
+ *   `count_desc` ranks each transition by how many transitions of the whole
+ *   ordered set share its hook — the pair (`component`, `hookIndex`) — the most
+ *   frequently changing hook first; then the hook identity ascending (the
+ *   component by code unit, then the hook index), which keeps one hook's
+ *   transitions together; then the start time and the id. A row naming neither
+ *   half of a hook — the truncation sentinel — belongs to no group and ranks
+ *   after every group, the store's rule for an ungrouped row. `duration_desc`
+ *   ranks each transition by the measured duration of the `state` event it
+ *   projects (its `eventId`, which is also its `id`), longest first, a row
+ *   whose event duration is unknown after every row with one; then the start
+ *   time and the id. The browser producer (`packages/telemetry/src/browser/
+ *   state.ts`) records every transition as an instant of duration 0, so its
+ *   transitions tie and are, in practice, ordered chronologically — but a
+ *   producer's non-zero durations are honoured.
+ * - **`metrics`** — every value describes the same capture window, so under
+ *   `start_asc` they all tie on start and their `METRIC_IDS` position decides:
+ *   the vocabulary order, which is also the order with no sort. `duration_desc`
+ *   puts the measured values whose unit is `milliseconds` first, largest
+ *   first; `count_desc` does the same for the values whose unit is `count`.
+ *   Under both, every other value — another unit, or `available: false` —
+ *   follows in `METRIC_IDS` order, and equal values are separated by that
+ *   position too; the id comes last.
  */
 export const SOURCE_SORT_KEYS: SourceSortKeys = Object.freeze({
   spans: {
@@ -398,6 +672,7 @@ export const SOURCE_SORT_KEYS: SourceSortKeys = Object.freeze({
       { field: 'startTime', direction: 'asc' },
       { field: 'id', direction: 'asc' },
     ],
+    count_desc: FLAT_COUNT_DESC_CHAIN,
   },
   events: {
     start_asc: [
@@ -408,6 +683,7 @@ export const SOURCE_SORT_KEYS: SourceSortKeys = Object.freeze({
       { field: 'duration', direction: 'desc' },
       { field: 'id', direction: 'asc' },
     ],
+    count_desc: FLAT_COUNT_DESC_CHAIN,
   },
   renders: {
     count_desc: [
@@ -457,20 +733,48 @@ export const SOURCE_SORT_KEYS: SourceSortKeys = Object.freeze({
       { field: 'startTime', direction: 'asc' },
       { field: 'id', direction: 'asc' },
     ],
+    count_desc: [
+      { derived: 'hookGroupSize', direction: 'desc', evaluate: hookGroupSizes },
+      { derived: 'hookComponent', direction: 'asc', evaluate: hookComponents },
+      { derived: 'hookIndex', direction: 'asc', evaluate: hookIndexes },
+      { field: 'startTime', direction: 'asc' },
+      { field: 'id', direction: 'asc' },
+    ],
+    duration_desc: [
+      { derived: 'eventDuration', direction: 'desc', evaluate: transitionEventDurations },
+      { field: 'startTime', direction: 'asc' },
+      { field: 'id', direction: 'asc' },
+    ],
+  },
+  metrics: {
+    start_asc: [
+      { derived: 'metricPosition', direction: 'asc', evaluate: metricPositions },
+      { field: 'id', direction: 'asc' },
+    ],
+    duration_desc: [
+      { derived: 'measuredMilliseconds', direction: 'desc', evaluate: measuredMilliseconds },
+      { derived: 'metricPosition', direction: 'asc', evaluate: metricPositions },
+      { field: 'id', direction: 'asc' },
+    ],
+    count_desc: [
+      { derived: 'measuredCount', direction: 'desc', evaluate: measuredCounts },
+      { derived: 'metricPosition', direction: 'asc', evaluate: metricPositions },
+      { field: 'id', direction: 'asc' },
+    ],
   },
 });
 
 /**
- * The order each sortable source takes when a query names no sort, or names
- * one that does not apply to it.
+ * The order each sortable source takes when a query names no sort.
  *
  * Each is the question the source is read for — and the order the renderer's
  * own table for it opens in: the slowest work first for `spans` (the "slowest
  * operations" ranking), capture order for the `events` log, the busiest
  * components and the most repeated requests first, the costliest statements
- * first, and transitions in the order they happened. Every value is a key of
- * that source's {@link SOURCE_SORT_KEYS} entry, which this module's suite
- * asserts.
+ * first, transitions in the order they happened, and the metric values in
+ * `METRIC_IDS` order (`start_asc`, under which they all tie on start). A named
+ * sort is never replaced by this default: every sort has a chain on every
+ * source ({@link SOURCE_SORT_KEYS}).
  */
 export const DEFAULT_SORT_BY_SOURCE: Readonly<Record<SortedDataSource, DataQuerySort>> =
   Object.freeze({
@@ -480,36 +784,35 @@ export const DEFAULT_SORT_BY_SOURCE: Readonly<Record<SortedDataSource, DataQuery
     requests: 'count_desc',
     queries: 'duration_desc',
     stateTransitions: 'start_asc',
+    metrics: 'start_asc',
   });
 
 /**
- * The sort a query on `source` is actually answered in: the requested one when
- * it applies to the source, and the source's default otherwise.
+ * The sort a query on `source` is answered in: the requested one whenever the
+ * query names one — every sort orders every sortable source — and the source's
+ * default ({@link DEFAULT_SORT_BY_SOURCE}) when it names none.
  *
  * @param source A sortable source.
  * @param requested The query's `sort`, possibly absent.
- * @returns A sort with a chain in {@link SOURCE_SORT_KEYS} for `source`.
+ * @returns The sort whose chain in {@link SOURCE_SORT_KEYS} orders the answer.
  */
 export function effectiveSort(
   source: SortedDataSource,
   requested: DataQuerySort | undefined,
 ): DataQuerySort {
-  const fallback = DEFAULT_SORT_BY_SOURCE[source];
-  if (requested === undefined) {
-    return fallback;
-  }
-  return SOURCE_SORT_KEYS[source][requested] === undefined ? fallback : requested;
+  return requested ?? DEFAULT_SORT_BY_SOURCE[source];
 }
 
 /**
- * Compares two values of one comparable field.
+ * Compares two values of one key.
  *
- * Numbers numerically, strings by UTF-16 code unit — never `localeCompare`,
- * whose answer depends on the host's locale and would let two machines page one
- * capture differently. A value of any other type sorts after both, which no
- * chain can reach because {@link ComparableField} admits only the two.
+ * Numbers numerically; strings by UTF-16 code unit, or by UTF-8 bytes under
+ * the `utf8` collation — never `localeCompare` (see {@link StringCollation}).
+ * A number sorts before a string and a value of any other type after both;
+ * neither case is reachable, because a field key admits only required number
+ * or string fields and each derived key yields one type.
  */
-function compareValues(left: unknown, right: unknown): number {
+function compareValues(left: unknown, right: unknown, collation: StringCollation): number {
   if (typeof left === 'number' && typeof right === 'number') {
     if (left === right) {
       return 0;
@@ -520,34 +823,113 @@ function compareValues(left: unknown, right: unknown): number {
     if (left === right) {
       return 0;
     }
+    if (collation === 'utf8') {
+      return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+    }
     return left < right ? -1 : 1;
   }
-  const leftRank = typeof left === 'number' || typeof left === 'string' ? 0 : 1;
-  const rightRank = typeof right === 'number' || typeof right === 'string' ? 0 : 1;
-  return leftRank - rightRank;
+  return typeRank(left) - typeRank(right);
+}
+
+/** The rank of a value's type in {@link compareValues}: numbers, strings, then anything else. */
+function typeRank(value: unknown): number {
+  if (typeof value === 'number') {
+    return 0;
+  }
+  return typeof value === 'string' ? 1 : 2;
+}
+
+/**
+ * A derived value as it is ranked: a string, or a finite number; anything else
+ * — `undefined`, `NaN`, an infinity — is "no value", which ranks last.
+ */
+function rankable(value: SortValue | undefined): SortValue | undefined {
+  return typeof value === 'number' ? finiteOrAbsent(value) : value;
+}
+
+/**
+ * Compares two rows' values of one derived key: rows with a value in the key's
+ * direction, and every row without one after them in either direction.
+ */
+function compareDerived(
+  left: SortValue | undefined,
+  right: SortValue | undefined,
+  direction: SortDirection,
+  collation: StringCollation,
+): number {
+  const leftValue = rankable(left);
+  const rightValue = rankable(right);
+  if (leftValue === undefined || rightValue === undefined) {
+    if (leftValue === rightValue) {
+      return 0;
+    }
+    return leftValue === undefined ? 1 : -1;
+  }
+  const order = compareValues(leftValue, rightValue, collation);
+  return direction === 'desc' ? -order : order;
 }
 
 /**
  * Orders rows by a comparator chain, into a fresh array.
  *
- * The input is never sorted in place: it may be an aggregate's own result,
- * which that aggregate documents as being in its base order.
+ * Every derived key is evaluated once, over the whole of `rows`, before any
+ * comparison; the rows are then compared key by key, a field key reading the
+ * row and a derived key reading the value evaluated for it. The input is never
+ * sorted in place: it may be an aggregate's own result, which that aggregate
+ * documents as being in its base order.
  *
- * @param rows The rows to order.
+ * @param rows The rows to order — the whole set, never a page of it, since a
+ * derived value may depend on every row.
  * @param chain The chain, ending in `id` ascending.
+ * @param context What a derived key may read besides the rows; empty unless
+ * the source supplies something (the `stateTransitions` event durations).
  * @returns A new array in chain order.
+ *
+ * @example
+ * ```ts
+ * // Largest group first, then the id.
+ * orderRows(groups, [
+ *   { field: 'count', direction: 'desc' },
+ *   { field: 'id', direction: 'asc' },
+ * ]);
+ * ```
  */
-export function orderRows<Row>(rows: readonly Row[], chain: SortChain<Row>): Row[] {
+export function orderRows<Row>(
+  rows: readonly Row[],
+  chain: SortChain<Row>,
+  context: SortContext = EMPTY_SORT_CONTEXT,
+): Row[] {
   const keys: readonly SortKey<Row>[] = chain;
-  return [...rows].sort((left, right) => {
-    for (const key of keys) {
-      const order = compareValues(left[key.field], right[key.field]);
+  const steps = keys.map((key) => ({
+    key,
+    values: isDerivedKey(key) ? key.evaluate(rows, context) : undefined,
+  }));
+  const entries = rows.map((row, index) => ({ row, index }));
+  entries.sort((left, right) => {
+    for (const { key, values } of steps) {
+      let order: number;
+      if (isDerivedKey(key)) {
+        order = compareDerived(
+          values?.[left.index],
+          values?.[right.index],
+          key.direction,
+          key.collation ?? 'utf16',
+        );
+      } else {
+        const compared = compareValues(
+          left.row[key.field],
+          right.row[key.field],
+          key.collation ?? 'utf16',
+        );
+        order = key.direction === 'desc' ? -compared : compared;
+      }
       if (order !== 0) {
-        return key.direction === 'desc' ? -order : order;
+        return order;
       }
     }
     return 0;
   });
+  return entries.map((entry) => entry.row);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1064,6 +1446,25 @@ const EMPTY_SLICE: EventSlice = Object.freeze({
 });
 
 /**
+ * The `stateTransitions` value of a slice: its transitions, and what ranks them
+ * under `duration_desc`.
+ *
+ * A `StateTransition` row carries no duration, so the measured duration of the
+ * `state` event each row projects is kept beside the rows, taken from the same
+ * slice in the same computation — which is why it is cached with them and can
+ * never describe another read.
+ */
+interface StateTransitionValue {
+  /** Every transition of the slice, in the aggregate's base order. */
+  readonly rows: readonly StateTransitionRow[];
+  /**
+   * The duration of every `state` event of the slice, by event id: the
+   * {@link SortContext.eventDurations} the rows are ordered with.
+   */
+  readonly durations: ReadonlyMap<EventId, number>;
+}
+
+/**
  * The value each aggregate source computes from its slice, before ordering and
  * paging: what a cache entry holds per source. Typed off the protocol's result
  * members, so a cached value is exactly what a response is built from.
@@ -1073,9 +1474,34 @@ interface AggregateValues {
   readonly componentTree: PayloadOf<'componentTree'>;
   readonly requests: readonly DataRowOf<'requests'>[];
   readonly queries: readonly DataRowOf<'queries'>[];
-  readonly stateTransitions: readonly DataRowOf<'stateTransitions'>[];
+  readonly stateTransitions: StateTransitionValue;
   readonly graph: PayloadOf<'graph'>;
   readonly metrics: readonly MetricValue[];
+}
+
+/**
+ * The measured duration of every `state` event of a slice, by event id — the
+ * events `aggregateStateTransitions` builds its rows from, each row's `eventId`
+ * naming one.
+ *
+ * Event ids are unique within a capture (the store's `id` column is `UNIQUE`);
+ * should one ever repeat, its first event in the slice decides. A duration
+ * that is not a finite number is left out, so its row ranks with the rows
+ * whose duration is unknown rather than on an invented value.
+ */
+function stateEventDurations(events: readonly TelemetryEvent[]): ReadonlyMap<EventId, number> {
+  const durations = new Map<EventId, number>();
+  const seen = new Set<EventId>();
+  for (const event of events) {
+    if (!STATE_KINDS.includes(event.kind) || seen.has(event.id)) {
+      continue;
+    }
+    seen.add(event.id);
+    if (Number.isFinite(event.duration)) {
+      durations.set(event.id, event.duration);
+    }
+  }
+  return durations;
 }
 
 /** How each aggregate source is computed from its input events. */
@@ -1090,16 +1516,19 @@ type AggregateComputations = {
  *
  * `stateTransitions` lifts the aggregate's own cap to the slice ceiling, so
  * `total` is every transition of the slice rather than the aggregate's
- * default; `componentTree` turns "no rendering evidence" (`undefined`, which
- * does not survive JSON) into the wire's `null`.
+ * default, and keeps the slice's `state` event durations beside the rows
+ * ({@link StateTransitionValue}); `componentTree` turns "no rendering evidence"
+ * (`undefined`, which does not survive JSON) into the wire's `null`.
  */
 const AGGREGATE_COMPUTE: AggregateComputations = Object.freeze({
   renders: (events) => aggregateRenders(events),
   componentTree: (events) => buildComponentTreeSnapshot(events) ?? null,
   requests: (events) => aggregateRequests(events),
   queries: (events) => aggregateQueries(events),
-  stateTransitions: (events) =>
-    aggregateStateTransitions(events, { maxTransitions: MAX_AGGREGATE_INPUT_EVENTS }),
+  stateTransitions: (events) => ({
+    rows: aggregateStateTransitions(events, { maxTransitions: MAX_AGGREGATE_INPUT_EVENTS }),
+    durations: stateEventDurations(events),
+  }),
   graph: (events) => buildDependencyGraph(events),
   metrics: (events) => computeMetrics(events),
 });
@@ -1291,6 +1720,10 @@ function summaryFor(
  * no value is left out rather than invented — "not computed" is never presented
  * as a measurement — and an `available: false` value is kept exactly as it came,
  * so the card renders "n/a" rather than a zero.
+ *
+ * This is the set the `metrics` source orders — by the requested sort's chain
+ * in {@link SOURCE_SORT_KEYS}, whose `start_asc` and no-sort order is this one —
+ * before its window is cut.
  */
 function orderMetrics(values: readonly MetricValue[]): MetricValue[] {
   const byId = new Map<MetricValue['id'], MetricValue>();
@@ -1774,12 +2207,20 @@ function computeBundle(shared: SharedSlices): AggregateValues {
   };
 }
 
-/** The paging counts of a result, for a timing record. */
-function pageCounts(result: DataResult): Record<string, number | boolean> {
+/**
+ * The paging counts of a result and the sort that ordered it, for a timing
+ * record: nothing for a single-value result, which has neither. The sort is a
+ * vocabulary name, never captured data.
+ */
+function pageCounts(
+  result: DataResult,
+  requested: DataQuerySort | undefined,
+): Record<string, number | boolean | string> {
   if (!('total' in result)) {
     return {};
   }
   return {
+    sort: effectiveSort(result.source, requested),
     total: result.total,
     limit: result.limit,
     offset: result.offset,
@@ -2268,7 +2709,14 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
     return aggregateAt(log, source, scope, captureId, filter, generation.value);
   };
 
-  /** One page of a flat event source, filtered, ordered and paged by the store. */
+  /**
+   * One page of a flat event source, filtered, ordered and paged by the store.
+   *
+   * The requested sort — or the source's default when none is named — reaches
+   * the store unchanged, with {@link FLAT_SOURCE_GROUP_KEY} as the group
+   * `count_desc` ranks by (the other two sorts do not read it), so the store
+   * applies exactly the chain {@link SOURCE_SORT_KEYS} states for the source.
+   */
   const readEventRows = (
     log: Logger,
     source: EventRowDataSource,
@@ -2282,21 +2730,13 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       return ok(applyPage<TelemetryEvent>([], paging));
     }
 
-    const sort = effectiveSort(source, requested);
-    if (requested !== undefined && requested !== sort) {
-      log.debug('The requested sort does not apply to this source; using its default.', {
-        source,
-        requested,
-        applied: sort,
-      });
-    }
-
     const page = guarded('reading a page of events', () =>
       telemetry.query({
         sessionId: scope.sessionId,
         captureId,
         ...narrowing,
-        sort,
+        sort: effectiveSort(source, requested),
+        groupBy: FLAT_SOURCE_GROUP_KEY,
         limit: paging.limit,
         offset: paging.offset,
       }),
@@ -2314,32 +2754,20 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
     return ok({ items: page.value.rows, page: pageFromStore(page.value, paging) });
   };
 
-  /** Rows of an in-memory source, ordered by the chain of the sort that applies. */
+  /**
+   * Every row of an in-memory source, ordered by the chain of the requested
+   * sort — or of the source's default when none is named. Total: the table
+   * has a chain for every sort of every sortable source, so a named sort is
+   * always the one applied.
+   */
   const orderFor = <S extends SortedDataSource>(
-    log: Logger,
     source: S,
     rows: readonly DataRowOf<S>[],
     requested: DataQuerySort | undefined,
-  ): Result<DataRowOf<S>[], DebuggenError> => {
-    const applied = effectiveSort(source, requested);
-    if (requested !== undefined && requested !== applied) {
-      log.debug('The requested sort does not apply to this source; using its default.', {
-        source,
-        requested,
-        applied,
-      });
-    }
+    context: SortContext = EMPTY_SORT_CONTEXT,
+  ): DataRowOf<S>[] => {
     const chains: SourceSortKeys[S] = SOURCE_SORT_KEYS[source];
-    const chain = chains[applied];
-    if (chain === undefined) {
-      return err(
-        new DebuggenError('INTERNAL', 'No ordering is declared for a panel data source.', {
-          hint: INTERNAL_FAILURE_HINT,
-          details: { source, sort: applied, reason: 'missing-sort-chain' },
-        }),
-      );
-    }
-    return ok(orderRows(rows, chain));
+    return orderRows(rows, chains[effectiveSort(source, requested)], context);
   };
 
   /**
@@ -2626,11 +3054,10 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
         if (!renders.ok) {
           return err(renders.error);
         }
-        const ordered = orderFor(log, query.source, renders.value, query.sort);
-        if (!ordered.ok) {
-          return err(ordered.error);
-        }
-        const { items, page } = applyPage(ordered.value, paging);
+        const { items, page } = applyPage(
+          orderFor(query.source, renders.value, query.sort),
+          paging,
+        );
         return ok({ source: query.source, renders: items, ...page });
       }
 
@@ -2647,11 +3074,10 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
         if (!requests.ok) {
           return err(requests.error);
         }
-        const ordered = orderFor(log, query.source, requests.value, query.sort);
-        if (!ordered.ok) {
-          return err(ordered.error);
-        }
-        const { items, page } = applyPage(ordered.value, paging);
+        const { items, page } = applyPage(
+          orderFor(query.source, requests.value, query.sort),
+          paging,
+        );
         return ok({ source: query.source, requests: items, ...page });
       }
 
@@ -2660,26 +3086,26 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
         if (!queries.ok) {
           return err(queries.error);
         }
-        const ordered = orderFor(log, query.source, queries.value, query.sort);
-        if (!ordered.ok) {
-          return err(ordered.error);
-        }
-        const { items, page } = applyPage(ordered.value, paging);
+        const { items, page } = applyPage(
+          orderFor(query.source, queries.value, query.sort),
+          paging,
+        );
         return ok({ source: query.source, queries: items, ...page });
       }
 
       case 'stateTransitions': {
         // Every transition of the slice: the aggregate's own cap is lifted to the
-        // slice ceiling (see AGGREGATE_COMPUTE).
+        // slice ceiling (see AGGREGATE_COMPUTE). The slice's state-event
+        // durations travel with the rows, for `duration_desc`.
         const transitions = aggregateOf(log, query.source, scope, filter);
         if (!transitions.ok) {
           return err(transitions.error);
         }
-        const ordered = orderFor(log, query.source, transitions.value, query.sort);
-        if (!ordered.ok) {
-          return err(ordered.error);
-        }
-        const { items, page } = applyPage(ordered.value, paging);
+        const { rows, durations } = transitions.value;
+        const { items, page } = applyPage(
+          orderFor(query.source, rows, query.sort, { eventDurations: durations }),
+          paging,
+        );
         return ok({ source: query.source, stateTransitions: items, ...page });
       }
 
@@ -2698,8 +3124,12 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
         if (!values.ok) {
           return err(values.error);
         }
-        // Fixed order, whatever `sort` says: a window over `METRIC_IDS` order.
-        const { items, page } = applyPage(orderMetrics(values.value), paging);
+        // One value per id in `METRIC_IDS` order, then the requested order —
+        // `METRIC_IDS` order again when none is named — then the window.
+        const { items, page } = applyPage(
+          orderFor(query.source, orderMetrics(values.value), query.sort),
+          paging,
+        );
         return ok({ source: query.source, metrics: items, ...page });
       }
 
@@ -2746,7 +3176,7 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
         source,
         binding: scope.value.binding,
         hasCapture: scope.value.captureId !== undefined,
-        ...pageCounts(result.value),
+        ...pageCounts(result.value, query.sort),
         durationMs: now() - started,
       });
       return result;

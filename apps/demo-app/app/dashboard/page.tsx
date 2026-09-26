@@ -37,7 +37,7 @@
  * place of the figures, never in place of the page. The filter row stays mounted above it and the
  * notice carries a link back to this route's own path, so the filter the notice is asking the
  * reader to clear is a filter they can actually reach: with both, recovery is one control away by
- * pointer or by keyboard, and with neither it was a URL to retype by hand.
+ * pointer or by keyboard rather than a URL to retype by hand.
  *
  * WHAT THE PAGE DOES NOT OWN
  *   - The document, the main landmark and the site chrome: `app/layout.tsx` mounts `PageContainer`
@@ -102,12 +102,6 @@ import {
 
 /* ---------------------------------------------------------------------------
  * Copy
- *
- * All-caps by convention, and the convention earns its keep:
- * `scripts/check-no-hardcoding.mjs` harvests this application's camel-case
- * declarations into vocabulary no product file may then mention, and skips a
- * name with no camel boundary. A constant spelled this way costs the product
- * nothing.
  * ------------------------------------------------------------------------- */
 
 /** The page's heading, and the title the root layout's template suffixes. */
@@ -401,13 +395,13 @@ async function DashboardData({
      * notice and a dead end. The most likely reason this branch is reached is
      * the filter itself - an identifier in the address bar that no longer names
      * a location - and the notice's own advice is to clear it, which a reader
-     * can only follow if the controls are still there. Dropping them left the
-     * whole page holding one interactive element, a breadcrumb, under a sentence
-     * about a filter that was nowhere on screen; recovery meant editing the URL
-     * by hand. The row is given no locations, because the payload that lists
-     * them is the payload that did not arrive, and it is given the parsed query,
-     * so it shows what was asked for - naming an unlisted location as unlisted -
-     * rather than a filter nobody chose.
+     * can only follow if the controls are still there. Without them the whole
+     * page would hold one interactive element, a breadcrumb, under a sentence
+     * about a filter that is nowhere on screen, and recovery would mean editing
+     * the URL by hand. The row is given no locations, because the payload that
+     * lists them is the payload that did not arrive, and it is given the parsed
+     * query, so it shows what was asked for - naming an unlisted location as
+     * unlisted - rather than a filter nobody chose.
      *
      * It is passed no children either: there are no figures behind this notice
      * to mark as updating, and the notice already announces itself.
@@ -439,12 +433,9 @@ async function DashboardData({
 
         <div className="ls-notice">
           {/*
-            Asking again is always offered. The way out of the filter is offered
-            only when there is something to leave: on an unfiltered visit this
-            branch means the read itself failed, and a link to the address
-            already being shown would be a control that changes nothing - the
-            same dead affordance this notice was missing, in the opposite
-            direction.
+            Retry is always offered. The link that resets the filter is offered
+            only while a filter is in force, because otherwise there is no filter
+            for it to clear.
           */}
           <Alert tone="warning" title={NOTICE_TITLE} actions={action}>
             {outcome.failure}

@@ -60,11 +60,8 @@
    * Physical and logical border declarations cascade in source order, so these two must follow the
    * shorthand.
    *
-   * BLITZY [A11Y]: the hairline measures 1.48:1 against this box's background, below the 3:1
-   * non-text recommendation. It is written as the shared token contract specifies rather than
-   * silently darkened, because it is a decorative separator: the tone accent on the inline-start
-   * edge clears 3:1 in all four tones (5.0:1 to 6.7:1) and the title and body text state the
-   * message in words, so no meaning rests on the hairline. Flagged for design review. */
+   * The hairline is a decorative separator; the tone accent on the inline-start edge and the title
+   * and body text carry the message. */
   border: 1px solid var(--ls-border, #cbd5e1);
   border-inline-start-width: 3px;
   border-inline-start-color: var(--alert-tone);

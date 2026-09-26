@@ -1,8 +1,8 @@
 /**
- * `components/RenderTable` — the colocated suite, and the renderer half of
- * acceptance test 2 (AAP 0.8.4: "render counts and timing per component;
- * trigger attribution (context/props/state) where determinable; component
- * names link to declarations").
+ * `components/RenderTable` — the colocated suite, and the renderer half of the
+ * render-count acceptance flow of the end-to-end suite: render counts and timing
+ * per component, trigger attribution (context/props/state) where determinable,
+ * and component names that link to their declarations.
  *
  * ## The one thing this suite exists for
  *
@@ -10,7 +10,7 @@
  * re-render panel is materially different from a latency panel — a different
  * set of node types over a different capture. What an end-to-end run cannot
  * prove cheaply is the **semantics the panel rests on**, and this table carries
- * the one distinction the whole product's honesty depends on (AAP 0.2.3):
+ * the one distinction the whole product's honesty depends on:
  *
  *   - `unchangedRenderCount` — props were shallow-equal, the component's own
  *     hook state was unchanged and no consumed context value changed. All
@@ -21,47 +21,45 @@
  * "We checked and nothing changed" is an actionable observation; "we could not
  * check" is the absence of one. A view that added, defaulted or substituted one
  * for the other would turn an unevidenced claim into a headline figure through
- * the renderer rather than through the model — exactly what AAP 0.8.4 forbids
- * of an analysis. The never-merge cases below therefore assert the two figures
- * under their own labels, assert that the full five-member trigger vocabulary
- * is drawn including its zeros (an absent chip cannot say which of "nothing
- * fell in this bucket" and "this bucket is not shown" it means), and assert
- * that **the digit of their sum appears nowhere in the row**.
+ * the renderer rather than through the model — a claim no analysis may ever
+ * contain. The never-merge cases below therefore assert the two figures under
+ * their own labels, assert that the full five-member trigger vocabulary is
+ * drawn including its zeros (an absent chip cannot say which of "nothing fell
+ * in this bucket" and "this bucket is not shown" it means), and assert that
+ * **the digit of their sum appears nowhere in the row**.
  *
  * ## The rest of what it pins, in the order the file asserts it
  *
- *  1. **All three states of a query-backed view** (AAP 0.8.3), driven through a
- *     stub `DataProvider`: a promise that never settles, a successful empty
- *     page and a rejection — with the failing query shown verbatim and a retry
- *     that really re-queries. The empty sentence is the wording AAP 0.6.2 gives
- *     this component, asserted exactly.
+ *  1. **All three states of a query-backed view**, driven through a stub
+ *     `DataProvider`: a promise that never settles, a successful empty page and
+ *     a rejection — with the failing query shown verbatim and a retry that
+ *     really re-queries. The node's fixed empty sentence is asserted exactly.
  *  2. **Rows, figures and column order**: one row per component, counts and
  *     durations formatted by the package's own helpers rather than by literals
  *     restated here, and the ten columns in their display order — each with a
  *     non-zero floor, so a narrow panel scrolls instead of squeezing a column
  *     to nothing.
- *  3. **Prop names only, never values** (AAP 0.5.2): the names render, no
- *     control exists to reveal a value, no cell pairs a name with one, and the
- *     expanded row states that values are never captured.
- *  4. **Bounded evidence is declared as bounded** (AAP 0.4.2): the footer says
- *     how much of the result is on screen; "Load more" requests the next page at
- *     exactly the provider's `nextOffset` with an unchanged `limit` and appends
- *     it, de-duplicated, beneath the rows already loaded — past the 5 000-row
- *     page ceiling too, and never without a `nextOffset`; a page beyond the
+ *  3. **Prop names only, never values**: the names render, no control exists to
+ *     reveal a value, no cell pairs a name with one, and the expanded row
+ *     states that values are never captured.
+ *  4. **Bounded evidence is declared as bounded**: the footer says how much of
+ *     the result is on screen; "Load more" requests the next page at exactly
+ *     the provider's `nextOffset` with an unchanged `limit` and appends it,
+ *     de-duplicated, beneath the rows already loaded — past the 5 000-row page
+ *     ceiling too, and never without a `nextOffset`; a page beyond the
  *     contract's ceiling is clamped before it is requested; an explicit
  *     `limit: 0` is sent as zero, never pages and states its count; an empty
  *     page of a non-empty result says so with its position and total instead
  *     of claiming an empty capture; and a row whose per-render list the
  *     producer truncated says so when it is expanded.
  *  5. **The interaction contract**: the component name itself is the link to
- *     its declaration (AAP 0.6.2, "component name → `onOpenSource`"), the
- *     row's only source control, and clicking it hands `onOpenSource` the very
- *     `SourceLocation` the row carries, once; a name with no location is text
- *     with its full name as a tooltip and no control; an individual render
- *     selects itself through `onSelectEvent`; and an **aggregate row selects nothing**,
- *     because it stands for many events and has no id of its own — a
- *     fabricated coordinate would open a details drawer on evidence the reader
- *     never pointed at.
+ *     its declaration and the row's only source control, and clicking it hands
+ *     `onOpenSource` the very `SourceLocation` the row carries, once; a name
+ *     with no location is text with its full name as a tooltip and no control;
+ *     an individual render selects itself through `onSelectEvent`; and an
+ *     **aggregate row selects nothing**, because it stands for many events and
+ *     has no id of its own — a fabricated coordinate would open a details
+ *     drawer on evidence the reader never pointed at.
  *  6. **Ordering belongs to the data layer**: rows appear in the provider's own
  *     order, and a sort gesture is a re-query carrying the mapped
  *     `DataQuerySort` rather than a local re-ranking of one page — and it
@@ -69,29 +67,29 @@
  *     came from: the toolbar's select and a header's sort button stay the same
  *     focused element while the re-ordered first page loads, fails, comes back
  *     empty or arrives, with no row of the previous order in between.
- *  7. **The grid is one Tab stop, and the keyboard reaches everything in it**
- *     (AAP 0.6.2, 0.6.4): exactly one element in the grid is in the Tab order —
- *     the active row — so Tab enters on it and the next Tab leaves; every
- *     control in a cell, an open detail row and the header is `tabIndex={-1}`
- *     and reached by the grid's arrow keys, ArrowRight first opening a
- *     collapsed row; every description — a header definition, an outlier's
- *     explanation, an unlinked component's full name — opens as an arrow key
- *     lands on its trigger, none sits inside a sortable header's button, and Escape closes
- *     an open one before it returns to the row. Every bubble stays mounted and
- *     resolves through `aria-describedby`, yet none is shown at rest: a closed
- *     one is `hidden`, and a pointer resting on a marked figure shows its
- *     explanation until the pointer leaves.
+ *  7. **The grid is one Tab stop, and the keyboard reaches everything in it**:
+ *     exactly one element in the grid is in the Tab order — the active row —
+ *     so Tab enters on it and the next Tab leaves; every control in a cell, an
+ *     open detail row and the header is `tabIndex={-1}` and reached by the
+ *     grid's arrow keys, ArrowRight first opening a collapsed row; every
+ *     description — a header definition, an outlier's explanation, an unlinked
+ *     component's full name — opens as an arrow key lands on its trigger, none
+ *     sits inside a sortable header's button, and Escape closes an open one
+ *     before it returns to the row. Every bubble stays mounted and resolves
+ *     through `aria-describedby`, yet none is shown at rest: a closed one is
+ *     `hidden`, and a pointer resting on a marked figure shows its explanation
+ *     until the pointer leaves.
  *  8. **Names identify their row, and state lives where ARIA allows it**: a
  *     disclosure toggle carries `aria-expanded` and an `aria-controls` that
  *     resolves to the detail row it opened (never the row itself, which a
  *     `grid` does not allow), toggle and selection names carry the component
  *     name and the visible offset, the order control has a name no other
  *     table shares, and the footer's count is a polite live region.
- *  9. **One selection, shared** (AAP 0.7.3): the render that is the panel's
- *     selected event is marked by `dg-is-selected` and `aria-pressed` alike —
- *     the view's own last selection outside a host, the host's shared
- *     selection under one, matched by event id or by trace and span — and an
- *     evidence chip of the summary and a render in the table move one mark.
+ *  9. **One selection, shared**: the render that is the panel's selected event
+ *     is marked by `dg-is-selected` and `aria-pressed` alike — the view's own
+ *     last selection outside a host, the host's shared selection under one,
+ *     matched by event id or by trace and span — and an evidence chip of the
+ *     summary and a render in the table move one mark.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -113,10 +111,11 @@
  *     renderer change rather than on a producer change. The vocabularies
  *     themselves (`RENDER_TRIGGERS`, `RENDER_PHASES`) and the row-id prefix are
  *     imported, so no spelling is restated.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): two component names, one
+ *   - **Generic fixture vocabulary only**: two component names, one
  *     project-relative path, two prop names — none of which belongs to any
  *     application, demonstration or otherwise. `scripts/check-no-hardcoding.mjs`
- *     scans this text with the rest of `packages/**`.
+ *     skips test files, so this suite keeps the product's neutral vocabulary by
+ *     convention.
  *   - **Queries by role and accessible name.** The grid, its rows, its cells,
  *     its header controls, the chips and the footer button are all reached that
  *     way; a class or an attribute is read only off an element already obtained
@@ -177,9 +176,9 @@ import { sourceLinkAccessibleName } from './SourceLink';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Application-neutral throughout (AAP 0.5.4): the component names, the file
- * path, the symbol and the prop names below belong to no inspected project, and
- * neither do the comments. The identifiers are shaped as a capture shapes them
+ * Application-neutral throughout: the component names, the file path, the
+ * symbol and the prop names below belong to no inspected project, and neither
+ * do the comments. The identifiers are shaped as a capture shapes them
  * — a 32-hex trace id, 16-hex span ids, epoch-millisecond start times,
  * millisecond durations — because those are the fields this view formats.
  * ---------------------------------------------------------------------------
@@ -259,7 +258,7 @@ const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
  * A reference to one of the column-geometry tokens a role track is built from.
  * Removing every such reference from a track template must leave nothing but
  * the `minmax()` frames and the spaces between tracks: no number and no unit is
- * the component's own (AAP 0.6.4).
+ * the component's own.
  */
 const COLUMN_TOKEN_REFERENCE = /var\(--dg-column-(?:min|share)-[a-z]+\)/gu;
 
@@ -285,7 +284,7 @@ const BASE_START_MS = 1_767_225_600_000;
 /** The identity of the node under test, as a normaliser would assign it. */
 const NODE_ID = 'layout.0.renderTable';
 
-/** The two prop names a row reports as changed. Names only — see AAP 0.5.2. */
+/** The two prop names a row reports as changed. Names only: prop values are never captured. */
 const FIRST_PROP = 'alpha';
 const SECOND_PROP = 'beta';
 
@@ -305,7 +304,7 @@ const LONGEST_TOTAL_FIRST: DataQuerySort = 'duration_desc';
  */
 const GRID_NAME = 'Render statistics per component';
 
-/** The empty sentence AAP 0.6.2 gives this node type, asserted exactly. */
+/** The node type's fixed empty sentence, asserted exactly. */
 const EMPTY_MESSAGE = 'No renders were captured for this interaction.';
 
 /** The first line above {@link EMPTY_MESSAGE}: the empty capture's short title. */
@@ -318,10 +317,11 @@ const FAILING_QUERY_NAME = 'Failing query';
 const RETRY_NAME = 'Retry';
 
 /**
- * The shared error-state contract, spelled out rather than imported so a drift
- * in the one place that words it fails here too (B1-F16, B2-F14): the titles of
- * a failed view and of a failed next page, the generic lead each message opens
- * with, and the focus key the retry control carries.
+ * The shared error-state contract, which every failed node reads by: the titles
+ * of a failed view and of a failed next page and the generic lead each message
+ * opens with, as `queryFailureProps` in `../host/useQuery` composes them, and
+ * the focus key the retry control of `ErrorState` carries. The shared contract
+ * is spelled out rather than imported, so a drift in its wording fails here too.
  */
 const VIEW_FAILURE_TITLE = 'Could not load this view';
 const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
@@ -396,7 +396,7 @@ function selectOccurrencePatternOf(component: string): RegExp {
  * column's label (see {@link cellFor}), so a case reads "the figure under
  * `Stable inputs`" instead of "the seventh cell". `Stable inputs` and
  * `Unclassified` are two entries here for the same reason they are two columns
- * in the component — they are different observations (AAP 0.2.3).
+ * in the component — they are different observations.
  */
 const COLUMN_LABELS = [
   'Component',
@@ -758,8 +758,7 @@ function pendingProvider(): StubProvider {
  * A provider that rejects every query.
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
- * implementation for: the code it carries is what the error state renders
- * (AAP 0.5.5).
+ * implementation for: the code it carries is what the error state renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -1265,7 +1264,7 @@ describe('RenderTable states', () => {
     expect(within(busy).getByText(/loading render statistics/i)).toBeDefined();
 
     // Nothing is drawn yet: no grid, therefore no rows, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -1280,9 +1279,9 @@ describe('RenderTable states', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    // The exact wording AAP 0.6.2 gives this component: generic product
-    // vocabulary that names the class of evidence and says the capture holds
-    // none of it, and no inspected project (AAP 0.5.4).
+    // The node's fixed empty sentence, exactly: generic product vocabulary
+    // that names the class of evidence and says the capture holds none of it,
+    // and no inspected project.
     const message = await screen.findByText(EMPTY_MESSAGE);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
 
@@ -1312,7 +1311,7 @@ describe('RenderTable states', () => {
     expect(alert.classList.contains('dg-render-table__error')).toBe(true);
 
     // What failed, and the provider's code so a developer can act on it. The
-    // sentence states the failure and never what it might mean (AAP 0.5.5).
+    // sentence states the failure and never what it might mean.
     expect(within(alert).getByText(/could not be loaded/i)).toBeDefined();
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
 
@@ -1516,12 +1515,12 @@ describe('RenderTable rows', () => {
     );
     expect(template.replace(COLUMN_TOKEN_REFERENCE, '')).toMatch(/^(?:minmax\(, \)| )+$/u);
 
-    // Not one track is the floorless `minmax(0, …)` that let the name, the
-    // histogram and the prop list collapse to their padding in a narrow panel
-    // while their content painted over the next column's: each role's floor is
-    // a positive length in every theme. And the name column is never narrower
-    // than any other: it is what identifies the row, and the link to its
-    // declaration.
+    // Not one track is a floorless `minmax(0, …)`, which would let the name,
+    // the histogram and the prop list collapse to their padding in a narrow
+    // panel while their content paints over the next column's: each role's
+    // floor is a positive length in every theme. And the name column is never
+    // narrower than any other: it is what identifies the row, and the link to
+    // its declaration.
     expect(template).not.toContain('minmax(0');
     for (const theme of THEMES) {
       const floors = COLUMN_WIDTHS.map((width) => floorChOf(width, theme) ?? 0);
@@ -1553,8 +1552,8 @@ describe('RenderTable trigger attribution', () => {
     const stable = cellFor(row, STABLE_INPUTS_COLUMN);
     const unclassified = cellFor(row, UNCLASSIFIED_COLUMN);
 
-    // Two figures, two columns, two meanings (AAP 0.2.3): three renders were
-    // observed to have stable inputs, and two could not be classified at all.
+    // Two figures, two columns, two meanings: three renders were observed to
+    // have stable inputs, and two could not be classified at all.
     expect(stable.textContent).toBe(formatCount(WIDGET_ROW.unchangedRenderCount));
     expect(unclassified.textContent).toBe(formatCount(WIDGET_ROW.unknownTriggerCount));
     expect(stable.textContent).not.toBe(unclassified.textContent);
@@ -1598,7 +1597,7 @@ describe('RenderTable trigger attribution', () => {
     // One component whose renders all had changed props: four of the five
     // buckets are empty, and an absent chip could not say whether the bucket
     // was empty or merely not shown — for `unchanged` and `unknown` those two
-    // readings support opposite conclusions (AAP 0.2.3).
+    // readings support opposite conclusions.
     const stat = makeRenderStat({
       renderCount: 6,
       totalDurationMs: 72,
@@ -1681,7 +1680,7 @@ describe('RenderTable changed props', () => {
 
     // Names, which is all the producer sends: the fiber diff reports key names
     // and change counts and never a value, and opt-in full values are not
-    // implemented (AAP 0.5.2).
+    // implemented.
     expect(within(cell).getByText(FIRST_PROP)).toBeDefined();
     expect(within(cell).getByText(SECOND_PROP)).toBeDefined();
 
@@ -1726,7 +1725,7 @@ describe('RenderTable changed props', () => {
     const detail = onlyDetailRow();
 
     // The expansion says what its prop list is, so its length is never read as
-    // the width of a props object (AAP 0.5.2).
+    // the width of a props object.
     expect(within(detail).getByText(/prop values are never captured/i)).toBeDefined();
 
     // Every reported name, with the number of renders it changed at — and
@@ -1859,7 +1858,7 @@ describe('RenderTable expansion', () => {
   it('says outright when the producer bounded a row per-render list', async () => {
     // Twelve renders, two of them listed: the producer's own bound. An
     // expansion that silently showed a prefix would invite the reader to count
-    // renders that are not there (AAP 0.4.2).
+    // renders that are not there.
     const truncated = makeRenderStat({
       occurrences: OCCURRENCES,
       occurrencesTruncated: true,
@@ -1920,10 +1919,10 @@ describe('RenderTable interactions', () => {
 
     const chip = await screen.findByRole('button', { name: nameChipName(WIDGET_COMPONENT) });
 
-    // The control IS the name (AAP 0.6.2, "component name → onOpenSource"): the
-    // element that draws the component name in the row header is this button,
-    // captioned with the name, and the row offers its location through nothing
-    // else — no second chip beside the name.
+    // The control IS the name, and activating it is how the row raises
+    // `onOpenSource`: the element that draws the component name in the row
+    // header is this button, captioned with the name, and the row offers its
+    // location through nothing else — no second chip beside the name.
     const row = rowFor(WIDGET_COMPONENT);
     expect(nameOf(row)).toBe(chip);
     expect(chip.textContent).toBe(WIDGET_COMPONENT);
@@ -1949,8 +1948,7 @@ describe('RenderTable interactions', () => {
     // The very object the row carried, by reference — not a copy and not a
     // rebuilt location — and therefore equal with the same key set: a dropped
     // `symbol`, `resolvedBy` or `confidence` and an invented extra field both
-    // fail here. Every hop after this one acts on the object it is handed
-    // (AAP 0.4.2).
+    // fail here. Every hop after this one acts on the object it is handed.
     expect(received).toBe(WIDGET_SOURCE);
     expect(received).toEqual(WIDGET_SOURCE);
     expect(Object.keys(received).toSorted()).toEqual(expectedKeys);
@@ -2173,9 +2171,9 @@ describe('RenderTable ordering', () => {
   it('renders rows in the order the provider returned them, without re-ranking', async () => {
     // The page is deliberately not in count order (4 renders, then 12) while
     // the node asks for `count_desc`: the service applied the ordering it was
-    // given (AAP 0.4.2), so a component that re-ranked the page locally would
-    // show an order no response ever reported — and would rank a page against a
-    // total it is only part of.
+    // given, so a component that re-ranked the page locally would show an
+    // order no response ever reported — and would rank a page against a total
+    // it is only part of.
     const stub = resolvingProvider(PROVIDER_ORDER);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -2714,7 +2712,7 @@ describe('RenderTable paging', () => {
 
     // A service that reported no total leaves this view unable to say how much
     // of the source it drew, and stating the count it has is the only truthful
-    // option (AAP 0.4.2).
+    // option.
     const coverage = await screen.findByText(`${formatCount(1)} components loaded.`);
     expect(coverage.textContent).not.toMatch(/\bof\b/);
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
@@ -4510,8 +4508,8 @@ describe('RenderTable shared selection', () => {
     expect(chip.getAttribute('aria-pressed')).toBe('false');
     expect(selectedFlags()).toEqual([false, false]);
 
-    // An evidence chip selects the event it cites (AAP 0.7.3), and the render
-    // that is that event is marked in the table beneath.
+    // An evidence chip selects the event it cites, and the render that is that
+    // event is marked in the table beneath.
     await user.click(chip);
 
     expect(chip.getAttribute('aria-pressed')).toBe('true');

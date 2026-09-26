@@ -1,6 +1,7 @@
 /**
  * Seeded defect 3 of the demo — duplicate network requests — proven end to end
- * through the real product (AAP §0.8.2, §0.8.3, §0.6.5 third case).
+ * through the real product (docs/DEMO.md, Walkthrough 3 and "Defect 3 —
+ * duplicate requests").
  *
  * ## What the demo does
  *
@@ -35,13 +36,14 @@
  *    the header's mini-rail and the detail body's rail — through the rail's own
  *    render telemetry, and carry at least two distinct initiators, every one
  *    running through `useRecommendations`.
- * 3. **Duplicate detection is keyed correctly** (AAP §0.5.2): the same capture
- *    also visits a second product. Its requests display under exactly the same
- *    redacted URL (`/api/recommendations?limit=?&productId=?`) yet form a
- *    different group — so grouping uses the pre-redaction HMAC `request_key`,
- *    not the shown URL. Byte-identical requests collide; a different
- *    `productId` does not. Neither the per-session key nor a digest is read or
- *    recomputed here: only the observable grouping is asserted.
+ * 3. **Duplicate detection is keyed correctly**: the same capture also visits
+ *    a second product. Its requests display under exactly the same redacted
+ *    URL (`/api/recommendations?limit=?&productId=?`) yet form a different
+ *    group — so grouping uses the pre-redaction HMAC `request_key`, not the
+ *    shown URL (docs/SECURITY.md, "The pre-redaction request key").
+ *    Byte-identical requests collide; a different `productId` does not.
+ *    Neither the per-session key nor a digest is read or recomputed here: only
+ *    the observable grouping is asserted.
  * 4. **Privacy holds on the stored events**: query values are masked while the
  *    path and the key names remain, no query value survives anywhere in an
  *    event, no attribute holds a body, a payload or a header, and neither the
@@ -70,13 +72,13 @@
  * a module-scoped tracker from the moment it exists and is ended — cleanup
  * included — in `afterAll`, inside a live editor announcement.
  *
- * Nothing here writes under `apps/demo-app` (AAP §0.5.1): instrumentation is
- * installed by the product's installer and removed by its cleanup. Nothing here
- * sleeps: every wait is a protocol frame (inside `runDebugSession`) or an
- * `expect.poll` over the service's stored telemetry. `tests/e2e/**` is exempt
- * from the no-hardcoding gate (AAP §0.5.4), which is why the demo's component,
- * hook and route names appear below; no seeded slug or product id does — both
- * are resolved at runtime from the demo's own `GET /api/products`.
+ * Nothing here writes under `apps/demo-app`: instrumentation is installed by
+ * the product's installer and removed by its cleanup. Nothing here sleeps:
+ * every wait is a protocol frame (inside `runDebugSession`) or an `expect.poll`
+ * over the service's stored telemetry. `tests/e2e/**` is exempt from the
+ * no-hardcoding gate, which is why the demo's component, hook and route names
+ * appear below; no seeded slug or product id does — both are resolved at
+ * runtime from the demo's own `GET /api/products`.
  *
  * @module tests/e2e/demo-duplicate-requests.spec
  */
@@ -136,14 +138,11 @@ import { waitForStreamedContent, withEditorAnnouncement } from './helpers/demo-a
 // The question, the target and the demo's observable surface
 // ---------------------------------------------------------------------------
 
-/**
- * The developer's question, verbatim: AAP §0.6.5's third demonstrated case and
- * `docs/DEMO.md` Walkthrough 3.
- */
+/** The developer's question, verbatim from `docs/DEMO.md` Walkthrough 3. */
 const QUESTION = 'Why are these requests duplicated?';
 
 /** What the panel and analysis assertions prove, for their failure text. */
-const AAP_THIRD_CASE = `AAP §0.6.5 third case ("${QUESTION}")`;
+const DUPLICATE_REQUESTS_CONTEXT = `The duplicate-requests panel and analysis for "${QUESTION}"`;
 
 /** The route both rails read (`apps/demo-app/app/api/recommendations/route.ts`). */
 const RECOMMENDATIONS_PATH = '/api/recommendations';
@@ -209,7 +208,10 @@ const FETCH_SIGNAL = 'fetch';
 /** The runtime hook label the `FetchAdapter` reports in `instrumentation.ready`. */
 const NETWORK_TRACING_HOOK = 'Network tracing';
 
-/** The node types AAP §0.6.5 composes for this question and the two metrics its cards show. */
+/**
+ * The node types this question's panel composes and the two metrics its cards
+ * show (docs/DEMO.md, "How the three panels differ").
+ */
 const REQUIRED_NODE_TYPES: readonly PanelNodeType[] = ['requestTable', 'metricCards'];
 const REQUIRED_METRICS: readonly MetricId[] = ['request_count', 'duplicate_request_count'];
 
@@ -220,8 +222,8 @@ const REQUEST_KINDS: readonly TelemetryEvent['kind'][] = ['fetch', 'xhr'];
 const EXPECTED_STATUS = 200;
 
 /**
- * The folder brief's floors: a redundancy of at least two (three identical
- * requests in one window) issued by at least two distinct initiators.
+ * The pass floors: a redundancy of at least two (three identical requests in
+ * one window) issued by at least two distinct initiators.
  */
 const MIN_DUPLICATE_COUNT = 2;
 const MIN_INITIATORS = 2;
@@ -237,7 +239,7 @@ const TRACEPARENT_VALUE_PATTERN = /\b00-[0-9a-f]{32}-[0-9a-f]{16}-0[0-9a-f]\b/u;
 
 /**
  * Attribute names that would carry request or response content or a header
- * (AAP §0.5.2: bodies are never captured, header values never stored). The
+ * (bodies are never captured, header values never stored). The
  * agent adds keys beyond the declared catalog (`traceparentSkipReason`,
  * `aborted`, `response.type` — `packages/telemetry/src/browser/fetch.ts`), so
  * the privacy check is by name and value rather than by catalog membership.
@@ -1010,14 +1012,14 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
       await expectBothRailsMounted(appPage);
     });
 
-    // The developer selects the detail rail in the Elements panel before asking
-    // (AAP §0.1.1). The product records a `$0` selection only on a session bound
-    // to the tab, while Stage 1 reads the target when a session is created — so
-    // the selection is made under a first session, whose record the service
+    // The developer selects the detail rail in the Elements panel before asking.
+    // The product records a `$0` selection only on a session bound to the tab,
+    // while Stage 1 reads the target when a session is created — so the
+    // selection is made under a first session, whose record the service
     // updates through the real `devtools.element` → `target.selected` path, and
     // the question is then asked with that recorded target, which
-    // `session.create` carries (AAP §0.4.2). The first session is ended — its
-    // cleanup included — before the question is asked.
+    // `session.create` carries. The first session is ended — its cleanup
+    // included — before the question is asked.
     const selected =
       await test.step('select the detail rail in the Elements panel through the product', async () => {
         const mark = editorClient.snapshotIndex();
@@ -1582,7 +1584,7 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
     expect(spec.sessionId).toBe(run.sessionId);
     expect(run.panelId).toBe(spec.id);
 
-    expectNodeTypes(spec, REQUIRED_NODE_TYPES, { message: AAP_THIRD_CASE });
+    expectNodeTypes(spec, REQUIRED_NODE_TYPES, { message: DUPLICATE_REQUESTS_CONTEXT });
     const types = layoutNodeTypes(spec);
     expect(
       types.filter((type) => !isKnownPanelNodeType(type) || !(type in PANEL_NODE_CATALOG)),
@@ -1627,8 +1629,8 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
     expect(result.captureId).toBe(run.captureId);
     expect(required(session, 'the session record').analyses.length).toBeGreaterThan(0);
 
-    expectFactsAndHypothesesSeparate(result, { message: AAP_THIRD_CASE });
-    expectEvidenceResolves(result, all, { message: AAP_THIRD_CASE });
+    expectFactsAndHypothesesSeparate(result, { message: DUPLICATE_REQUESTS_CONTEXT });
+    expectEvidenceResolves(result, all, { message: DUPLICATE_REQUESTS_CONTEXT });
 
     // An observed fact is evidenced by the identical requests themselves.
     const duplicated = new Set<string>();

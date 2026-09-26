@@ -24,7 +24,13 @@
  *    are redacted by the builder before they are capped, so an ordinary
  *    queried page, secret-shaped element text and an element string carrying
  *    a queried URL build instead of being refused, while the same values
- *    handed to the guard raw still are (or, as prose, would have been sent).
+ *    handed to the guard raw still are (or, where the guard cannot read the
+ *    query as a URL — a quoted path, a bare `?x=` — would have been sent). The
+ *    developer's question gets the same redaction before it is rendered, and
+ *    every string of the structured input has its embedded URLs masked, so a
+ *    question, a code-tool request or a source excerpt that quotes a queried
+ *    route builds with its values masked, while a credential in an excerpt is
+ *    still refused.
  * 4. **The `{{outputSchema}}` documents.** Each is rendered from (or delegates
  *    to) its upstream owner, accepts what the upstream schema accepts, rejects
  *    what it rejects, is byte-stable and names no application.
@@ -89,7 +95,7 @@ import {
   type Logger,
   type Result,
 } from '@debuggen/shared';
-import { MAX_QUERY_PAIRS, redactTextUrls } from '@debuggen/telemetry';
+import { MAX_QUERY_PAIRS, MAX_SCAN_LENGTH, redactTextUrls } from '@debuggen/telemetry';
 
 import { ANALYSIS_INPUT_LIMITS, type AnalysisStageInput } from '../analysis/summarize.js';
 import {
@@ -112,6 +118,8 @@ import {
   outputSchemaFor,
   redactAndCapText,
   redactAndCapUrl,
+  redactEmbeddedUrlsDeep,
+  redactQuestionText,
   resolveContextLimits,
   toBoundedJson,
   toPromptJson,
@@ -447,10 +455,17 @@ const PROBE_CLOSE = '\u27e7';
  * A template that names exactly the stage's placeholder set, each wrapped in
  * delimiters, so a rendered probe prompt gives back the `values` object the
  * builder supplied, key for key.
+ *
+ * Each delimiter sits on its own line. The outbound guard reads a URL run up
+ * to the next whitespace, so a closing delimiter glued to a value would become
+ * part of that value's last query parameter (`?view=?⟦/currentUrl⟧`) and the
+ * probe prompt — not the builder — would be refused.
  */
 function probeTemplate(stage: PromptStage): string {
   return STAGE_PLACEHOLDERS[stage]
-    .map((key) => `${PROBE_OPEN}${key}${PROBE_CLOSE}{{${key}}}${PROBE_OPEN}/${key}${PROBE_CLOSE}`)
+    .map(
+      (key) => `${PROBE_OPEN}${key}${PROBE_CLOSE}\n{{${key}}}\n${PROBE_OPEN}/${key}${PROBE_CLOSE}`,
+    )
     .join('\n');
 }
 
@@ -460,10 +475,14 @@ function probeLibrary(): PromptLibrary {
   );
 }
 
-/** The `values` a builder supplied, recovered from a rendered probe prompt. */
+/**
+ * The `values` a builder supplied, recovered from a rendered probe prompt:
+ * the text between a key's delimiters, less exactly the one line break the
+ * template put after the opening and before the closing delimiter.
+ */
 function probeValues(prompt: string): Record<string, string> {
   const pattern = new RegExp(
-    `${PROBE_OPEN}([A-Za-z0-9_.]+)${PROBE_CLOSE}([\\s\\S]*?)${PROBE_OPEN}/\\1${PROBE_CLOSE}`,
+    `${PROBE_OPEN}([A-Za-z0-9_.]+)${PROBE_CLOSE}\\n([\\s\\S]*?)\\n${PROBE_OPEN}/\\1${PROBE_CLOSE}`,
     'g',
   );
   const values: Record<string, string> = {};
@@ -1819,14 +1838,15 @@ describe('caps: pure helpers', () => {
       expect({ raw, redacted }).toEqual({ raw, redacted: { text: expected, truncated: false } });
       expect({ raw, ok: guardTargetText(builder, redacted.text).ok }).toEqual({ raw, ok: true });
     }
-    // The embedded-URL pass alone leaves the first two to be refused.
-    for (const [raw] of cases.slice(0, 2)) {
-      const refused = guardTargetText(builder, redactTextUrls(raw));
-      expect({ raw, ruleIds: expectErr(refused).details?.['ruleIds'] }).toEqual({
-        raw,
-        ruleIds: ['url-query-value'],
-      });
-    }
+    // The embedded-URL pass masks a run whole, sentence punctuation included, so the link needs
+    // nothing more; it ends a run at a quote, so the path selector alone still needs the re-mask.
+    expect(redactTextUrls(`${LINK_URL}.`)).toBe(LINK_URL_REDACTED);
+    const selector = `/html/body/a[@href="/p?id=${PLANTED_TOKEN}"]`;
+    expect(redactTextUrls(selector)).toBe(`/html/body/a[@href="/p?id=${URL_QUERY_MASK}"]`);
+    expect(expectErr(guardTargetText(builder, redactTextUrls(selector))).details).toMatchObject({
+      ruleIds: ['url-query-value'],
+      paths: ['input.target.text?id'],
+    });
   });
 
   it('redactAndCapText never leaves a cut single-token query value the outbound guard would refuse', () => {
@@ -1852,14 +1872,23 @@ describe('caps: pure helpers', () => {
         capped: { text: expected, truncated: true },
       });
     }
-    // The cut a plain capText makes inside a value is exactly what the guard refuses.
+    // A plain cut of the masked link leaves a half pair (`step=?…`, `step=…`, `coupon=…`). The
+    // guard counts those values as a mask cut short and lets them through; the pinned cuts above
+    // drop the half pair all the same.
     for (const max of [
       full.length - 1,
       full.length - 2,
       LINK_URL_REDACTED.length + 1,
       LINK_URL_REDACTED.length,
     ]) {
-      const refused = guardTargetText(builder, capText(full, max).text);
+      expect({ max, ok: guardTargetText(builder, capText(full, max).text).ok }).toEqual({
+        max,
+        ok: true,
+      });
+    }
+    // What the guard refuses is a cut made before redaction, which keeps the head of a value.
+    for (const max of [full.length - 1, full.length - 2, LINK_URL_REDACTED.length + 1]) {
+      const refused = guardTargetText(builder, capText(raw, max).text);
       expect({ max, ruleIds: expectErr(refused).details?.['ruleIds'] }).toEqual({
         max,
         ruleIds: ['url-query-value'],
@@ -1958,15 +1987,27 @@ describe('caps: pure helpers', () => {
       });
       expect({ max, ok: guarded.ok }).toEqual({ max, ok: true });
     }
-    // The cut a plain capText makes inside a value is exactly what the guard refuses.
-    for (const max of [45, 44, 38, 37]) {
-      const refused = builder.buildStageRequest({
+    // A plain cut of the masked address leaves a half pair (`page=?…`, `sort=…`), which the guard
+    // counts as a mask cut short; the pinned cuts above drop it all the same.
+    const guardedUrl = (currentUrl: string): Result<StageRequestBuild, DebuggenError> =>
+      builder.buildStageRequest({
         stage: 'understand',
         values: understandProbeValues(),
-        input: { currentUrl: capText(QUERIED_URL_REDACTED, max).text },
+        input: { currentUrl },
         sessionId: SESSION_ID,
       });
-      expect(expectErr(refused).details?.['ruleIds']).toEqual(['url-query-value']);
+    for (const max of [45, 44, 38, 37]) {
+      expect({ max, ok: guardedUrl(capText(QUERIED_URL_REDACTED, max).text).ok }).toEqual({
+        max,
+        ok: true,
+      });
+    }
+    // What the guard refuses is a cut made before redaction, which keeps the head of a value.
+    for (const max of [45, 44, 38]) {
+      expect({
+        max,
+        ruleIds: expectErr(guardedUrl(capText(QUERIED_URL, max).text)).details?.['ruleIds'],
+      }).toEqual({ max, ruleIds: ['url-query-value'] });
     }
   });
 
@@ -3282,7 +3323,7 @@ describe('page-derived redaction', () => {
     expect(refused.details?.['paths']).toEqual(['input.target.text?coupon']);
   });
 
-  it('masks queries in element prose, a selector and a component name, which the guard alone lets through', () => {
+  it('masks queries in element prose, a selector and a component name, two of which the guard alone lets through', () => {
     const target: SelectedTarget = {
       ...TARGET,
       tagName: 'A',
@@ -3310,7 +3351,9 @@ describe('page-derived redaction', () => {
       }
     }
 
-    // None of these strings is a URL to the guard: unredacted, their values would have been sent.
+    // Unredacted, the guard refuses the prose, whose route follows a space; the quoted path of the
+    // selector and the bare query of the component name are no URL to it, so their values would
+    // have been sent. Only the builder's own redaction keeps those two out.
     const unredacted = builder.buildStageRequest({
       stage: 'understand',
       values: understandProbeValues(),
@@ -3324,7 +3367,10 @@ describe('page-derived redaction', () => {
       },
       sessionId: SESSION_ID,
     });
-    expect(unredacted.ok).toBe(true);
+    expect(expectErr(unredacted).details).toMatchObject({
+      ruleIds: ['url-query-value'],
+      paths: ['input.target.text?coupon'],
+    });
   });
 
   it('builds a selected link longer than the text cap whose cut falls inside a query value', () => {
@@ -3335,10 +3381,15 @@ describe('page-derived redaction', () => {
     expect(masked.length).toBeGreaterThan(CONTEXT_LIMITS.maxTargetTextChars);
     const { builder } = builderFixture(committedLibrary());
 
-    // A plain cut of the masked link leaves `name=…`, which the guard refuses.
+    // A plain cut of the masked link leaves the half pair `name=…`, which the guard counts as a
+    // mask cut short; the builder drops that pair all the same (below). A cut made before
+    // redaction keeps the first value whole, and that is what the guard refuses.
     const plain = capText(masked, CONTEXT_LIMITS.maxTargetTextChars).text;
     expect(plain).toBe(`${LINK_URL_REDACTED}&${name}=${TRUNCATION_MARKER}`);
-    expect(expectErr(guardTargetText(builder, plain)).details?.['ruleIds']).toEqual([
+    expect(guardTargetText(builder, plain).ok).toBe(true);
+    const cutFirst = capText(text, CONTEXT_LIMITS.maxTargetTextChars).text;
+    expect(cutFirst).toContain(PLANTED_VALUE);
+    expect(expectErr(guardTargetText(builder, cutFirst)).details?.['ruleIds']).toEqual([
       'url-query-value',
     ]);
 
@@ -3355,6 +3406,491 @@ describe('page-derived redaction', () => {
       expect(sent).not.toContain(PLANTED_VALUE);
       expect(sent).not.toContain(PLANTED_TOKEN);
     }
+  });
+
+  it('masks a query value of punctuation only in the element and the page address alike', () => {
+    // Punctuation is a legal query value, not the end of a sentence: `!!!!` must be masked
+    // whole wherever the page put it, and must never survive as a "trailing" remainder.
+    const bangs = '!'.repeat(4);
+    const target: SelectedTarget = {
+      ...TARGET,
+      tagName: 'A',
+      selector: `a[href="/reset?code=${bangs}"]`,
+      text: `Reset at /reset?code=${bangs}`,
+      componentChain: ['ExportControl', `ResetLink?code=${bangs}`],
+    };
+    const currentUrl = `${DEV_SERVER_URL}/reset?code=${bangs}`;
+    const { builder } = builderFixture(probeLibrary());
+    const fixture = stageContext({ target, currentUrl });
+    const build = expectOk(builder.buildUnderstandRequest({ context: fixture.context }));
+
+    const inputTarget = build.request.input['target'];
+    expect(inputTarget).toEqual({
+      tagName: 'A',
+      selector: `a[href="/reset?code=${URL_QUERY_MASK}"]`,
+      text: `Reset at /reset?code=${URL_QUERY_MASK}`,
+      componentChain: ['ExportControl', `ResetLink?code=${URL_QUERY_MASK}`],
+    });
+    expect(build.request.input['currentUrl']).toBe(
+      `${DEV_SERVER_URL}/reset?code=${URL_QUERY_MASK}`,
+    );
+    expect(build.truncated).toEqual([]);
+    expect(probeValues(build.request.prompt)['target']).toBe(toPromptJson(inputTarget));
+    for (const sent of [build.request.prompt, JSON.stringify(build.request.input)]) {
+      expect(sent).not.toContain(bangs);
+    }
+    // The context keeps the element as recorded; only what is sent is redacted.
+    expect(fixture.context.target).toEqual(target);
+
+    // Unredacted, the guard reads the punctuation as the value it is and refuses it.
+    expect(expectErr(guardTargetText(builder, target.text ?? '')).details).toMatchObject({
+      ruleIds: ['url-query-value'],
+      paths: ['input.target.text?code'],
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The developer's question, and URLs embedded in structured sections
+// ---------------------------------------------------------------------------
+
+/** The stage builders that render a developer question into their prompt. */
+const QUESTION_STAGES = ['understand', 'investigate', 'analyze', 'followup'] as const;
+type QuestionStage = (typeof QUESTION_STAGES)[number];
+
+/** A question carrying a value no request may send, and what a request may carry of it. */
+interface SensitiveQuestion {
+  readonly label: string;
+  /** The question as the developer typed or pasted it. */
+  readonly question: string;
+  /** The only form of it a prompt may carry. */
+  readonly redacted: string;
+  /** Substrings of the raw question no prompt, input, error or log record may contain. */
+  readonly leaks: readonly string[];
+  /** The rule the outbound guard refuses the raw question under. */
+  readonly ruleId: string;
+}
+
+/**
+ * A queried route whose value no content rule recognises, the same route with a
+ * value of punctuation only, and two pasted request-header lines with values too
+ * short for any credential-shape rule. Only the URL rule and the header-line
+ * rule can keep them out. Header lines are assembled, so none appears whole in
+ * this tracked file.
+ */
+function sensitiveQuestions(): readonly SensitiveQuestion[] {
+  const code = assemble('ZIP', '42');
+  const bangs = '!'.repeat(4);
+  const bearer = assemble('S3', 'CRET');
+  const cookie = assemble('ab', 'c');
+  return [
+    {
+      label: 'a queried route',
+      question: `Why is /reset?code=${code} slow?`,
+      redacted: `Why is /reset?code=${URL_QUERY_MASK} slow?`,
+      leaks: [code, `code=${code}`],
+      ruleId: 'url-query-value',
+    },
+    {
+      label: 'a punctuation-only query value',
+      question: `Why is /reset?code=${bangs} slow?`,
+      redacted: `Why is /reset?code=${URL_QUERY_MASK} slow?`,
+      leaks: [bangs, `code=${bangs}`],
+      ruleId: 'url-query-value',
+    },
+    {
+      label: 'a pasted authorization header',
+      question: assemble('Author', 'ization: ', 'Bea', 'rer ', bearer),
+      redacted: `Authorization: ${REDACTION_MARKER}`,
+      leaks: [bearer, assemble('Bea', 'rer ', bearer)],
+      ruleId: 'sensitive-header',
+    },
+    {
+      label: 'a pasted cookie header',
+      question: assemble('Coo', 'kie: ', 'session=', cookie),
+      redacted: `Cookie: ${REDACTION_MARKER}`,
+      leaks: [assemble('session=', cookie)],
+      ruleId: 'sensitive-header',
+    },
+  ];
+}
+
+/** The placeholder a question stage renders its question into. */
+function questionKey(stage: QuestionStage): string {
+  return stage === 'followup' ? 'followUpQuestion' : 'question';
+}
+
+/** A question build: the context fixture it ran against and its result. */
+interface QuestionBuild {
+  readonly fixture: ContextFixture;
+  readonly result: Result<StageRequestBuild, DebuggenError>;
+}
+
+/**
+ * Builds `stage` with the suite's canonical inputs, except that the question
+ * the stage renders is `text`: the session's question for understand,
+ * investigate and analyze, the follow-up for the follow-up builder.
+ */
+function buildWithQuestion(
+  builder: ContextBuilder,
+  stage: QuestionStage,
+  text: string,
+): QuestionBuild {
+  if (stage === 'followup') {
+    const fixture = stageContext();
+    return {
+      fixture,
+      result: builder.buildFollowUpRequest(
+        deepFreeze({
+          context: fixture.context,
+          followUpQuestion: text,
+          understanding: UNDERSTANDING,
+          plan: INSTALLED_PLAN,
+        }),
+      ),
+    };
+  }
+  const fixture = stageContext({ question: text });
+  return { fixture, result: buildStage(builder, stage, fixture) };
+}
+
+describe('question redaction', () => {
+  const cases = QUESTION_STAGES.flatMap((stage) =>
+    sensitiveQuestions().map((entry) => ({ ...entry, stage })),
+  );
+
+  it.each(cases)(
+    'the $stage builder renders $label only in its redacted form',
+    ({ stage, question, redacted, leaks }) => {
+      const { builder, log } = builderFixture(probeLibrary());
+      const { fixture, result } = buildWithQuestion(builder, stage, question);
+      const build = expectOk(result);
+
+      expect(probeValues(build.request.prompt)[questionKey(stage)]).toBe(redacted);
+      expect(redactQuestionText(question, CONTEXT_LIMITS.maxQuestionChars)).toEqual({
+        text: redacted,
+        truncated: false,
+      });
+      // Prompt-only: the structured input carries no question section.
+      expect(Object.keys(build.request.input)).not.toContain(questionKey(stage));
+      expect(build.truncated).toEqual([]);
+      const sent = [build.request.prompt, JSON.stringify(build.request.input)];
+      const logged = [JSON.stringify(log.records), JSON.stringify(fixture.log.records)];
+      for (const leak of leaks) {
+        for (const text of [...sent, ...logged]) {
+          expect(text).not.toContain(leak);
+        }
+      }
+    },
+  );
+
+  it.each(cases)(
+    'the $stage builder builds $label against the committed prompt',
+    ({ stage, question, redacted, leaks }) => {
+      const { builder } = builderFixture(committedLibrary());
+      const build = expectOk(buildWithQuestion(builder, stage, question).result);
+      expect(build.request.prompt).toContain(redacted);
+      for (const leak of leaks) {
+        expect(build.request.prompt).not.toContain(leak);
+        expect(JSON.stringify(build.request.input)).not.toContain(leak);
+      }
+    },
+  );
+
+  it.each(sensitiveQuestions())(
+    '$label, rendered unredacted, is refused by the guard, leaking nothing',
+    ({ question, leaks, ruleId }) => {
+      const { builder, log } = builderFixture(committedLibrary());
+      const error = expectErr(
+        builder.buildStageRequest({
+          stage: 'understand',
+          values: { ...understandProbeValues(), question },
+          input: {},
+          sessionId: SESSION_ID,
+        }),
+      );
+      expect(error.details?.['ruleIds']).toEqual([ruleId]);
+      const paths = error.details?.['paths'];
+      expect(Array.isArray(paths) && paths.length > 0).toBe(true);
+      for (const path of Array.isArray(paths) ? (paths as unknown[]) : []) {
+        expect(String(path).startsWith('prompt')).toBe(true);
+      }
+      for (const leak of leaks) {
+        expect(errorText(error)).not.toContain(leak);
+        expect(JSON.stringify(log.records)).not.toContain(leak);
+      }
+    },
+  );
+
+  it.each(QUESTION_STAGES)('the %s builder redacts the question before it caps it', (stage) => {
+    const code = assemble('ZIP', '42');
+    const question = `Why is /reset?code=${code} slow?`;
+    // A cap whose cut would fall inside the raw value, had the question been cut first.
+    const max = 'Why is /reset?code=ZI'.length + 1;
+    expect(capText(question, max).text).toContain(code.slice(0, 2));
+
+    const { builder } = builderFixture(probeLibrary(), { limits: { maxQuestionChars: max } });
+    const build = expectOk(buildWithQuestion(builder, stage, question).result);
+    const sent = probeValues(build.request.prompt)[questionKey(stage)] ?? '';
+    expect(sent).toBe(redactQuestionText(question, max).text);
+    expect(sent.length).toBeLessThanOrEqual(max);
+    expect(sent.startsWith(`Why is /reset?code=${URL_QUERY_MASK}`)).toBe(true);
+    expect(sent).not.toContain(code.slice(0, 2));
+    expect(build.truncated).toEqual([questionKey(stage)]);
+  });
+
+  it.each(sensitiveQuestions())(
+    'the analyze builder redacts $label in a follow-up it renders in place of the session question',
+    ({ question, redacted, leaks }) => {
+      const { builder } = builderFixture(probeLibrary());
+      const fixture = stageContext({ followUpQuestion: question });
+      const build = expectOk(buildStage(builder, 'analyze', fixture));
+      expect(probeValues(build.request.prompt)['question']).toBe(redacted);
+      for (const leak of leaks) {
+        expect(build.request.prompt).not.toContain(leak);
+        expect(JSON.stringify(build.request.input)).not.toContain(leak);
+      }
+    },
+  );
+});
+
+describe('embedded URLs in structured sections', () => {
+  it('redactEmbeddedUrlsDeep masks every embedded query value in a copy, leaving code and keys alone', () => {
+    const code = assemble('ZIP', '42');
+    const section = deepFreeze({
+      request: { tool: 'routeForUrl', url: `${DEV_SERVER_URL}/reset?code=${'!'.repeat(4)}` },
+      notes: [
+        `see /reset?code=${code} first`,
+        "fetch('/api/items?page=2')",
+        'const next = cursor?.page ?? (done ? 0 : 1);',
+      ],
+      count: 3,
+      flag: true,
+      none: null,
+    });
+    const masked = redactEmbeddedUrlsDeep(section);
+    expect(masked).toEqual({
+      request: { tool: 'routeForUrl', url: `${DEV_SERVER_URL}/reset?code=${URL_QUERY_MASK}` },
+      notes: [
+        `see /reset?code=${URL_QUERY_MASK} first`,
+        "fetch('/api/items?page=2')",
+        'const next = cursor?.page ?? (done ? 0 : 1);',
+      ],
+      count: 3,
+      flag: true,
+      none: null,
+    });
+    expect(masked).not.toBe(section);
+    expect(Object.keys(masked)).toEqual(Object.keys(section));
+    // Idempotent, and total over every JSON value.
+    expect(redactEmbeddedUrlsDeep(masked)).toEqual(masked);
+    expect(redactEmbeddedUrlsDeep(`GET /reset?code=${code}`)).toBe(
+      `GET /reset?code=${URL_QUERY_MASK}`,
+    );
+    expect(redactEmbeddedUrlsDeep(7)).toBe(7);
+    expect(redactEmbeddedUrlsDeep(null)).toBeNull();
+    expect(redactEmbeddedUrlsDeep([false, 'plain'])).toEqual([false, 'plain']);
+  });
+
+  it('redactEmbeddedUrlsDeep never scrubs a credential and never copies a prototype key', () => {
+    const body = cycle(ALNUM, 24);
+    const credential = assemble('Bea', 'rer ', body);
+    expect(redactEmbeddedUrlsDeep({ text: `const auth = '${credential}';` })).toEqual({
+      text: `const auth = '${credential}';`,
+    });
+
+    const parsed = JSON.parse('{"__proto__":{"polluted":"yes"},"kept":"/p?id=7"}') as JsonObject;
+    const masked = redactEmbeddedUrlsDeep(parsed);
+    expect(Object.keys(masked)).toEqual(['kept']);
+    expect(masked['kept']).toBe(`/p?id=${URL_QUERY_MASK}`);
+    expect(Object.getPrototypeOf(masked)).toBe(Object.prototype);
+    expect((masked as Record<string, unknown>)['polluted']).toBeUndefined();
+  });
+
+  it('the analyze builder masks the URLs a source excerpt quotes and keeps its code as written', () => {
+    // The prompt renders the excerpt as JSON, and the outbound guard reads a URL run there up to
+    // whitespace or a quote, not up to a backslash: a masked value directly before an escaped line
+    // break (`?page=?\n`) would read as the value `?\n…`. Every masked URL here is followed by a
+    // space or a quote, which is the case this test pins.
+    const lines = (page: string, tab: string): string =>
+      [
+        'const rows = await load(cursor?.page ?? 1);',
+        `// GET /api/items?page=${page} answers one page`,
+        `const docs = 'https://example.test/docs?tab=${tab}';`,
+        "const next = fetch('/api/items?page=' + String(rows.length));",
+      ].join('\n');
+    const source: ExcerptFixture = {
+      file: 'src/server/items.ts',
+      symbol: 'loadItems',
+      startLine: 10,
+      endLine: 13,
+      text: lines('2', '2'),
+      truncated: false,
+    };
+    const stageInput = analysisStageInput([source]);
+    const { builder } = builderFixture(probeLibrary());
+    const build = expectOk(
+      builder.buildAnalyzeRequest(
+        deepFreeze({ context: stageContext().context, understanding: UNDERSTANDING, stageInput }),
+      ),
+    );
+
+    const kept = build.request.input['codeExcerpts'];
+    expect(kept).toEqual([{ ...source, text: lines(URL_QUERY_MASK, URL_QUERY_MASK) }]);
+    expect(probeValues(build.request.prompt)['codeExcerpts']).toBe(toPromptJson(kept ?? null));
+    expect(build.truncated).toEqual([]);
+    for (const sent of [build.request.prompt, JSON.stringify(build.request.input)]) {
+      expect(sent).not.toContain('page=2');
+      expect(sent).not.toContain('tab=2');
+    }
+    // The caller's excerpt is untouched.
+    expect(stageInput.excerpts[0]?.text).toBe(lines('2', '2'));
+  });
+
+  it('reports a section truncated when the masker had to bound one of its strings', () => {
+    // No builder cap lets a string this long through; an upstream section serialised as it
+    // arrives can, and the masker cuts it at its own bound rather than pass it unexamined.
+    const long = cycle('abcdefghij ', MAX_SCAN_LENGTH + 100);
+    const stageInput = analysisStageInput();
+    const { builder } = builderFixture(probeLibrary());
+    const build = expectOk(
+      builder.buildAnalyzeRequest(
+        deepFreeze({
+          context: stageContext().context,
+          understanding: UNDERSTANDING,
+          stageInput: {
+            ...stageInput,
+            factCandidates: stageInput.factCandidates.map((candidate, index) =>
+              index === 0 ? { ...candidate, statement: long } : candidate,
+            ),
+          },
+        }),
+      ),
+    );
+    expect(build.truncated).toEqual(['captureSummary']);
+    const summary = build.request.input['captureSummary'];
+    const candidates = isRecord(summary) ? summary['factCandidates'] : undefined;
+    const [first] = Array.isArray(candidates) ? (candidates as unknown[]) : [];
+    const statement = isRecord(first) ? first['statement'] : undefined;
+    expect(typeof statement).toBe('string');
+    expect(String(statement).length).toBe(MAX_SCAN_LENGTH);
+    expect(String(statement).endsWith(`\n${REDACTION_MARKER}`)).toBe(true);
+    expect(String(statement)).toBe(
+      `${long.slice(0, String(statement).length - REDACTION_MARKER.length - 1)}\n${REDACTION_MARKER}`,
+    );
+  });
+
+  it('the analyze builder still refuses a source excerpt carrying a literal credential', () => {
+    const body = cycle(ALNUM, 24);
+    const source: ExcerptFixture = {
+      file: 'src/server/client.ts',
+      symbol: 'authorize',
+      startLine: 1,
+      endLine: 1,
+      text: assemble("const auth = '", 'Bea', 'rer ', body, "';"),
+      truncated: false,
+    };
+    const { builder, log } = builderFixture(committedLibrary());
+    const fixture = stageContext();
+    const error = expectErr(
+      builder.buildAnalyzeRequest(
+        deepFreeze({
+          context: fixture.context,
+          understanding: UNDERSTANDING,
+          stageInput: analysisStageInput([source]),
+        }),
+      ),
+    );
+    expect(error.code).toBe('INTERNAL');
+    expect(error.details?.['ruleIds']).toContain('bearer-token');
+    for (const probe of leakProbes(body, body)) {
+      expect(errorText(error)).not.toContain(probe);
+      expect(JSON.stringify(log.records)).not.toContain(probe);
+      expect(JSON.stringify(fixture.log.records)).not.toContain(probe);
+    }
+  });
+
+  it('the analyze builder refuses a source excerpt carrying a literal cookie value, quoted or not', () => {
+    // Excerpts are never scrubbed, so a cookie written into source is the
+    // guard's to refuse, in each spelling a cookie value takes.
+    const value = assemble('q7', 'Zr', 'W2');
+    for (const line of [
+      assemble('// Cookie: session="', value, '"'),
+      assemble('// Cookie: session=; theme=', value),
+      assemble('// Set-Cookie: sid="', value, '"; Path=/'),
+    ]) {
+      const source: ExcerptFixture = {
+        file: 'src/server/session.ts',
+        symbol: 'readSession',
+        startLine: 1,
+        endLine: 2,
+        text: `${line}\nexport const ready = true;`,
+        truncated: false,
+      };
+      const { builder, log } = builderFixture(committedLibrary());
+      const fixture = stageContext();
+      const error = expectErr(
+        builder.buildAnalyzeRequest(
+          deepFreeze({
+            context: fixture.context,
+            understanding: UNDERSTANDING,
+            stageInput: analysisStageInput([source]),
+          }),
+        ),
+      );
+      expect(error.code, line).toBe('INTERNAL');
+      expect(error.details?.['ruleIds'], line).toContain('sensitive-header');
+      expect(errorText(error), line).not.toContain(value);
+      expect(JSON.stringify(log.records), line).not.toContain(value);
+    }
+  });
+
+  it('the investigate builder masks a queried address in a tool request and a model-authored hint', () => {
+    const code = assemble('ZIP', '42');
+    const address = `${DEV_SERVER_URL}/reset?code=${code}`;
+    const { builder } = builderFixture(probeLibrary());
+    const build = expectOk(
+      builder.buildInvestigateRequest(
+        deepFreeze({
+          context: stageContext().context,
+          understanding: { ...UNDERSTANDING, searchHints: [`/reset?code=${code}`, 'export'] },
+          toolCatalog: TOOL_CATALOG,
+          queryResults: [
+            { request: { tool: 'routeForUrl', url: address }, result: { route: null } },
+          ],
+          remainingQueries: 5,
+          toolNames: TOOL_NAMES,
+        }),
+      ),
+    );
+    expect(build.request.input['queryResults']).toEqual([
+      {
+        request: { tool: 'routeForUrl', url: `${DEV_SERVER_URL}/reset?code=${URL_QUERY_MASK}` },
+        result: { route: null },
+      },
+    ]);
+    expect(build.request.input['understanding']).toMatchObject({
+      searchHints: [`/reset?code=${URL_QUERY_MASK}`, 'export'],
+    });
+    expect(probeValues(build.request.prompt)['queryResults']).toBe(
+      toPromptJson(build.request.input['queryResults'] ?? null),
+    );
+    for (const sent of [build.request.prompt, JSON.stringify(build.request.input)]) {
+      expect(sent).not.toContain(code);
+    }
+
+    // Unmasked, the same tool request is what the guard refuses.
+    const refused = expectErr(
+      builder.buildStageRequest({
+        stage: 'investigate',
+        values: Object.fromEntries(
+          STAGE_PLACEHOLDERS.investigate.map((key) => [key, ABSENT_VALUE]),
+        ),
+        input: { queryResults: [{ request: { tool: 'routeForUrl', url: address } }] },
+        sessionId: SESSION_ID,
+      }),
+    );
+    expect(refused.details?.['ruleIds']).toEqual(['url-query-value']);
   });
 });
 

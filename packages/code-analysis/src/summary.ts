@@ -335,7 +335,8 @@ const PG_POOL_BINDING = 'Pool';
  * a published convention of a common tool — the ORM's default seed module and
  * migrations directory, the test runners' colocated directories and filename
  * markers, a framework's `*.config.*` module — and none names anything a
- * particular project chose, which is AAP 0.5.4's rule for product source.
+ * particular project chose. Product source holds no knowledge of any one
+ * project; `scripts/check-no-hardcoding.mjs` enforces that rule.
  */
 
 /**
@@ -1172,21 +1173,21 @@ export function detectDatabaseAccess(
  * ## Why the distinction matters
  *
  * Database query spans are runtime hooks the Node preload installs inside the
- * **dev-server process** only (AAP 0.5.1). A seed, migration, operational
- * script, test or configuration module runs in a process of its own — the
- * ORM's seed command, a test runner, a command-line tool reading its
- * configuration — so no query it issues can ever be observed by a capture, and
- * an instrumentation plan anchored on one promises evidence that never
- * arrives. {@link detectDatabaseAccess} uses this classifier to prefer the
- * application's shared handle module over a script that builds its own, and
- * the Prisma and Postgres adapters of `@debuggen/instrumentation` use it to
- * leave such modules out of the query sites they anchor on.
+ * **dev-server process** only. A seed, migration, operational script, test or
+ * configuration module runs in a process of its own — the ORM's seed command,
+ * a test runner, a command-line tool reading its configuration — so no query
+ * it issues can ever be observed by a capture, and an instrumentation plan
+ * anchored on one promises evidence that never arrives.
+ * {@link detectDatabaseAccess} uses this classifier to prefer the application's
+ * shared handle module over a script that builds its own, and the Prisma and
+ * Postgres adapters of `@debuggen/instrumentation` use it to leave such modules
+ * out of the query sites they anchor on.
  *
  * ## The rule
  *
  * Conservative on purpose, and built from published tool conventions only —
- * never from anything a particular project chose (AAP 0.5.4). A path is a
- * tooling module when any of these holds:
+ * never from anything a particular project chose. A path is a tooling module
+ * when any of these holds:
  *
  * | Signal | Examples |
  * | --- | --- |

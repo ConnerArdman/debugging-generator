@@ -5,10 +5,9 @@
  * ## What this suite is protecting
  *
  * A waterfall is one of the three views the slow-interaction acceptance panel
- * is assembled from (AAP 0.6.5, 0.8.3), and it is the one that has to answer
- * *what was waiting on what*. Two properties carry that answer, and a
- * regression in either turns the view into a list of unrelated bars that still
- * renders perfectly:
+ * is assembled from, and it is the one that has to answer *what was waiting on
+ * what*. Two properties carry that answer, and a regression in either turns
+ * the view into a list of unrelated bars that still renders perfectly:
  *
  *   - **Offsets are relative to the first *included* call.** The case below
  *     deliberately puts an earlier record of a kind this view does not draw in
@@ -20,11 +19,12 @@
  *     and a record whose immediate parent is of an undrawn kind still lands
  *     beneath its nearest drawn ancestor.
  *
- * Alongside those, AAP 0.8.3 asks every component suite here for the three
- * states of a query-backed view — loading, empty and error — and for the
- * click-to-source payload, and AAP 0.4.2 asks for honest paging: what a footer
- * claims about coverage, and that "load more" advances the offset the *service*
- * reported on the query the provider actually receives.
+ * Alongside those, every component suite here covers the three states of a
+ * query-backed view — loading, empty and error — and the click-to-source
+ * payload (`docs/ARCHITECTURE.md`, "The renderer contract"), and this one holds
+ * the view to honest paging: what a footer claims about coverage, and that
+ * "load more" advances the offset the *service* reported on the query the
+ * provider actually receives.
  *
  * Paging far must stay bounded, so three blocks hold the bounds the component
  * documents. "Pages folded as they arrive" proves a page folded into what is
@@ -37,7 +37,7 @@
  * that Previous/Next rows and the keyboard move the window, and that expansion
  * and the single tab stop survive every move.
  *
- * ## The privacy cases, and why they are byte-comparisons (AAP 0.5.2)
+ * ## The privacy cases, and why they are byte-comparisons
  *
  * A redacted URL and a parameterized statement arrive in their final display
  * form: query-parameter values are already replaced per key, and statement
@@ -55,7 +55,8 @@
  * offers to reveal a raw value, a body or a result set. A transferred-byte
  * figure the runtime genuinely could not observe renders as
  * {@link NOT_AVAILABLE_LABEL} and never as a zero that would read as "nothing
- * was transferred" (AAP 0.6.6).
+ * was transferred". The boundary itself is stated in `docs/SECURITY.md`
+ * ("Redaction", "Never captured").
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -91,9 +92,9 @@
  *     filled mostly with records of a kind this view does not draw, and the
  *     row budget with the rows of one expanded call, so each bound is crossed
  *     for real without mounting more than the bound itself.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): a loopback URL, an
- *     `/example/…` path, an `example_…` table and a `src/example/…` file, none
- *     of which belongs to any inspected application.
+ *   - **Generic fixture vocabulary only**: a loopback URL, an `/example/…`
+ *     path, an `example_…` table and a `src/example/…` file, none of which
+ *     belongs to any inspected application.
  *   - **Queries by role and accessible name**, with a class read only off an
  *     element already obtained semantically (no `jest-dom` matchers exist in
  *     this repository), and no timers — post-resolution assertions go through
@@ -146,12 +147,11 @@ import { Waterfall } from './Waterfall';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Every string below is application-neutral (AAP 0.5.4): no component, route,
- * service, table or symbol of any inspected project appears here, in the
- * fixtures or in the comments. The identifiers are shaped as a capture shapes
- * them — a 32-hex trace id, 16-hex span ids, epoch-millisecond start times,
- * millisecond durations — because the component reads those fields and formats
- * them.
+ * Every string below is application-neutral: no component, route, service,
+ * table or symbol of any inspected project appears here, in the fixtures or in
+ * the comments. The identifiers are shaped as a capture shapes them — a 32-hex
+ * trace id, 16-hex span ids, epoch-millisecond start times, millisecond
+ * durations — because the component reads those fields and formats them.
  * ---------------------------------------------------------------------------
  */
 
@@ -176,7 +176,7 @@ const BASE_START_MS = 1_767_225_600_000;
 
 /**
  * The request URL as it arrives: every query-parameter *value* already replaced
- * per key with the redaction mask, the path retained (AAP 0.5.2).
+ * per key with the redaction mask, the path retained.
  *
  * This exact string is what the row must render — it is already the correct
  * display form, and re-deriving any part of it is the defect the verbatim case
@@ -208,8 +208,8 @@ const TRANSFERRED_BYTES = 2048;
  * Values a producer must never report and this view must never render. They sit
  * in the fixtures' attribute bags under body- and row-shaped keys so that the
  * privacy cases are a statement about the RENDERER: bodies and row contents are
- * not captured (AAP 0.5.2), and a bag that carried them anyway — a producer
- * from a future build, a hand-built fixture — must still draw nothing.
+ * not captured, and a bag that carried them anyway — a producer from a future
+ * build, a hand-built fixture — must still draw nothing.
  */
 const UNRENDERABLE_REQUEST_BODY = 'unrendered-request-payload';
 const UNRENDERABLE_RESPONSE_BODY = 'unrendered-response-payload';
@@ -263,8 +263,10 @@ const FAILING_QUERY_NAME = 'Failing query';
 
 /*
  * The shared error-state contract, spelled out rather than imported: these are
- * the words every query-backed node shows a reader, so a change to any of them
- * is a change this suite should notice (B1-F16, B2-F14).
+ * the words every query-backed node shows a reader — one title and lead for a
+ * view whose own data could not be loaded, another for a failed next page below
+ * rows that stay on screen — so a change to any of them fails this suite
+ * instead of being followed silently through an import.
  */
 
 /** The title of a view whose own data could not be loaded. */
@@ -314,7 +316,7 @@ const EMPTY_CAPTURE_TITLE = 'No calls';
 /**
  * Anything that would offer to reveal a captured body, a raw value or a result
  * set. No control in this view may match it: the data behind such a control was
- * never captured, so the control could only ever mislead (AAP 0.5.2).
+ * never captured, so the control could only ever mislead.
  */
 const BODY_CONTROL = /\braw\b|\bbody\b|payload|result set|row data|contents/i;
 
@@ -594,7 +596,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -821,11 +823,11 @@ afterEach(() => {
  *
  * A browser request, the server request it reached, and the statement that
  * server request ran — the shape of the interaction the slow-button panel is
- * built for (AAP 0.4.2). The records are linked by `parentSpanId`, so a page
- * holding all three draws one row with two levels nested inside it, while a
- * page holding any one of them alone draws it as a top-level row: a parent link
- * that points outside the page is an unresolved ancestry, which this view is
- * honest about rather than inventing.
+ * built for. The records are linked by `parentSpanId`, so a page holding all
+ * three draws one row with two levels nested inside it, while a page holding
+ * any one of them alone draws it as a top-level row: a parent link that points
+ * outside the page is an unresolved ancestry, which this view is honest about
+ * rather than inventing.
  *
  * The attribute bags are named constants so that a case needing a record on its
  * own builds one with the same attributes rather than restating them.
@@ -834,7 +836,7 @@ afterEach(() => {
 
 /**
  * The browser request's attributes, including two keys a producer must never
- * report: bodies are not captured (AAP 0.5.2), and no row may render one.
+ * report: bodies are not captured, and no row may render one.
  */
 const REQUEST_ATTRIBUTES: TelemetryEvent['attributes'] = {
   'http.method': REQUEST_METHOD,
@@ -946,7 +948,7 @@ describe('Waterfall states', () => {
     expect(within(busy).getByText(LOADING_LABEL)).toBeTruthy();
 
     // Nothing is drawn yet: no tree, therefore no rows, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('tree')).toBeNull();
     expect(drawnRows()).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -996,7 +998,7 @@ describe('Waterfall states', () => {
 
     // The shared lead opens the message and the provider's own cause follows
     // it, with its code beside them, which is what makes the failure
-    // actionable (AAP 0.5.5).
+    // actionable.
     expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
     expect(alert.textContent).toContain(CHANNEL_CLOSED);
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
@@ -1058,11 +1060,11 @@ describe('Waterfall states', () => {
     );
 
     // The query block holds exactly the query the provider received, in the
-    // one pretty-printed form every node prints — never the compact form this
-    // view used to print. The expected text is built from a literal written in
-    // the formatter's member order (source, filter, sort, limit, offset), so
-    // the spelling is pinned independently of how the query was assembled.
-    // Looked up by name: the closed details disclosure below it is a group too.
+    // one pretty-printed form every node prints: JSON indented by two spaces.
+    // The expected text is built from a literal written in the formatter's
+    // member order (source, filter, sort, limit, offset), so the spelling is
+    // pinned independently of how the query was assembled. Looked up by name:
+    // the closed details disclosure below it is a group too.
     const expected = {
       source: 'requests',
       filter: { tier: 'browser' },
@@ -1476,8 +1478,7 @@ describe('Waterfall rows', () => {
     // The page also holds a record that starts HALF A SECOND EARLIER and is of
     // a kind this view does not draw. The window must still begin at the first
     // drawn call, or every offset on screen would be inflated by that lead —
-    // which is exactly the staircase reading a waterfall exists to give
-    // (AAP 0.4.2).
+    // which is exactly the staircase reading a waterfall exists to give.
     const earlier = makeEvent({
       id: eventIdFor(13),
       spanId: spanIdFor(13),
@@ -1623,7 +1624,7 @@ describe('Waterfall nesting', () => {
     expect(rowLabelled(REQUEST_URL).getAttribute('aria-owns')).toBe(group?.getAttribute('id'));
 
     // The host is told which view, which row and which state — not asked to
-    // work out a parity (AAP 0.4.2).
+    // work out a parity.
     expect(spies.onExpand).toHaveBeenCalledTimes(1);
     expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, REQUEST_EVENT.id, true);
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
@@ -1715,7 +1716,7 @@ describe('Waterfall privacy', () => {
     // Byte comparisons rather than containment checks: both strings arrive in
     // their final display form, and re-assembling a URL from parts,
     // unescaping a mask, pretty-printing a statement or putting a placeholder's
-    // value back would each satisfy a looser assertion (AAP 0.5.2).
+    // value back would each satisfy a looser assertion.
     const url = screen.getByText(REQUEST_URL);
     expect(url.textContent).toBe(REQUEST_URL);
     expect(url.textContent).toContain('tenant=?');
@@ -1799,7 +1800,7 @@ describe('Waterfall privacy', () => {
 
     // Not observed, though this kind of call would normally carry it: stated as
     // unavailable, never as a zero that would read as "nothing was
-    // transferred" (AAP 0.6.6).
+    // transferred".
     const unmeasuredRow = rowLabelled(unmeasuredUrl);
     const unmeasuredDescription = unmeasuredRow.getAttribute('aria-label') ?? '';
     expect(unmeasuredDescription).toContain(`transferred ${NOT_AVAILABLE_LABEL}`);
@@ -1858,7 +1859,7 @@ describe('Waterfall interactions', () => {
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts blind on the object it is handed (AAP 0.4.2).
+    // this one acts blind on the object it is handed.
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -1952,8 +1953,7 @@ describe('Waterfall paging', () => {
   it('says how much of the result is on screen and appends the next page', async () => {
     // `nextOffset` is deliberately not the length of the page: the contract is
     // that a view copies the offset the SERVICE reported, never one it derived
-    // from what arrived, which drifts the moment a limit is clamped
-    // (AAP 0.4.2).
+    // from what arrived, which drifts the moment a limit is clamped.
     const firstCall = makeEvent({
       id: eventIdFor(41),
       spanId: spanIdFor(41),
@@ -2846,10 +2846,11 @@ describe('Waterfall description for the keyboard', () => {
  *
  * A call the correlator re-attached to the top level because the parent it
  * named could not be resolved is evidence, drawn and FLAGGED — never dropped and
- * never disguised as an ordinary top-level row (AAP 0.4.2). The verdict is the
- * flag the service persisted on the flat record, which a parent present in the
- * page proves stale. The correlated `trace` tree is not a source this node type
- * reads (its catalog entry excludes it), so no case here draws one.
+ * never disguised as an ordinary top-level row (`docs/ARCHITECTURE.md`,
+ * "Attribution, joining and orphans"). The verdict is the flag the service
+ * persisted on the flat record, which a parent present in the page proves
+ * stale. The correlated `trace` tree is not a source this node type reads (its
+ * catalog entry excludes it), so no case here draws one.
  * ---------------------------------------------------------------------------
  */
 
@@ -3760,8 +3761,8 @@ describe('Waterfall counted copy', () => {
       }),
     ).toBeTruthy();
 
-    // No control anywhere carries the generic name any longer, and the row
-    // with no children offers no disclosure at all.
+    // No control anywhere carries the generic name, and the row with no
+    // children offers no disclosure at all.
     expect(controlNames()).not.toContain('Expand nested calls');
     expect(controlNames()).not.toContain('Collapse nested calls');
     expect(

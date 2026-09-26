@@ -4,10 +4,10 @@
  *
  * ## What this module is for
  *
- * `panel-render.spec.ts` proves that "a stored `PanelSpec` fixture renders
- * every catalogued node type in the panel page" (AAP 0.8.3). The deterministic
- * pipeline cannot produce such a document - its panels are derived from real
- * capture aggregates and never compose all sixteen node types at once - so the
+ * `panel-render.spec.ts` proves that a stored `PanelSpec` fixture renders
+ * every catalogued node type in the panel page. The deterministic pipeline
+ * cannot produce such a document - its panels are derived from real capture
+ * aggregates and never compose all sixteen node types at once - so the
  * spec is committed here, under `tests/browser/` (`tests/fixtures/` is reserved
  * for the generalization target `sample-next-app`).
  *
@@ -53,9 +53,10 @@
  * because a value was special-cased, and {@link EMPTY_DATA_SOURCES} is computed
  * by resolving every source and keeping the empty ones. The spec asserts that
  * the node reading such a source renders its `EmptyState` - the documented
- * behaviour of AAP 0.6.2, not a failure.
+ * behaviour for a missing signal (docs/ARCHITECTURE.md, section 10.4 "The
+ * renderer contract"), not a failure.
  *
- * ## Privacy (AAP 0.5.2)
+ * ## Privacy
  *
  * Every value models already-redacted telemetry: no header value, no request or
  * response body, no URL query value, SQL in parameterized form only (`$1`), and
@@ -281,9 +282,10 @@ export const FIXTURE_TRACE_ID: TraceId = fixtureTraceId(1);
  * The service-assigned `request_key` every occurrence of the fixture's
  * `GET /api/ping` shares, which is what makes them one duplicate group.
  *
- * In a real store this is an HMAC computed at ingest (AAP 0.5.2); here it is a
- * short, obviously synthetic label, because the aggregate only needs equal keys
- * to collide and no fixture value may look like key material.
+ * In a real store this is an HMAC computed at ingest (docs/SECURITY.md, section
+ * 3.3 "The pre-redaction request key"); here it is a short, obviously
+ * synthetic label, because the aggregate only needs equal keys to collide and
+ * no fixture value may look like key material.
  */
 const FIXTURE_PING_REQUEST_KEY = 'rk_fixture_ping';
 
@@ -867,13 +869,14 @@ export function fixtureEventRef(key: FixtureEventKey, label?: string): EventRef 
  * The panel-data resolver
  *
  * The documented semantics of `POST /sessions/:id/panel-data`
- * (`apps/local-service/src/panels/data.ts`, AAP 0.4.2), applied to the fixture
- * capture in memory: `filter` narrows, `sort` orders with the stable secondary
- * key `id`, `limit` (default 200, clamped to 5 000) and `offset` (default 0) page
- * the array-valued sources, and every page echoes `total` and `nextOffset`. The
- * route is an application module that `tests/tsconfig.json` does not map, so its
- * orderings and read plans are restated here as data; everything they feed -
- * the correlator and every aggregate - is the telemetry package's own function.
+ * (`apps/local-service/src/panels/data.ts`; docs/ARCHITECTURE.md, section 4.5
+ * "Panel data"), applied to the fixture capture in memory: `filter` narrows,
+ * `sort` orders with the stable secondary key `id`, `limit` (default 200,
+ * clamped to 5 000) and `offset` (default 0) page the array-valued sources,
+ * and every page echoes `total` and `nextOffset`. The route is an application
+ * module that `tests/tsconfig.json` does not map, so its orderings and read
+ * plans are restated here as data; everything they feed - the correlator and
+ * every aggregate - is the telemetry package's own function.
  * ---------------------------------------------------------------------------------------------- */
 
 /** The sources whose result carries a `DataPage` echo, read off the protocol's union. */

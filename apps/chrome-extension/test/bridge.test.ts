@@ -21,16 +21,21 @@
  *   port took it, or when it refused it for good; with no port, or a port whose
  *   post throws, the frame stays with the agent, the port is treated as lost
  *   without a re-entrant `bridge.gone`, and after the reconnect the agent's
- *   re-sent frame is relayed exactly once.
+ *   re-sent frame is relayed exactly once. The one exception is the agent's
+ *   own loss-only batch, whose count the bridge takes and reports itself, at
+ *   once on the next port, because the agent's capture reset would zero it.
  * - **A meter.** A per-document token bucket over telemetry events relays a
  *   burst up to its capacity, refuses — and acknowledges — a batch beyond it
  *   as `rate-limited` only after every structural and provenance check, refills
  *   over an injected monotonic clock, spends nothing for a batch the port did
- *   not take, and reports the refused events exactly once: in the
- *   `droppedCount` of the next batch actually posted or, when none carries
- *   them within `BRIDGE_LOSS_REPORT_DELAY_MS` or the browser (never a page
- *   script) fires `pagehide`, in an event-less batch of its own that the
+ *   not take, and reports the refused events exactly once and only under
+ *   their own capture: in the `droppedCount` of the next batch of that capture
+ *   actually posted or, when none carries them within
+ *   `BRIDGE_LOSS_REPORT_DELAY_MS`, the browser (never a page script) fires
+ *   `pagehide` or a new port opens, in an event-less batch of its own that the
  *   worker's guard accepts and that moves neither the sequence nor the budget.
+ *   A failed report never merges one capture's count into another's; beyond
+ *   `BRIDGE_MAX_HELD_LOSS_CAPTURES` the oldest count is abandoned and counted.
  *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project (happy-dom), whose real `EventTarget`,
@@ -106,6 +111,7 @@ import {
   BRIDGE_EVENT_BUDGET_CAPACITY,
   BRIDGE_EVENT_BUDGET_REFILL_PER_SECOND,
   BRIDGE_LOSS_REPORT_DELAY_MS,
+  BRIDGE_MAX_HELD_LOSS_CAPTURES,
   BRIDGE_PORT_STABLE_MS,
   BRIDGE_RECONNECT_BASE_MS,
   BRIDGE_RECONNECT_JITTER,
@@ -717,6 +723,11 @@ interface FakeAgentOptions {
   readonly announceOnReady?: PageAgentReadyPayload;
   /** Called when a `bridge.ready` arrives, before the agent drains. */
   readonly onBridgeReady?: () => void;
+  /**
+   * Called when an `agent.config` arrives, inside its dispatch — where the
+   * real agent's terminal flush posts the capture's tail.
+   */
+  readonly onAgentConfig?: () => void;
 }
 
 /** The `type` of a frame-shaped value, for the send log. */
@@ -799,6 +810,8 @@ function installFakeAgent(win: FakeWindow, options: FakeAgentOptions = {}): Fake
       }
     } else if (parsed.type === 'bridge.gone') {
       bridgeAvailable = false;
+    } else if (parsed.type === 'agent.config') {
+      options.onAgentConfig?.();
     }
   }
 
@@ -1082,10 +1095,11 @@ function startedHarness(options: HarnessOptions = {}): Harness {
  * ===========================================================================
  */
 
-/** The counts a `rate-limited` verdict carries beside its reason. */
+/** The counts a `rate-limited` verdict carries beside its reason, and the loss's capture. */
 interface RateLimitedLoss {
   readonly events: number;
   readonly droppedCount: number;
+  readonly captureId: string | undefined;
 }
 
 interface RefusalVariant {
@@ -1275,13 +1289,20 @@ const REFUSAL_CASES: { readonly [Reason in BridgeRefusalReason]: readonly Refusa
       label: 'a two-event batch with one event of budget left',
       detail: () => detailOf(batchFrame()),
       context: budgetContext(1.999),
-      loss: { events: 2, droppedCount: 0 },
+      loss: { events: 2, droppedCount: 0, captureId: CAPTURE_ID },
     },
     {
       label: "a batch against an empty budget, carrying the agent's own loss",
       detail: () => detailOf(batchFrame(batchPayload({ droppedCount: 7 }))),
       context: budgetContext(0),
-      loss: { events: 2, droppedCount: 7 },
+      loss: { events: 2, droppedCount: 7, captureId: CAPTURE_ID },
+    },
+    {
+      label:
+        'a batch of another capture than the last relayed one, which its loss is labelled with',
+      detail: () => detailOf(batchFrame(batchPayload({ captureId: OTHER_CAPTURE_ID }))),
+      context: { ...AFTER_BATCH_3, budget: { availableEvents: 0 } },
+      loss: { events: 2, droppedCount: 0, captureId: OTHER_CAPTURE_ID },
     },
     {
       // Element-level validation is the worker's, so minimal event records
@@ -1299,13 +1320,13 @@ const REFUSAL_CASES: { readonly [Reason in BridgeRefusalReason]: readonly Refusa
           }),
         ),
       context: budgetContext(BRIDGE_EVENT_BUDGET_CAPACITY),
-      loss: { events: BRIDGE_EVENT_BUDGET_CAPACITY + 1, droppedCount: 0 },
+      loss: { events: BRIDGE_EVENT_BUDGET_CAPACITY + 1, droppedCount: 0, captureId: CAPTURE_ID },
     },
     {
       label: 'a batch against a non-finite budget level, which refuses rather than admits',
       detail: () => detailOf(batchFrame()),
       context: budgetContext(Number.NaN),
-      loss: { events: 2, droppedCount: 0 },
+      loss: { events: 2, droppedCount: 0, captureId: CAPTURE_ID },
     },
   ],
 };
@@ -1405,7 +1426,7 @@ const PRECEDENCE_ROWS: readonly PrecedenceRow[] = [
     expected: 'rate-limited',
     detail: detailOf(batchFrame(batchPayload({ batchSeq: 4 }))),
     context: { ...AFTER_BATCH_3, budget: EMPTY_BUDGET },
-    loss: { events: 2, droppedCount: 0 },
+    loss: { events: 2, droppedCount: 0, captureId: CAPTURE_ID },
   },
 ];
 
@@ -1969,6 +1990,8 @@ describe('createContentBridge', () => {
         rateLimitedEvents: 0,
         pendingDroppedCount: 0,
         lossReports: 0,
+        agentLossReportsHeld: 0,
+        abandonedLossEvents: 0,
         budgetAvailableEvents: BRIDGE_EVENT_BUDGET_CAPACITY,
       };
       expect(counters).toEqual(expectedCounters);
@@ -2587,9 +2610,11 @@ describe('createContentBridge', () => {
     }
 
     /** A started harness on a held budget clock, its document pinned by `agent.ready`. */
-    function meteredHarness(): Harness & { readonly clock: ManualClock } {
+    function meteredHarness(
+      options: HarnessOptions = {},
+    ): Harness & { readonly clock: ManualClock } {
       const clock = manualClock();
-      const harness = startedHarness({ monotonicNow: clock.read });
+      const harness = startedHarness({ ...options, monotonicNow: clock.read });
       expect(harness.agent.send(readyFrame())).toBe(true);
       return { ...harness, clock };
     }
@@ -3084,7 +3109,7 @@ describe('createContentBridge', () => {
         expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 4 });
       });
 
-      it('keeps the loss held while no port is open, and reports it by the timer the reconnect re-arms', () => {
+      it('keeps the loss held while no port is open, and reports it at once on the next port, after bridge.ready', () => {
         const { bridge, runtime, agent, timers } = meteredHarness();
         const first = runtime.latestPort();
         const next = spendWholeBudget(agent);
@@ -3105,17 +3130,22 @@ describe('createContentBridge', () => {
         // Only the reconnect is pending now.
         expect(timers.pending()).toBe(1);
 
+        const reportTimersBefore = timers
+          .delays()
+          .filter((delay) => delay === BRIDGE_LOSS_REPORT_DELAY_MS).length;
         vi.advanceTimersByTime(BRIDGE_RECONNECT_BASE_MS);
         const second = runtime.latestPort();
         expect(second).not.toBe(first);
-        expect(upstreamTypes(second)).toEqual(['agent.ready']);
-        // Re-armed once the new port had sent bridge.ready.
-        expect(timers.delays().at(-1)).toBe(BRIDGE_LOSS_REPORT_DELAY_MS);
-
-        vi.advanceTimersByTime(BRIDGE_LOSS_REPORT_DELAY_MS);
+        // Reported as soon as the new port had sent bridge.ready: no timer
+        // waits for it, and none is armed.
+        expect(agent.receivedTypes().at(-1)).toBe('bridge.ready');
         expect(upstreamTypes(second)).toEqual(['agent.ready', 'telemetry.batch']);
         expect(lossOnlyBatches(second)).toStrictEqual([lossOnlyPayload(40, next - 1)]);
         expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 1 });
+        expect(
+          timers.delays().filter((delay) => delay === BRIDGE_LOSS_REPORT_DELAY_MS),
+        ).toHaveLength(reportTimersBefore);
+        expect(timers.pending()).toBe(0);
       });
 
       it('keeps the loss held when the report post throws, and reports it on the next port', () => {
@@ -3140,7 +3170,7 @@ describe('createContentBridge', () => {
         expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 1 });
       });
 
-      it('stop() disarms the report and keeps the loss, which a restart re-arms', () => {
+      it('stop() disarms the report and keeps the loss, which a restart reports at once', () => {
         const { bridge, runtime, agent, timers } = meteredHarness();
         const port = runtime.latestPort();
         const next = spendWholeBudget(agent);
@@ -3156,10 +3186,10 @@ describe('createContentBridge', () => {
         expect(bridge.getStats().pendingDroppedCount).toBe(40);
 
         bridge.start();
-        vi.advanceTimersByTime(BRIDGE_LOSS_REPORT_DELAY_MS);
         expect(lossOnlyBatches(runtime.latestPort())).toStrictEqual([
           lossOnlyPayload(40, next - 1),
         ]);
+        expect(timers.pending()).toBe(0);
       });
 
       it('termination disarms the report: nothing is posted once the context is invalidated', () => {
@@ -3218,6 +3248,458 @@ describe('createContentBridge', () => {
         const [report] = lossOnlyBatches(port);
         expect(report).toStrictEqual(lossOnlyPayload(1, 0, {}));
         expect(report).not.toHaveProperty('captureId');
+      });
+
+      it('reports held loss at once after an agent.config, whose dispatch flushed the capture’s tail', () => {
+        // What the fake agent does inside the configuration's dispatch; set
+        // once the harness — and so the agent — exists.
+        const inDispatch: { flushTail: () => void } = { flushTail: () => undefined };
+        const { bridge, runtime, agent, timers } = meteredHarness({
+          onAgentConfig: () => {
+            inDispatch.flushTail();
+          },
+        });
+        const port = runtime.latestPort();
+        const next = spendWholeBudget(agent);
+        const tailClaimed: boolean[] = [];
+        inDispatch.flushTail = () => {
+          tailClaimed.push(agent.send(sizedBatchFrame(30, next)));
+        };
+
+        // The worker ends the capture: inside the dispatch the agent flushes
+        // its tail, and the spent budget refuses it.
+        port.emitMessage(downstreamFrames()['agent.config']);
+
+        expect(tailClaimed).toEqual([true]);
+        expect(agent.listenerErrors).toEqual([]);
+        // Reported at once — no timer left — under the tail's capture, at the
+        // capture's last relayed position.
+        expect(lossOnlyBatches(port)).toStrictEqual([lossOnlyPayload(30, next - 1)]);
+        expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 1 });
+        expect(timers.pending()).toBe(0);
+        vi.advanceTimersByTime(BRIDGE_LOSS_REPORT_DELAY_MS * 2);
+        expect(lossOnlyBatches(port)).toHaveLength(1);
+      });
+
+      it('posts nothing extra after an agent.config when no loss is held', () => {
+        const { bridge, runtime, agent } = meteredHarness();
+        const port = runtime.latestPort();
+        relayFullBatches(agent, 2);
+        const posted = port.accepted.length;
+
+        port.emitMessage(downstreamFrames()['agent.config']);
+
+        expect(port.accepted).toHaveLength(posted);
+        expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 0 });
+      });
+
+      it("reports one capture's held loss on its own before a batch of the next capture, which carries none of it", () => {
+        const { bridge, runtime, agent, clock, timers } = meteredHarness();
+        const port = runtime.latestPort();
+        const next = spendWholeBudget(agent);
+        expect(agent.send(sizedBatchFrame(30, next))).toBe(true);
+        clock.ms += 1_000;
+        const firstOfNext = batchFrame(
+          batchPayload({ events: eventsOf(10), batchSeq: 0, captureId: OTHER_CAPTURE_ID }),
+        );
+
+        expect(agent.send(firstOfNext)).toBe(true);
+
+        // The earlier capture's report first, labelled with its own capture;
+        // then the new capture's batch exactly as the agent sent it.
+        expect(relayedBatches(port).slice(-2)).toStrictEqual([
+          lossOnlyPayload(30, next - 1),
+          firstOfNext.payload,
+        ]);
+        expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 1 });
+        expect(timers.pending()).toBe(0);
+        vi.advanceTimersByTime(BRIDGE_LOSS_REPORT_DELAY_MS * 2);
+        expect(lossOnlyBatches(port)).toHaveLength(1);
+      });
+
+      it("holds a refused batch's loss under its own capture: the next batch of that capture carries it", () => {
+        const { bridge, runtime, agent, clock } = meteredHarness();
+        const port = runtime.latestPort();
+        spendWholeBudget(agent);
+        // The next capture's first batch finds the budget spent; the last
+        // relayed batch is still the earlier capture's.
+        expect(
+          agent.send(
+            batchFrame(
+              batchPayload({ events: eventsOf(20), batchSeq: 0, captureId: OTHER_CAPTURE_ID }),
+            ),
+          ),
+        ).toBe(true);
+        expect(bridge.getStats().pendingDroppedCount).toBe(20);
+        clock.ms += 1_000;
+        const second = batchFrame(
+          batchPayload({ events: eventsOf(5), batchSeq: 1, captureId: OTHER_CAPTURE_ID }),
+        );
+
+        expect(agent.send(second)).toBe(true);
+
+        expect(lossOnlyBatches(port)).toEqual([]);
+        expect(relayedBatches(port).at(-1)).toStrictEqual({ ...second.payload, droppedCount: 20 });
+        expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 0 });
+      });
+
+      it('names the loss’s own capture, at position 0, when no batch of that capture was relayed', () => {
+        const { runtime, agent } = meteredHarness();
+        const port = runtime.latestPort();
+        spendWholeBudget(agent);
+        expect(
+          agent.send(
+            batchFrame(
+              batchPayload({ events: eventsOf(20), batchSeq: 0, captureId: OTHER_CAPTURE_ID }),
+            ),
+          ),
+        ).toBe(true);
+
+        vi.advanceTimersByTime(BRIDGE_LOSS_REPORT_DELAY_MS);
+
+        expect(lossOnlyBatches(port)).toStrictEqual([
+          lossOnlyPayload(20, 0, { captureId: OTHER_CAPTURE_ID }),
+        ]);
+      });
+
+      it("reports held loss of one capture at once when a refusal of another capture's batch arrives", () => {
+        const { bridge, runtime, agent } = meteredHarness();
+        const port = runtime.latestPort();
+        const next = spendWholeBudget(agent);
+        expect(agent.send(sizedBatchFrame(30, next))).toBe(true);
+
+        expect(
+          agent.send(
+            batchFrame(
+              batchPayload({ events: eventsOf(20), batchSeq: 0, captureId: OTHER_CAPTURE_ID }),
+            ),
+          ),
+        ).toBe(true);
+
+        // Never summed: the earlier capture's loss went out under its label …
+        expect(lossOnlyBatches(port)).toStrictEqual([lossOnlyPayload(30, next - 1)]);
+        expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 20, lossReports: 1 });
+        // … and the new capture's is reported under its own when the timer fires.
+        vi.advanceTimersByTime(BRIDGE_LOSS_REPORT_DELAY_MS);
+        expect(lossOnlyBatches(port)).toStrictEqual([
+          lossOnlyPayload(30, next - 1),
+          lossOnlyPayload(20, 0, { captureId: OTHER_CAPTURE_ID }),
+        ]);
+      });
+
+      /** A genuine batch of `count` events of `captureId`, carrying the agent's own `droppedCount`. */
+      function captureBatch(
+        captureId: string,
+        count: number,
+        batchSeq: number,
+        droppedCount = 0,
+      ): AgentChannelMessage<'telemetry.batch'> {
+        return batchFrame(
+          batchPayload({ events: eventsOf(count), batchSeq, droppedCount, captureId }),
+        );
+      }
+
+      /** The two ways a port refuses a frame: it is gone, or its post throws. */
+      const PORT_OUTAGES: readonly {
+        readonly label: string;
+        readonly takeDown: (port: FakePort) => void;
+      }[] = [
+        {
+          label: 'the port disconnected',
+          takeDown: (port) => {
+            port.emitDisconnect();
+          },
+        },
+        {
+          label: 'the post throws',
+          takeDown: (port) => {
+            port.failPosts();
+          },
+        },
+      ];
+
+      describe('one bucket per capture: a count never takes another capture’s label', () => {
+        /** A canonical capture id, distinct for every `index`. */
+        function captureIdAt(index: number): string {
+          return `cap_${String(index).padStart(16, '0')}`;
+        }
+
+        it.each(PORT_OUTAGES)(
+          'reports capture A and capture B separately once a port returns, when A’s report failed because $label',
+          ({ takeDown }) => {
+            const { bridge, runtime, agent, timers } = meteredHarness();
+            const first = runtime.latestPort();
+            const next = spendWholeBudget(agent);
+            // Capture A's tail is refused: 30 events held under A.
+            expect(agent.send(sizedBatchFrame(30, next))).toBe(true);
+            takeDown(first);
+
+            // Capture B's first batch is refused too, with the agent's own loss
+            // of 4. A's report is attempted first and finds no usable port.
+            expect(agent.send(captureBatch(OTHER_CAPTURE_ID, 20, 0, 4))).toBe(true);
+
+            expect(lossOnlyBatches(first)).toEqual([]);
+            expect(bridge.getStats()).toMatchObject({
+              connected: false,
+              pendingDroppedCount: 30 + 24,
+              lossReports: 0,
+              abandonedLossEvents: 0,
+            });
+
+            vi.advanceTimersByTime(BRIDGE_RECONNECT_BASE_MS);
+
+            const second = runtime.latestPort();
+            expect(second).not.toBe(first);
+            // Oldest first, one frame per capture, each with its own count and
+            // position — never A + B under B.
+            expect(lossOnlyBatches(second)).toStrictEqual([
+              lossOnlyPayload(30, next - 1),
+              lossOnlyPayload(24, 0, { captureId: OTHER_CAPTURE_ID }),
+            ]);
+            expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 2 });
+            expect(timers.pending()).toBe(0);
+          },
+        );
+
+        it('lets a batch of capture B carry only B’s bucket, after A’s was reported alone', () => {
+          const { bridge, runtime, agent, clock, timers } = meteredHarness();
+          const first = runtime.latestPort();
+          const next = spendWholeBudget(agent);
+          expect(agent.send(sizedBatchFrame(30, next))).toBe(true);
+          first.emitDisconnect();
+          expect(agent.send(captureBatch(OTHER_CAPTURE_ID, 20, 0))).toBe(true);
+          expect(bridge.getStats().pendingDroppedCount).toBe(50);
+
+          // B's next batch fits the refilled budget, but the agent keeps it
+          // while the bridge is away.
+          clock.ms += 1_000;
+          const carrier = captureBatch(OTHER_CAPTURE_ID, 10, 1, 2);
+          agent.deliver(carrier);
+          expect(agent.pending).toEqual([carrier]);
+
+          vi.advanceTimersByTime(BRIDGE_RECONNECT_BASE_MS);
+
+          // The agent drains inside bridge.ready: A's bucket goes out on its own
+          // first, then B's batch with B's bucket — and nothing of A's — added.
+          const second = runtime.latestPort();
+          expect(agent.pending).toEqual([]);
+          expect(relayedBatches(second)).toStrictEqual([
+            lossOnlyPayload(30, next - 1),
+            { ...carrier.payload, droppedCount: 2 + 20 },
+          ]);
+          expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 1 });
+          expect(timers.pending()).toBe(0);
+        });
+
+        it('abandons the oldest bucket beyond the bound into abandonedLossEvents, never relabelling it', () => {
+          const { bridge, runtime, agent, timers } = meteredHarness();
+          spendWholeBudget(agent);
+          runtime.latestPort().emitDisconnect();
+          /** Capture `index` has a refused batch of `10 + index` events. */
+          const heldFor = (index: number): number => 10 + index;
+          const withinBound = Array.from({ length: BRIDGE_MAX_HELD_LOSS_CAPTURES }, (_, index) =>
+            captureIdAt(index),
+          );
+
+          for (const [index, captureId] of withinBound.entries()) {
+            expect(agent.send(captureBatch(captureId, heldFor(index), 0))).toBe(true);
+          }
+          // Exactly the bound is held: nothing is abandoned.
+          const heldWithinBound = withinBound.reduce((sum, _, index) => sum + heldFor(index), 0);
+          expect(bridge.getStats()).toMatchObject({
+            pendingDroppedCount: heldWithinBound,
+            abandonedLossEvents: 0,
+          });
+
+          // One capture more: the oldest bucket (capture 0) is given up.
+          const newest = captureIdAt(BRIDGE_MAX_HELD_LOSS_CAPTURES);
+          expect(agent.send(captureBatch(newest, heldFor(BRIDGE_MAX_HELD_LOSS_CAPTURES), 0))).toBe(
+            true,
+          );
+          // More loss of a capture that already has a bucket abandons nothing further.
+          expect(agent.send(captureBatch(newest, 5, 1))).toBe(true);
+          const held = heldWithinBound - heldFor(0) + heldFor(BRIDGE_MAX_HELD_LOSS_CAPTURES) + 5;
+          expect(bridge.getStats()).toMatchObject({
+            pendingDroppedCount: held,
+            abandonedLossEvents: heldFor(0),
+          });
+
+          vi.advanceTimersByTime(BRIDGE_RECONNECT_BASE_MS);
+
+          // Every surviving capture is reported under its own id with its own
+          // count, oldest first; capture 0's count appears nowhere.
+          const kept = [...withinBound.slice(1), newest];
+          expect(lossOnlyBatches(runtime.latestPort())).toStrictEqual(
+            kept.map((captureId, offset) =>
+              lossOnlyPayload(heldFor(offset + 1) + (captureId === newest ? 5 : 0), 0, {
+                captureId,
+              }),
+            ),
+          );
+          expect(bridge.getStats()).toMatchObject({
+            pendingDroppedCount: 0,
+            lossReports: kept.length,
+            abandonedLossEvents: heldFor(0),
+          });
+          expect(timers.pending()).toBe(0);
+        });
+      });
+
+      describe('the agent’s own loss-only batch that no port can take (custody case 3)', () => {
+        /** The agent's terminal loss-only report: no events, its pending count, its capture. */
+        function agentLossReport(
+          batchSeq: number,
+          droppedCount: number,
+          captureId = CAPTURE_ID,
+        ): AgentChannelMessage<'telemetry.batch'> {
+          return captureBatch(captureId, 0, batchSeq, droppedCount);
+        }
+
+        /**
+         * A metered harness whose agent records, at every `bridge.ready`, how
+         * many frames the newest port had accepted — so a case can tell what
+         * the bridge posted after the signal from what it posted before.
+         */
+        function readyProbedHarness(): ReturnType<typeof meteredHarness> & {
+          readonly acceptedAtReady: readonly number[];
+        } {
+          const acceptedAtReady: number[] = [];
+          const probe: { runtime: FakeRuntime | undefined } = { runtime: undefined };
+          const harness = meteredHarness({
+            onBridgeReady: () => {
+              const port = probe.runtime?.ports.at(-1);
+              if (port !== undefined) {
+                acceptedAtReady.push(port.accepted.length);
+              }
+            },
+          });
+          probe.runtime = harness.runtime;
+          return { ...harness, acceptedAtReady };
+        }
+
+        it.each(PORT_OUTAGES)(
+          'acknowledges it when $label, holds it under its own capture, and reports it at once after the next bridge.ready',
+          ({ takeDown }) => {
+            const { bridge, runtime, agent, timers, acceptedAtReady } = readyProbedHarness();
+            const first = runtime.latestPort();
+            const next = relayFullBatches(agent, 3);
+            takeDown(first);
+
+            // Claimed: the agent's transport clears its count and its capture
+            // reset can no longer zero it.
+            expect(agent.send(agentLossReport(next, 7))).toBe(true);
+
+            expect(lossOnlyBatches(first)).toEqual([]);
+            expect(bridge.getStats()).toMatchObject({
+              connected: false,
+              relayed: 1 + next,
+              unclaimed: 0,
+              agentLossReportsHeld: 1,
+              pendingDroppedCount: 7,
+              lossReports: 0,
+            });
+
+            vi.advanceTimersByTime(BRIDGE_RECONNECT_BASE_MS);
+
+            // The new port had taken only the re-announcement at bridge.ready;
+            // the report followed at once, under the batch's own capture at its
+            // last relayed position — no loss-report timer was waited for.
+            const second = runtime.latestPort();
+            expect(second).not.toBe(first);
+            expect(acceptedAtReady).toEqual([1]);
+            expect(upstreamTypes(second)).toEqual(['agent.ready', 'telemetry.batch']);
+            expect(lossOnlyBatches(second)).toStrictEqual([lossOnlyPayload(7, next - 1)]);
+            expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 1 });
+            expect(timers.pending()).toBe(0);
+          },
+        );
+
+        it.each(PORT_OUTAGES)(
+          'still reports it under its own capture when $label and the agent has moved to the next capture',
+          ({ takeDown }) => {
+            const { bridge, runtime, agent, timers } = meteredHarness();
+            const next = relayFullBatches(agent, 3);
+            takeDown(runtime.latestPort());
+            expect(agent.send(agentLossReport(next, 7))).toBe(true);
+
+            // The agent's disarm and the next capture's arm: its count is gone
+            // on its side, and the new capture's first batch waits in its
+            // custody for the bridge to return.
+            const firstOfNext = captureBatch(OTHER_CAPTURE_ID, 10, 0);
+            agent.deliver(firstOfNext);
+            expect(agent.pending).toEqual([firstOfNext]);
+            expect(bridge.getStats().pendingDroppedCount).toBe(7);
+
+            vi.advanceTimersByTime(BRIDGE_RECONNECT_BASE_MS);
+
+            // The ended capture's count goes out under its own label before the
+            // new capture's batch, which carries none of it.
+            expect(agent.pending).toEqual([]);
+            expect(relayedBatches(runtime.latestPort())).toStrictEqual([
+              lossOnlyPayload(7, next - 1),
+              firstOfNext.payload,
+            ]);
+            expect(bridge.getStats()).toMatchObject({ pendingDroppedCount: 0, lossReports: 1 });
+            expect(timers.pending()).toBe(0);
+          },
+        );
+
+        it('leaves every other batch with no usable port unacknowledged, holding nothing', () => {
+          const { bridge, runtime, agent } = meteredHarness();
+          const next = relayFullBatches(agent, 3);
+          runtime.latestPort().emitDisconnect();
+
+          // An event batch — even one reporting the agent's own loss — stays
+          // with the agent, which re-sends it whole after bridge.ready …
+          expect(agent.send(captureBatch(CAPTURE_ID, 10, next, 5))).toBe(false);
+          // … and so does an empty batch that reports no loss: nothing to hold.
+          expect(agent.send(agentLossReport(next, 0))).toBe(false);
+
+          expect(bridge.getStats()).toMatchObject({
+            unclaimed: 2,
+            agentLossReportsHeld: 0,
+            pendingDroppedCount: 0,
+          });
+        });
+
+        it('relays it like any batch while the port takes it, carrying its own capture’s bucket', () => {
+          const { bridge, runtime, agent } = meteredHarness();
+          const port = runtime.latestPort();
+          const next = spendWholeBudget(agent);
+          expect(agent.send(sizedBatchFrame(30, next))).toBe(true);
+          const report = agentLossReport(next + 1, 7);
+
+          expect(agent.send(report)).toBe(true);
+
+          // An event-less batch spends nothing, so the spent budget passes it.
+          expect(relayedBatches(port).at(-1)).toStrictEqual({
+            ...report.payload,
+            droppedCount: 7 + 30,
+          });
+          expect(bridge.getStats()).toMatchObject({
+            agentLossReportsHeld: 0,
+            pendingDroppedCount: 0,
+            lossReports: 0,
+          });
+        });
+
+        it('leaves it with the agent once a throwing post shows the extension context is gone', () => {
+          const { bridge, runtime, agent, timers } = meteredHarness();
+          const next = relayFullBatches(agent, 3);
+          runtime.id = undefined;
+          runtime.latestPort().failPosts();
+
+          // The bridge terminates inside the post and could never report the count.
+          expect(agent.send(agentLossReport(next, 7))).toBe(false);
+
+          expect(bridge.getStats()).toMatchObject({
+            terminated: true,
+            unclaimed: 1,
+            agentLossReportsHeld: 0,
+            pendingDroppedCount: 0,
+          });
+          expect(timers.pending()).toBe(0);
+        });
       });
     });
   });

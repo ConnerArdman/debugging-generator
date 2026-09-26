@@ -13,7 +13,13 @@
  *     later page of the trace is fetched and shown as a complete chain, a
  *     lookup that reaches its page budget is stated as incomplete with the
  *     count read and continues from where it stopped, and a failed lookup
- *     offers a retry that reads the trace again.
+ *     offers a retry that reads the trace again;
+ *   - the drawer reads the rendered panel's evidence: a selection absent from
+ *     the live tail is looked up with the rendered specification's `id`, so the
+ *     service answers from the capture that panel was generated from;
+ *   - an unexpected exception's text never reaches the screen, the store or the
+ *     console: a command that fails with one is presented as fixed copy under
+ *     its fallback code, and the panel logs that closed code alone.
  *
  * Harness: the panel connection module is replaced with one whose port
  * requests this suite answers (`harness.handler`), so the real store, data
@@ -22,9 +28,11 @@
  * product vocabulary written for this suite; no inspected project's names or
  * routes appear in it (AAP 0.5.4).
  */
+import { PANEL_SPEC_VERSION } from '@debuggen/panel-schema';
+import type { PanelSpec } from '@debuggen/panel-schema';
 import type { SessionRecord, TelemetryEvent } from '@debuggen/protocol';
-import { parseSessionRecord } from '@debuggen/protocol';
-import { cleanup, render, screen } from '@testing-library/react';
+import { createEnvelope, parseSessionRecord } from '@debuggen/protocol';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockInstance } from 'vitest';
@@ -33,7 +41,9 @@ import { App } from '../src/panel/App';
 import { EVENT_RESOLUTION_PAGE_BUDGET } from '../src/panel/data-provider';
 import type * as ConnectionModule from '../src/panel/state/connection';
 import {
+  applyRelayedMessage,
   applySessionSnapshot,
+  getPanelSnapshot,
   resetPanelStore,
   selectEvent,
   setConnectionStatus,
@@ -222,10 +232,31 @@ function panelDataRequests(): readonly RecordedRequest[] {
   return harness.requests.filter((request) => request.kind === 'panelData.query');
 }
 
-/** Show `SESSION` as the bound, connected session and select the leaf event. */
-function showSessionWithLeafSelected(): void {
+/** The id of the generated panel {@link PANEL} renders. */
+const PANEL_ID = 'panel-app-0001';
+
+/**
+ * A validated specification of the session's panel. Its layout holds no
+ * query-backed view, so the only `panelData.query` requests are the drawer's.
+ */
+const PANEL: PanelSpec = {
+  version: PANEL_SPEC_VERSION,
+  id: PANEL_ID,
+  sessionId: SESSION_ID,
+  panelVersion: 1,
+  title: 'Where the item list spends its time',
+  summary: { observed: [], likelyCauses: [] },
+  layout: [],
+};
+
+/**
+ * Show `SESSION` as the bound, connected session — with `panel` as its current
+ * panel when one is given — and select the leaf event.
+ */
+function showSessionWithLeafSelected(panel?: PanelSpec): void {
   applySessionSnapshot({
     session: SESSION,
+    panel,
     connection: { status: 'connected', serviceUrl: 'http://127.0.0.1:43117' },
     binding: { kind: 'bound', sessionId: SESSION_ID, tabId: 7, url: 'http://127.0.0.1:3100/' },
   });
@@ -391,5 +422,239 @@ describe('App — the drawer parent chain', () => {
     expect(panelDataRequests().map((request) => queryOffset(request.payload))).toEqual([
       0, 1, 0, 1,
     ]);
+  });
+});
+
+describe('App — an unexpected failure is presented without its text', () => {
+  /**
+   * A credential-shaped value: a token prefix and a run of the length that
+   * prefix is followed by. Assembled from pieces so that the repository's
+   * secret scan does not read this fixture as a committed credential.
+   */
+  const CREDENTIAL_SHAPED = ['gh', 'p_', 'x'.repeat(36)].join('');
+  /** The private parts an unexpected exception's message might carry. */
+  const PRIVATE_PATH = '/home/dev/.env';
+  const PRIVATE_SQL = 'SELECT password FROM users';
+  const PRIVATE_TEXT = `${PRIVATE_PATH}: ${PRIVATE_SQL} WHERE token='${CREDENTIAL_SHAPED}'`;
+  const START_CAPTURE_LABEL = 'Start capture';
+  const LAST_ERROR_TITLE = 'A Debug Generator request did not complete';
+  const FIXED_COPY =
+    'Could not start the capture: an unexpected error stopped the request in the Debug Generator panel. Try again; if it keeps failing, reopen Chrome DevTools.';
+
+  /** Whether `text` holds any part of {@link PRIVATE_TEXT}. */
+  function leaksPrivateText(text: string): boolean {
+    return [PRIVATE_TEXT, PRIVATE_PATH, PRIVATE_SQL, CREDENTIAL_SHAPED].some((part) =>
+      text.includes(part),
+    );
+  }
+
+  it('shows fixed copy for a capture.start that rejects with a plain Error, and logs only its code', async () => {
+    harness.handler = (kind) =>
+      Promise.reject(
+        kind === 'capture.start'
+          ? new Error(PRIVATE_TEXT)
+          : new Error(`This suite does not answer ${kind}.`),
+      );
+    // A session ready to capture, bound to this tab over a connected panel.
+    applySessionSnapshot({
+      session: { ...SESSION, status: 'ready' },
+      connection: { status: 'connected', serviceUrl: 'http://127.0.0.1:43117' },
+      binding: { kind: 'bound', sessionId: SESSION_ID, tabId: 7, url: 'http://127.0.0.1:3100/' },
+    });
+    const user = userEvent.setup();
+
+    render(<App theme="dark" />);
+    await user.click(screen.getByRole('button', { name: START_CAPTURE_LABEL }));
+
+    expect(await screen.findByText(LAST_ERROR_TITLE)).toBeTruthy();
+    expect(screen.getByText(FIXED_COPY)).toBeTruthy();
+    expect(harness.requests.map((request) => request.kind)).toEqual(['capture.start']);
+    // Nothing of the exception's text anywhere in the document or the store.
+    expect(leaksPrivateText(document.body.textContent)).toBe(false);
+    expect(getPanelSnapshot().lastError).toEqual({
+      code: 'TRANSPORT_DISCONNECTED',
+      message: FIXED_COPY,
+    });
+    expect(leaksPrivateText(JSON.stringify(getPanelSnapshot().lastError))).toBe(false);
+
+    // The panel's log records the closed code, and nothing of the cause.
+    expect(consoleWarn).toHaveBeenCalledTimes(1);
+    expect(consoleWarn).toHaveBeenCalledWith(expect.stringMatching(/^\[panel\] /u), {
+      code: 'TRANSPORT_DISCONNECTED',
+    });
+    expect(leaksPrivateText(JSON.stringify(consoleWarn.mock.calls))).toBe(false);
+    // Asserted above; `afterEach` holds every other case to a silent console.
+    consoleWarn.mockClear();
+  });
+});
+
+/** The capture every fixture event belongs to, streamed by the live tail below. */
+const CAPTURE_ID = BASE_EVENT.captureId;
+
+/** The chip caption of {@link PANEL_WITH_EVIDENCE}'s one citation. */
+const EVIDENCE_CHIP_LABEL = 'cited item request';
+
+/** {@link PANEL}, with an observed fact citing the leaf event. */
+const PANEL_WITH_EVIDENCE: PanelSpec = {
+  ...PANEL,
+  summary: {
+    observed: [
+      {
+        statement: 'The item list request started after the click.',
+        evidence: [
+          {
+            eventId: LEAF_EVENT.id,
+            traceId: TRACE_ID,
+            spanId: LEAF_SPAN,
+            kind: 'fetch',
+            label: EVIDENCE_CHIP_LABEL,
+          },
+        ],
+      },
+    ],
+    likelyCauses: [],
+  },
+};
+
+/**
+ * Show `SESSION` with `panel` rendered while {@link CAPTURE_ID} runs and the
+ * live tail holds `tail` — nothing selected yet.
+ */
+function showSessionStreaming(panel: PanelSpec, tail: TelemetryEvent[]): void {
+  applySessionSnapshot({
+    session: SESSION,
+    panel,
+    connection: { status: 'connected', serviceUrl: 'http://127.0.0.1:43117' },
+    binding: { kind: 'bound', sessionId: SESSION_ID, tabId: 7, url: 'http://127.0.0.1:3100/' },
+  });
+  applyRelayedMessage(
+    createEnvelope(
+      'capture.started',
+      { sessionId: SESSION_ID, captureId: CAPTURE_ID },
+      { ts: 1_700_000_000_000 },
+    ),
+  );
+  applyRelayedMessage(
+    createEnvelope(
+      'telemetry.tail',
+      { sessionId: SESSION_ID, events: tail },
+      { ts: 1_700_000_000_050 },
+    ),
+  );
+}
+
+/** Whether a recorded `panelData.query` request named a panel. */
+function namesPanel(request: RecordedRequest): boolean {
+  return (
+    isRecord(request.payload) &&
+    isRecord(request.payload.query) &&
+    'panelId' in request.payload.query
+  );
+}
+
+/** The drawer's complementary landmark. */
+function drawerRegion(): HTMLElement {
+  return screen.getByRole('complementary', { name: 'Selected event' });
+}
+
+describe('App — whose evidence the drawer reads follows where the selection was raised', () => {
+  it('reads a live-tail row live while a panel is rendered, and so its ancestor too', async () => {
+    // The tail holds the leaf but not its root, so the drawer sends a stored lookup.
+    answerPanelData((offset) => Promise.resolve(eventsPage([ROOT_EVENT, LEAF_EVENT], offset, 2)));
+    showSessionStreaming(PANEL, [LEAF_EVENT]);
+    const user = userEvent.setup();
+
+    const view = render(<App theme="dark" />);
+    const tail = screen.getByRole('region', { name: 'Live event tail' });
+    const row = tail.querySelector('[data-row-index="0"]');
+    if (!(row instanceof HTMLElement)) {
+      throw new Error('The live tail rendered no row for the streamed event.');
+    }
+    await user.click(row);
+
+    const ancestor = await within(drawerRegion()).findByRole('button', {
+      name: /click primary action/,
+    });
+    const requests = panelDataRequests();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.payload).toMatchObject({
+      sessionId: SESSION_ID,
+      query: { source: 'events', filter: { traceId: TRACE_ID } },
+    });
+    expect(requests.some(namesPanel)).toBe(false);
+
+    // The ancestor, selected from the drawer, is evidence of the same capture:
+    // it is read live as well, never as the rendered panel's.
+    await user.click(ancestor);
+    expect(
+      await within(drawerRegion()).findByText('click primary action', { selector: 'p' }),
+    ).toBeTruthy();
+    expect(panelDataRequests().some(namesPanel)).toBe(false);
+    view.unmount();
+  });
+
+  it('binds a panel evidence chip to the panel even when the live tail holds the same event', async () => {
+    answerPanelData((offset) => Promise.resolve(eventsPage([ROOT_EVENT, LEAF_EVENT], offset, 2)));
+    showSessionStreaming(PANEL_WITH_EVIDENCE, [LEAF_EVENT]);
+    const user = userEvent.setup();
+
+    render(<App theme="dark" />);
+    await user.click(screen.getByRole('button', { name: EVIDENCE_CHIP_LABEL }));
+
+    expect(
+      await within(drawerRegion()).findByRole('button', { name: /click primary action/ }),
+    ).toBeTruthy();
+    const requests = panelDataRequests();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.payload).toMatchObject({
+      sessionId: SESSION_ID,
+      query: { source: 'events', filter: { traceId: TRACE_ID }, panelId: PANEL_ID },
+    });
+  });
+
+  it('rebinds the same event when it is raised again from the other place', async () => {
+    answerPanelData((offset) => Promise.resolve(eventsPage([ROOT_EVENT, LEAF_EVENT], offset, 2)));
+    showSessionStreaming(PANEL_WITH_EVIDENCE, [LEAF_EVENT]);
+    const user = userEvent.setup();
+
+    render(<App theme="dark" />);
+    const row = screen
+      .getByRole('region', { name: 'Live event tail' })
+      .querySelector('[data-row-index="0"]');
+    if (!(row instanceof HTMLElement)) {
+      throw new Error('The live tail rendered no row for the streamed event.');
+    }
+
+    // Raised by the tail first: a live read.
+    await user.click(row);
+    await within(drawerRegion()).findByRole('button', { name: /click primary action/ });
+    expect(panelDataRequests().map(namesPanel)).toEqual([false]);
+
+    // The same event, raised by the panel's evidence chip: the panel's evidence.
+    await user.click(screen.getByRole('button', { name: EVIDENCE_CHIP_LABEL }));
+    await within(drawerRegion()).findByRole('button', { name: /click primary action/ });
+    const requests = panelDataRequests();
+    expect(requests.map(namesPanel)).toEqual([false, true]);
+    expect(requests[1]?.payload).toMatchObject({ query: { panelId: PANEL_ID } });
+  });
+});
+
+describe('App — the drawer reads the rendered panel’s evidence', () => {
+  it('binds the lookup of a selection absent from the live tail to the rendered panel', async () => {
+    // The trace's one page holds the selection and its root.
+    answerPanelData((offset) => Promise.resolve(eventsPage([ROOT_EVENT, LEAF_EVENT], offset, 2)));
+    showSessionWithLeafSelected(PANEL);
+
+    render(<App theme="dark" />);
+
+    expect(await screen.findByRole('button', { name: /click primary action/ })).toBeTruthy();
+    const requests = panelDataRequests();
+    expect(requests).toHaveLength(1);
+    for (const request of requests) {
+      expect(request.payload).toMatchObject({
+        sessionId: SESSION_ID,
+        query: { source: 'events', filter: { traceId: TRACE_ID }, panelId: PANEL_ID },
+      });
+    }
   });
 });

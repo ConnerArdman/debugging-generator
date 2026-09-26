@@ -204,11 +204,10 @@ export const catalogQuerySchema = z.object({
   ),
   // A free-text term matched against product names and SKUs. A blank term
   // narrows nothing, so a search box submitted empty is not an error the
-  // customer has to read: `unset` turns it into an absent filter, which is the
-  // same unfiltered listing the field's own lower bound used to allow as an
-  // empty string. A term made only of printable characters is the whole of what
-  // a search box can produce, so one carrying a control character is refused
-  // rather than matched against nothing.
+  // customer has to read: `unset` turns it into an absent filter and the
+  // listing is unfiltered. A term made only of printable characters is the
+  // whole of what a search box can produce, so one carrying a control character
+  // is refused rather than matched against nothing.
   search: z.preprocess(
     unset,
     z
@@ -323,9 +322,9 @@ function reported(names: Iterable<string>): CatalogQueryParameter[] {
  * not be applied to it.
  *
  * The two travel together because neither is complete on its own. A query
- * without the rejections is what the catalog page used to render - a listing
- * nobody can tell has ignored half of its address - and a list of rejections
- * without a query is a diagnostic rather than a page.
+ * without its rejections would render a listing that silently ignores part of
+ * its address, and a list of rejections without a query is a diagnostic rather
+ * than a page.
  */
 export interface CatalogQueryResult {
   /** The query to read the catalog with; complete, whatever the caller sent. */

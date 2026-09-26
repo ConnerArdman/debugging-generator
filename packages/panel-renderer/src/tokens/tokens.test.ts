@@ -1,6 +1,5 @@
 /**
- * The token gate — the suite that keeps the design system's value layer honest
- * (AAP 0.6.1, 0.6.3, 0.6.4).
+ * The token gate — the suite that keeps the design system's value layer honest.
  *
  * `src/tokens/tokens.ts` is the single source of truth for every visual value,
  * `scripts/build-tokens.mjs` projects it into the committed
@@ -38,15 +37,14 @@
  *      is measured and held to the text minimum, and the span-kind scale — used
  *      as fills that carry their own text labels — and the relationship-edge
  *      stroke to the non-text minimum, with the rules that draw a connector
- *      pinned to that stroke and the figures AAP 0.6.3 publishes pinned so a
- *      change in the arithmetic stays distinguishable from a change in the
- *      palette. The two
- *      minimums are stated here as literals rather than imported from the code
- *      under test, tied to the product's exported constants by one deliberate
- *      assertion, and exercised at their inclusive and immediately-below
- *      boundaries against independently computed known answers. Accessibility
- *      outranks visual fidelity (AAP 0.6.4), so no threshold here is ever
- *      relaxed to make a colour pass: the colour changes instead.
+ *      pinned to that stroke and the palettes' reference contrast figures
+ *      pinned so a change in the arithmetic stays distinguishable from a change
+ *      in the palette. The two minimums are stated here as literals rather than
+ *      imported from the code under test, tied to the product's exported
+ *      constants by one deliberate assertion, and exercised at their inclusive
+ *      and immediately-below boundaries against independently computed known
+ *      answers. Accessibility outranks visual fidelity, so no threshold here is
+ *      ever relaxed to make a colour pass: the colour changes instead.
  *   5. **Theme mapping.** The two host signals — the DevTools theme name and
  *      the VS Code webview body class list — translate to the three themes, and
  *      the light high-contrast class resolves to the high-contrast value set
@@ -54,8 +52,8 @@
  *      real cost: getting it wrong withdraws the high-contrast theme from the
  *      people who asked for it.
  *
- * `pnpm test` is part of the blocking `verify` chain (AAP 0.8.5), so every
- * assertion below is a hard requirement rather than advice, and the suite is
+ * `pnpm test` is part of the blocking `pnpm verify` chain, so every assertion
+ * below is a hard requirement rather than advice, and the suite is
  * deterministic: it reads one committed file, regenerates one string in memory,
  * and touches no network, no clock and no build output.
  *
@@ -99,14 +97,14 @@
  *
  * ## The stylesheet is a committed artifact
  *
- * `.prettierignore` and AAP 0.6.1 both treat `src/tokens/tokens.css` as
- * committed, and `tsup.config.ts` concatenates it into `dist/styles.css`. The
- * drift assertion regenerates in memory and compares against the file on disk,
- * which holds whether or not the artifact is tracked — so keep it. Were the
- * stylesheet ever excluded by the root ignore rules, the fix is a negation
- * entry there, never a weakening here, and this assertion is never to become a
- * snapshot: a snapshot records whatever it is given, which is the one thing a
- * drift gate must not do.
+ * `src/tokens/tokens.css` is committed generated output: `.prettierignore`
+ * exempts it from formatting, and `tsup.config.ts` concatenates it into
+ * `dist/styles.css`. The drift assertion regenerates in memory and compares
+ * against the file on disk, which holds whether or not the artifact is
+ * tracked — so keep it. Were the stylesheet ever excluded by the root ignore
+ * rules, the fix is a negation entry there, never a weakening here, and this
+ * assertion is never to become a snapshot: a snapshot records whatever it is
+ * given, which is the one thing a drift gate must not do.
  */
 
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -181,7 +179,7 @@ const REGENERATE_COMMAND = 'node scripts/build-tokens.mjs';
  * The part of the stylesheet generator this suite uses.
  *
  * Declared locally, and narrowly, because the module is plain JavaScript: the
- * two functions below are the ones AAP 0.6.1 makes this suite responsible for,
+ * two functions below are the ones the drift and naming-agreement checks call,
  * and naming only those keeps the dynamic import from becoming an untyped
  * surface. `toCssPropertyName` takes a `string` rather than a `TokenKey`
  * because the generator accepts any authored key — checking that it agrees with
@@ -274,8 +272,9 @@ const TOKEN_KEYS = Object.keys(DESIGN_TOKENS.dark) as TokenKey[];
  * `--dg-shadow-1` — which a naive camel-to-kebab conversion renders as
  * `--dg-space0` and `--dg-shadow1`, matching nothing in the stylesheet.
  *
- * The families AAP 0.6.3 tabulates are here verbatim. The names beyond that
- * table belong to it all the same: `--dg-font-weight-medium`,
+ * The core families — colour, spacing, type, radius, elevation, focus ring and
+ * stacking — are here verbatim. The names beyond them belong to the table all
+ * the same: `--dg-font-weight-medium`,
  * `--dg-motion-duration`, `--dg-motion-easing` and `--dg-shimmer-duration`
  * carry a weight, two durations and an easing function; `--dg-graph-edge` is
  * the stroke of a relationship connector, which neither border colour can
@@ -286,12 +285,10 @@ const TOKEN_KEYS = Object.keys(DESIGN_TOKENS.dark) as TokenKey[];
  * the unit a measured coordinate is given; and the `--dg-column-min-*` and
  * `--dg-column-share-*` families are the floors and spare-width shares every
  * data-table column role is built from (`src/primitives/DataTable.tsx`).
- * The stylesheets and the table primitive need every one of them and 0.6.3
- * does not enumerate them.
- * AAP 0.6.4 permits no literal for any of them and 0.6.6 records no exception,
- * so the only lawful place for them is this table — which is also what puts
- * them under every check below, the property a parallel "internal constant"
- * namespace could never have.
+ * The stylesheets and the table primitive need every one of them, and none of
+ * them may be written as a literal, so the only lawful place for them is this
+ * table — which is also what puts them under every check below, the property a
+ * parallel "internal constant" namespace could never have.
  */
 const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-accent',
@@ -400,7 +397,7 @@ const TEXT_KEYS = [
 /**
  * The status colours and the accent, all of which appear as text — a badge
  * label, a status word, a link — and are therefore held to the text minimum
- * rather than the non-text one (AAP 0.6.3).
+ * rather than the non-text one.
  */
 const STATUS_TEXT_KEYS = [
   'success',
@@ -412,8 +409,8 @@ const STATUS_TEXT_KEYS = [
 
 /**
  * The span-kind scale: categorical fills for timeline lanes, hierarchy blocks
- * and graph nodes. They carry their own text labels, so AAP 0.6.3 holds them to
- * the non-text minimum.
+ * and graph nodes. They carry their own text labels, so they are held to the
+ * non-text minimum.
  */
 const KIND_FILL_KEYS = [
   'kindInteraction',
@@ -653,11 +650,11 @@ const STRUCTURAL_LENGTH_DECLARATIONS = [
  * to make a colour pass, an imported threshold would lower this suite's bar in
  * the same edit and every pair below would keep passing. The equality between
  * the two is asserted once, on purpose, as its own failure: accessibility
- * outranks visual fidelity (AAP 0.6.4), so the colour changes, never the bar.
+ * outranks visual fidelity, so the colour changes, never the bar.
  *
- * 4.5:1 is the figure AAP 0.6.3 holds every text and status colour of every
- * theme to, and WCAG 2.2 success criterion 1.4.3 (Contrast Minimum, AA) for
- * normal-size text.
+ * 4.5:1 is the bar every text and status colour of every theme must reach on
+ * that theme's surfaces, and WCAG 2.2 success criterion 1.4.3 (Contrast
+ * Minimum, AA) for normal-size text.
  */
 const REQUIRED_TEXT_CONTRAST = 4.5;
 
@@ -665,8 +662,8 @@ const REQUIRED_TEXT_CONTRAST = 4.5;
  * The contrast minimum a non-text visual must reach, stated here as a literal
  * for the same reason as {@link REQUIRED_TEXT_CONTRAST}.
  *
- * 3:1 is what AAP 0.6.3 holds the span-kind scale to — those tokens are fills
- * that carry their own text labels — and WCAG 2.2 success criterion 1.4.11
+ * 3:1 is the bar the span-kind scale must reach — those tokens are fills that
+ * carry their own text labels — and WCAG 2.2 success criterion 1.4.11
  * (Non-text Contrast, AA).
  */
 const REQUIRED_NON_TEXT_CONTRAST = 3;
@@ -732,7 +729,7 @@ const DURATION_ALIASES = [
 
 /**
  * The token families that carry the same value in every theme: a theme changes
- * colour and elevation, never geometry or type (AAP 0.6.3). Grouped by name so
+ * colour and elevation, never geometry or type. Grouped by name so
  * a failure says which family drifted.
  */
 const THEME_INVARIANT_FAMILIES = [
@@ -815,10 +812,10 @@ const CSS_EASING_PATTERN =
  * The declarations whose value this table now covers completely, and the
  * literals each may still carry.
  *
- * AAP 0.6.4 admits only `0`, `none`, `auto`, `inherit`, `currentColor` and
- * `transparent` as literals in this package, so for these properties a value
- * that is neither a token reference nor one of those is a visual decision taken
- * outside the design system — the exact shape of a hardcoded weight or a
+ * The design system admits only `0`, `none`, `auto`, `inherit`, `currentColor`
+ * and `transparent` as literals in this package, so for these properties a
+ * value that is neither a token reference nor one of those is a visual decision
+ * taken outside the design system — the exact shape of a hardcoded weight or a
  * hardcoded duration. Scanning every property in a three-thousand-line
  * stylesheet is a different job (the structural-value policy in the stylesheet
  * headers governs lengths, ratios and geometry); these are the families the
@@ -852,7 +849,7 @@ const TOKEN_BACKED_DECLARATIONS = [
 /**
  * The keys whose high-contrast value differs from the default theme's, sorted.
  *
- * AAP 0.6.1 states the high-contrast set as the default set with three deltas —
+ * The high-contrast set is the default set with exactly three deltas —
  * borders raised to the primary text colour, a 2 px focus ring, no elevation
  * shadows — which is these five keys, because two of the deltas cover a pair.
  * `shadow0` is absent deliberately: it is `none` in every theme, so removing
@@ -1117,7 +1114,7 @@ function authoredStyleRules(): StyleRule[] {
 }
 
 /* -------------------------------------------------------------------------- */
-/* 1. Drift and naming agreement (AAP 0.6.1)                                  */
+/* 1. Drift and naming agreement                                              */
 /* -------------------------------------------------------------------------- */
 
 describe('generated token stylesheet', () => {
@@ -1222,7 +1219,7 @@ describe('generated token stylesheet', () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 2. Completeness (AAP 0.6.1)                                                */
+/* 2. Completeness                                                            */
 /* -------------------------------------------------------------------------- */
 
 describe('design token completeness', () => {
@@ -1333,10 +1330,11 @@ describe('design token completeness', () => {
     // The reason this token exists: the type roles are complete `font`
     // shorthands and the shorthand RESETS weight, so a rule wanting a role's
     // size with a heavier face has to restate the weight — and a numeral in a
-    // stylesheet is a visual value outside this table, which AAP 0.6.4 does not
-    // permit. The weight it restates is the one the large role already carries,
-    // so the two are pinned to each other here: change one and this fails
-    // rather than leaving the stylesheet a hair heavier than the role it sets.
+    // stylesheet is a visual value outside this table, which the design system
+    // does not permit. The weight it restates is the one the large role
+    // already carries, so the two are pinned to each other here: change one
+    // and this fails rather than leaving the stylesheet a hair heavier than the
+    // role it sets.
     for (const theme of PANEL_THEMES) {
       const values = DESIGN_TOKENS[theme];
 
@@ -1501,7 +1499,7 @@ describe('design token completeness', () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 3. Reach: the stylesheets extend the table nowhere (AAP 0.6.1, 0.6.4)      */
+/* 3. Reach: the stylesheets extend the table nowhere                         */
 /* -------------------------------------------------------------------------- */
 
 describe('authored stylesheets', () => {
@@ -1560,7 +1558,7 @@ describe('authored stylesheets', () => {
             offenders,
             `a ${property} value that is neither a --dg-* token reference nor one of the ` +
               `permitted literals [${literals.join(', ') || 'none'}] is a visual decision taken ` +
-              'outside the token table (AAP 0.6.4). Add the value to src/tokens/tokens.ts and ' +
+              'outside the token table. Add the value to src/tokens/tokens.ts and ' +
               'reference it here',
           ).toEqual([]);
         });
@@ -1591,7 +1589,7 @@ describe('authored stylesheets', () => {
 
         expect(
           offenders,
-          'a length written as a literal is a visual value outside the token table (AAP 0.6.4). ' +
+          'a length written as a literal is a visual value outside the token table. ' +
             'Resolve it to a --dg-* token — add one to src/tokens/tokens.ts if none fits',
         ).toEqual([]);
       });
@@ -1600,7 +1598,7 @@ describe('authored stylesheets', () => {
         // `thin`, `medium` and `thick` are edge weights, and an edge weight is
         // a visual decision: the stylesheet names the edge's role through
         // `--dg-border-width-hairline` or `--dg-border-width-marker`, and the
-        // weight itself lives in the token table (AAP 0.6.4).
+        // weight itself lives in the token table.
         const offenders: string[] = [];
 
         for (const { selector, declarations } of styleRules(rules)) {
@@ -1622,8 +1620,8 @@ describe('authored stylesheets', () => {
 
         expect(
           offenders,
-          'a border width written as a keyword is an edge weight outside the token table ' +
-            '(AAP 0.6.4). Use var(--dg-border-width-hairline) or var(--dg-border-width-marker)',
+          'a border width written as a keyword is an edge weight outside the token table. ' +
+            'Use var(--dg-border-width-hairline) or var(--dg-border-width-marker)',
         ).toEqual([]);
       });
 
@@ -1699,7 +1697,7 @@ describe('authored stylesheets', () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 4. WCAG contrast (AAP 0.6.3, 0.6.4) — the accessibility gate               */
+/* 4. WCAG contrast — the accessibility gate                                  */
 /* -------------------------------------------------------------------------- */
 
 describe('contrast thresholds and arithmetic', () => {
@@ -1718,12 +1716,12 @@ describe('contrast thresholds and arithmetic', () => {
     expect(
       WCAG_AA_TEXT_CONTRAST,
       'the exported text minimum no longer matches the required 4.5:1; raise the colour, not ' +
-        'the threshold (AAP 0.6.4)',
+        'the threshold',
     ).toBe(REQUIRED_TEXT_CONTRAST);
     expect(
       WCAG_AA_NON_TEXT_CONTRAST,
       'the exported non-text minimum no longer matches the required 3:1; raise the colour, not ' +
-        'the threshold (AAP 0.6.4)',
+        'the threshold',
     ).toBe(REQUIRED_NON_TEXT_CONTRAST);
   });
 
@@ -1988,9 +1986,9 @@ describe('design token contrast', () => {
 
   it('states the high-contrast border colour as an identity rather than a ratio', () => {
     // A border carries no text, so it belongs to no ratio suite above. The
-    // guarantee it carries instead is the delta AAP 0.6.1 states: both border
-    // colours are the primary text colour, which is the strongest separation
-    // the palette has.
+    // guarantee it carries instead is the high-contrast border delta: both
+    // border colours are the primary text colour, which is the strongest
+    // separation the palette has.
     const { highContrast } = DESIGN_TOKENS;
 
     expect(highContrast.borderSubtle).toBe(highContrast.textPrimary);
@@ -1999,11 +1997,11 @@ describe('design token contrast', () => {
 });
 
 describe('published contrast reference figures', () => {
-  // These are the figures AAP 0.6.3 publishes, reproduced here to two decimals
-  // so a change in the arithmetic stays distinguishable from a change in the
-  // palette: the suite above would fail either way, while a mismatch here says
-  // which of the two moved. The overlay surface is the extreme of both
-  // palettes, so every worst pair sits on it.
+  // These are the palettes' reference contrast figures, reproduced here to two
+  // decimals so a change in the arithmetic stays distinguishable from a change
+  // in the palette: the suite above would fail either way, while a mismatch
+  // here says which of the two moved. The overlay surface is the extreme of
+  // both palettes, so every worst pair sits on it.
 
   it('reproduces the worst text pair of the dark palette', () => {
     expect(measureContrast('dark', 'textMuted', 'surfaceOverlay')).toBeCloseTo(5.09, 2);
@@ -2238,7 +2236,7 @@ describe('editor webview body class mapping', () => {
     // first is the only correct implementation: `vscode-high-contrast-light`
     // contains both `vscode-high-contrast` and `light`, so a substring test
     // would answer the light value set and withdraw the high-contrast theme
-    // from the people who selected it (AAP 0.6.4).
+    // from the people who selected it.
     expect(themeFromVsCodeBodyClass('vscode-high-contrast-light')).not.toBe('light');
     expect(themeFromVsCodeBodyClass('vscode-high-contrast-light')).toBe('highContrast');
     expect(themeFromVsCodeBodyClass('vscode-high-contrast vscode-high-contrast-light')).toBe(

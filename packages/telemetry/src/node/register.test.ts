@@ -7,8 +7,9 @@
  * Two promises this module makes to a developer whose dev server it is loaded
  * into, and the evidence for each:
  *
- * 1. **Without its credential it installs nothing at all** (AAP §0.5.1,
- *    §0.5.6). The artefact stays on `NODE_OPTIONS` after a session ends and
+ * 1. **Without its credential it installs nothing at all**
+ *    (`docs/ARCHITECTURE.md` §7.6, `docs/SECURITY.md`). The artefact stays on
+ *    `NODE_OPTIONS` after a session ends and
  *    `scripts/dev-instrumented.mjs --spawn-local` deliberately runs without a
  *    token, so "inert" is the ordinary state of the machine. Every inert case
  *    asserts the *absence* of each process-global effect — no registered tracer

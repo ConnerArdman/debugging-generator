@@ -2904,7 +2904,8 @@ describe('elements that cannot be read', () => {
   it('rejects a statement that is not an object, and checks the statements beside it', () => {
     const summary = summarize(makeInteraction().events);
 
-    // The probe's own case: a bare string in the observed list used to pass.
+    // A bare string in the observed list is not a fact to check: the panel is
+    // invalid, with `malformed-spec` at that string's own index.
     expect(validateAgainstCapture(withObserved(['fabricated']), summary)).toEqual({
       status: 'invalid',
       issues: [
@@ -2945,7 +2946,8 @@ describe('elements that cannot be read', () => {
   it('rejects a citation that is not an object or names no event, and checks the citations beside it', () => {
     const summary = summarize(makeInteraction().events);
 
-    // The probe's own case: a citation written as a bare id used to pass.
+    // A citation written as a bare id rather than an EventRef object is
+    // refused as `malformed-spec` at its own evidence path.
     expect(
       issuesOf(
         validateAgainstCapture(
@@ -3019,7 +3021,7 @@ describe('elements that cannot be read', () => {
       },
     ]);
 
-    // …and an unrecognised node before it no longer hides it: both are reported.
+    // …and an unrecognised node before it does not hide it: both are reported.
     expect(
       validateAgainstCapture(withLayout([{ type: 'gauge', id: 'layout.0' }, later]), summary),
     ).toEqual({
@@ -3088,7 +3090,9 @@ describe('elements that cannot be read', () => {
       readonly path: readonly (string | number)[];
       readonly nodeType?: PanelNodeType;
     }[] = [
-      // The probe's own case: a node whose type read throws used to be skipped.
+      // A node whose `type` getter throws is reported at
+      // `['layout', 0, 'type']` with no node type, and the walk still checks
+      // the node after it.
       { node: withThrowingField({ id: 'layout.0' }, 'type'), path: ['layout', 0, 'type'] },
       {
         node: withThrowingField({ type: 'timeline', id: 'layout.0' }, 'query'),
@@ -3207,7 +3211,8 @@ describe('elements that cannot be read', () => {
     const summary = summarize(makeInteraction().events);
     const refuted = fact([ref(ABSENT_EVENT_ID)]);
     const cases: readonly { readonly statement: unknown; readonly path: string }[] = [
-      // The probe's own case: an evidence getter that throws used to throw out.
+      // An evidence getter that throws is reported at the evidence path; the
+      // validator itself does not throw, and still checks the next statement.
       {
         statement: withThrowingField({ statement: 'A claim.' }, 'evidence'),
         path: 'summary.observed.0.evidence',
@@ -3484,8 +3489,9 @@ describe('inputs beside the specification that cannot be read', () => {
       },
     );
     const unreadable: readonly unknown[] = [
-      // The probe's own case: a capture whose traceIds getter throws used to
-      // throw out of the validator.
+      // A capture whose `traceIds` getter throws vouches for nothing: the
+      // validator returns an outcome rather than throwing, and leaves the
+      // claims it would have checked unverifiable.
       withThrowingField(summary, 'traceIds'),
       revokedProxy(),
       trapping,

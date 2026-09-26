@@ -1,18 +1,17 @@
 /**
  * Tests for the WebSocket transport contract — `../envelope.ts` — in the
- * directory `packages/protocol/tsconfig.json` names for this package's suites
- * (AAP 0.8.3).
+ * directory `packages/protocol/tsconfig.json` names for this package's suites.
  *
  * Provenance: this suite covers `../envelope.ts`, the primitives it is built
  * from in `../version.ts`, the registry vocabulary of `../messages/index.ts`,
  * the HTTP-only operation names of `../http.ts`, the package barrel
  * `../index.ts`, and the contract points of the two transport clients in
  * `../client/`. Each client's exhaustive behaviour lives in its own suite; the
- * last group here pins only what the AAP states outright about them.
+ * last group here pins only their cross-process contract points.
  *
- * What is on trial here is the **frame**: the shape AAP 0.2.3 fixes
+ * What is on trial here is the **frame**: its shape
  * (`{ id, type, sessionId?, ts, payload }`, plus the optional acting `tabId`
- * AAP 0.5.6's tab rule needs), the completeness of the one
+ * the tab authorization rule needs), the completeness of the one
  * discriminated union built over it, and the four properties a boundary between
  * four processes lives or dies by. Each group below exists because a producer
  * and a consumer live in different bundles — the local service, the VS Code
@@ -30,11 +29,11 @@
  * - **The union covers the vocabulary exactly.** `../messages/index.ts` proves
  *   at compile time that its registry and its tuple agree; this suite proves at
  *   run time that the union has one member per name, no duplicate and no extra,
- *   and that the tuple still names the twenty-five WebSocket messages AAP 0.4.2
- *   specifies plus `source.result`, the answer to `source.open` — written out
+ *   and that the tuple still holds the twenty-five specified WebSocket message
+ *   names plus `source.result`, the answer to `source.open` — written out
  *   literally below so drift fails loudly rather than quietly redefining the
  *   protocol. The five names that are HTTP operations rather than frames are
- *   asserted to be exactly that, so no name from the user's list is lost in
+ *   asserted to be exactly that, so no name from the vocabulary is lost in
  *   either direction.
  * - **A stray field is a violation, not extra information.** The envelope is a
  *   strict object: a sixth top-level key, a missing `id`, a timestamp on the
@@ -42,7 +41,7 @@
  *   because tolerating any of them lets a producer's typo look like a valid
  *   frame — a silently dropped `sessionId` is a frame that parses and reaches
  *   nobody.
- * - **A rejected frame is never echoed (AAP 0.5.2).** A frame that fails
+ * - **A rejected frame is never echoed.** A frame that fails
  *   validation is unvalidated data from another process and routinely carries
  *   telemetry attributes, a database statement, a URL or a bearer credential.
  *   The service logs every parse failure, both user interfaces show it and a
@@ -53,14 +52,14 @@
  *   details, stack, serialised form or the payload that crosses the wire.
  * - **One frame names one session.** The service routes and authorizes by the
  *   envelope's `sessionId` while a handler acts on the payload's own subject, so
- *   a frame whose two answers differ is a confused-deputy request (AAP 0.5.6).
+ *   a frame whose two answers differ is a confused-deputy request.
  *   The routing cases refuse it on receive — for a payload `sessionId` and for a
  *   `session.created` / `session.updated` record id alike — without naming
  *   either id, and `createEnvelope` refuses to build it; an absent routing key,
  *   and a routing key on a payload that names no session, stay valid.
  * - **One frame acts for one tab.** One paired DevTools credential and one
  *   service-worker socket carry every inspected tab, so the envelope's acting
- *   `tabId` is what the service authorizes a DevTools frame by (AAP 0.5.6). The
+ *   `tabId` is what the service authorizes a DevTools frame by. The
  *   acting-tab cases prove it is a tab id or refused, round-trips on every
  *   member, is absent unless a caller set it, agrees with a payload's own
  *   `tabId` or is refused without naming either, and is never lifted from the
@@ -78,8 +77,7 @@
  *   the package's own modules export reaches the barrel unchanged, the only
  *   borrowed values are the named closed vocabularies, there is no default
  *   export, and re-evaluating the barrel does nothing observable — and it lives
- *   here, in the suite that already holds the union, because AAP 0.8.3 fixes
- *   this package at three suites.
+ *   here, in the suite that already holds the union.
  * - **The clients speak this frame and nothing else.** Driven through their
  *   injection seams alone — a fake socket constructor, a manual timer pair, a
  *   stub transport — the WebSocket client writes `client.hello` first on every
@@ -161,6 +159,7 @@ import {
   AUTH_EXEMPT_OPERATIONS,
   HTTP_OPERATIONS,
   HTTP_ROUTES,
+  READ_PROOF_LENGTH,
   WS_PATH,
 } from '../http.js';
 import * as httpModule from '../http.js';
@@ -621,14 +620,14 @@ const AAP_WEBSOCKET_MESSAGE_NAMES = [
 ] as const;
 
 /**
- * The WebSocket message names this protocol adds to the AAP 0.4.2 list, written
+ * The WebSocket message names this protocol adds to the list above, written
  * out for the same reason: `source.result`, the correlated answer to
  * `source.open` that lets a click on a source link be reported as opened, as
  * falling back to the editor-open URI, or as failed.
  *
- * Kept apart from {@link AAP_WEBSOCKET_MESSAGE_NAMES} so that list stays a
- * verbatim copy of the specification, and an addition is a visible, separate
- * statement rather than a silent edit to it.
+ * Kept apart from that list so it stays a literal copy of the twenty-five
+ * specified names, and an addition is a visible, separate statement rather
+ * than a silent edit to it.
  */
 const ANSWER_MESSAGE_NAMES = ['source.result'] as const;
 
@@ -818,7 +817,7 @@ describe('protocolMessageSchema — one member per declared message type', () =>
   });
 
   it('keeps telemetry.event and target.request in both vocabularies on purpose', () => {
-    // Not collisions. AAP 0.4.2 lists two rows under `telemetry.event`: the
+    // Not collisions. `telemetry.event` is one operation on two transports: the
     // browser agent's batches reach the service as a WebSocket frame (wrapped by
     // the service worker), and the Node preload posts its spans to
     // `POST /telemetry/ingest`. `target.request` is the service's push asking the
@@ -1280,9 +1279,8 @@ describe('parseMessage — rejections are typed, total and silent about the valu
 
 // The service routes and authorizes by the envelope's `sessionId`, and a handler
 // acts on the payload's own subject. A devtools principal is authorized only for
-// the session bound to its tab (AAP 0.5.6), so a frame whose two answers differ
-// is a confused-deputy request and must be refused — without naming either id
-// (AAP 0.5.2).
+// the session bound to its tab, so a frame whose two answers differ is a
+// confused-deputy request and must be refused — without naming either id.
 describe('parseMessage — the routing key agrees with the session the payload names', () => {
   /** The session the QA reproduction's payload names. */
   const REPRO_SUBJECT = 'ses_q4a2aaaaaaaaaaaa';
@@ -1396,10 +1394,10 @@ describe('parseMessage — the routing key agrees with the session the payload n
 });
 
 // One paired DevTools credential and one service-worker socket carry every
-// inspected tab, so the envelope's acting `tabId` is what the service holds a
-// DevTools frame to "only the session bound to that tab" by (AAP 0.5.6). A frame
-// whose acting tab and payload tab differ is a confused-deputy request, refused
-// without naming either tab (AAP 0.5.2).
+// inspected tab, so the envelope's acting `tabId` is what the service checks
+// when it authorizes a DevTools frame only for the session bound to that tab. A
+// frame whose acting tab and payload tab differ is a confused-deputy request,
+// refused without naming either tab.
 describe('parseMessage — the acting tab is a tab id and agrees with the payload’s tab', () => {
   /**
    * The tab a payload names in the contradiction cases: distinctive, so its
@@ -2819,12 +2817,12 @@ describe('the package barrel — the only door into @debuggen/protocol', () => {
 //
 // Each client's exhaustive behaviour — races, queue bounds, cancellation, the
 // loopback-only origin policy — is proved in `ws-client.test.ts` and
-// `http-client.test.ts`. The cases here pin the handful of contract points the
-// AAP states outright, against the frame vocabulary this suite owns: the
-// handshake is the first frame of every connection (0.5.6), the reconnect curve
-// runs from half a second to ten (0.5.5), a 4401 stops the loop, an invalid
-// inbound frame never reaches a typed handler, the bearer rule and its two
-// exemptions hold, and a refused reply is never echoed (0.5.2). Both clients
+// `http-client.test.ts`. The cases here pin the handful of cross-process
+// contract points, against the frame vocabulary this suite owns: the handshake
+// is the first frame of every connection, the reconnect curve runs from half a
+// second to ten, a 4401 stops the loop, an invalid inbound frame never reaches
+// a typed handler, the bearer rule and its two exemptions hold, and a refused
+// reply is never echoed. Both clients
 // are driven through their injection seams only — a fake socket constructor, a
 // manual timer pair, a stub transport — so nothing here opens a socket, sleeps
 // or touches the network.
@@ -2835,6 +2833,9 @@ const SERVICE_URL = 'http://127.0.0.1:43117';
 
 /** A second credential, for the rotation case. Obviously fake, like the first. */
 const ROTATED_CREDENTIAL = 'devtools-credential-placeholder-rotated';
+
+/** The read proof issued with {@link ROTATED_CREDENTIAL} at pairing; low-entropy on purpose. */
+const READ_PROOF_PLACEHOLDER = 'q'.repeat(READ_PROOF_LENGTH);
 
 /** The `readyState` both real socket implementations report while open. */
 const SOCKET_OPEN = 1;
@@ -3331,7 +3332,10 @@ describe('HttpClient — the bearer rule, typed replies and typed failures', () 
       protocolVersion: PROTOCOL_VERSION,
       pairingAvailable: true,
     });
-    const pairing = stubFetch(200, { token: ROTATED_CREDENTIAL });
+    const pairing = stubFetch(200, {
+      token: ROTATED_CREDENTIAL,
+      readProof: READ_PROOF_PLACEHOLDER,
+    });
     // A credential is configured on purpose: the exemption is that it is not
     // sent, not that there was nothing to send.
     const healthClient = new HttpClient({
@@ -3352,7 +3356,10 @@ describe('HttpClient — the bearer rule, typed replies and typed failures', () 
       ok: true,
       value: { version: '0.1.0', protocolVersion: PROTOCOL_VERSION, pairingAvailable: true },
     });
-    expect(pairingResult).toStrictEqual({ ok: true, value: { token: ROTATED_CREDENTIAL } });
+    expect(pairingResult).toStrictEqual({
+      ok: true,
+      value: { token: ROTATED_CREDENTIAL, readProof: READ_PROOF_PLACEHOLDER },
+    });
     expect(Object.hasOwn(onlyRequestHeaders(health.requests), AUTHORIZATION_HEADER)).toBe(false);
     expect(Object.hasOwn(onlyRequestHeaders(pairing.requests), AUTHORIZATION_HEADER)).toBe(false);
     expect(health.requests[0]?.url).toBe(`${SERVICE_URL}/health`);

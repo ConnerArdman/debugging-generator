@@ -24,10 +24,8 @@ import type { RecommendationItem, StorefrontErrorCode } from '@/lib/types';
 /**
  * How many suggestions a rail asks for.
  *
- * This is the size the storefront's rails are laid out for, and the value a
- * call site should pass as {@link RecommendationsOptions.limit} unless it has a
- * reason of its own to differ: every place the rail appears asking for the same
- * number keeps the suggestions a buyer sees consistent across the page.
+ * This is the number of tiles the rail is laid out for, and the value a caller
+ * should pass as {@link RecommendationsOptions.limit}.
  */
 export const RECOMMENDED_ITEM_LIMIT: number = 4;
 
@@ -166,15 +164,14 @@ function recommendationNotice(code: StorefrontErrorCode, status: number): string
  * working - and a later successful read clears the wording again.
  *
  * `isLoading` describes the first read only. It is true from the first render
- * until that read settles and false from then on, so a rail already showing
- * tiles keeps showing them while a further read is in flight instead of
- * flashing its skeleton back over them. A read that answers with what the feed
- * already holds - the same products in the same order, and identical in every
- * field a tile renders - leaves the feed exactly as it stands, which is what
- * spares a page nobody is touching a re-render for each read its rails make.
- * Any difference at all replaces the list with the answer that carried it, so a
- * renamed product, a repriced one, a new photograph or reworded advice reaches
- * the screen on the read that reported it.
+ * until that read settles and false from then on, so tiles already on screen
+ * stay there while a later read - for a newly selected product, say - is in
+ * flight, instead of the skeleton flashing back over them. An answer identical
+ * to the list the feed holds - the same products in the same order, and equal
+ * in every field a tile renders - keeps that list, so the feed's state does
+ * not change. Any difference at all replaces the list with the answer that
+ * carried it, so a renamed product, a repriced one, a new photograph or
+ * reworded advice reaches the screen on the read that reported it.
  *
  * A read whose answer the rail can no longer use - it has unmounted, or the
  * product it accompanies has changed - is abandoned rather than merely

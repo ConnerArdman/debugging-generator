@@ -449,8 +449,9 @@ export type ChromeAlarmsSatisfiesWorkerAlarmsApi = AssertTrue<
  *
  * `now` is the epoch-millisecond clock (production: `nowEpochMs` from
  * `@debuggen/shared`) that stamps `connectedAt`, `boundAt` and `receivedAt`;
- * `timers` schedules the bounded waits; `alarms` keeps the worker alive. A
- * module that needs only one of the three takes only that member.
+ * `timers` schedules the bounded waits; `alarms` holds the keepalive, which
+ * revives the worker after Manifest V3 suspends it rather than preventing the
+ * suspension. A module that needs only one of the three takes only that member.
  */
 export interface WorkerClock {
   /** The current time, in epoch milliseconds. */

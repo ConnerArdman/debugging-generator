@@ -4,12 +4,12 @@
  * ## What this suite is protecting
  *
  * `MetricCards` is one of only three components that recur across otherwise
- * dissimilar panels (AAP 0.6.5, with the summary header and the source chip): a
+ * dissimilar panels (with the summary header and the source chip): a
  * slow-interaction panel opens with the per-tier durations, a re-render panel
- * with the render counts, a duplicate-request panel with the request counts, and
- * **the same component draws all three**. The only thing that differs between
- * them is the node's `metrics` option, so three of the cases below are the
- * mechanical proof of that mechanism rather than tests of pixels:
+ * with the render counts, a duplicate-request panel with the request counts,
+ * and **the same component draws all three**. The only thing that differs
+ * between them is the node's `metrics` option, so three of the cases below are
+ * the mechanical proof of that mechanism rather than tests of pixels:
  *
  *   - **order** renders a response whose order disagrees with the node's and
  *     asserts the tiles follow the *node*, because the id list is the panel
@@ -20,8 +20,8 @@
  *     different question.
  *   - **the id list lives on the node** asserts `metrics` is a node option and
  *     never a query field, and that the query the provider receives is the
- *     node's own, unmodified (AAP 0.2.3 — "`metrics` kept as the node's
- *     option").
+ *     node's own, unmodified: normalisation keeps `metrics` as the node's
+ *     option (`docs/ARCHITECTURE.md`, "What normalisation does").
  *
  * The `metrics` source is paged by the same `DataPage` rule as every
  * array-valued source, so a further group pins how the tiles read it:
@@ -42,11 +42,10 @@
  *     page needed settles, and a failed later page is reported with its own
  *     query and a retry that re-requests exactly that page.
  *
- * Alongside those, AAP 0.8.3 asks every component suite in this folder for the
- * three states of a query-backed view — loading, empty and error — and for the
- * click-to-source payload. The first three are driven through a stub
- * `DataProvider` that respectively never settles, resolves an empty page and
- * rejects.
+ * Alongside those, every component suite in this folder covers the three states
+ * of a query-backed view — loading, empty and error — and the click-to-source
+ * payload. The first three are driven through a stub `DataProvider` that
+ * respectively never settles, resolves an empty page and rejects.
  *
  * **On the click-to-source case, which this suite deliberately substitutes
  * for** (so a reader does not think it was forgotten): a metric is an aggregate
@@ -55,19 +54,19 @@
  * payload to assert. Its place is taken by the two properties that matter here
  * instead:
  *
- *   - **the absent-label contract** (AAP 0.6.6): an unobservable value renders
- *     the package's own {@link NOT_AVAILABLE_LABEL} — never `0`, never a blank
- *     tile — and carries no unit and no severity colour, because an absence
- *     dressed as a measurement is a fabricated observation. The label is
- *     imported rather than spelled out anywhere below, so a change to the
- *     product's spelling of absence cannot pass this suite unnoticed;
+ *   - **the absent-label contract**: an unobservable value renders the
+ *     package's own {@link NOT_AVAILABLE_LABEL} — never `0`, never a blank tile
+ *     — and carries no unit and no severity colour, because an absence dressed
+ *     as a measurement is a fabricated observation. The label is imported
+ *     rather than spelled out anywhere below, so a change to the product's
+ *     spelling of absence cannot pass this suite unnoticed;
  *   - **no fabricated interaction**: the group holds no control tied to a tile
  *     value, and clicking a tile raises nothing on a host's actions, which is
  *     what stops a click from having to invent a target.
  *
  * The remaining cases pin the two render-trigger metrics apart
- * (`unchanged_render_count` versus `render_trigger_unknown_count`, AAP 0.2.3 —
- * an unevaluated render is not an unnecessary one, and nothing may show their
+ * (`unchanged_render_count` versus `render_trigger_unknown_count` — an
+ * unevaluated render is not an unnecessary one, and nothing may show their
  * sum), the figure/unit split, the severity treatment across the product's own
  * duration thresholds, and the accessible naming a screen-reader user hears.
  *
@@ -91,12 +90,12 @@
  *     it), and rejects an offset the case did not declare.
  *   - **In-file synthetic builders, no fixture files**: {@link makeMetric} and
  *     {@link makeNode}, both taking overrides.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4). Metric ids are the
- *     product's own closed vocabulary and belong here; every label and note
- *     below is product prose naming no application, demonstration or
- *     otherwise. `METRIC_IDS` is deliberately **not** imported as a runtime
- *     value — the component may not read it and neither may its test, so the
- *     ids a case needs are written out.
+ *   - **Generic fixture vocabulary only.** Metric ids are the product's own
+ *     closed vocabulary and belong here; every label and note below is product
+ *     prose naming no application, demonstration or otherwise. `METRIC_IDS` is
+ *     deliberately **not** imported as a runtime value — the component may not
+ *     read it and neither may its test, so the ids a case needs are written
+ *     out.
  *   - **Queries by role and accessible name.** The group, its tiles, the busy
  *     announcement, the alert and the note's description are all reached that
  *     way; a class is read only off an element already obtained semantically,
@@ -230,8 +229,8 @@ const UNKNOWN_TRIGGER_RENDERS = 3;
 /**
  * Product prose for the fixtures that need a heading or a caveat of their own.
  *
- * Generic by construction (AAP 0.5.4): these are the kind of sentences the
- * aggregate layer writes about coverage, and they name no inspected project.
+ * Generic by construction: these are the kind of sentences the aggregate layer
+ * writes about coverage, and they name no inspected project.
  */
 const COVERAGE_NOTE = 'Reported for same-origin responses only.';
 const TOTAL_DURATION_LABEL = 'Total duration';
@@ -337,10 +336,10 @@ interface NodeOverrides {
 /**
  * A normalised `metricCards` node, as the panel normaliser produces one.
  *
- * `metrics` sits on the node and **never inside `query`** (AAP 0.2.3): the
- * renderer reads the id list from the node, and a `metrics` tidied under the
- * query would leave the node parsing while rendering nothing. One case below
- * asserts that shape directly.
+ * `metrics` sits on the node and **never inside `query`**: the renderer reads
+ * the id list from the node, and a `metrics` tidied under the query would leave
+ * the node parsing while rendering nothing. One case below asserts that shape
+ * directly.
  *
  * @param metrics The ids to show, in display order.
  * @param overrides Fields to replace.
@@ -426,8 +425,7 @@ function pendingProvider(): StubProvider {
  * A provider that rejects every query.
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
- * implementation for: the code it carries is what the error state renders
- * (AAP 0.5.5).
+ * implementation for: the code it carries is what the error state renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -771,7 +769,7 @@ describe('MetricCards states', () => {
     expect(busy.textContent).toBe('Loading the computed values of this capture…');
 
     // Nothing is drawn yet: no group, therefore no tiles, and above all no
-    // empty state — an unsettled query is not an answer (AAP 0.5.5).
+    // empty state — an unsettled query is not an answer.
     expect(screen.queryByRole('list')).toBeNull();
     expect(screen.queryAllByRole('listitem')).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -787,7 +785,7 @@ describe('MetricCards states', () => {
 
     // Queried by a generic substring of the product's own copy rather than by a
     // restatement of the sentence: product vocabulary, naming no inspected
-    // project (AAP 0.5.4).
+    // project.
     const message = await screen.findByText(/no metrics were computed/i);
 
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
@@ -895,11 +893,15 @@ describe('MetricCards states', () => {
     const alert = await screen.findByRole('alert');
     const message = alert.querySelector('.dg-error-state__message');
 
-    // The status maps to the code it means, and the provider's own sentence is
-    // kept after the generic lead instead of being replaced by it.
+    // The status maps to the code it means, and the generic lead is followed
+    // by the renderer's own sentence naming the status: a plain rejection's
+    // text is foreign, so it is never shown.
     expect(within(alert).getByText('TRANSPORT_DISCONNECTED').closest('.dg-badge')).not.toBeNull();
     expect(within(alert).queryByText('INTERNAL')).toBeNull();
-    expect(message?.textContent).toBe(`${QUERY_FAILURE_LEAD} ${SERVICE_UNAVAILABLE_MESSAGE}`);
+    expect(message?.textContent).toBe(
+      `${QUERY_FAILURE_LEAD} The request for this view's data failed with HTTP 503.`,
+    );
+    expect(message?.textContent).not.toContain(SERVICE_UNAVAILABLE_MESSAGE);
   });
 
   it('reports a node whose query names another source, and asks the provider for nothing', async () => {
@@ -951,7 +953,7 @@ describe('MetricCards selection and order', () => {
     // The response arrives in the vocabulary's own order; the node asks for the
     // reverse. The node wins: its order is the panel author's emphasis, and it
     // is the only thing that distinguishes this component's use in one panel
-    // from its use in another (AAP 0.6.5).
+    // from its use in another.
     const stub = resolvingProvider([
       makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL),
       makeMetric('render_count', { label: RENDER_COUNT_LABEL, value: RENDER_COUNT }),
@@ -1005,10 +1007,9 @@ describe('MetricCards selection and order', () => {
   });
 
   it('keeps the id list on the node and issues the node\u2019s query unmodified', async () => {
-    // AAP 0.2.3: normalisation gives this node the implicit
-    // `query: { source: "metrics" }` and keeps `metrics` as the node's own
-    // option. Both halves are asserted — the shape of the node, and the query
-    // the provider actually receives.
+    // Normalisation gives this node the implicit `query: { source: "metrics" }`
+    // and keeps `metrics` as the node's own option. Both halves are asserted —
+    // the shape of the node, and the query the provider actually receives.
     const node = makeNode(['total_duration', 'render_count']);
 
     expect(node.metrics).toEqual(['total_duration', 'render_count']);
@@ -1484,9 +1485,9 @@ describe('MetricCards figures', () => {
   });
 
   it('renders an unobservable value as the absent label, never as a zero', async () => {
-    // The AAP 0.6.6 gap this component owns: a transfer size is exposed by the
-    // browser for same-origin responses only and by a server span not at all.
-    // Printing `0` there would turn an absence into an observation.
+    // The unobservable value this component owns: a transfer size is exposed by
+    // the browser for same-origin responses only and by a server span not at
+    // all. Printing `0` there would turn an absence into an observation.
     const stub = resolvingProvider([
       makeMetric('transferred_bytes', { unit: 'bytes', value: undefined, note: COVERAGE_NOTE }),
     ]);
@@ -1532,7 +1533,7 @@ describe('MetricCards figures', () => {
     // Severity is read against the product's four shared thresholds and arrives
     // as a token reference. Asserted through the reference `../utils/color`
     // computes — never as a colour literal, which this package forbids
-    // outright (AAP 0.6.4).
+    // outright.
     const stub = resolvingProvider([
       makeDuration('backend_duration', CRITICAL_MS),
       makeDuration('frontend_duration', FAST_MS),
@@ -1632,10 +1633,10 @@ describe('MetricCards figures', () => {
 
 describe('MetricCards render-trigger split', () => {
   it('keeps the two render-trigger metrics apart and shows no total of them', async () => {
-    // AAP 0.2.3: `unchanged_render_count` counts renders whose inputs were
-    // provably stable, `render_trigger_unknown_count` counts renders whose
-    // trigger could not be evaluated at all. An unevaluated render is not an
-    // unnecessary one, so they are never added, grouped or relabelled.
+    // `unchanged_render_count` counts renders whose inputs were provably
+    // stable, `render_trigger_unknown_count` counts renders whose trigger could
+    // not be evaluated at all. An unevaluated render is not an unnecessary one,
+    // so they are never added, grouped or relabelled.
     const stub = resolvingProvider([
       makeMetric('render_count', { value: RENDER_COUNT, label: RENDER_COUNT_LABEL }),
       makeMetric('unchanged_render_count', {
@@ -1748,10 +1749,10 @@ describe('MetricCards accessibility and interaction', () => {
   });
 
   it('offers no control tied to a tile value, and raises nothing when a tile is clicked', async () => {
-    // This case stands in for the click-to-source payload assertion AAP 0.8.3
-    // asks every component suite here for (see the file note): a metric is an
-    // aggregate of the whole capture and references no single record, so a
-    // clickable tile would have to invent a target — fabricated evidence.
+    // This case stands in for the click-to-source payload assertion every other
+    // component suite here makes (see the file note): a metric is an aggregate
+    // of the whole capture and references no single record, so a clickable tile
+    // would have to invent a target — fabricated evidence.
     const user = userEvent.setup();
     const spies = makeActions();
     const stub = resolvingProvider([
@@ -1847,8 +1848,8 @@ function declarationsFor(selector: string): readonly string[] {
 describe('MetricCards tile presentation', () => {
   it('draws an unavailable tile in a shape of its own, not only in the muted colour', async () => {
     // A measured zero duration is muted too: the fast-duration token is the
-    // muted text colour (AAP 0.6.3). So the unavailable tile must differ in
-    // shape — a dashed edge and an italic figure — and the zero must not.
+    // muted text colour. So the unavailable tile must differ in shape — a
+    // dashed edge and an italic figure — and the zero must not.
     const stub = resolvingProvider([
       makeDuration('frontend_duration', 0),
       makeMetric('transferred_bytes', { unit: 'bytes', value: undefined, note: COVERAGE_NOTE }),

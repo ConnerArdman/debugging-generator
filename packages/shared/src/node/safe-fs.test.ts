@@ -1108,14 +1108,13 @@ describe('ensureSecureDir', () => {
   );
 
   /*
-   * The refusal of an existing over-permissive directory. AAP 0.4.2 requires
-   * every parent to be verified as a real directory owned by this account with
-   * mode `0700`, and the write to *refuse to proceed otherwise*. A directory
-   * that has been readable by another account may already have been read, so
-   * it is refused with its path and mode — never quietly tightened — and each
-   * case asserts the three halves of "refused": the reason and the outermost
-   * offender, the mode left exactly as the fixture set it, and nothing created
-   * beneath it.
+   * The refusal of an existing over-permissive directory. Every parent must be
+   * verified as a real directory owned by this account with mode `0700`, and
+   * the write must *refuse to proceed otherwise*. A directory that has been
+   * readable by another account may already have been read, so it is refused
+   * with its path and mode — never quietly tightened — and each case asserts
+   * the three halves of "refused": the reason and the outermost offender, the
+   * mode left exactly as the fixture set it, and nothing created beneath it.
    */
 
   for (const mode of [PROJECT_DIR_MODE, WORLD_WRITABLE_DIR_MODE, GROUP_READABLE_DIR_MODE]) {

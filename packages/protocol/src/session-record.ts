@@ -949,11 +949,11 @@ export const FOLLOW_UP_ATTEMPT_ID_PREFIX = 'fua';
  *
  * A follow-up is recorded when it is asked, before anything answers it, and a
  * follow-up that then fails is retried. Neither the question text nor the time
- * it was asked can tell a retry from a new question: comparing text is exactly
- * the question-matching AAP §0.5.4 forbids, and two asks in the same
- * millisecond share an `askedAt`. So the client mints one id per question it
- * asks and **resends the same id on a Retry**; a new question — reworded or
- * not — always gets a new one. The service keys the idempotency of
+ * it was asked can tell a retry from a new question: comparing text would be
+ * matching on the question, which the product never does, and two asks in
+ * the same millisecond share an `askedAt`. So the client mints one id per
+ * question it asks and **resends the same id on a Retry**; a new question —
+ * reworded or not — always gets a new one. The service keys the idempotency of
  * `session.question` on it: an id it has not recorded is a new follow-up; an
  * id naming the latest, still unanswered follow-up is a retry of that attempt,
  * recorded in place rather than appended; an id naming an answered or an
@@ -1110,7 +1110,7 @@ export type FollowUpOutcomeKey = (typeof FOLLOW_UP_OUTCOME_KEYS)[number];
  * Presence is checked, never truth: `needsNewCapture: false` is a decision,
  * and a decided follow-up is answered. An unanswered follow-up is one the
  * stage recorded and then did not finish — the only kind a Retry may resend
- * under its own `attemptId`. Reads no question text (AAP §0.5.4).
+ * under its own `attemptId`. Reads no question text.
  *
  * @param followUp A follow-up from a session's ladder.
  * @returns `true` once any outcome link is present.

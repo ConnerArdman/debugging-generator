@@ -2,20 +2,25 @@
  * check-no-residual-instrumentation.test.mjs
  *
  * The proof that `scripts/check-no-residual-instrumentation.mjs` - the gate behind
- * `pnpm check:no-residual-instrumentation`, which `pnpm verify` runs (AAP 0.8.5) - fails when a
- * debugging session left anything behind in the demo application and passes when it did not.
+ * `pnpm check:no-residual-instrumentation`, which `pnpm verify` runs - fails when a debugging
+ * session left anything behind in the demo application and passes when it did not.
  *
- * WHAT THIS SUITE OWNS. AAP 0.5.1 states the contract: the demo app's tracked source contains no
- * `__DEBUGGEN__` or `__DebuggenSpanHelper` marker, and `git status --porcelain apps/demo-app` is
- * empty. Each `describe` below owns one part of that sentence or of the machinery around it, so a
- * rule that loses its coverage is visible in the test report rather than inferable from it:
+ * WHAT THIS SUITE OWNS. The contract: the demo app's tracked source contains no instrumentation
+ * marker - neither literal in `MARKERS` - and `git status --porcelain apps/demo-app` is empty
+ * (docs/SECURITY.md, section 6.2, "Enforced in CI"). Each `describe` below owns one part of that
+ * sentence or of the machinery around it, so a rule that loses its coverage is visible in the test
+ * report rather than inferable from it:
  *
  *   * the marker contract - `MARKERS` agrees with the patch template that writes the literals;
  *   * a clean target passes, including the lowercase word `debuggen` that required files use;
  *   * a committed marker fails, with the exact 1-based line and a sanitized, bounded excerpt;
  *   * an uncommitted target fails, and nothing outside the target can make it fail;
- *   * the tracked files the scan does not read are accounted for, never passed over: the ones it
- *     skips by design are recorded with the reason, and one it cannot read - on any account,
+ *   * every tracked entry is searched or accounted for, never passed over: a regular file byte for
+ *     byte whatever it holds - streamed when it is large, markers straddling chunk boundaries
+ *     included - and a tracked symbolic link as its target text, never followed; a submodule is
+ *     skipped and listed; an entry missing or replaced in the working tree is skipped with its
+ *     reason only when `git status` reports it, so the check exits 1, and fails the check with
+ *     `file-unscanned` (exit 2) when it does not; and one the scan cannot read - on any account,
  *     root included - fails the check with `file-unreadable` (exit 2) naming it and its error code;
  *   * every condition that leaves the check without a subject exits 2, never 0 (it fails closed);
  *   * the command line - options, exit codes, the text and `--json` reports;
@@ -43,11 +48,13 @@
  * WHY THE UNREADABLE FILE IS INJECTED. A tracked file the scan cannot read must fail the check,
  * and a mode bit cannot make such a file for root, which reads a mode-000 file regardless - and the
  * specified test host runs as root. So the fail-closed contract is asserted on every account by
- * {@link withInjectedFs}: a freshly imported copy of the module whose `node:fs` fails one
- * `readFileSync` or `lstatSync` with the code the kernel would report and delegates every other
- * call to the real implementation, so the rest of the fixture is genuinely read. {@link runMain}
- * drives that copy's `main` exactly as it drives the real one. The `chmod` case beside it is the
- * real-permissions second opinion, and runs wherever the account is not root.
+ * {@link withInjectedFs}: a freshly imported copy of the module whose `node:fs` fails chosen
+ * `readFileSync`, `lstatSync`, `readlinkSync` or `readSync` calls with the code the kernel would
+ * report and delegates every other call to the real implementation, so the rest of the fixture is
+ * genuinely read. The same wrappers record the paths they are called with, which is how the
+ * streaming case proves a large file is opened and streamed rather than read whole.
+ * {@link runMain} drives that copy's `main` exactly as it drives the real one. The `chmod` case
+ * beside it is the real-permissions second opinion, and runs wherever the account is not root.
  *
  * WHY THE MARKERS ARE ASSEMBLED. Fixture source is built from the `MARKERS` export rather than
  * from restated literals, so a renamed marker changes every fixture with it. The two literals
@@ -55,9 +62,9 @@
  * This file lives under `scripts/`, never under the gate's target.
  *
  * HARNESS. The root `vitest.config.ts` collects this file into the `tooling` project
- * (`scripts/*.test.mjs`, environment `node`, `globals: false`), which `pnpm test` runs as part of
- * the blocking gate of AAP 0.8.5 and 0.7.1 Group 0. `describe`/`it`/`expect` are imported
- * explicitly because that project sets no globals. Every case builds what it asserts about, and the
+ * (`scripts/*.test.mjs`, environment `node`, `globals: false`), which `pnpm test` runs, and with it
+ * `pnpm verify` and CI, as a blocking gate. `describe`/`it`/`expect` are imported explicitly
+ * because that project sets no globals. Every case builds what it asserts about, and the
  * process environment is restored in `finally` blocks, so the suite is order-independent under
  * `--sequence.shuffle`. The git-dependent blocks skip themselves when `git --version` fails.
  */
@@ -74,7 +81,6 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
-  truncateSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -111,11 +117,17 @@ const EXIT_ERROR = 2;
 /** Longest excerpt printed for an offending line, ellipsis included. */
 const MAX_SNIPPET_LENGTH = 120;
 
-/** Bytes inspected for a NUL when deciding whether a tracked file is binary. */
-const BINARY_SNIFF_BYTES = 8192;
+/** Regular files up to this size are read whole; larger ones are streamed. */
+const MAX_WHOLE_READ_BYTES = 16 * 1024 * 1024;
 
-/** Files larger than this are skipped as `too-large` rather than read. */
-const MAX_SCAN_BYTES = 16 * 1024 * 1024;
+/** Bytes read per step when a file is streamed; the chunk boundaries are multiples of it. */
+const STREAM_CHUNK_BYTES = 1024 * 1024;
+
+/** Bytes of an offending line decoded for its excerpt; a longer line's excerpt ends in `...`. */
+const EXCERPT_WINDOW_BYTES = 4096;
+
+/** The line-feed byte, the only line break the scan counts. */
+const LINE_FEED = 0x0a;
 
 /** First line of the `--help` text, which usage errors repeat on stderr. */
 const USAGE_HEADING = 'Usage: node scripts/check-no-residual-instrumentation.mjs';
@@ -242,6 +254,80 @@ const WRAPPER_LINES = [
   '}',
   '',
 ];
+
+/**
+ * Width of every line of {@link largeSource}, line feed included. It does not divide
+ * `STREAM_CHUNK_BYTES`, so the chunk boundaries of a streamed file fall inside lines, each at its
+ * own column.
+ */
+const LARGE_LINE_BYTES = 100;
+
+/**
+ * How many lines {@link largeSource} writes: enough to pass `MAX_WHOLE_READ_BYTES` by half a
+ * chunk, so the scan streams the file and its last window is a partial one.
+ *
+ * @returns {number}
+ */
+function largeLineCount() {
+  return Math.ceil((MAX_WHOLE_READ_BYTES + STREAM_CHUNK_BYTES / 2) / LARGE_LINE_BYTES);
+}
+
+/**
+ * A marker to write into {@link largeSource}.
+ *
+ * @typedef {object} LargePlacement
+ * @property {number} offset Byte offset of the marker's first byte in the file.
+ * @property {string} marker
+ */
+
+/**
+ * The placement of `marker` across the boundary that ends chunk `chunk - 1`, with `before` of its
+ * bytes on the earlier side. Asserts that it really straddles the boundary.
+ *
+ * @param {number} chunk 1-based index of the chunk the boundary opens.
+ * @param {string} marker
+ * @param {number} before Bytes of the marker before the boundary, at least one and not all.
+ * @returns {LargePlacement}
+ */
+function straddling(chunk, marker, before) {
+  expect(before).toBeGreaterThan(0);
+  expect(before).toBeLessThan(marker.length);
+  return { offset: chunk * STREAM_CHUNK_BYTES - before, marker };
+}
+
+/**
+ * Content over `MAX_WHOLE_READ_BYTES` - so the scan streams it - made of fixed-width lines of `-`
+ * ending in a line feed, with every placement written over the filler, and the findings the scan
+ * must report for it. A placement must stay inside one line, which is asserted, so the line of
+ * each marker is plain arithmetic and its excerpt is its whole line.
+ *
+ * @param {readonly LargePlacement[]} placements
+ * @returns {{ content: Buffer, expected: { line: number, marker: string, text: string }[] }}
+ *   The bytes, and one finding per marker per line in line then `MARKERS` order.
+ */
+function largeSource(placements) {
+  const content = Buffer.alloc(largeLineCount() * LARGE_LINE_BYTES, '-');
+  for (let end = LARGE_LINE_BYTES - 1; end < content.length; end += LARGE_LINE_BYTES) {
+    content[end] = LINE_FEED;
+  }
+  for (const { offset, marker } of placements) {
+    expect((offset % LARGE_LINE_BYTES) + marker.length).toBeLessThan(LARGE_LINE_BYTES);
+    content.write(marker, offset, 'utf8');
+  }
+  /** @type {Map<string, { line: number, marker: string, text: string }>} */
+  const findings = new Map();
+  for (const { offset, marker } of placements) {
+    const index = Math.floor(offset / LARGE_LINE_BYTES);
+    const start = index * LARGE_LINE_BYTES;
+    const text = content.toString('utf8', start, start + LARGE_LINE_BYTES - 1);
+    findings.set(`${index}:${marker}`, { line: index + 1, marker, text });
+  }
+  const expected = [...findings.values()].sort(
+    (left, right) =>
+      left.line - right.line || MARKERS.indexOf(left.marker) - MARKERS.indexOf(right.marker),
+  );
+  return { content, expected };
+}
 
 /* ---------------------------------------------------------------------------
  * Temporary tree
@@ -1063,6 +1149,27 @@ describe.skipIf(!GIT_AVAILABLE)(
       expect(kept.isWellFormed()).toBe(true);
     });
 
+    it('builds the excerpt of a line longer than the excerpt window from its first bytes, ending in ...', () => {
+      // The marker, then more blank bytes than the window holds, then text the excerpt never reads.
+      const padded = `const leftover = '${GLOBAL_MARKER}';${' '.repeat(EXCERPT_WINDOW_BYTES)}// tail`;
+      // A two-byte character whose first byte is the window's last: it is dropped, not decoded
+      // into a replacement character.
+      const prefix = `${TYPE_MARKER} `;
+      const cut = `${prefix}${' '.repeat(EXCERPT_WINDOW_BYTES - prefix.length - 1)}\u00e9${'x'.repeat(8)}`;
+      expect(Buffer.byteLength(cut.slice(0, cut.indexOf('\u00e9')))).toBe(EXCERPT_WINDOW_BYTES - 1);
+      const repository = createRepository({
+        'apps/demo-app/src/cut.ts': `${cut}\n`,
+        'apps/demo-app/src/padded.ts': `${padded}\n`,
+      });
+
+      const texts = new Map(findMarkers(repository).map((finding) => [finding.file, finding.text]));
+
+      expect(texts.get('apps/demo-app/src/padded.ts')).toBe(
+        `const leftover = '${GLOBAL_MARKER}';...`,
+      );
+      expect(texts.get('apps/demo-app/src/cut.ts')).toBe(`${TYPE_MARKER}...`);
+    });
+
     it('catches a patched file that was staged but never committed, twice over', async () => {
       const repository = createRepository(CLEAN_FILES);
       writeFixture(repository, 'apps/demo-app/src/staged.ts', patchedSource(TYPE_MARKER).content);
@@ -1189,50 +1296,224 @@ describe.skipIf(!GIT_AVAILABLE)(
 );
 
 /* ---------------------------------------------------------------------------
- * Tracked files the scan does not read
+ * Every tracked entry is read or accounted for
  * ------------------------------------------------------------------------ */
 
 describe.skipIf(!GIT_AVAILABLE)(
-  'tracked files the scan does not read are accounted for: skipped by design, or unreadable and failing closed',
+  'every tracked entry is searched whatever it holds, or accounted for by git status, or fails closed',
   { timeout: GIT_TEST_TIMEOUT_MS },
   () => {
-    it('skips a binary file as binary even when marker bytes follow its NUL', async () => {
+    it('searches a binary file byte for byte and reports the marker bytes after its NUL', async () => {
       const repository = createRepository({
         ...CLEAN_FILES,
+        // A PNG signature - with its CR, LF, SUB and a NUL - followed by both markers.
         'apps/demo-app/public/logo.png': Buffer.concat([
           Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]),
           Buffer.from(`${GLOBAL_MARKER}\n${TYPE_MARKER}\n`, 'utf8'),
         ]),
+        'apps/demo-app/public/clean.png': Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0x0a]),
       });
 
       const scan = scanResidualMarkers(repository);
-      expect(scan.findings).toEqual([]);
-      expect(scan.skipped).toEqual([{ file: 'apps/demo-app/public/logo.png', reason: 'binary' }]);
-      expect(scan.files).toHaveLength(CLEAN_TARGET_FILES.length + 1);
-      expect(scan.filesScanned).toBe(CLEAN_TARGET_FILES.length);
+      // The signature's two line feeds put the markers on lines 3 and 4; the NUL before the first
+      // one becomes a space in the excerpt and is trimmed away.
+      expect(scan.findings).toEqual([
+        {
+          file: 'apps/demo-app/public/logo.png',
+          line: 3,
+          marker: GLOBAL_MARKER,
+          text: GLOBAL_MARKER,
+        },
+        { file: 'apps/demo-app/public/logo.png', line: 4, marker: TYPE_MARKER, text: TYPE_MARKER },
+      ]);
+      expect(scan.skipped).toEqual([]);
+      expect(scan.filesScanned).toBe(CLEAN_TARGET_FILES.length + 2);
 
       const { exitCode, stdout } = await runMain([], { repository });
-      expect(exitCode).toBe(EXIT_OK);
-      expect(stdout).toContain(', 1 skipped (binary, symlink or oversized)\n');
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      expect(stdout).toContain(
+        `apps/demo-app/public/logo.png:3: residual-marker: found ${GLOBAL_MARKER}\n`,
+      );
+      expect(stdout).not.toContain('clean.png');
+      expect(
+        stdout.endsWith(
+          summaryLine(
+            'FAIL',
+            `${CLEAN_TARGET_FILES.length + 2} files scanned, 2 marker findings, 0 worktree entries`,
+          ),
+        ),
+      ).toBe(true);
     });
 
-    it('looks for a NUL only in the first 8 KiB when deciding a file is binary', () => {
+    it('reports a marker in a source file whatever NUL bytes precede it', () => {
       const repository = createRepository({
-        'apps/demo-app/src/late-nul.ts': Buffer.concat([
-          Buffer.from(`${patchedSource(GLOBAL_MARKER).content}//`, 'utf8'),
-          Buffer.alloc(BINARY_SNIFF_BYTES, 0x2f),
-          Buffer.from([0x00, 0x0a]),
+        'apps/demo-app/src/nul.ts': Buffer.concat([
+          Buffer.from('// a NUL byte follows: \0 and ends this line\n', 'utf8'),
+          Buffer.from('export const values: number[] = [];\n', 'utf8'),
+          Buffer.from(`const leftover = '\0${TYPE_MARKER}';\n`, 'utf8'),
         ]),
       });
 
-      const scan = scanResidualMarkers(repository);
-      expect(scan.skipped).toEqual([]);
-      expect(scan.findings).toEqual([
-        expect.objectContaining({ file: 'apps/demo-app/src/late-nul.ts', line: 3 }),
-      ]);
+      expect(scanResidualMarkers(repository)).toMatchObject({
+        filesScanned: 1,
+        skipped: [],
+        findings: [
+          {
+            file: 'apps/demo-app/src/nul.ts',
+            line: 3,
+            marker: TYPE_MARKER,
+            text: `const leftover = ' ${TYPE_MARKER}';`,
+          },
+        ],
+      });
     });
 
-    it('records a tracked symlink and never follows it, even to a file carrying a marker', async () => {
+    it('streams a tracked file over 16 MiB and reports every marker on its exact line, across chunk boundaries', async () => {
+      const lastLine = largeLineCount() - 1;
+      const { content, expected } = largeSource([
+        // Early in the first chunk, twice on one line: one finding.
+        { offset: 2 * LARGE_LINE_BYTES + 10, marker: GLOBAL_MARKER },
+        { offset: 2 * LARGE_LINE_BYTES + 40, marker: GLOBAL_MARKER },
+        // Straddling chunk boundaries: only the last byte after one, the full overlap needed...
+        straddling(5, GLOBAL_MARKER, GLOBAL_MARKER.length - 1),
+        straddling(7, TYPE_MARKER, TYPE_MARKER.length - 1),
+        // ...only the first byte before one, and an even split.
+        straddling(9, GLOBAL_MARKER, 1),
+        straddling(11, TYPE_MARKER, TYPE_MARKER.length / 2),
+        // Both markers on the last line, the alias first: reported in MARKERS order all the same.
+        { offset: lastLine * LARGE_LINE_BYTES + 10, marker: TYPE_MARKER },
+        { offset: lastLine * LARGE_LINE_BYTES + 50, marker: GLOBAL_MARKER },
+      ]);
+      expect(content.length).toBeGreaterThan(MAX_WHOLE_READ_BYTES);
+      expect(expected).toHaveLength(7);
+      const repository = createRepository(CLEAN_FILES);
+      // Written after the commit, so the working tree is dirty as well.
+      const large = writeFixture(repository, 'apps/demo-app/src/total.ts', content);
+      const findings = expected.map((finding) => ({
+        file: 'apps/demo-app/src/total.ts',
+        ...finding,
+      }));
+
+      const scan = scanResidualMarkers(repository);
+      expect(scan.findings).toEqual(findings);
+      expect(scan.skipped).toEqual([]);
+      expect(scan.filesScanned).toBe(CLEAN_TARGET_FILES.length);
+      expect(worktreeStatus(repository)).toEqual([' M apps/demo-app/src/total.ts']);
+
+      // It is streamed through a descriptor, never read whole, and every other file is read whole.
+      /** @type {string[]} */
+      const wholeReads = [];
+      /** @type {string[]} */
+      const opened = [];
+      await withInjectedFs(
+        (real) => ({
+          readFileSync: failingFsCall(real.readFileSync, 'open', new Map(), wholeReads),
+          openSync: failingFsCall(real.openSync, 'open', new Map(), opened),
+        }),
+        async (injected) => {
+          expect(injected.findMarkers(repository)).toEqual(findings);
+        },
+      );
+      expect(opened).toEqual([large]);
+      expect(wholeReads).toEqual(
+        CLEAN_TARGET_FILES.filter((file) => file !== 'apps/demo-app/src/total.ts').map((file) =>
+          path.join(repository, file),
+        ),
+      );
+
+      const { exitCode, stdout } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      for (const { line, marker } of expected) {
+        expect(stdout).toContain(
+          `apps/demo-app/src/total.ts:${line}: residual-marker: found ${marker}\n`,
+        );
+      }
+      expect(stdout).toContain('residual-worktree:  M apps/demo-app/src/total.ts\n');
+    });
+
+    it('streams a large clean file to the end, finds nothing and counts it as scanned', async () => {
+      const repository = createRepository({
+        ...CLEAN_FILES,
+        'apps/demo-app/public/bundle.js': largeSource([]).content,
+      });
+
+      const scan = scanResidualMarkers(repository);
+      expect(scan).toMatchObject({ filesScanned: CLEAN_TARGET_FILES.length + 1, skipped: [] });
+      expect(scan.findings).toEqual([]);
+
+      const { exitCode, stdout } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_OK);
+      expect(stdout).toBe(
+        summaryLine(
+          'OK',
+          `${CLEAN_TARGET_FILES.length + 1} files scanned, 0 marker findings, 0 worktree entries`,
+        ),
+      );
+    });
+
+    it('fails closed on a streamed file whose read fails part-way, and still closes it (file-unreadable)', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      const large = writeFixture(repository, 'apps/demo-app/src/total.ts', largeSource([]).content);
+      /** @type {string[]} */
+      const opened = [];
+      let closed = 0;
+
+      await withInjectedFs(
+        (real) => ({
+          openSync: failingFsCall(real.openSync, 'open', new Map(), opened),
+          // The fourth chunk fails with an I/O error: three were read, so the file was partly
+          // searched, which is not searched.
+          readSync: (
+            /** @type {number} */ descriptor,
+            /** @type {Buffer} */ buffer,
+            /** @type {number} */ offset,
+            /** @type {number} */ length,
+            /** @type {number} */ position,
+          ) => {
+            if (position >= 3 * STREAM_CHUNK_BYTES) {
+              throw Object.assign(new Error('EIO: injected failure, read'), {
+                code: 'EIO',
+                syscall: 'read',
+              });
+            }
+            return real.readSync(descriptor, buffer, offset, length, position);
+          },
+          closeSync: (/** @type {number} */ descriptor) => {
+            closed += 1;
+            real.closeSync(descriptor);
+          },
+        }),
+        async (injected) => {
+          const error = expectResidualError(
+            () => injected.scanResidualMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+          expect(error.message).toContain(
+            '1 tracked file under apps/demo-app could not be read, so the marker scan cannot ' +
+              'vouch for it and this check cannot be performed:\n' +
+              '  apps/demo-app/src/total.ts (EIO)\n',
+          );
+          expect(/** @type {AggregateError} */ (error.cause).errors).toEqual([
+            expect.objectContaining({ code: 'EIO', syscall: 'read' }),
+          ]);
+
+          const { exitCode, stdout } = await runMain(['--json'], {
+            repository,
+            main: injected.main,
+          });
+          expect(exitCode).toBe(EXIT_ERROR);
+          expect(JSON.parse(stdout).error).toEqual({
+            code: 'file-unreadable',
+            message: error.message,
+          });
+        },
+      );
+      expect(opened).toEqual([large, large]);
+      expect(closed).toBe(opened.length);
+    });
+
+    it('searches a tracked symbolic link as its target text and never follows it', async () => {
       const repository = createRepository({
         ...CLEAN_FILES,
         'vendor/patched.ts': patchedSource(GLOBAL_MARKER).content,
@@ -1242,14 +1523,140 @@ describe.skipIf(!GIT_AVAILABLE)(
 
       // The link's target does carry a marker, outside the target...
       expect(findMarkers(repository, 'vendor')).toHaveLength(1);
-      // ...and the scan of the target records the link instead of reading through it.
+      // ...and the scan of the target searches the link's own content, its target text, instead.
       const scan = scanResidualMarkers(repository);
       expect(scan.findings).toEqual([]);
-      expect(scan.skipped).toEqual([{ file: 'apps/demo-app/src/linked.ts', reason: 'symlink' }]);
+      expect(scan.skipped).toEqual([]);
       expect(scan.files).toContain('apps/demo-app/src/linked.ts');
+      expect(scan.filesScanned).toBe(CLEAN_TARGET_FILES.length + 1);
 
-      const { exitCode } = await runMain([], { repository });
+      const { exitCode, stdout } = await runMain([], { repository });
       expect(exitCode).toBe(EXIT_OK);
+      expect(stdout).toBe(
+        summaryLine(
+          'OK',
+          `${CLEAN_TARGET_FILES.length + 1} files scanned, 0 marker findings, 0 worktree entries`,
+        ),
+      );
+    });
+
+    it('reports a marker in the target text of a tracked symbolic link, dangling or not', async () => {
+      const linkTarget = `../../generated/${GLOBAL_MARKER}.ts`;
+      const repository = createRepository(CLEAN_FILES);
+      plantSymlink(repository, 'apps/demo-app/src/linked.ts', linkTarget);
+      commitAll(repository);
+
+      expect(findMarkers(repository)).toEqual([
+        { file: 'apps/demo-app/src/linked.ts', line: 1, marker: GLOBAL_MARKER, text: linkTarget },
+      ]);
+      const { exitCode, stdout } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      expect(stdout).toContain(
+        `apps/demo-app/src/linked.ts:1: residual-marker: found ${GLOBAL_MARKER}\n    | ${linkTarget}\n`,
+      );
+    });
+
+    it('reads a regular file standing where git tracks a symbolic link as the text it holds', () => {
+      const repository = createRepository(CLEAN_FILES);
+      plantSymlink(repository, 'apps/demo-app/src/linked.ts', 'total.ts');
+      commitAll(repository);
+      // A checkout with core.symlinks=false writes a link as a regular file; this one carries a
+      // marker, and is searched like any other regular file.
+      unlinkSync(path.join(repository, 'apps/demo-app/src/linked.ts'));
+      writeFixture(repository, 'apps/demo-app/src/linked.ts', patchedSource(TYPE_MARKER).content);
+
+      expect(findMarkers(repository)).toEqual([
+        expect.objectContaining({
+          file: 'apps/demo-app/src/linked.ts',
+          line: 3,
+          marker: TYPE_MARKER,
+        }),
+      ]);
+      expect(worktreeStatus(repository)).toEqual([' T apps/demo-app/src/linked.ts']);
+    });
+
+    it('fails closed on a tracked symbolic link whose target text cannot be read (file-unreadable)', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      plantSymlink(repository, 'apps/demo-app/src/linked.ts', 'total.ts');
+      commitAll(repository);
+      const link = path.join(repository, 'apps/demo-app/src/linked.ts');
+
+      await withInjectedFs(
+        (real) => ({
+          readlinkSync: failingFsCall(real.readlinkSync, 'readlink', new Map([[link, 'EIO']])),
+        }),
+        async (injected) => {
+          const error = expectResidualError(
+            () => injected.scanResidualMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+          expect(error.message).toContain(
+            '1 tracked file under apps/demo-app could not be read, so the marker scan cannot ' +
+              'vouch for it and this check cannot be performed:\n' +
+              '  apps/demo-app/src/linked.ts (EIO)\n',
+          );
+        },
+      );
+    });
+
+    it('lists an unmerged path once, however many merge stages the index holds it at', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      const file = 'apps/demo-app/src/total.ts';
+      git(repository, ['checkout', '-q', '-b', 'other']);
+      writeFixture(repository, file, 'export const total = 1;\n');
+      commitAll(repository);
+      git(repository, ['checkout', '-q', 'main']);
+      writeFixture(repository, file, 'export const total = 2;\n');
+      commitAll(repository);
+      const merge = spawnSync('git', [...COMMIT_OPTIONS, 'merge', '-q', '--no-edit', 'other'], {
+        cwd: repository,
+        encoding: 'utf8',
+        env: childEnvironment(),
+      });
+      // A conflict: the index holds the path at stages 1, 2 and 3.
+      expect(merge.status).toBe(1);
+      expect(git(repository, ['ls-files', '--stage', '--', file]).trim().split('\n')).toHaveLength(
+        3,
+      );
+
+      const scan = scanResidualMarkers(repository);
+      expect(scan.files).toEqual(CLEAN_TARGET_FILES);
+      expect(scan.filesScanned).toBe(CLEAN_TARGET_FILES.length);
+      expect(scan).toMatchObject({ skipped: [], findings: [] });
+      expect(worktreeStatus(repository)).toEqual([`UU ${file}`]);
+      const { exitCode } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
+    });
+
+    it('skips a submodule as submodule, and names it in the summary', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      const commit = git(repository, ['rev-parse', 'HEAD']).trim();
+      git(repository, [
+        'update-index',
+        '--add',
+        '--cacheinfo',
+        `160000,${commit},apps/demo-app/vendor/sub`,
+      ]);
+      git(repository, [...COMMIT_OPTIONS, 'commit', '-q', '--no-verify', '-m', 'submodule']);
+      // An uninitialized submodule: an empty directory, which git status reports as unchanged.
+      mkdirSync(path.join(repository, 'apps/demo-app/vendor/sub'), { recursive: true });
+      expect(worktreeStatus(repository)).toEqual([]);
+
+      const scan = scanResidualMarkers(repository);
+      expect(scan.files).toEqual([...CLEAN_TARGET_FILES, 'apps/demo-app/vendor/sub']);
+      expect(scan.skipped).toEqual([{ file: 'apps/demo-app/vendor/sub', reason: 'submodule' }]);
+      expect(scan.filesScanned).toBe(CLEAN_TARGET_FILES.length);
+
+      const { exitCode, stdout } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_OK);
+      expect(stdout).toBe(
+        summaryLine(
+          'OK',
+          `${CLEAN_TARGET_FILES.length} files scanned, 0 marker findings, 0 worktree entries, ` +
+            '1 submodule skipped',
+        ),
+      );
     });
 
     it('records a tracked file deleted from disk as missing and as a worktree entry', async () => {
@@ -1264,6 +1671,15 @@ describe.skipIf(!GIT_AVAILABLE)(
       const { exitCode, stdout } = await runMain([], { repository });
       expect(exitCode).toBe(EXIT_FINDINGS);
       expect(stdout).toContain('residual-worktree:  D apps/demo-app/src/total.ts\n');
+      expect(
+        stdout.endsWith(
+          summaryLine(
+            'FAIL',
+            `${CLEAN_TARGET_FILES.length - 1} files scanned, 0 marker findings, 1 worktree entry, ` +
+              '1 not read (reported by git status)',
+          ),
+        ),
+      ).toBe(true);
     });
 
     it('records tracked files as missing when their parent directory became a file (ENOTDIR)', async () => {
@@ -1288,7 +1704,7 @@ describe.skipIf(!GIT_AVAILABLE)(
       expect(exitCode).toBe(EXIT_FINDINGS);
     });
 
-    it('records a tracked path replaced by a directory as not a regular file', () => {
+    it('records a tracked path replaced by a directory as not a regular file', async () => {
       const repository = createRepository(CLEAN_FILES);
       const replaced = path.join(repository, 'apps/demo-app/src/total.ts');
       unlinkSync(replaced);
@@ -1297,16 +1713,179 @@ describe.skipIf(!GIT_AVAILABLE)(
       expect(scanResidualMarkers(repository).skipped).toEqual([
         { file: 'apps/demo-app/src/total.ts', reason: 'not-a-regular-file' },
       ]);
+      expect(worktreeStatus(repository)).toEqual([' D apps/demo-app/src/total.ts']);
+      const { exitCode } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
     });
 
-    it('records a tracked file over 16 MiB as too large without reading it', () => {
+    it('never opens a FIFO standing at a tracked path, which git reports as modified', async (context) => {
       const repository = createRepository(CLEAN_FILES);
-      // Sparse growth after the commit: the size is what is under test, not the content.
-      truncateSync(path.join(repository, 'apps/demo-app/src/total.ts'), MAX_SCAN_BYTES + 1);
+      const fifo = path.join(repository, 'apps/demo-app/src/total.ts');
+      unlinkSync(fifo);
+      const made = spawnSync('mkfifo', [fifo], { env: childEnvironment() });
+      context.skip(
+        made.error !== undefined || made.status !== 0,
+        'mkfifo is not available on this host; the directory case above covers not-a-regular-file',
+      );
+
+      // Opening a FIFO for reading blocks until a writer appears, so a scan that read it would
+      // never return: this case finishing at all is half of the assertion.
+      expect(scanResidualMarkers(repository).skipped).toEqual([
+        { file: 'apps/demo-app/src/total.ts', reason: 'not-a-regular-file' },
+      ]);
+      expect(worktreeStatus(repository)).toEqual([' M apps/demo-app/src/total.ts']);
+      const { exitCode } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
+    });
+
+    it('records a symbolic link standing where git tracks a regular file, without following it', async () => {
+      const repository = createRepository({
+        ...CLEAN_FILES,
+        'vendor/patched.ts': patchedSource(GLOBAL_MARKER).content,
+      });
+      unlinkSync(path.join(repository, 'apps/demo-app/src/total.ts'));
+      plantSymlink(repository, 'apps/demo-app/src/total.ts', '../../../vendor/patched.ts');
 
       const scan = scanResidualMarkers(repository);
-      expect(scan.skipped).toEqual([{ file: 'apps/demo-app/src/total.ts', reason: 'too-large' }]);
-      expect(worktreeStatus(repository)).toEqual([' M apps/demo-app/src/total.ts']);
+      expect(scan.findings).toEqual([]);
+      expect(scan.skipped).toEqual([{ file: 'apps/demo-app/src/total.ts', reason: 'symlink' }]);
+      expect(worktreeStatus(repository)).toEqual([' T apps/demo-app/src/total.ts']);
+      const { exitCode } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
+    });
+
+    it('never reads through a directory replaced with a symbolic link', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      const underDirectory = CLEAN_TARGET_FILES.filter((file) =>
+        file.startsWith('apps/demo-app/src/'),
+      );
+      // A stand-in outside the checkout, holding the same names, one of them patched.
+      const elsewhere = createDirectory('elsewhere');
+      for (const file of underDirectory) {
+        writeFixture(elsewhere, path.posix.basename(file), patchedSource(GLOBAL_MARKER).content);
+      }
+      rmSync(path.join(repository, 'apps/demo-app/src'), { recursive: true });
+      symlinkSync(elsewhere, path.join(repository, 'apps/demo-app/src'));
+
+      const scan = scanResidualMarkers(repository);
+      expect(scan.findings).toEqual([]);
+      expect(scan.skipped).toEqual(
+        underDirectory.map((file) => ({ file, reason: 'symlinked-directory' })),
+      );
+      expect([...worktreeStatus(repository)].sort()).toEqual(
+        [...underDirectory.map((file) => ` D ${file}`), '?? apps/demo-app/src'].sort(),
+      );
+
+      const { exitCode, stdout } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      expect(
+        stdout.endsWith(
+          summaryLine(
+            'FAIL',
+            `${CLEAN_TARGET_FILES.length - underDirectory.length} files scanned, 0 marker ` +
+              `findings, ${underDirectory.length + 1} worktree entries, ` +
+              `${underDirectory.length} not read (reported by git status)`,
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    it('fails closed on a missing file git status does not report (skip-worktree, file-unscanned)', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      git(repository, ['update-index', '--skip-worktree', '--', 'apps/demo-app/src/total.ts']);
+      unlinkSync(path.join(repository, 'apps/demo-app/src/total.ts'));
+      // A sparse checkout's state: git neither compares the path nor reports it.
+      expect(worktreeStatus(repository)).toEqual([]);
+
+      const error = expectResidualError(() => scanResidualMarkers(repository), 'file-unscanned');
+      expect(error.message).toBe(
+        '1 tracked file under apps/demo-app is not in the working tree as git records it, and ' +
+          '`git status` does not report it as changed, so the marker scan cannot vouch for it and ' +
+          'this check cannot be performed:\n' +
+          '  apps/demo-app/src/total.ts (missing)\n' +
+          'Git does not compare a path with the working tree while the index marks it ' +
+          'skip-worktree (a sparse checkout) or assume-unchanged. Restore every listed file - run ' +
+          '`git sparse-checkout disable`, or clear each flag with ' +
+          '`git update-index --no-skip-worktree -- <path>` and ' +
+          '`git update-index --no-assume-unchanged -- <path>` (one flag per command) and run ' +
+          '`git checkout -- <path>` - then re-run the check.',
+      );
+      expectResidualError(() => findMarkers(repository), 'file-unscanned');
+
+      const text = await runMain([], { repository });
+      expect(text.exitCode).toBe(EXIT_ERROR);
+      expect(text.stdout).toBe('');
+      expect(text.stderr).toBe(`residual-instrumentation: file-unscanned: ${error.message}\n`);
+
+      const json = await runMain(['--json'], { repository });
+      expect(json.exitCode).toBe(EXIT_ERROR);
+      expect(JSON.parse(json.stdout)).toEqual({
+        ok: false,
+        exitCode: EXIT_ERROR,
+        error: { code: 'file-unscanned', message: error.message },
+      });
+
+      // The remedy the message names, command by command, restores a subject and the check passes.
+      for (const flag of ['--no-skip-worktree', '--no-assume-unchanged']) {
+        git(repository, ['update-index', flag, '--', 'apps/demo-app/src/total.ts']);
+      }
+      git(repository, ['checkout', '--', 'apps/demo-app/src/total.ts']);
+      expect((await runMain([], { repository })).exitCode).toBe(EXIT_OK);
+    });
+
+    it('lists every unread entry git status does not report with its reason, and only those', () => {
+      const repository = createRepository(CLEAN_FILES);
+      // Hidden by assume-unchanged: a file replaced by a directory, and one replaced by a link.
+      git(repository, [
+        'update-index',
+        '--assume-unchanged',
+        '--',
+        'apps/demo-app/src/label.tsx',
+        'apps/demo-app/src/total.ts',
+      ]);
+      unlinkSync(path.join(repository, 'apps/demo-app/src/label.tsx'));
+      mkdirSync(path.join(repository, 'apps/demo-app/src/label.tsx'));
+      unlinkSync(path.join(repository, 'apps/demo-app/src/total.ts'));
+      plantSymlink(repository, 'apps/demo-app/src/total.ts', '../../../package.json');
+      // Reported: a deleted file that git still compares.
+      unlinkSync(path.join(repository, 'apps/demo-app/tsconfig.json'));
+      expect(worktreeStatus(repository)).toEqual([' D apps/demo-app/tsconfig.json']);
+
+      const error = expectResidualError(() => scanResidualMarkers(repository), 'file-unscanned');
+      expect(error.message).toContain(
+        '2 tracked files under apps/demo-app are not in the working tree as git records them, ' +
+          'and `git status` does not report them as changed, so the marker scan cannot vouch ' +
+          'for them and this check cannot be performed:\n' +
+          '  apps/demo-app/src/label.tsx (not-a-regular-file)\n' +
+          '  apps/demo-app/src/total.ts (symlink)\n' +
+          'Git does not compare',
+      );
+      expect(error.message).not.toContain('tsconfig.json');
+    });
+
+    it('raises file-unreadable before it consults git status about an unread entry', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      git(repository, ['update-index', '--skip-worktree', '--', 'apps/demo-app/src/label.tsx']);
+      unlinkSync(path.join(repository, 'apps/demo-app/src/label.tsx'));
+      const locked = path.join(repository, 'apps/demo-app/src/total.ts');
+
+      await withInjectedFs(
+        (real) => ({
+          readFileSync: failingFsCall(real.readFileSync, 'open', new Map([[locked, 'EACCES']])),
+        }),
+        async (injected) => {
+          const error = expectResidualError(
+            () => injected.scanResidualMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+          expect(error.message).toContain('\n  apps/demo-app/src/total.ts (EACCES)\n');
+          expect(error.message).not.toContain('label.tsx');
+        },
+      );
+      // With every file readable again, the hidden one fails the check on its own.
+      const error = expectResidualError(() => scanResidualMarkers(repository), 'file-unscanned');
+      expect(error.message).toContain('\n  apps/demo-app/src/label.tsx (missing)\n');
     });
 
     it('fails closed on a tracked file it cannot read, on every account (file-unreadable)', async () => {
@@ -1437,10 +2016,50 @@ describe.skipIf(!GIT_AVAILABLE)(
       );
     });
 
+    it('fails closed on every tracked file under a directory it cannot examine (file-unreadable)', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      const directory = path.join(repository, 'apps/demo-app/src');
+      const underDirectory = CLEAN_TARGET_FILES.filter((file) =>
+        file.startsWith('apps/demo-app/src/'),
+      );
+      /** @type {string[]} */
+      const examined = [];
+
+      await withInjectedFs(
+        (real) => ({
+          lstatSync: failingFsCall(
+            real.lstatSync,
+            'lstat',
+            new Map([[directory, 'EACCES']]),
+            examined,
+          ),
+        }),
+        async (injected) => {
+          const error = expectResidualError(
+            () => injected.scanResidualMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+          expect(error.message).toContain(
+            `${underDirectory.length} tracked files under apps/demo-app could not be read`,
+          );
+          for (const file of underDirectory) {
+            expect(error.message).toContain(`\n  ${file} (EACCES)\n`);
+          }
+          expect(/** @type {AggregateError} */ (error.cause).errors).toEqual(
+            underDirectory.map(() => expect.objectContaining({ code: 'EACCES', path: directory })),
+          );
+        },
+      );
+      // One lstat answers for the directory, and nothing below it is examined.
+      expect(examined.filter((entry) => entry === directory)).toHaveLength(1);
+      expect(examined.filter((entry) => entry.startsWith(`${directory}${path.sep}`))).toEqual([]);
+    });
+
     it('fails closed on a mode-000 tracked file under real permissions (file-unreadable)', async (context) => {
       context.skip(
         process.getuid?.() === 0,
-        'running as root, which reads a mode-000 file regardless; the two injected-failure cases ' +
+        'running as root, which reads a mode-000 file regardless; the injected-failure cases ' +
           'above assert the same file-unreadable contract on this account',
       );
       const repository = createRepository(CLEAN_FILES);
@@ -1656,7 +2275,7 @@ describe.skipIf(!GIT_AVAILABLE)(
 
       const error = expectResidualError(() => scanResidualMarkers(repository), 'git-failed');
       expect(error.message).toContain(
-        `\`git ls-files -z -- apps/demo-app\` failed in ${repository}: `,
+        `\`git ls-files -z --stage -- apps/demo-app\` failed in ${repository}: `,
       );
       expect(error.message).toContain('index');
 
@@ -1780,8 +2399,9 @@ describe.skipIf(!GIT_AVAILABLE)(
     });
 
     it('still runs the check when invoked through a symbolic link to the checkout', () => {
-      // Node reports the module's URL as a real path and argv[1] as typed; comparing the two raw
-      // made this invocation skip the check and exit 0 in silence over a committed marker.
+      // Node reports the module's URL as a real path and argv[1] as typed. Compared raw, the two
+      // differ through a link, and the command would skip the check and exit 0 in silence over a
+      // committed marker; the entry-point test canonicalizes both, which this case holds it to.
       const repository = createRepository({
         ...CLEAN_FILES,
         'apps/demo-app/src/patched.ts': patchedSource(TYPE_MARKER).content,

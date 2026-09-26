@@ -13,10 +13,9 @@
  * Snapshots, notices and pairing frames settle nothing. None of them names the request it answers:
  * a snapshot also moves for unrelated reasons (a progress row, the capture counter, another session
  * reopened from the Sessions tree, the session ended by another control), and a notice may belong
- * to another request, to a command run from the Command Palette or to a service event. Inferring an
- * answer from them is what used to let the "pick the element" notice re-enable a pending "Stop
- * capture", a reopened session clear an unaccepted question, End session's `ended` snapshot clear a
- * pending follow-up's draft, and an unrelated error fail a question that was still in flight.
+ * to another request, to a command run from the Command Palette or to a service event. So no such
+ * frame re-enables, clears or fails a pending request: its control stays disabled and a pending
+ * submission keeps its draft until the matching `actionResult` or the safety timeout settles it.
  *
  * `ready` and `openFile` wait on nothing, carry no id and never reach this reducer.
  *

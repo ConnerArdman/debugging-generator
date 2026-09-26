@@ -66,8 +66,8 @@ const SPANS_QUERY = { source: 'spans', limit: 25, offset: 0 } as const;
  * A validated, normalized specification with one query-backed view: a span
  * table over one page of spans.
  *
- * @param id - The panel's own id.
- * @param panelVersion - Its version within the session.
+ * @param id The panel's own id.
+ * @param panelVersion Its version within the session.
  * @returns A fresh specification.
  */
 function tableSpec(id: string, panelVersion: number): PanelSpec {
@@ -111,7 +111,7 @@ function harness() {
 /**
  * The payload of the only port request a spy received.
  *
- * @param request - The request spy, called exactly once.
+ * @param request The request spy, called exactly once.
  * @returns The `panelData.query` payload.
  */
 function onlyPayload(request: ReturnType<typeof harness>['request']) {
@@ -127,7 +127,7 @@ function onlyPayload(request: ReturnType<typeof harness>['request']) {
 /**
  * Await a refusal and return it as a `DebuggenError`.
  *
- * @param pending - A call expected to reject with a typed error.
+ * @param pending A call expected to reject with a typed error.
  * @returns The rejection.
  */
 async function refusal(pending: Promise<unknown>): Promise<DebuggenError> {

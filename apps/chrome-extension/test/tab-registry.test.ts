@@ -85,6 +85,8 @@ import type {
 } from '../src/background/service-worker';
 import {
   BINDING_STORAGE_KEY,
+  MAX_STORED_TAB_BINDINGS,
+  MAX_STORED_UNBIND_TOMBSTONES,
   MAX_UNBIND_TOMBSTONE_DELIVERIES,
   TAB_UNBIND_CAUSES,
   UNBIND_TOMBSTONE_STORAGE_KEY,
@@ -192,6 +194,84 @@ function refusedSend(): SendResult {
 /** The instant the clock reports on its `reading`-th call (1-based). */
 function clockReading(reading: number): number {
   return CLOCK_START_MS + reading * CLOCK_STEP_MS;
+}
+
+/*
+ * The protocol's bounds on the fields a stored binding and tombstone carry: a
+ * URL of at most 2,048 characters and an id of at most 64 — the limits of the
+ * `@debuggen/protocol` binding and capture payload schemas the registry
+ * validates hydrated entries with. Restated here only to build values on
+ * either side of them.
+ */
+const PROTOCOL_MAX_URL_LENGTH = 2_048;
+const PROTOCOL_MAX_ID_LENGTH = 64;
+
+/** A URL on {@link ORIGIN_A}, under {@link PATH_SEGMENT}, exactly `length` characters long. */
+function urlOfLength(length: number): string {
+  const prefix = `${ORIGIN_A}${PATH_SEGMENT}`;
+  return `${prefix}${'x'.repeat(length - prefix.length)}`;
+}
+
+/** A synthetic id starting with `prefix`, exactly `length` characters long. */
+function idOfLength(prefix: string, length: number): string {
+  return `${prefix}${'x'.repeat(length - prefix.length)}`;
+}
+
+/** The tab id the bulk fixtures that fill the registry to its limits count up from. */
+const BULK_TAB_BASE = 10_000;
+
+/** The session id of the `index`-th (1-based) bulk fixture. */
+function bulkSessionId(index: number): string {
+  return `session-test-bulk-${String(index)}`;
+}
+
+/**
+ * The `index`-th (1-based) bulk binding: its own tab and session, bound at the
+ * clock's `boundAtReading`-th reading (by default its index, so a higher
+ * index is a more recent binding).
+ */
+function bulkRecord(index: number, boundAtReading = index): TabBindingRecord {
+  return {
+    tabId: BULK_TAB_BASE + index,
+    sessionId: bulkSessionId(index),
+    url: URL_A_OVERVIEW,
+    origin: ORIGIN_A,
+    boundAt: clockReading(boundAtReading),
+  };
+}
+
+/**
+ * The `index`-th (1-based) bulk tombstone: the unbind of its own tab, decided
+ * at the clock's `createdAtReading`-th reading (by default its index) and
+ * handed to an open socket `deliveries` times (by default none — still owed).
+ */
+function bulkTombstone(
+  index: number,
+  createdAtReading = index,
+  deliveries = 0,
+): TabUnbindTombstone {
+  return {
+    tabId: BULK_TAB_BASE + index,
+    sessionId: bulkSessionId(index),
+    cause: 'tab-closed',
+    createdAt: clockReading(createdAtReading),
+    deliveries,
+  };
+}
+
+/** The tab ids of `entries`, in their order. */
+function tabIdsOf(entries: readonly { readonly tabId: TabId }[]): TabId[] {
+  return entries.map((entry) => entry.tabId);
+}
+
+/** `count` items built by `build` from the 1-based indexes `1..count`. */
+function buildMany<T>(count: number, build: (index: number) => T): T[] {
+  return Array.from({ length: count }, (_, offset) => build(offset + 1));
+}
+
+/** The stored form of `records`: a snapshot keyed by decimal tab id, as the registry writes it. */
+function snapshotOf(records: readonly TabBindingRecord[]): TabBindingSnapshot {
+  return Object.fromEntries(records.map((record) => [String(record.tabId), record]));
 }
 
 /*
@@ -471,6 +551,74 @@ async function confirmBinding(
     throw new Error(`Expected the binding to be recorded, got '${outcome.kind}'`);
   }
   return outcome.record;
+}
+
+/** The `tabId` a frame's payload carries, if it carries a numeric one. */
+function payloadTabId(payload: unknown): TabId | undefined {
+  if (typeof payload !== 'object' || payload === null || !('tabId' in payload)) {
+    return undefined;
+  }
+  const { tabId } = payload;
+  return typeof tabId === 'number' ? tabId : undefined;
+}
+
+/**
+ * The local service's side of the bindings, as far as the registry can
+ * observe it: the bindings the service holds for this worker's tabs, which it
+ * keeps across a dropped socket and a worker restart alike (AAP §0.5.5), and
+ * which it never lists back to the worker.
+ *
+ * {@link attach} makes it the harness's transport. While `connected`, each
+ * frame is applied as the service applies it — a `session.unbind` ends the
+ * tab's binding and, only when one was held, is answered with a `session.bound`
+ * of reason `unbound`, applied through the registry's own `applyBound` — and
+ * answered `sent`. While not connected every frame is `queued` and never
+ * reaches it, as a frame handed to a reconnecting socket that the worker's
+ * eviction then discards. Seeded directly with the bindings an earlier worker
+ * generation had confirmed.
+ */
+class FakeBindingService {
+  /** The bindings the service holds, by tab. */
+  readonly bindings = new Map<TabId, { readonly sessionId: string; readonly url: string }>();
+  /** Whether the worker's socket is open. */
+  connected = true;
+  /** The answers sent back, until {@link settle} waits for them. */
+  private readonly answers: Promise<unknown>[] = [];
+
+  /** Hold a binding of each record, as if an earlier generation had it confirmed. */
+  seed(records: readonly TabBindingRecord[]): void {
+    for (const record of records) {
+      this.bindings.set(record.tabId, { sessionId: record.sessionId, url: record.url });
+    }
+  }
+
+  /** Become `harness`'s transport, answering through its registry. */
+  attach(harness: Harness): void {
+    harness.send.mockImplementation((type, payload) => {
+      if (!this.connected) {
+        return QUEUED;
+      }
+      const tabId = payloadTabId(payload);
+      const held = tabId === undefined ? undefined : this.bindings.get(tabId);
+      if (type === 'session.unbind' && tabId !== undefined && held !== undefined) {
+        this.bindings.delete(tabId);
+        this.answers.push(
+          harness.registry.applyBound(bound(tabId, held.sessionId, held.url, 'unbound')),
+        );
+      }
+      return SENT;
+    });
+  }
+
+  /** Wait until every answer sent so far has been applied by the registry. */
+  async settle(): Promise<void> {
+    await Promise.all(this.answers.splice(0));
+  }
+
+  /** The tabs the service still holds a binding for, ordered by id. */
+  boundTabs(): TabId[] {
+    return [...this.bindings.keys()].sort((left, right) => left - right);
+  }
 }
 
 /*
@@ -982,6 +1130,24 @@ describe('capture id bookkeeping', () => {
     expect(await h.registry.listBindings()).toStrictEqual([]);
   });
 
+  it('refuses a capture id longer than the protocol admits, so storage never holds one hydration would drop', async () => {
+    const record = await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    const tooLong = idOfLength('capture-test-', PROTOCOL_MAX_ID_LENGTH + 1);
+    const atBound = idOfLength('capture-test-', PROTOCOL_MAX_ID_LENGTH);
+    resetObservations(h);
+
+    expect(await h.registry.setCaptureId(TAB_ONE, tooLong)).toBe(false);
+    expect(await h.registry.getBinding(TAB_ONE)).toStrictEqual(record);
+    expect(h.storage.stored()).toStrictEqual({ [String(TAB_ONE)]: record });
+    expect(h.changes).toStrictEqual([]);
+
+    // Exactly at the bound it is stored, and a restarted worker hydrates it.
+    expect(await h.registry.setCaptureId(TAB_ONE, atBound)).toBe(true);
+    const capturing: TabBindingRecord = { ...record, captureId: atBound };
+    const revived = restartWorker(h);
+    expect(await revived.registry.reload()).toStrictEqual([capturing]);
+  });
+
   it('a relayed capture.started lands on the tab bound to its session', async () => {
     await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
     const started: CaptureStartedPayload = { sessionId: SESSION_ALPHA, captureId: CAPTURE_ONE };
@@ -1109,15 +1275,248 @@ describe('persistence through chrome.storage.session', () => {
       '303': 'not-a-binding',
       // An empty capture id.
       '404': { ...valid, tabId: 404, sessionId: SESSION_UNKNOWN, captureId: '' },
+      // A same-origin URL one character past the protocol's bound.
+      '505': {
+        ...valid,
+        tabId: 505,
+        sessionId: 'session-test-long-url',
+        url: urlOfLength(PROTOCOL_MAX_URL_LENGTH + 1),
+      },
+      // A same-origin URL of 50,000 characters.
+      '606': {
+        ...valid,
+        tabId: 606,
+        sessionId: 'session-test-huge-url',
+        url: urlOfLength(50_000),
+      },
+      // A session id one character past the protocol's bound.
+      '707': {
+        ...valid,
+        tabId: 707,
+        sessionId: idOfLength('session-test-', PROTOCOL_MAX_ID_LENGTH + 1),
+      },
+      // A capture id one character past the protocol's bound.
+      '808': {
+        ...valid,
+        tabId: 808,
+        sessionId: 'session-test-long-capture',
+        captureId: idOfLength('capture-test-', PROTOCOL_MAX_ID_LENGTH + 1),
+      },
     };
 
     const reloaded = await h.registry.reload();
 
     expect(reloaded).toStrictEqual([valid]);
     expect(h.storage.stored()).toStrictEqual({ [String(TAB_ONE)]: valid });
+    expect(h.logger.entries).toContainEqual({
+      level: 'warn',
+      message: 'Dropped malformed or excess tab bindings read back from session storage',
+      fields: { dropped: 8, overLimit: 0, kept: 1, limit: MAX_STORED_TAB_BINDINGS },
+    });
+    // The refused URLs stay out of the log, like every other URL.
+    for (const entry of h.logger.entries) {
+      expect(JSON.stringify(entry)).not.toContain(PATH_SEGMENT);
+    }
+    expect(h.send).not.toHaveBeenCalled();
   });
 
-  it('restores one tab per session when storage names a session twice', async () => {
+  it('keeps a stored entry exactly at the protocol bounds: a 2048-character URL and 64-character ids', async () => {
+    const atBounds: TabBindingRecord = {
+      tabId: TAB_ONE,
+      sessionId: idOfLength('session-test-', PROTOCOL_MAX_ID_LENGTH),
+      url: urlOfLength(PROTOCOL_MAX_URL_LENGTH),
+      origin: ORIGIN_A,
+      boundAt: clockReading(1),
+      captureId: idOfLength('capture-test-', PROTOCOL_MAX_ID_LENGTH),
+    };
+    h.storage.items[BINDING_STORAGE_KEY] = { [String(TAB_ONE)]: atBounds };
+
+    expect(await h.registry.reload()).toStrictEqual([atBounds]);
+
+    // Nothing was dropped, so nothing was rewritten.
+    expect(h.storage.writes).toBe(0);
+    expect(h.storage.stored()).toStrictEqual({ [String(TAB_ONE)]: atBounds });
+    expect(await h.registry.getTabForSession(atBounds.sessionId)).toBe(TAB_ONE);
+  });
+
+  it(`keeps the newest ${String(MAX_STORED_TAB_BINDINGS)} stored bindings and ends the rest through owed unbinds, clearing them at the service and telling their panels`, async () => {
+    const excess = 2;
+    // Tabs 2 and 3 were bound at the same instant, straddling the cut: the tie
+    // keeps the higher tab id, the rule a session named twice is resolved by.
+    const records = buildMany(MAX_STORED_TAB_BINDINGS + excess, (index) =>
+      bulkRecord(index, index === 3 ? 2 : index),
+    );
+    const pruned = records.slice(0, excess);
+    const newest = records.slice(excess);
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(records);
+    // The service still holds every one of them: it keeps bindings across a
+    // dropped socket, and nothing but an unbind ends one.
+    const service = new FakeBindingService();
+    service.seed(records);
+    service.attach(h);
+
+    expect(await h.registry.reload()).toStrictEqual(newest);
+    await service.settle();
+
+    expect(h.storage.stored()).toStrictEqual(snapshotOf(newest));
+    expect(await h.registry.getBinding(BULK_TAB_BASE + 1)).toBeUndefined();
+    expect(await h.registry.getBinding(BULK_TAB_BASE + 2)).toBeUndefined();
+    expect(await h.registry.getTabForSession(bulkSessionId(3))).toBe(BULK_TAB_BASE + 3);
+    // Each pruned binding was unbound at the service, and nothing else was.
+    expect(sentFrames(h)).toStrictEqual(
+      pruned.map((record) => ({ type: 'session.unbind', payload: { tabId: record.tabId } })),
+    );
+    expect(service.boundTabs()).toStrictEqual(tabIdsOf(newest));
+    // Its panel is told, and every listener hears of it.
+    expect(bindingPushes(h)).toStrictEqual(
+      pruned.map((record) => ({ tabId: record.tabId, state: { kind: 'unbound' } })),
+    );
+    expect(h.changes).toStrictEqual(
+      pruned.map((record) => ({
+        kind: 'removed',
+        tabId: record.tabId,
+        previous: record,
+        current: undefined,
+        state: { kind: 'unbound' },
+        reason: 'unbound',
+        cause: undefined,
+      })),
+    );
+    expect(await h.registry.getPanelBindingState(BULK_TAB_BASE + 1)).toStrictEqual({
+      kind: 'unbound',
+    });
+    // The service's answers acknowledged the owed unbinds, so none is left.
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    expect(h.logger.entries).toContainEqual({
+      level: 'warn',
+      message: 'Dropped malformed or excess tab bindings read back from session storage',
+      fields: {
+        dropped: excess,
+        overLimit: excess,
+        kept: MAX_STORED_TAB_BINDINGS,
+        limit: MAX_STORED_TAB_BINDINGS,
+      },
+    });
+    expect(h.logger.entries).toContainEqual({
+      level: 'warn',
+      message: 'Ended stored tab bindings beyond the binding limit through owed unbinds',
+      fields: {
+        ended: excess,
+        tombstoned: excess,
+        handed: excess,
+        heldBack: 0,
+        limit: MAX_STORED_TAB_BINDINGS,
+      },
+    });
+
+    // The rewritten storage is exactly what the next generation keeps: it
+    // hydrates all of it and has nothing to rewrite or send.
+    const writesBefore = h.storage.writes;
+    const revived = restartWorker(h);
+    expect(await revived.registry.reload()).toStrictEqual(newest);
+    expect(revived.storage.writes).toBe(writesBefore);
+    expect(revived.send).not.toHaveBeenCalled();
+  });
+
+  it('a stored binding beyond the limit ended while the socket is down stays owed across a restart, and the reconnect clears it at the service', async () => {
+    const records = buildMany(MAX_STORED_TAB_BINDINGS + 1, (index) => bulkRecord(index));
+    const [oldest] = records;
+    const orphan = required(oldest, 'the least recently bound fixture');
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(records);
+    const service = new FakeBindingService();
+    service.seed(records);
+    service.attach(h);
+    service.connected = false;
+
+    await h.registry.reload();
+
+    // The unbind could only be queued, so it is written ahead as owed…
+    expect(h.storage.storedTombstones()).toStrictEqual([
+      {
+        tabId: orphan.tabId,
+        sessionId: orphan.sessionId,
+        cause: 'binding-limit',
+        createdAt: clockReading(1),
+        deliveries: 0,
+      },
+    ]);
+    // …the panel already shows the tab unbound, while the service still holds it.
+    expect(bindingPushes(h)).toStrictEqual([{ tabId: orphan.tabId, state: { kind: 'unbound' } }]);
+    expect(service.boundTabs()).toContain(orphan.tabId);
+
+    // The worker is evicted with the socket still down; its successor connects.
+    const revived = restartWorker(h, 1);
+    service.attach(revived);
+    service.connected = true;
+    expect(await revived.registry.flushPendingUnbinds()).toBe(1);
+    await service.settle();
+
+    expect(service.boundTabs()).toStrictEqual(tabIdsOf(records.slice(1)));
+    expect(Object.hasOwn(revived.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    expect(await revived.registry.listBindings()).toStrictEqual(records.slice(1));
+  });
+
+  it(`ends at most ${String(MAX_STORED_UNBIND_TOMBSTONES)} stored bindings beyond the limit in one hydration, dropping any older ones as corruption`, async () => {
+    const records = buildMany(MAX_STORED_TAB_BINDINGS + MAX_STORED_UNBIND_TOMBSTONES + 1, (index) =>
+      bulkRecord(index),
+    );
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(records);
+
+    expect(await h.registry.reload()).toStrictEqual(records.slice(-MAX_STORED_TAB_BINDINGS));
+
+    // The most recently bound of the pruned ones are unbound; the oldest is dropped.
+    const unbound = records.slice(1, MAX_STORED_UNBIND_TOMBSTONES + 1);
+    expect(sentFrames(h)).toStrictEqual(
+      unbound.map((record) => ({ type: 'session.unbind', payload: { tabId: record.tabId } })),
+    );
+    expect(h.storage.storedTombstones()).toHaveLength(MAX_STORED_UNBIND_TOMBSTONES);
+    expect(h.logger.entries).toContainEqual({
+      level: 'error',
+      message:
+        'Dropped stored tab bindings beyond what one hydration ends: storage held more than the registry writes',
+      fields: { dropped: 1, limit: MAX_STORED_UNBIND_TOMBSTONES },
+    });
+  });
+
+  it('holds back the owed unbind of a stored binding beyond the limit whose tab has a bind in flight, and lets its confirmation supersede it', async () => {
+    const records = buildMany(MAX_STORED_TAB_BINDINGS + 1, (index) => bulkRecord(index));
+    const inFlight = required(records[0], 'the least recently bound fixture');
+    unwrap(
+      await h.registry.requestBind({
+        tabId: inFlight.tabId,
+        url: inFlight.url,
+        origin: inFlight.origin,
+      }),
+    );
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(records);
+    resetObservations(h);
+
+    await h.registry.reload();
+
+    // Sent now, the unbind would follow the bind in flight and end it.
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: inFlight.tabId, cause: 'binding-limit', deliveries: 0 },
+    ]);
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.send).not.toHaveBeenCalled();
+
+    // The confirmation supersedes the tombstone. The map is still full from
+    // storage the registry did not write, so the least recently bound kept
+    // binding is ended for it, through the ordinary unbind.
+    await confirmBinding(h, inFlight.tabId, SESSION_ALPHA, inFlight.url);
+    const lru = required(records[1], 'the least recently bound kept fixture');
+    expect(sentFrames(h)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: lru.tabId } },
+    ]);
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: lru.tabId, cause: 'binding-limit', deliveries: 1 },
+    ]);
+    expect(await h.registry.getTabForSession(SESSION_ALPHA)).toBe(inFlight.tabId);
+    expect(await h.registry.listBindings()).toHaveLength(MAX_STORED_TAB_BINDINGS);
+  });
+
+  it('restores one tab per session when storage names a session twice, without unbinding the stale duplicate', async () => {
     const older: TabBindingRecord = {
       tabId: TAB_ONE,
       sessionId: SESSION_ALPHA,
@@ -1133,6 +1532,12 @@ describe('persistence through chrome.storage.session', () => {
 
     expect(await h.registry.reload()).toStrictEqual([newer]);
     expect(await h.registry.getTabForSession(SESSION_ALPHA)).toBe(TAB_TWO);
+    // The service holds the session on one tab only, so the duplicate names no
+    // binding it can still hold, and `session.unbind { tabId }` for it could
+    // end an unrelated, newer binding of that tab.
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.changes).toStrictEqual([]);
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
   });
 
   it('starts empty when storage cannot be read, and rebuilds from the next confirmation', async () => {
@@ -1142,6 +1547,91 @@ describe('persistence through chrome.storage.session', () => {
 
     const record = await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
     expect(await h.registry.getBinding(TAB_ONE)).toStrictEqual(record);
+  });
+
+  it(`a confirmed bind of a new tab at ${String(MAX_STORED_TAB_BINDINGS)} bindings unbinds the least recently bound tab, never dropping it silently`, async () => {
+    const held = buildMany(MAX_STORED_TAB_BINDINGS, (index) => bulkRecord(index));
+    const [oldest] = held;
+    const least = required(oldest, 'the least recently bound fixture');
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(held);
+    const revived = restartWorker(h, MAX_STORED_TAB_BINDINGS);
+
+    const outcome = unwrap(
+      await revived.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW)),
+    );
+
+    const record: TabBindingRecord = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      url: URL_A_OVERVIEW,
+      origin: ORIGIN_A,
+      boundAt: clockReading(MAX_STORED_TAB_BINDINGS + 1),
+    };
+    expect(outcome).toStrictEqual({
+      kind: 'recorded',
+      record,
+      previous: undefined,
+      displaced: [],
+      reason: 'bound',
+    });
+    // The ordinary unbind: the service is told, under a write-ahead tombstone…
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: least.tabId } },
+    ]);
+    expect(revived.storage.storedTombstones()).toStrictEqual([
+      {
+        tabId: least.tabId,
+        sessionId: least.sessionId,
+        cause: 'binding-limit',
+        createdAt: clockReading(MAX_STORED_TAB_BINDINGS + 2),
+        deliveries: 1,
+      },
+    ]);
+    // …the panel is shown unbound and every listener hears of it.
+    expect(bindingPushes(revived)).toStrictEqual([
+      {
+        tabId: TAB_ONE,
+        state: { kind: 'bound', sessionId: SESSION_ALPHA, tabId: TAB_ONE, url: URL_A_OVERVIEW },
+      },
+      { tabId: least.tabId, state: { kind: 'unbound' } },
+    ]);
+    expect(revived.changes).toStrictEqual([
+      {
+        kind: 'recorded',
+        tabId: TAB_ONE,
+        previous: undefined,
+        current: record,
+        state: { kind: 'bound', sessionId: SESSION_ALPHA, tabId: TAB_ONE, url: URL_A_OVERVIEW },
+        reason: 'bound',
+        cause: undefined,
+      },
+      {
+        kind: 'removed',
+        tabId: least.tabId,
+        previous: least,
+        current: undefined,
+        state: { kind: 'unbound' },
+        reason: 'unbound',
+        cause: undefined,
+      },
+    ]);
+    // Storage holds exactly the limit, the new binding in and the oldest out.
+    expect(revived.storage.stored()).toStrictEqual(snapshotOf([...held.slice(1), record]));
+    expect(await revived.registry.getBinding(least.tabId)).toBeUndefined();
+    expect(await revived.registry.getPanelBindingState(least.tabId)).toStrictEqual({
+      kind: 'unbound',
+    });
+
+    // A re-confirmation of a tab already held makes no room, so it ends nothing.
+    resetObservations(revived);
+    const second = required(held[1], 'the second bulk fixture');
+    await confirmBinding(revived, second.tabId, second.sessionId, second.url);
+    expect(revived.send).not.toHaveBeenCalled();
+    expect(await revived.registry.listBindings()).toHaveLength(MAX_STORED_TAB_BINDINGS);
+
+    // The service's answer to that unbind acknowledges the tombstone, as for any other.
+    await revived.registry.applyBound(bound(least.tabId, least.sessionId, least.url, 'unbound'));
+    expect(Object.hasOwn(revived.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
   });
 
   it('keeps a confirmed binding in memory when the storage write fails', async () => {
@@ -1155,6 +1645,175 @@ describe('persistence through chrome.storage.session', () => {
     expect(await h.registry.getTabForSession(SESSION_ALPHA)).toBe(TAB_ONE);
     expect(h.storage.stored()).toBeUndefined();
     expect(h.changes).toMatchObject([{ kind: 'recorded', tabId: TAB_ONE }]);
+  });
+});
+
+describe('capacity — bounded by the obligations it tracks, never by forgetting one', () => {
+  /** A request to bind `tabId` on the fixture origin. */
+  function bindRequest(tabId: TabId): { tabId: TabId; url: string; origin: string } {
+    return { tabId, url: URL_A_OVERVIEW, origin: ORIGIN_A };
+  }
+
+  /** An owed unbind of `tabId`, which holds no record. */
+  function owedTombstone(tabId: TabId): TabUnbindTombstone {
+    return {
+      tabId,
+      sessionId: SESSION_BETA,
+      cause: 'tab-closed',
+      createdAt: clockReading(1),
+      deliveries: 0,
+    };
+  }
+
+  it('always has room in the tombstone list for every unbind a slot can owe', () => {
+    expect(MAX_STORED_UNBIND_TOMBSTONES).toBeGreaterThanOrEqual(MAX_STORED_TAB_BINDINGS);
+  });
+
+  it('a bind in flight holds its slot: a new tab is refused meanwhile, and the confirmation is recorded without ending a binding', async () => {
+    const held = buildMany(MAX_STORED_TAB_BINDINGS - 1, (index) => bulkRecord(index));
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(held);
+    const revived = restartWorker(h, MAX_STORED_TAB_BINDINGS);
+
+    expect(unwrap(await revived.registry.requestBind(bindRequest(TAB_ONE)))).toBe('sent');
+    const refused = await revived.registry.requestBind(bindRequest(TAB_TWO));
+    expect(refused).toMatchObject({ ok: false, error: { code: 'RATE_LIMITED' } });
+    // A tab already holding a slot is never refused.
+    expect(unwrap(await revived.registry.requestBind(bindRequest(TAB_ONE)))).toBe('sent');
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.bind', payload: bindRequest(TAB_ONE) },
+      { type: 'session.bind', payload: bindRequest(TAB_ONE) },
+    ]);
+    expect(revived.logger.entries).toContainEqual({
+      level: 'warn',
+      message: 'Refused to request a binding: every slot is held',
+      fields: { tabId: TAB_TWO, slots: MAX_STORED_TAB_BINDINGS, limit: MAX_STORED_TAB_BINDINGS },
+    });
+
+    resetObservations(revived);
+    const outcome = unwrap(
+      await revived.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW)),
+    );
+
+    expect(outcome.kind).toBe('recorded');
+    expect(revived.send).not.toHaveBeenCalled();
+    expect(revived.changes).toMatchObject([{ kind: 'recorded', tabId: TAB_ONE }]);
+    expect(await revived.registry.listBindings()).toHaveLength(MAX_STORED_TAB_BINDINGS);
+    expect(Object.hasOwn(revived.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+  });
+
+  it('DevTools closing on a tab with a bind in flight writes its owed unbind into that slot', async () => {
+    const held = buildMany(MAX_STORED_TAB_BINDINGS - 1, (index) => bulkRecord(index));
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(held);
+    const revived = restartWorker(h, MAX_STORED_TAB_BINDINGS);
+    revived.send.mockReturnValue(QUEUED);
+    unwrap(await revived.registry.requestBind(bindRequest(TAB_ONE)));
+
+    await revived.registry.unbind(TAB_ONE, 'devtools-closed');
+
+    expect(revived.storage.storedTombstones()).toStrictEqual([
+      {
+        tabId: TAB_ONE,
+        cause: 'devtools-closed',
+        createdAt: clockReading(MAX_STORED_TAB_BINDINGS + 1),
+        deliveries: 0,
+      },
+    ]);
+    // The slot moved from the bind to the owed unbind: still every slot held.
+    const refused = await revived.registry.requestBind(bindRequest(TAB_TWO));
+    expect(refused).toMatchObject({ ok: false, error: { code: 'RATE_LIMITED' } });
+  });
+
+  it('a confirmation holding no slot at the limit delivers an owed unbind to make room, ending no binding', async () => {
+    const held = buildMany(MAX_STORED_TAB_BINDINGS - 1, (index) => bulkRecord(index));
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(held);
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = [owedTombstone(TAB_TWO)];
+    const revived = restartWorker(h, MAX_STORED_TAB_BINDINGS);
+
+    const outcome = unwrap(
+      await revived.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW)),
+    );
+
+    expect(outcome.kind).toBe('recorded');
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_TWO } },
+    ]);
+    expect(revived.storage.storedTombstones()).toStrictEqual([
+      { ...owedTombstone(TAB_TWO), deliveries: 1 },
+    ]);
+    expect(revived.changes).toMatchObject([{ kind: 'recorded', tabId: TAB_ONE }]);
+    expect(await revived.registry.listBindings()).toHaveLength(MAX_STORED_TAB_BINDINGS);
+  });
+
+  it('declines such a confirmation when the socket takes no frame, ending nothing, and records it once the socket is back', async () => {
+    const held = buildMany(MAX_STORED_TAB_BINDINGS - 1, (index) => bulkRecord(index));
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(held);
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = [owedTombstone(TAB_TWO)];
+    const revived = restartWorker(h, MAX_STORED_TAB_BINDINGS);
+    revived.send.mockImplementation(refusedSend);
+
+    const outcome = unwrap(
+      await revived.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW)),
+    );
+
+    expect(outcome).toStrictEqual({ kind: 'ignored', reason: 'bound' });
+    expect(await revived.registry.getBinding(TAB_ONE)).toBeUndefined();
+    expect(await revived.registry.listBindings()).toStrictEqual(held);
+    expect(revived.changes).toStrictEqual([]);
+    expect(revived.notify).not.toHaveBeenCalled();
+    expect(revived.storage.storedTombstones()).toStrictEqual([owedTombstone(TAB_TWO)]);
+    expect(revived.logger.entries).toContainEqual({
+      level: 'error',
+      message:
+        'Declined to record a confirmed binding: every slot is held and the socket took no frame to free one',
+      fields: {
+        tabId: TAB_ONE,
+        sessionId: SESSION_ALPHA,
+        slots: MAX_STORED_TAB_BINDINGS,
+        limit: MAX_STORED_TAB_BINDINGS,
+        displacedTabs: [],
+        limitEndedTabs: [],
+      },
+    });
+
+    // The socket opens: the flush delivers the owed unbind, freeing its slot,
+    // and the DevTools page's rebind is confirmed and recorded.
+    revived.send.mockImplementation(() => SENT);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(1);
+    expect(unwrap(await revived.registry.requestBind(bindRequest(TAB_ONE)))).toBe('sent');
+    await confirmBinding(revived, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    expect(await revived.registry.getTabForSession(SESSION_ALPHA)).toBe(TAB_ONE);
+  });
+
+  it('with the map full and the socket taking no frame, the binding ended for room stays owed and the confirmation is declined', async () => {
+    const held = buildMany(MAX_STORED_TAB_BINDINGS, (index) => bulkRecord(index));
+    const least = required(held[0], 'the least recently bound fixture');
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(held);
+    const revived = restartWorker(h, MAX_STORED_TAB_BINDINGS);
+    revived.send.mockImplementation(refusedSend);
+
+    const outcome = unwrap(
+      await revived.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW)),
+    );
+
+    expect(outcome).toStrictEqual({ kind: 'ignored', reason: 'bound' });
+    expect(await revived.registry.getBinding(TAB_ONE)).toBeUndefined();
+    // The ended binding is told to its panel and kept owed, never forgotten.
+    expect(bindingPushes(revived)).toStrictEqual([
+      { tabId: least.tabId, state: { kind: 'unbound' } },
+    ]);
+    expect(revived.changes).toMatchObject([
+      { kind: 'removed', tabId: least.tabId, reason: 'unbound', cause: undefined },
+    ]);
+    expect(revived.storage.storedTombstones()).toStrictEqual([
+      {
+        tabId: least.tabId,
+        sessionId: least.sessionId,
+        cause: 'binding-limit',
+        createdAt: clockReading(MAX_STORED_TAB_BINDINGS + 2),
+        deliveries: 0,
+      },
+    ]);
+    expect(revived.storage.stored()).toStrictEqual(snapshotOf(held.slice(1)));
   });
 });
 
@@ -1284,6 +1943,41 @@ describe('handleNavigated — keep and re-arm, or unbind', () => {
       reported: true,
     });
     expect(await h.registry.getBinding(TAB_ONE)).toBeUndefined();
+  });
+
+  it('handles a navigation to a URL longer than the protocol admits as unreportable, never recording it', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    resetObservations(h);
+    // Same origin, but past the bound: it can be neither reported nor stored.
+    const oversized = urlOfLength(PROTOCOL_MAX_URL_LENGTH + 1);
+
+    const decision = await h.registry.handleNavigated({ tabId: TAB_ONE, url: oversized });
+
+    expect(decision).toStrictEqual({
+      kind: 'unbound-cross-origin',
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      captureId: undefined,
+      previousOrigin: ORIGIN_A,
+      origin: undefined,
+      notice: formatTabLeftMessage(ORIGIN_A),
+      reported: false,
+    });
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+    expect(await h.registry.getBinding(TAB_ONE)).toBeUndefined();
+    expect(Object.hasOwn(h.storage.items, BINDING_STORAGE_KEY)).toBe(false);
+    for (const entry of h.logger.entries) {
+      expect(JSON.stringify(entry)).not.toContain(PATH_SEGMENT);
+    }
+
+    // An unbound tab navigating there is not an event: nothing is sent.
+    resetObservations(h);
+    expect(await h.registry.handleNavigated({ tabId: TAB_TWO, url: oversized })).toStrictEqual({
+      kind: 'not-bound',
+      tabId: TAB_TWO,
+      reported: false,
+    });
+    expect(h.send).not.toHaveBeenCalled();
   });
 
   it('reports the navigation of an unbound tab and changes nothing else', async () => {
@@ -1893,6 +2587,12 @@ describe('unbind tombstones — an unbind outlives the worker that decided it', 
       { ...valid, tabId: TAB_TWO, cause: 'navigated' },
       // An empty session id.
       { ...valid, tabId: TAB_TWO, sessionId: '' },
+      // A session id one character past the protocol's bound.
+      {
+        ...valid,
+        tabId: TAB_TWO,
+        sessionId: idOfLength('session-test-', PROTOCOL_MAX_ID_LENGTH + 1),
+      },
       // A fractional delivery count.
       { ...valid, tabId: TAB_TWO, deliveries: 1.5 },
       // No creation stamp.
@@ -1908,6 +2608,211 @@ describe('unbind tombstones — an unbind outlives the worker that decided it', 
     expect(h.storage.storedTombstones()).toStrictEqual([valid]);
     expect(await h.registry.flushPendingUnbinds()).toBe(1);
     expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+  });
+
+  it('keeps a stored tombstone whose session id is exactly at the protocol bound', async () => {
+    const atBound: TabUnbindTombstone = {
+      tabId: TAB_ONE,
+      sessionId: idOfLength('session-test-', PROTOCOL_MAX_ID_LENGTH),
+      cause: 'tab-closed',
+      createdAt: clockReading(1),
+      deliveries: 0,
+    };
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = [atBound];
+
+    await h.registry.reload();
+
+    expect(h.storage.writes).toBe(0);
+    expect(h.storage.storedTombstones()).toStrictEqual([atBound]);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+  });
+
+  it(`hydrates only the newest ${String(MAX_STORED_UNBIND_TOMBSTONES)} tombstones and rewrites storage without the rest`, async () => {
+    const excess = 2;
+    // Tabs 2 and 3 were unbound at the same instant, straddling the cut: the
+    // tie keeps the higher tab id, the tail of the flush order.
+    const tombstones = buildMany(MAX_STORED_UNBIND_TOMBSTONES + excess, (index) =>
+      bulkTombstone(index, index === 3 ? 2 : index),
+    );
+    const newest = tombstones.slice(excess);
+    // Stored newest first: what is kept follows `createdAt`, not the position.
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = [...tombstones].reverse();
+
+    await h.registry.reload();
+
+    expect(h.storage.storedTombstones()).toStrictEqual(newest);
+    expect(h.logger.entries).toContainEqual({
+      level: 'warn',
+      message: 'Dropped malformed or excess unbind tombstones read back from session storage',
+      fields: {
+        dropped: excess,
+        overLimit: excess,
+        kept: MAX_STORED_UNBIND_TOMBSTONES,
+        limit: MAX_STORED_UNBIND_TOMBSTONES,
+      },
+    });
+
+    // Only the kept tombstones are ever re-sent, oldest first.
+    expect(await h.registry.flushPendingUnbinds()).toBe(MAX_STORED_UNBIND_TOMBSTONES);
+    expect(sentFrames(h)).toStrictEqual(
+      newest.map((tombstone) => ({
+        type: 'session.unbind',
+        payload: { tabId: tombstone.tabId },
+      })),
+    );
+    // More owed unbinds than the registry ever writes can only be corruption.
+    expect(h.logger.entries).toContainEqual({
+      level: 'error',
+      message:
+        'Dropped undelivered unbind tombstones read back from session storage: it held more owed unbinds than the registry writes',
+      fields: { owed: excess, limit: MAX_STORED_UNBIND_TOMBSTONES },
+    });
+  });
+
+  it(`hydration keeps every undelivered tombstone before a delivered one, however new the delivered one is`, async () => {
+    const excess = 2;
+    // The two newest were already delivered; every older one is still owed.
+    const tombstones = buildMany(MAX_STORED_UNBIND_TOMBSTONES + excess, (index) =>
+      bulkTombstone(index, index, index > MAX_STORED_UNBIND_TOMBSTONES ? 1 : 0),
+    );
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = tombstones;
+
+    await h.registry.reload();
+
+    expect(h.storage.storedTombstones()).toStrictEqual(
+      tombstones.slice(0, MAX_STORED_UNBIND_TOMBSTONES),
+    );
+    expect(h.logger.entries.filter((entry) => entry.level === 'error')).toStrictEqual([]);
+  });
+
+  it(`writing a tombstone beyond ${String(MAX_STORED_UNBIND_TOMBSTONES)} evicts the oldest delivered one, never an undelivered one`, async () => {
+    // The oldest is still owed; the second oldest was delivered once.
+    const stored = buildMany(MAX_STORED_UNBIND_TOMBSTONES, (index) =>
+      bulkTombstone(index, index, index === 2 ? 1 : 0),
+    );
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = stored;
+    const revived = restartWorker(h, MAX_STORED_UNBIND_TOMBSTONES);
+
+    await revived.registry.unbind(TAB_UNKNOWN, 'devtools-closed');
+
+    const written: TabUnbindTombstone = {
+      tabId: TAB_UNKNOWN,
+      cause: 'devtools-closed',
+      createdAt: clockReading(MAX_STORED_UNBIND_TOMBSTONES + 1),
+      deliveries: 1,
+    };
+    const [oldest] = stored;
+    expect(revived.storage.storedTombstones()).toStrictEqual([
+      required(oldest, 'the oldest stored tombstone'),
+      ...stored.slice(2),
+      written,
+    ]);
+    expect(revived.logger.entries).toContainEqual({
+      level: 'warn',
+      message: 'Evicted the oldest delivered unbind tombstones to stay within the stored limit',
+      fields: {
+        evicted: 1,
+        owed: 0,
+        pending: MAX_STORED_UNBIND_TOMBSTONES,
+        limit: MAX_STORED_UNBIND_TOMBSTONES,
+      },
+    });
+
+    // The owed unbind is still re-sent; only the delivered one's retransmission is gone.
+    resetObservations(revived);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(MAX_STORED_UNBIND_TOMBSTONES);
+    const flushedTabs = sentFrames(revived).map((frame) => frame.payload);
+    expect(flushedTabs).toContainEqual({ tabId: BULK_TAB_BASE + 1 });
+    expect(flushedTabs).not.toContainEqual({ tabId: BULK_TAB_BASE + 2 });
+    expect(flushedTabs).toContainEqual({ tabId: TAB_UNKNOWN });
+  });
+
+  it(`never evicts an owed unbind: ${String(MAX_STORED_TAB_BINDINGS)} bindings ended during an outage all reach the service on reconnect, and a further DevTools close is sent without a tombstone`, async () => {
+    const held = buildMany(MAX_STORED_TAB_BINDINGS, (index) => bulkRecord(index));
+    h.storage.items[BINDING_STORAGE_KEY] = snapshotOf(held);
+    const service = new FakeBindingService();
+    service.seed(held);
+    const revived = restartWorker(h, MAX_STORED_TAB_BINDINGS);
+    service.attach(revived);
+    service.connected = false;
+
+    // Every bound tab closes while the socket is down: each unbind is owed.
+    for (const record of held) {
+      await revived.registry.unbind(record.tabId, 'tab-closed');
+    }
+    const owed = h.storage.storedTombstones();
+    expect(owed).toHaveLength(MAX_STORED_UNBIND_TOMBSTONES);
+    expect(owed).toMatchObject(held.map((record) => ({ tabId: record.tabId, deliveries: 0 })));
+    expect(bindingPushes(revived)).toStrictEqual(
+      held.map((record) => ({ tabId: record.tabId, state: { kind: 'unbound' } })),
+    );
+
+    // Every slot is owed now. DevTools closing on a tab holding none is a race
+    // closer only, so it is handed over without a tombstone and nothing is
+    // evicted for it…
+    resetObservations(revived);
+    await revived.registry.unbind(TAB_UNKNOWN, 'devtools-closed');
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_UNKNOWN } },
+    ]);
+    expect(h.storage.storedTombstones()).toStrictEqual(owed);
+    expect(revived.logger.entries).toContainEqual({
+      level: 'warn',
+      message: 'Unbind sent without a tombstone: every slot is held and the tab holds none',
+      fields: {
+        tabId: TAB_UNKNOWN,
+        cause: 'devtools-closed',
+        slots: MAX_STORED_TAB_BINDINGS,
+        limit: MAX_STORED_TAB_BINDINGS,
+      },
+    });
+    // …and a bind of a new tab is refused before anything is sent.
+    resetObservations(revived);
+    const refused = await revived.registry.requestBind({
+      tabId: TAB_ONE,
+      url: URL_A_OVERVIEW,
+      origin: ORIGIN_A,
+    });
+    expect(refused).toMatchObject({ ok: false, error: { code: 'RATE_LIMITED' } });
+    expect(revived.send).not.toHaveBeenCalled();
+
+    // The worker is evicted during the outage; its successor connects and
+    // flushes, and every binding the service held is cleared.
+    const next = restartWorker(revived, 3 * MAX_STORED_TAB_BINDINGS);
+    service.attach(next);
+    service.connected = true;
+    expect(await next.registry.flushPendingUnbinds()).toBe(MAX_STORED_TAB_BINDINGS);
+    await service.settle();
+    expect(service.boundTabs()).toStrictEqual([]);
+    expect(Object.hasOwn(next.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+
+    // With the obligations settled, binding a tab is possible again.
+    expect(
+      unwrap(
+        await next.registry.requestBind({ tabId: TAB_ONE, url: URL_A_OVERVIEW, origin: ORIGIN_A }),
+      ),
+    ).toBe('sent');
+  });
+
+  it('the tombstone being written is never the one evicted, even when the clock places it first', async () => {
+    // Every stored tombstone was delivered once, and decided after the clock's
+    // reading this worker takes.
+    const stored = buildMany(MAX_STORED_UNBIND_TOMBSTONES, (index) =>
+      bulkTombstone(index, MAX_STORED_UNBIND_TOMBSTONES + index, 1),
+    );
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = stored;
+    h.send.mockReturnValue(QUEUED);
+
+    await h.registry.unbind(TAB_UNKNOWN, 'devtools-closed');
+
+    const written: TabUnbindTombstone = {
+      tabId: TAB_UNKNOWN,
+      cause: 'devtools-closed',
+      createdAt: clockReading(1),
+      deliveries: 0,
+    };
+    expect(h.storage.storedTombstones()).toStrictEqual([written, ...stored.slice(1)]);
   });
 
   it('drops a stored tombstone value that is not a list', async () => {
@@ -2102,6 +3007,8 @@ describe('unbind tombstones — an unbind outlives the worker that decided it', 
       undefined,
     ],
     ['tab-closed', { kind: 'unbound' } satisfies PanelBindingState, 'unbound', 'tab-closed'],
+    // Not one of the worker's three unbind causes: announced without a cause.
+    ['binding-limit', { kind: 'unbound' } satisfies PanelBindingState, 'unbound', undefined],
   ] as const)(
     'a %s tombstone read back late ends the record it outranks, and announces it',
     async (cause, state, reason, changeCause) => {

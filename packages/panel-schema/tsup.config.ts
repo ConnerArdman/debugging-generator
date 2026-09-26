@@ -121,7 +121,9 @@ export default defineConfig({
    * Declarations are the product of this package as much as the JavaScript is:
    * `PanelSpec`, `PanelSpecInput`, `PanelNode`, `PanelNodeInput`, `DataQuery`,
    * `Fact`, `Hypothesis`, `EventRef` and the catalog types are consumed as types
-   * by four workspaces, and `dist/index.d.ts` is what they type-check against.
+   * by four workspaces, and `dist/index.d.ts` is what a packed tarball carries
+   * them in (inside the repository those workspaces type-check against this
+   * project's `.tsbuild` declarations; root tsconfig.json, `"// no-aliases"`).
    * The catalog and the validators must stay *values* in `dist/index.js` too —
    * `packages/panel-renderer/src/host/registry.test.ts` imports the catalog from
    * this build output to prove every node type has a renderer component — so the

@@ -634,6 +634,33 @@ export function usePanelSnapshot(): PanelSnapshot {
 }
 
 /**
+ * The `getSnapshot` argument `usePanelStoreSelector` hands to
+ * `useSyncExternalStore`: applies `selector` to the current snapshot at most
+ * once per snapshot, and keeps returning the previous value while each new
+ * selection is `Object.is`-equal to it.
+ *
+ * A plain function rather than part of the hook, so the memo it closes over
+ * belongs to the reader and is never a render-scoped local reassigned after
+ * render.
+ *
+ * @param selector A pure function of the snapshot.
+ * @returns A getter whose result keeps its identity until the selection changes.
+ */
+function createSelectionReader<T>(selector: (snapshot: PanelSnapshot) => T): () => T {
+  let memo: { readonly snapshot: PanelSnapshot; readonly value: T } | undefined;
+  return (): T => {
+    const snapshot = getPanelSnapshot();
+    if (memo !== undefined && memo.snapshot === snapshot) {
+      return memo.value;
+    }
+    const selected = selector(snapshot);
+    const value = memo !== undefined && Object.is(memo.value, selected) ? memo.value : selected;
+    memo = { snapshot, value };
+    return value;
+  };
+}
+
+/**
  * A derived value of the snapshot, re-rendering the caller only when that value
  * changes by `Object.is`.
  *
@@ -649,19 +676,7 @@ export function usePanelSnapshot(): PanelSnapshot {
  * @param selector A pure function of the snapshot.
  */
 export function usePanelStoreSelector<T>(selector: (snapshot: PanelSnapshot) => T): T {
-  const getSelection = useMemo(() => {
-    let memo: { readonly snapshot: PanelSnapshot; readonly value: T } | undefined;
-    return (): T => {
-      const snapshot = getPanelSnapshot();
-      if (memo !== undefined && memo.snapshot === snapshot) {
-        return memo.value;
-      }
-      const selected = selector(snapshot);
-      const value = memo !== undefined && Object.is(memo.value, selected) ? memo.value : selected;
-      memo = { snapshot, value };
-      return value;
-    };
-  }, [selector]);
+  const getSelection = useMemo(() => createSelectionReader(selector), [selector]);
   return useSyncExternalStore(subscribePanelStore, getSelection);
 }
 

@@ -1,15 +1,16 @@
 /**
- * Tests for `./function-timing.ts`: the two ways the mandated wrapper template
- * can change what a developer's program *means*, and the refusals and the
+ * Tests for `./function-timing.ts`: the two ways the wrapper template can
+ * change what a developer's program *means*, and the refusals and the
  * annotations that stop it.
  *
- * AAP §0.5.1 states the emitted wrapper verbatim and states its mechanism — the
- * body is moved into an inner function declared inside the original — so the
- * transform cannot choose a different shape to dodge a problem. What it can do
- * is decline a target, which AAP §0.5.5 makes the product's graceful path, and
- * emit a receiver annotation that is *correct*. This suite is the evidence for
- * both, and it is organised around the two failure modes rather than around the
- * module's functions:
+ * The shape of the emitted wrapper is not the transform's to choose: the body
+ * is moved into an inner function declared inside the original
+ * (docs/ARCHITECTURE.md, "What a patch does"), so a problem cannot be dodged by
+ * emitting something else. What it can do is decline a target, with a refusal
+ * that names the reason and the developer's next step, and emit a receiver
+ * annotation that is *correct*. This suite is the evidence for both, and it is
+ * organised around the two failure modes rather than around the module's
+ * functions:
  *
  * 1. **A sloppy-mode `arguments` object is observably mapped to its parameter
  *    bindings.** Measured in Node 24 on exactly the shape this module emits:
@@ -24,12 +25,12 @@
  *    a generic class's type arguments are illegal on a static member
  *    (`TS2302`), a polymorphic `this` cannot be named at all, and an anonymous
  *    class has no name to name. None of it is visible to a syntax-only check,
- *    which is why the module now type-checks its own output and compares the
+ *    which is why the module type-checks its own output and compares the
  *    result against the original's.
  *
- * The second half of the file is organised the other way round: around the case
- * list AAP §0.5.1 states by name — function declarations, exported route
- * handlers, arrow functions, class methods, async functions, throwing
+ * The second half of the file is organised the other way round: around the
+ * cases the transform must cover by name — function declarations, exported
+ * route handlers, arrow functions, class methods, async functions, throwing
  * functions, `this`-dependent methods, and single invocation of the body with
  * and without the helper present — each read out of the committed fixture
  * corpus under `test/fixtures/project-a` and, wherever a guarantee is about
@@ -42,20 +43,20 @@
  *   sloppy-mode `.js` scripts, static and generic class members and nested
  *   declarations — shapes that exist to be refused or annotated, and that a
  *   realistic corpus has no reason to contain — so those sources are written
- *   inline. The mandated case list of the second half is about patching a
- *   stranger's project, so it reads the fixture corpus (`fixture-kiln-studio`),
- *   which is an independent corpus in the sense AAP §0.5.4 requires and shares
- *   no vocabulary with the demo application. `FunctionTimingPatcher` performs no
- *   I/O, so a fixture is read as *text* and the committed bytes are asserted
- *   unchanged at the end of the run; the one case that genuinely needs a project
- *   on disk works in a `mkdtemp` copy.
+ *   inline. The case list of the second half is about patching a stranger's
+ *   project, so it reads the fixture corpus (`fixture-kiln-studio`): an
+ *   independent corpus that shares no vocabulary with the demo application, so
+ *   a pass cannot rest on knowledge of the demo. `FunctionTimingPatcher`
+ *   performs no I/O, so a fixture is read as *text* and the committed bytes
+ *   are asserted unchanged at the end of the run; the one case that genuinely
+ *   needs a project on disk works in a `mkdtemp` copy.
  * - **A refusal is asserted by its `code`, its `details.reason` and the
  *   presence of a `hint`**, never by its prose: rewording a message must not
  *   fail a test, while losing the machine-readable reason or the developer's
  *   next step must.
  * - **Every successful patch goes through {@link expectPatch}**, which asserts
  *   the properties that hold for *all* of them — the original text returned
- *   unchanged, byte-identical output across two calls, the AAP-verbatim inner
+ *   unchanged, byte-identical output across two calls, the template's inner
  *   call, the marker literals the residual-instrumentation gate greps for, and
  *   an independent re-parse of the emitted text — so no individual case has to
  *   restate them and none can quietly skip them.
@@ -102,6 +103,7 @@ import {
   SPAN_HELPER_GLOBAL,
   SPAN_HELPER_TYPE_NAME,
   STRICT_MODE_DIRECTIVE,
+  WRAPPER_COMMENT_LINE,
   buildWrapperBody,
   detectArgumentsHazard,
   isStrictModeDirective,
@@ -261,8 +263,8 @@ function expectRefusal(
 
   expect(error.code).toBe(code);
   expect(error.details?.reason).toBe(reason);
-  // A refusal with no next step is a dead end for the developer, and AAP §0.5.5
-  // makes the hint part of the graceful path rather than decoration.
+  // A refusal with no next step is a dead end for the developer, so the hint is
+  // part of the graceful path rather than decoration.
   expect(typeof error.hint).toBe('string');
   expect(error.message.endsWith('.')).toBe(true);
 
@@ -277,7 +279,8 @@ function expectRefusal(
  * - Two calls produce byte-identical `patchedText`. Determinism is what lets
  *   `./patcher.ts` record `instrumentedHash` before the write and
  *   `../cleanup.ts` authorise a restore against it.
- * - The emitted text contains the inner call AAP §0.5.1 states verbatim, in the
+ * - The emitted text contains the template's inner call
+ *   (`__orig.apply(this, arguments as never)` and its variants), in the
  *   language the extension implies.
  * - The emitted text contains the marker literals
  *   `scripts/check-no-residual-instrumentation.mjs` greps for: both in a
@@ -353,7 +356,7 @@ function innerDeclarationOf(patch: FunctionTimingPatch): string {
   return line.trim();
 }
 
-describe('sloppy-mode arguments (R1-F45)', () => {
+describe('sloppy-mode arguments', () => {
   it('refuses a sloppy .js function whose body reads arguments', () => {
     const text = 'function scaleEntry(a) {\n  arguments[0] = 9;\n  return a;\n}\n';
     const result = patcher.patch({ file: 'src/scale.js', symbol: 'scaleEntry', text });
@@ -712,7 +715,7 @@ describe('executed semantics of an accepted patch', () => {
   });
 
   it('runs a patched nested function exactly once, answering identically', () => {
-    // The nested case of the guarantee above. The wrapper now sits inside the
+    // The nested case of the guarantee above. Here the wrapper sits inside the
     // enclosing function's body, so the enclosing call is what exercises it,
     // and the closure the body reads — `seed` — is a binding the move must not
     // disturb.
@@ -881,7 +884,7 @@ describe('the strict-mode directive', () => {
   });
 });
 
-describe('receiver typing (R1-F46)', () => {
+describe('receiver typing', () => {
   it('types a static method with the constructor type', () => {
     const patch = expectPatch({
       file: 'src/kiln.ts',
@@ -1289,7 +1292,7 @@ describe('receiver typing (R1-F46)', () => {
   });
 });
 
-describe('nested declarations (C1-F06)', () => {
+describe('nested declarations', () => {
   /** A component-shaped enclosing function with a handler nested inside it. */
   const NESTED_FUNCTION_TEXT =
     'export function outer(seed: number): number {\n' +
@@ -1559,11 +1562,11 @@ describe('nested declarations (C1-F06)', () => {
   });
 });
 
-describe('a declaration in a position no wrapper can replace (C1-F07)', () => {
+describe('a declaration in a position no wrapper can replace', () => {
   /**
    * Asserts a target is refused as not addressable, and returns the details.
    *
-   * The distinction the finding is about: this is `PATCH_TARGET_NOT_FOUND` like
+   * The distinction these cases assert: this is `PATCH_TARGET_NOT_FOUND` like
    * `'symbol-not-found'` — nothing may be written either way — but it says the
    * declaration *was* found, which is what makes "re-index the project" the
    * wrong advice and the hint's own next step the right one.
@@ -1734,8 +1737,8 @@ describe('a declaration in a position no wrapper can replace (C1-F07)', () => {
   });
 
   it('refuses a type-level declaration', () => {
-    // The more precise answer for a case that used to report "no such symbol":
-    // a type alias is declared right there, and erases before anything runs.
+    // Not addressable rather than "no such symbol": a type alias is declared
+    // right there, and erases before anything runs.
     expectNotAddressable(
       {
         file: 'src/panel.ts',
@@ -1972,7 +1975,7 @@ describe('a declaration in a position no wrapper can replace (C1-F07)', () => {
   });
 });
 
-describe('React components and hooks (C1-F13)', () => {
+describe('React components and hooks', () => {
   /**
    * Asserts a target is refused as a React render, and returns the details.
    *
@@ -1980,8 +1983,8 @@ describe('React components and hooks (C1-F13)', () => {
    * preserved, since the helper invokes the callback synchronously — while the
    * developer's own lint reports every moved hook call as a rules-of-hooks
    * violation. So the assertion is on the reason, the recognised site and the
-   * hint that sends the planner to the runtime route AAP §0.5.1 designates for
-   * renders.
+   * hint that sends the planner to the runtime route, which is where renders
+   * are tracked.
    *
    * @param request The target to patch.
    * @param site The `details.site` the refusal must carry.
@@ -2279,9 +2282,9 @@ describe('React components and hooks (C1-F13)', () => {
  *
  * The corpus is `fixture-kiln-studio`, a kiln-firing studio application that
  * exists to be patched, refused and restored. It is deliberately not the demo
- * application: AAP §0.5.4 requires the product to be provably free of demo
- * knowledge, so the suite that proves the patcher works on a stranger's project
- * uses a corpus that shares no vocabulary with the one the end-to-end run uses.
+ * application: the product must be provably free of demo knowledge, so the
+ * suite that proves the patcher works on a stranger's project uses a corpus
+ * that shares no vocabulary with the one the end-to-end run uses.
  */
 const FIXTURE_PROJECT = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -2358,7 +2361,7 @@ function readFixture(file: string): string {
  *
  * Every success case in the second half of this file goes through here, so each
  * one inherits the properties that hold for all of them — the original text
- * returned unchanged, determinism across two calls, the AAP-verbatim inner
+ * returned unchanged, determinism across two calls, the template's inner
  * call, the marker literals and the independent re-parse — and stays a few
  * lines of its own.
  *
@@ -2385,9 +2388,9 @@ function patchFixture(
  * line below it, so a position read out of the patched text would agree with a
  * transform that recorded the position *after* rewriting — which is the one
  * mistake in this module that fails nothing and simply sends the developer to
- * the wrong line (AAP §0.4.2). The anchor is asserted to occur exactly once, so
- * a fixture edit that duplicated a declaration makes the case fail loudly
- * rather than measure the wrong occurrence.
+ * the wrong line on click-to-source. The anchor is asserted to occur exactly
+ * once, so a fixture edit that duplicated a declaration makes the case fail
+ * loudly rather than measure the wrong occurrence.
  *
  * @param text The pre-patch text.
  * @param anchor A unique substring of the declaration that contains its name.
@@ -2726,10 +2729,11 @@ interface HelperState {
 }
 
 /**
- * The five states AAP §0.5.1's "with and without the helper present" covers,
- * plus the sixth that spells the malformed helper a second way.
+ * The five helper states single invocation must hold across, with and without
+ * the helper present, plus the sixth that spells the malformed helper a second
+ * way.
  *
- * Each has caught a real class of template bug: no helper at all (the fallback
+ * Each catches a distinct class of template bug: no helper at all (the fallback
  * path), a working helper (the instrumented path), a helper that answers `null`
  * and one that answers `undefined` (a guard that tested the *result*), and a
  * helper whose `span` is not callable, either declared-but-not-a-function or
@@ -2955,7 +2959,8 @@ describe('an exported route handler', () => {
     const patch = patchFixture(file, 'POST');
 
     // Recognised structurally — an exported function declaration in the module
-    // the plan named — and not by matching a route path (AAP §0.5.4).
+    // the plan named — and not by matching a route path, which would be
+    // application knowledge in product code.
     expect(patch.shape).toBe('function-declaration');
     expect(patch.patchedText).toContain(
       'export async function POST(request: Request): Promise<Response> {',
@@ -3742,9 +3747,137 @@ describe('async and promise-returning functions', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The helper type alias, the directive prologue and the file's own formatting
+ * The wrapper comment, the helper type alias, the directive prologue and the
+ * file's own formatting
  * ---------------------------------------------------------------------------
  */
+
+describe('the wrapper comment', () => {
+  /**
+   * The lines a patch added to a file: what is left of the patched text once
+   * every line of the original has been matched off, each occurrence once.
+   *
+   * Exact because the moved body is embedded verbatim, so every line of it is
+   * a line of the original. A multiset difference rather than a set one, so an
+   * added line that happens to repeat a line the developer wrote is still
+   * counted as added.
+   *
+   * @param patch The patch to read.
+   * @returns The added lines, in patched-text order and with their indentation.
+   */
+  function addedLinesOf(patch: FunctionTimingPatch): string[] {
+    const unmatched = new Map<string, number>();
+
+    for (const line of patch.originalText.split('\n')) {
+      unmatched.set(line, (unmatched.get(line) ?? 0) + 1);
+    }
+
+    return patch.patchedText.split('\n').filter((line) => {
+      const count = unmatched.get(line) ?? 0;
+
+      if (count > 0) {
+        unmatched.set(line, count - 1);
+
+        return false;
+      }
+
+      return true;
+    });
+  }
+
+  /** Whether a line, once its indentation is set aside, opens a comment. */
+  function isCommentLine(line: string): boolean {
+    const trimmed = line.trimStart();
+
+    return trimmed.startsWith('//') || trimmed.startsWith('/*');
+  }
+
+  it('is the only comment a patch adds, one line directly above the helper capture', () => {
+    // Both languages in both call styles: a declaration, a class method, a
+    // TypeScript arrow, a TSX handler, a JavaScript arrow and a JSX handler.
+    for (const [file, symbol] of [
+      ['src/server/cone-rules.ts', 'findConeProfile'],
+      ['src/server/kiln-controller.ts', 'settleSegments'],
+      ['src/server/glaze-rules.ts', 'scoreShelfSlot'],
+      ['src/components/FiringLogForm.tsx', 'handleFiringSubmit'],
+      ['src/legacy/rack-tally.js', 'tallyRackSlots'],
+      ['src/legacy/ShelfPlaqueCard.jsx', 'handlePlaqueSelect'],
+    ] as const) {
+      const added = addedLinesOf(patchFixture(file, symbol));
+      const comments = added.filter(isCommentLine);
+
+      // Compared against the exported constant, never a literal, for the same
+      // reason as the alias below: a restated line could drift from the
+      // template while both looked correct.
+      expect(
+        comments.map((line) => line.trim()),
+        `${file}#${symbol}`,
+      ).toEqual([WRAPPER_COMMENT_LINE]);
+
+      const position = added.findIndex((line) => line.trim() === WRAPPER_COMMENT_LINE);
+
+      expect(
+        added[position + 1]?.trimStart().startsWith(`const ${HELPER_LOCAL_IDENTIFIER} = `),
+        `${file}#${symbol}`,
+      ).toBe(true);
+    }
+  });
+
+  it('is added once per wrapper when a second symbol in the same file is patched', () => {
+    const file = 'src/server/cycle-planner.ts';
+    const first = patchFixture(file, 'planCycleSegments');
+    const second = patchFixture(file, 'estimateSoakMinutes', first.patchedText);
+
+    // The second patch's original already carries the first wrapper's line, so
+    // this is the case the multiset difference exists for: the identical line
+    // the second wrapper adds is still counted as added.
+    expect(
+      addedLinesOf(second)
+        .filter(isCommentLine)
+        .map((line) => line.trim()),
+    ).toEqual([WRAPPER_COMMENT_LINE]);
+    expect(
+      second.patchedText.split('\n').filter((line) => line.trim() === WRAPPER_COMMENT_LINE),
+    ).toHaveLength(2);
+  });
+
+  it('is one neutral line in both languages and call styles, promising no removal', () => {
+    // Cleanup leaves a file the developer edited while it was instrumented
+    // exactly as it is, so a line that promised the block would disappear
+    // would be false in precisely that file.
+    expect(WRAPPER_COMMENT_LINE.startsWith('// ')).toBe(true);
+    expect(WRAPPER_COMMENT_LINE).not.toMatch(/[\n\r\u2028\u2029]/u);
+    expect(WRAPPER_COMMENT_LINE).not.toMatch(/removed|session ends|temporary/iu);
+
+    for (const [language, file] of [
+      ['typescript', 'src/scale.ts'],
+      ['javascript', 'src/scale.js'],
+    ] as const) {
+      for (const callStyle of ['arguments', 'rest'] as const) {
+        const built = buildWrapperBody({
+          language,
+          callStyle,
+          spanName: 'scaleEntry',
+          meta: { file, line: 1, column: 10, symbol: 'scaleEntry' },
+        });
+
+        if (!built.ok) {
+          throw new Error(`expected a ${language} ${callStyle} wrapper, received a refusal`);
+        }
+
+        const lines = built.value.text.split('\n');
+
+        expect(built.value.comment, `${language} ${callStyle}`).toBe(WRAPPER_COMMENT_LINE);
+        expect(built.value.statements[0], `${language} ${callStyle}`).toBe(WRAPPER_COMMENT_LINE);
+        // The comment and three one-line statements, and no other prose.
+        expect(lines, `${language} ${callStyle}`).toHaveLength(4);
+        expect(lines.filter(isCommentLine), `${language} ${callStyle}`).toEqual([
+          WRAPPER_COMMENT_LINE,
+        ]);
+      }
+    }
+  });
+});
 
 describe('the helper type alias', () => {
   it('is the template’s own line, introducing no import', () => {
@@ -3977,11 +4110,11 @@ describe('the file’s own formatting', () => {
   });
 
   it('refuses the render function in the same file, so only the helper is patched', () => {
-    // AAP §0.5.1 tracks React renders at run time instead of patching them, so
-    // the component beside the helper is a refusal rather than a second
-    // wrapper. Asserted here because it is what makes the case above the
-    // *complete* account of this file: one symbol is patched, the other is
-    // declined with a hint naming the runtime route.
+    // React renders are tracked at run time instead of being patched, so the
+    // component beside the helper is a refusal rather than a second wrapper.
+    // Asserted here because it is what makes the case above the *complete*
+    // account of this file: one symbol is patched, the other is declined with
+    // a hint naming the runtime route.
     const refusal = patcher.patch({
       file,
       symbol: 'KilnShelfMap',
@@ -4214,7 +4347,7 @@ describe('the recorded source location', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The patched file keeps type-checking in its own project (A1-F03, A1-F06)
+ * The patched file keeps type-checking in its own project
  * ---------------------------------------------------------------------------
  */
 
@@ -4274,11 +4407,12 @@ const IMPORTED_TYPES = [
   '',
 ].join('\n');
 
-describe('the patched file keeps type-checking in its own project (A1-F03, A1-F06)', () => {
+describe('the patched file keeps type-checking in its own project', () => {
   it('restates an imported declared return type on the inner function', () => {
-    // Before the fix the inner function carried no return type, so the literal
-    // `'placed'` widened to `string` and the project failed with TS2322 — while
-    // the single-file pre-flight, which cannot resolve `./types`, saw nothing.
+    // The inner function declares the outer's return type, so the literal
+    // `'placed'` is checked against `Outcome` instead of widening to `string`.
+    // A widened literal is a TS2322 in the project's own build, which the
+    // single-file pre-flight cannot see because it does not resolve `./types`.
     const text = [
       "import type { Receipt } from './types';",
       '',
@@ -4312,9 +4446,9 @@ describe('the patched file keeps type-checking in its own project (A1-F03, A1-F0
   });
 
   it('patches a function whose declared return type lives in the same file instead of refusing it', () => {
-    // The same widening with the type declared locally was visible to the
-    // pre-flight, which then refused the patch outright: such a function could
-    // not be timed at all.
+    // With the type declared locally the pre-flight sees the same widening, and
+    // it refuses a patch that introduces a diagnostic, so the restated return
+    // type is what lets such a function be timed at all.
     const text = [
       "type Grade = 'a' | 'b';",
       'interface Graded {',
@@ -4386,8 +4520,9 @@ describe('the patched file keeps type-checking in its own project (A1-F03, A1-F0
   });
 
   it("keeps an exported arrow's parameter list as its public signature", () => {
-    // Before the fix the wrapper was `(...__args: unknown[])`, and a consumer
-    // indexing `Parameters<typeof measure>` failed with TS2571 in its own file.
+    // The rest parameter restates the arrow's own parameter list as a tuple, so
+    // a consumer indexing `Parameters<typeof measure>` compiles in its own
+    // file; `(...__args: unknown[])` would make that index a TS2571 there.
     const text =
       'export const measure = (width: number, label: string): number => width + label.length;\n';
     const consumer = [
@@ -4408,8 +4543,8 @@ describe('the patched file keeps type-checking in its own project (A1-F03, A1-F0
       projectDiagnostics({ 'src/measure.ts': patch.patchedText, 'src/consumer.ts': consumer }),
     ).toEqual([]);
 
-    // Argument checking at call sites is back too: a wrong argument is still an
-    // error against the patched signature, as it was against the original.
+    // Argument checking at call sites is kept too: a wrong argument is the same
+    // error against the patched signature as against the original.
     const misuse = "import { measure } from './measure';\nexport const bad = measure('3', 4);\n";
 
     expect(
@@ -4491,8 +4626,8 @@ describe('the patched file keeps type-checking in its own project (A1-F03, A1-F0
   });
 
   it('keeps a generic arrow generic by leaving its type parameters on the outer arrow only', () => {
-    // A second, shadowing type-parameter list on the inner arrow made
-    // `__orig.apply(…)` answer `unknown`, which the pre-flight refused.
+    // A second, shadowing type-parameter list on the inner arrow would make
+    // `__orig.apply(…)` answer `unknown`, which the pre-flight refuses.
     const text =
       'export const pick = <T,>(items: readonly T[], index: number): T | undefined => items[index];\n';
     const consumer =
@@ -4516,9 +4651,9 @@ describe('the patched file keeps type-checking in its own project (A1-F03, A1-F0
 
   it('restates the contextual type of an arrow bound to an annotated variable or property', () => {
     // The outer arrow stays typed by `Settle`; the inner arrow that holds the
-    // original head is not, so without `satisfies` its parameters became
-    // implicit `any` and its returned literal widened — a build error that an
-    // imported `Settle` hides from any single-file check.
+    // original head is not, so without `satisfies` its parameters would be
+    // implicit `any` and its returned literal would widen — a build error that
+    // an imported `Settle` hides from any single-file check.
     const text = [
       "import type { Settle } from './types';",
       '',
@@ -4615,11 +4750,11 @@ describe('the patched file keeps type-checking in its own project (A1-F03, A1-F0
 
 /*
  * ---------------------------------------------------------------------------
- * A position recorded over already-patched text (A1-F01)
+ * A position recorded over already-patched text
  * ---------------------------------------------------------------------------
  */
 
-describe('a position recorded over already-patched text (A1-F01)', () => {
+describe('a position recorded over already-patched text', () => {
   const file = 'src/server/cone-rules.ts';
 
   it("records the developer's line for a second symbol patched in the same file", () => {

@@ -100,11 +100,7 @@ import { Scroller } from './Scroller';
 /* ---------------------------------------------------------------------------
  * Constants
  *
- * All-caps by convention, and that convention is enforced by more than taste:
- * `scripts/check-no-hardcoding.mjs` harvests this application's camel-case
- * declarations into vocabulary no product file may then mention, and skips
- * constants with no camel boundary. A name spelled this way costs the product
- * nothing.
+ * All-caps by convention.
  * ------------------------------------------------------------------------- */
 
 /** Printed where a figure or a name is not available, matching `@/lib/format`'s own placeholder. */
@@ -330,8 +326,7 @@ function categoryLabelFor(category: string | null, categoryName: string | undefi
  * Props of {@link InventoryLevelsTable}.
  *
  * Local and deliberately not exported: the dashboard page types its own props and passes them
- * through, and the repository's guard scripts treat an exported demo identifier as vocabulary no
- * product file may then mention, so a second exported name would buy a constraint and nothing else.
+ * through.
  *
  * Every optional member spells `| undefined` out where its type does not already include it,
  * because this workspace compiles with `exactOptionalPropertyTypes`: under it a bare
@@ -692,12 +687,11 @@ export function InventoryLevelsTable({
         the current page leaves nowhere to go are inert `<span>`s - rendered rather than omitted, so
         the row keeps its shape as the reader moves through the pages.
 
-        Both links carry `scroll={false}`. A page change swaps the rows of a table that sits at the
-        bottom of a five-thousand-pixel page, and Next.js's default would scroll the document back
-        to the top: the reader would be thrown four viewports away from the control they had just
-        clicked, and would have to scroll all the way back to turn another page (measured in
-        Chrome: scroll position 4,139 to 195). Staying put is also what the filter row above this
-        table already does with its own navigations, so one component no longer behaves two ways.
+        Both links carry `scroll={false}`, which keeps the document's scroll position across the
+        navigation. A page change swaps the rows of a table far down a long page, and Next.js's
+        default would scroll the document to the top, away from the control the reader just used.
+        With the position kept, the reader stays by the paged table and can turn page after page in
+        place - the same as the filter row above, whose own navigations keep the position too.
       */}
       {lastPage > 1 ? (
         <nav className={styles.pager} aria-label="Inventory levels pages">

@@ -39,9 +39,7 @@
  * It sets no positioning scheme and no stacking order: the footer sits in normal flow at the end
  * of the body's flex column, and the stacking tiers belong to the sticky header, the cart drawer
  * (`--ls-z-drawer`) and the toast viewport (`--ls-z-toast`). It pulls in no other stylesheet, it
- * never escapes its own module scope, and it couples the storefront to none of the debugging
- * product's packages or its separate token namespace - this application is the instrumentation
- * target and stays free of both.
+ * never escapes its own module scope, and the only shared tokens it reads are the `--ls-*` ones.
  */
 
 .root {
@@ -168,13 +166,9 @@
   transition: color var(--footer-transition-duration, 160ms) ease-out;
 }
 
-/* BLITZY [A11Y]: a link's box measures roughly 26px on the block axis - 13px of label on a 1.4
- * ratio plus this rule's padding - which is below the 44x44px touch-target recommendation. The
- * dense rhythm is what this footer's specification asks for (`--ls-space-1` between rows,
- * `--ls-text-sm` labels) and the padding above is the most of it the rhythm allows, so the
- * specification is implemented as written rather than the rendered size silently enlarged. Nothing
- * here is reachable only from the footer - the header and the page body carry the same
- * destinations - and the keyboard path is unaffected. Flagged for design review. */
+/* A link's box is about 26px tall - 13px of label on a 1.4 ratio plus the block padding above -
+ * which clears the 24px minimum of WCAG 2.5.8 on that axis. The same destinations are also
+ * reachable from the primary navigation. */
 
 /* Hover is gated so a tap on a touch device does not leave a link stuck in its hover appearance
  * after the finger lifts. */

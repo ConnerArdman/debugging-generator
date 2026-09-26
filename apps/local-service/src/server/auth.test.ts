@@ -28,6 +28,10 @@
  *    writer and fails exactly the step of a replacement a test names, and a
  *    per-connection `TEMP` trigger fails a store commit, which is how the
  *    two-resource rotation is interrupted at every point without a mock.
+ *    Workspace containment runs against real `mkdtemp` trees with real
+ *    symlinks; `requireProjectScope`'s real-path resolver is its own argument,
+ *    and a table or failing resolver is passed only for what a real tree cannot
+ *    stage on this host (`EACCES` as root, a drive root, a relative answer).
  * 3. **Protocol is imported, never restated.** The exempt operations, the
  *    close code, the hello deadline, the protocol version and the hello schema
  *    come from `@debuggen/protocol`; the failure table, the pairing constants
@@ -48,8 +52,10 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -70,6 +76,9 @@ import {
   HTTP_OPERATIONS,
   HTTP_ROUTES,
   PROTOCOL_VERSION,
+  READ_PROOF_BYTES,
+  READ_PROOF_HEADER,
+  READ_PROOF_LENGTH,
   WS_CLOSE_UNAUTHORIZED,
   clientHelloPayloadSchema,
   formatBearer,
@@ -86,7 +95,7 @@ import {
   newSessionId,
   unwrap,
 } from '@debuggen/shared';
-import type { Logger, Result } from '@debuggen/shared';
+import type { Logger, RealPathResolver, Result } from '@debuggen/shared';
 import { sha256Hex, writeSecureFileAtomic } from '@debuggen/shared/node';
 
 import { loadServiceConfig } from '../config.js';
@@ -104,9 +113,9 @@ import {
   PAIRING_CODE_LENGTH,
   PAIRING_CODE_MAX_REDEMPTIONS,
   PAIRING_CODE_TTL_MS,
-  PAIRING_GLOBAL_MAX_FAILURES,
   PAIRING_LOCKOUT_MS,
   PAIRING_MAX_FAILURES,
+  admitProjectRoot,
   authErrorResponse,
   authFailureReasonOf,
   authFailureStatus,
@@ -115,6 +124,7 @@ import {
   createAuthMiddleware,
   createAuthService,
   isAllowedOrigin,
+  reconfirmProjectRoot,
   requireBoundSession,
   requireProjectScope,
   requireRole,
@@ -558,12 +568,31 @@ function editorToken(h: Harness = harness): string {
   return readAuthFile(h.config).token;
 }
 
-/** Pairs a DevTools client through the real pairing flow and returns its credential. */
+/**
+ * The read proof pairing issued with each DevTools credential of the suite,
+ * keyed by the credential's plaintext. Both are remembered as secrets.
+ */
+const pairedReadProofs = new Map<string, string>();
+
+/**
+ * Pairs a DevTools client through the real pairing flow and returns its
+ * credential; the read proof issued with it is kept for {@link readProofOf}.
+ */
 function pairDevtools(h: Harness = harness, extensionId: string = EXTENSION_ID): string {
   const { code } = expectOk(h.auth.startPairing());
   remember(code);
   const issued = expectOk(h.auth.completePairing({ code, origin: extensionOrigin(extensionId) }));
-  return remember(issued.token);
+  pairedReadProofs.set(remember(issued.token), remember(issued.readProof));
+  return issued.token;
+}
+
+/** The read proof pairing issued with a credential {@link pairDevtools} returned. */
+function readProofOf(token: string): string {
+  const proof = pairedReadProofs.get(token);
+  if (proof === undefined) {
+    throw new Error('this credential was not paired by pairDevtools');
+  }
+  return proof;
 }
 
 /** Issues a server-agent credential scoped to `projectRoot` and returns its plaintext. */
@@ -611,6 +640,33 @@ function helloPayload(
     ...(claims.projectRoot === undefined ? {} : { projectRoot: claims.projectRoot }),
     ...(claims.tabId === undefined ? {} : { tabId: claims.tabId }),
   };
+}
+
+/**
+ * {@link authorize} with extra request headers beside the bearer credential —
+ * a `Headers` object, or Node's record form, which can carry one header twice.
+ */
+function authorizeWith(
+  operation: HttpOperationId,
+  token: string | undefined,
+  extra: Readonly<Record<string, string | readonly string[]>>,
+  origin?: string,
+): Result<Principal | null, DebuggenError> {
+  const record: Record<string, string | readonly string[]> = { ...extra };
+  if (token !== undefined) {
+    record[AUTHORIZATION_HEADER] = formatBearer(token);
+  }
+  const single = Object.values(record).every((value) => typeof value === 'string');
+  return harness.auth.authorizeHttpRequest({
+    headers: single ? new Headers(record as Record<string, string>) : record,
+    origin,
+    operation,
+  });
+}
+
+/** A fresh, well-formed read proof, generated at run time and remembered as a secret. */
+function newReadProof(): string {
+  return remember(cryptoRandomBytes(READ_PROOF_BYTES).toString('base64url'));
 }
 
 /** Narrows a principal to the editor role, failing the test otherwise. */
@@ -1115,10 +1171,11 @@ describe('the origin policy', () => {
   });
 
   // Chrome sends no `Origin` on a `GET` the extension's service worker makes to a
-  // host it holds a permission for, so the extension's reads arrive without one;
-  // every state-changing request, and the hello, still name the extension.
-  it('accepts a DevTools credential from no origin on its GET routes only', () => {
-    const devtools = pairDevtools();
+  // host it holds a permission for, and an `Origin` is only a claim a local
+  // process holding the credential can write. So every DevTools read carries
+  // the read proof pairing issued with its credential — a secret nothing sent
+  // later, on a socket or otherwise, can register or replace.
+  describe('the read proof of a DevTools read', () => {
     const devtoolsOperations = (
       Object.keys(OPERATION_ROLES) as (keyof typeof OPERATION_ROLES)[]
     ).filter((operation) => (OPERATION_ROLES[operation] as readonly string[]).includes('devtools'));
@@ -1126,29 +1183,261 @@ describe('the origin policy', () => {
     const writes = devtoolsOperations.filter(
       (operation) => HTTP_ROUTES[operation].method !== 'GET',
     );
-    expect(reads).toEqual(['session.get', 'panel.get', 'panel.getById', 'modifications.list']);
-    expect(writes).toEqual(['capture.start', 'capture.stop', 'panel.data']);
+    /** The two origins a genuine DevTools read may arrive with: none, and its own extension's. */
+    const readOrigins = [undefined, extensionOrigin(EXTENSION_ID)] as const;
 
-    for (const operation of reads) {
-      asDevtools(expectOk(authorize(operation, devtools)));
-      for (const origin of [WEBVIEW_ORIGIN, extensionOrigin(OTHER_EXTENSION_ID)]) {
-        expectRefusal(authorize(operation, devtools, origin), 'origin-not-permitted-for-role', [
-          devtools,
-        ]);
+    /** One read presenting `readProof`, from `origin` (none by default). */
+    function readWith(
+      operation: HttpOperationId,
+      token: string,
+      readProof: string,
+      origin?: string,
+    ): Result<Principal | null, DebuggenError> {
+      return authorizeWith(operation, token, { [READ_PROOF_HEADER]: readProof }, origin);
+    }
+
+    it('covers exactly the four DevTools reads, and pairing issues a proof of the published shape', () => {
+      expect(reads).toEqual(['session.get', 'panel.get', 'panel.getById', 'modifications.list']);
+      expect(writes).toEqual(['capture.start', 'capture.stop', 'panel.data']);
+      const proof = readProofOf(pairDevtools());
+      expect(proof).toMatch(new RegExp(`^[A-Za-z0-9_-]{${String(READ_PROOF_LENGTH)}}$`));
+      expect(Buffer.from(proof, 'base64url')).toHaveLength(READ_PROOF_BYTES);
+    });
+
+    it('stores only the proof digest, inside the credential record, and keeps it out of the principal', () => {
+      const devtools = pairDevtools();
+      const proof = readProofOf(devtools);
+      const row = rowFor(devtools);
+
+      expect(storedScope(row)).toEqual({
+        kind: 'extension',
+        extensionId: EXTENSION_ID,
+        readProofDigest: sha256Hex(proof),
+      });
+      expect(JSON.stringify(credentialRows())).not.toContain(proof);
+      const principal = asDevtools(expectOk(readWith('session.get', devtools, proof)));
+      expect(principal.scope).toEqual({ kind: 'extension', extensionId: EXTENSION_ID });
+    });
+
+    it('issues a distinct proof with every credential, including one issued directly', () => {
+      const first = pairDevtools();
+      const second = pairDevtools(harness, OTHER_EXTENSION_ID);
+      const direct = expectOk(harness.auth.issueDevtoolsCredential(EXTENSION_ID));
+      remember(direct.token);
+      remember(direct.readProof);
+
+      const proofs = new Set([readProofOf(first), readProofOf(second), direct.readProof]);
+      expect(proofs.size).toBe(3);
+      expect(direct.readProof).toMatch(new RegExp(`^[A-Za-z0-9_-]{${String(READ_PROOF_LENGTH)}}$`));
+      asDevtools(expectOk(readWith('panel.get', direct.token, direct.readProof)));
+    });
+
+    it('refuses a read that carries no proof, several, or a malformed one — with or without the extension origin', () => {
+      const devtools = pairDevtools();
+      const issued = readProofOf(devtools);
+
+      const malformed = [
+        '',
+        'x',
+        `${issued}=`,
+        issued.slice(1),
+        `${issued.slice(1)}+`,
+        `${issued.slice(1)}/`,
+        ` ${issued.slice(1)}`,
+        `${issued}, ${issued}`,
+      ];
+      for (const operation of reads) {
+        for (const origin of readOrigins) {
+          const refused = expectRefusal(
+            authorize(operation, devtools, origin),
+            'missing-credential',
+            [devtools, issued],
+          );
+          expect(refused.code).toBe('UNAUTHORIZED');
+          expect(authFailureStatus(refused)).toBe(401);
+          // The next step is a new pairing, not the reused reason's bearer-header hint.
+          expect(refused.hint).toMatch(/^Pair the Debug Generator DevTools extension again/);
+          expect(refused.hint).not.toBe(AUTH_FAILURE_REASONS['missing-credential'].hint);
+          for (const value of malformed) {
+            const garbled = expectRefusal(
+              readWith(operation, devtools, value, origin),
+              'malformed-credential',
+              [devtools, issued],
+            );
+            expect(garbled.hint).toBe(refused.hint);
+          }
+          // The same header twice — Node's record form keeps both values.
+          expectRefusal(
+            authorizeWith(operation, devtools, { [READ_PROOF_HEADER]: [issued, issued] }, origin),
+            'malformed-credential',
+            [devtools, issued],
+          );
+        }
       }
-    }
-    for (const operation of writes) {
-      asDevtools(expectOk(authorize(operation, devtools, extensionOrigin(EXTENSION_ID))));
-      expectRefusal(authorize(operation, devtools), 'origin-not-permitted-for-role', [devtools]);
-    }
-    expectRefusal(
-      harness.auth.authorizeHello({
-        payload: helloPayload('devtools', devtools, { tabId: 5 }),
-        origin: undefined,
-      }),
-      'origin-not-permitted-for-role',
-      [devtools],
-    );
+    });
+
+    it('refuses a well-formed proof other than the one issued with the credential, as unauthorized', () => {
+      const devtools = pairDevtools();
+      const other = pairDevtools(harness, OTHER_EXTENSION_ID);
+      const invented = newReadProof();
+
+      for (const operation of reads) {
+        for (const origin of readOrigins) {
+          for (const proof of [invented, readProofOf(other)]) {
+            const refused = expectRefusal(
+              readWith(operation, devtools, proof, origin),
+              'unknown-credential',
+              [devtools, proof, readProofOf(devtools)],
+            );
+            expect(refused.code).toBe('UNAUTHORIZED');
+            expect(authFailureStatus(refused)).toBe(401);
+            expect(refused.hint).toMatch(/^Pair the Debug Generator DevTools extension again/);
+          }
+        }
+      }
+    });
+
+    it('admits every DevTools read carrying the issued proof, from no origin or the issuing extension only', () => {
+      const devtools = pairDevtools();
+      const proof = readProofOf(devtools);
+
+      for (const operation of reads) {
+        for (const origin of readOrigins) {
+          asDevtools(expectOk(readWith(operation, devtools, proof, origin)));
+        }
+        for (const origin of [WEBVIEW_ORIGIN, extensionOrigin(OTHER_EXTENSION_ID)]) {
+          expectRefusal(
+            readWith(operation, devtools, proof, origin),
+            'origin-not-permitted-for-role',
+            [devtools, proof],
+          );
+        }
+      }
+      for (const operation of writes) {
+        asDevtools(expectOk(authorize(operation, devtools, extensionOrigin(EXTENSION_ID))));
+        // A proof makes no write acceptable from no origin …
+        expectRefusal(readWith(operation, devtools, proof), 'origin-not-permitted-for-role', [
+          devtools,
+          proof,
+        ]);
+        // … and is refused on a write from the extension, which has no use for one.
+        expectRefusal(
+          readWith(operation, devtools, proof, extensionOrigin(EXTENSION_ID)),
+          'role-not-permitted',
+          [devtools, proof],
+        );
+      }
+      // A hello still needs the issuing extension's origin.
+      expectRefusal(
+        harness.auth.authorizeHello({
+          payload: helloPayload('devtools', devtools, { tabId: 5 }),
+          origin: undefined,
+        }),
+        'origin-not-permitted-for-role',
+        [devtools],
+      );
+    });
+
+    it('gives a stolen credential nothing to read with, whatever Origin it writes or hello it sends', () => {
+      const devtools = pairDevtools();
+      const issued = readProofOf(devtools);
+      const chosen = newReadProof();
+
+      // The holder of the credential alone writes the issuing extension's origin
+      // on the socket it opens: the hello is admitted — the origin is all a
+      // hello can be judged by — but it cannot carry a proof, so it registers none.
+      asDevtools(
+        expectOk(
+          harness.auth.authorizeHello({
+            payload: helloPayload('devtools', devtools),
+            origin: extensionOrigin(EXTENSION_ID),
+          }),
+        ),
+      );
+      expectRefusal(
+        harness.auth.authorizeHello({
+          payload: { ...helloPayload('devtools', devtools), readProof: chosen },
+          origin: extensionOrigin(EXTENSION_ID),
+        }),
+        'hello-invalid',
+        [devtools, chosen],
+      );
+      for (const operation of reads) {
+        for (const origin of readOrigins) {
+          // Neither a forged origin nor a proof of its own choosing reads anything …
+          expectRefusal(authorize(operation, devtools, origin), 'missing-credential', [devtools]);
+          expectRefusal(readWith(operation, devtools, chosen, origin), 'unknown-credential', [
+            devtools,
+            chosen,
+          ]);
+        }
+      }
+      // … while the proof pairing issued still does.
+      asDevtools(expectOk(readWith('session.get', devtools, issued)));
+    });
+
+    it('refuses every read of a DevTools credential stored without a proof digest, and nothing else', () => {
+      const devtools = pairDevtools();
+      const proof = readProofOf(devtools);
+      harness.store.db
+        .prepare('UPDATE credentials SET scope = ? WHERE token_hash = ?')
+        .run(JSON.stringify({ kind: 'extension', extensionId: EXTENSION_ID }), sha256Hex(devtools));
+
+      for (const operation of reads) {
+        for (const origin of readOrigins) {
+          expectRefusal(readWith(operation, devtools, proof, origin), 'unknown-credential', [
+            devtools,
+            proof,
+          ]);
+        }
+      }
+      // It is still the extension's credential for everything that is not a read.
+      asDevtools(expectOk(authorize('panel.data', devtools, extensionOrigin(EXTENSION_ID))));
+    });
+
+    it('refuses the header wherever it proves nothing: other roles, exempt operations', () => {
+      const editor = editorToken();
+      const agent = serverAgentToken(projectPath('alpha'));
+      const proof = newReadProof();
+      const header = { [READ_PROOF_HEADER]: proof };
+
+      expectRefusal(authorizeWith('session.get', editor, header), 'role-not-permitted', [
+        editor,
+        proof,
+      ]);
+      expectRefusal(authorizeWith('session.list', editor, header), 'role-not-permitted', [
+        editor,
+        proof,
+      ]);
+      expectRefusal(authorizeWith('telemetry.event', agent, header), 'role-not-permitted', [
+        agent,
+        proof,
+      ]);
+      for (const operation of AUTH_EXEMPT_OPERATIONS) {
+        expectRefusal(authorizeWith(operation, undefined, header), 'role-not-permitted', [proof]);
+      }
+    });
+
+    it('keeps the proof across a service restart, and deletes it with the credential on rotation', () => {
+      const devtools = pairDevtools();
+      const proof = readProofOf(devtools);
+
+      // Nothing in memory holds it: closing the service loses nothing.
+      harness.auth.close();
+      asDevtools(expectOk(readWith('session.get', devtools, proof)));
+
+      expectOk(harness.auth.rotateAll());
+      expectRefusal(readWith('session.get', devtools, proof), 'unknown-credential', [
+        devtools,
+        proof,
+      ]);
+      const repaired = pairDevtools();
+      expectRefusal(readWith('session.get', repaired, proof), 'unknown-credential', [
+        repaired,
+        proof,
+      ]);
+      asDevtools(expectOk(readWith('session.get', repaired, readProofOf(repaired))));
+    });
   });
 });
 
@@ -1262,7 +1551,12 @@ describe('bearer enforcement', () => {
     const devtoolsRow = rowFor(devtools);
     expect(devtoolsPrincipal.role).toBe(devtoolsRow['role']);
     expect(devtoolsPrincipal.tokenHash).toBe(devtoolsRow['token_hash']);
-    expect(storedScope(devtoolsRow)).toEqual(devtoolsPrincipal.scope);
+    // The stored scope adds only the digest of the read proof issued with the
+    // credential, which never reaches the principal.
+    expect(storedScope(devtoolsRow)).toEqual({
+      ...devtoolsPrincipal.scope,
+      readProofDigest: sha256Hex(readProofOf(devtools)),
+    });
     expect(devtoolsPrincipal.scope.extensionId).toBe(EXTENSION_ID);
 
     const agentPrincipal = asServerAgent(expectOk(authorize('telemetry.event', agent)));
@@ -1348,7 +1642,12 @@ describe('bearer enforcement', () => {
       const permitted: readonly PrincipalRole[] = OPERATION_ROLES[operation];
       for (const role of CREDENTIAL_ROLES) {
         const { token, origin } = presented[role];
-        const result = authorize(operation, token, origin);
+        // A DevTools client presents its read proof on the reads it may make,
+        // as the extension does; the proof itself is judged elsewhere.
+        const result =
+          role === 'devtools' && HTTP_ROUTES[operation].method === 'GET' && permitted.includes(role)
+            ? authorizeWith(operation, token, { [READ_PROOF_HEADER]: readProofOf(token) }, origin)
+            : authorize(operation, token, origin);
         if (permitted.includes(role)) {
           expect(expectOk(result)?.role).toBe(role);
           admitted.set(role, (admitted.get(role) ?? 0) + 1);
@@ -1921,6 +2220,7 @@ describe('role and scope authorization', () => {
     };
     const devtoolsHeaders = (tab?: string): Record<string, string> => ({
       [AUTHORIZATION_HEADER]: formatBearer(devtools),
+      [READ_PROOF_HEADER]: readProofOf(devtools),
       origin,
       ...(tab === undefined ? {} : { [ACTING_TAB_HEADER]: tab }),
     });
@@ -2086,6 +2386,418 @@ describe('role and scope authorization', () => {
     const released = asEditor(expectOk(authorize('session.create', editor)));
     expect(released.scope.workspaceFolders).toEqual([]);
     expectRefusal(requireProjectScope(released, workspace), 'project-out-of-scope');
+  });
+
+  describe('canonical workspace containment (links inside an announced folder)', () => {
+    /**
+     * An editor principal whose live connections announced exactly `folders`,
+     * one `client.hello` each, all presenting the same credential.
+     */
+    function editorAnnouncing(...folders: readonly string[]): EditorPrincipal {
+      const editor = editorToken();
+      for (const folder of folders) {
+        const hello = asEditor(
+          expectOk(
+            harness.auth.authorizeHello({
+              payload: helloPayload('vscode', editor, { projectRoot: folder }),
+              origin: undefined,
+            }),
+          ),
+        );
+        expectOk(harness.auth.announceWorkspace(hello));
+      }
+      const principal = asEditor(expectOk(authorize('session.create', editor)));
+      expect([...principal.scope.workspaceFolders].sort()).toEqual([...folders].sort());
+      return principal;
+    }
+
+    /**
+     * A real tree in a fresh sandbox:
+     *
+     * - `shop/` — the workspace, holding `packages/web/src/` and a `web` link
+     *   to `shop/packages/web` (a link that stays inside);
+     * - `shop/external` — a link to `private/`, outside the workspace;
+     * - `private/sub/` — the outside directory the link reaches;
+     * - `linked-shop` — a link to `shop/`, for a workspace announced through one.
+     */
+    function linkedTree(): {
+      readonly workspace: string;
+      readonly outside: string;
+      readonly linkedWorkspace: string;
+    } {
+      const base = openSandbox();
+      const workspace = join(base, 'shop');
+      const outside = join(base, 'private');
+      const linkedWorkspace = join(base, 'linked-shop');
+      mkdirSync(join(workspace, 'packages', 'web', 'src'), { recursive: true });
+      mkdirSync(join(outside, 'sub'), { recursive: true });
+      symlinkSync(join(workspace, 'packages', 'web'), join(workspace, 'web'), 'dir');
+      symlinkSync(outside, join(workspace, 'external'), 'dir');
+      symlinkSync(workspace, linkedWorkspace, 'dir');
+      return { workspace, outside, linkedWorkspace };
+    }
+
+    /** A resolver that records what it was asked and fails every call with `code`. */
+    function failingResolver(code: string): {
+      readonly calls: string[];
+      readonly resolve: RealPathResolver;
+    } {
+      const calls: string[] = [];
+      return {
+        calls,
+        resolve: (absolutePath) => {
+          calls.push(absolutePath);
+          throw Object.assign(new Error(`${code}: the resolver failed`), { code });
+        },
+      };
+    }
+
+    /**
+     * A resolver over a table of paths that exist and links between them,
+     * walked component by component as `realpath` walks them; a missing
+     * component fails with `ENOENT`.
+     */
+    function tableResolver(
+      existing: readonly string[],
+      links: Readonly<Record<string, string>> = {},
+    ): { readonly calls: string[]; readonly resolve: RealPathResolver } {
+      const present = new Set(['/', ...existing]);
+      const calls: string[] = [];
+      return {
+        calls,
+        resolve: (absolutePath) => {
+          calls.push(absolutePath);
+          let resolved = '/';
+          for (const segment of absolutePath.split('/').filter((part) => part.length > 0)) {
+            const joined = resolved === '/' ? `/${segment}` : `${resolved}/${segment}`;
+            const target = links[joined] ?? joined;
+            if (!present.has(target)) {
+              throw Object.assign(new Error('ENOENT: no such file or directory'), {
+                code: 'ENOENT',
+              });
+            }
+            resolved = target;
+          }
+          return resolved;
+        },
+      };
+    }
+
+    it('refuses a root reached through a link that leaves the workspace, and everything beneath it', () => {
+      const { workspace, outside } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+
+      for (const escaped of [
+        join(workspace, 'external'),
+        join(workspace, 'external', 'sub'),
+        // A tail that does not exist yet is re-appended beneath the link's target.
+        join(workspace, 'external', 'not-created-yet'),
+      ]) {
+        expectRefusal(requireProjectScope(principal, escaped), 'project-out-of-scope');
+        expectRefusal(
+          requireSessionAccess(principal, { id: newSessionId(), projectRoot: escaped }),
+          'project-out-of-scope',
+        );
+      }
+      // The outside directory itself was never announced either.
+      expectRefusal(requireProjectScope(principal, outside), 'project-out-of-scope');
+    });
+
+    it('refuses a dangling link inside the workspace, before and after its target appears', () => {
+      const { workspace, outside } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+      // `realpath` answers ENOENT for a link whose target does not exist yet,
+      // exactly as for a missing component; the link must not be kept as spelled.
+      const target = join(outside, 'created-later');
+      const dangling = join(workspace, 'dangling');
+      symlinkSync(target, dangling, 'dir');
+
+      for (const root of [dangling, join(dangling, 'app'), join(dangling, 'app', 'web')]) {
+        expectRefusal(requireProjectScope(principal, root), 'project-out-of-scope');
+        expectRefusal(
+          requireSessionAccess(principal, { id: newSessionId(), projectRoot: root }),
+          'project-out-of-scope',
+        );
+      }
+
+      // Once the target exists the link is an ordinary escape, refused as one.
+      mkdirSync(join(target, 'app'), { recursive: true });
+      expectRefusal(requireProjectScope(principal, dangling), 'project-out-of-scope');
+      expectRefusal(requireProjectScope(principal, join(dangling, 'app')), 'project-out-of-scope');
+    });
+
+    it('re-judges a root on every call, so a link retargeted out of the workspace loses it', () => {
+      const { workspace, outside } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+      const root = join(workspace, 'web');
+      const session = { id: newSessionId(), projectRoot: root };
+
+      expectOk(requireProjectScope(principal, root));
+      expectOk(requireSessionAccess(principal, session));
+
+      // The link is pointed outside after the session was admitted.
+      unlinkSync(root);
+      symlinkSync(outside, root, 'dir');
+      expectRefusal(requireProjectScope(principal, root), 'project-out-of-scope');
+      expectRefusal(requireSessionAccess(principal, session), 'project-out-of-scope');
+
+      // And pointed back inside, it is admitted again: nothing was cached.
+      unlinkSync(root);
+      symlinkSync(join(workspace, 'packages', 'web'), root, 'dir');
+      expectOk(requireSessionAccess(principal, session));
+    });
+
+    it('admits a root with the canonical path it was judged on, and requireProjectScope agrees', () => {
+      const { workspace, outside, linkedWorkspace } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+      const packaged = realpathSync.native(join(workspace, 'packages', 'web'));
+
+      const cases: readonly (readonly [string, string])[] = [
+        [workspace, realpathSync.native(workspace)],
+        [join(workspace, 'web'), packaged],
+        [join(workspace, 'web', 'src'), join(packaged, 'src')],
+        [join(workspace, 'web', 'not-created-yet'), join(packaged, 'not-created-yet')],
+      ];
+      for (const [root, canonical] of cases) {
+        const admitted = expectOk(admitProjectRoot(principal, root));
+        expect(admitted).toStrictEqual({ projectRoot: root, canonicalRoot: canonical });
+        expect(Object.isFrozen(admitted)).toBe(true);
+        expectOk(requireProjectScope(principal, root));
+      }
+      for (const refused of [
+        join(workspace, 'external'),
+        outside,
+        join(linkedWorkspace, 'external'),
+        'relative/root',
+      ]) {
+        expectRefusal(admitProjectRoot(principal, refused), 'project-out-of-scope');
+        expectRefusal(requireProjectScope(principal, refused), 'project-out-of-scope');
+      }
+    });
+
+    it('admits only an editor principal by its workspace folders', () => {
+      const { workspace } = linkedTree();
+      const agent = asServerAgent(
+        expectOk(authorize('telemetry.event', serverAgentToken(workspace))),
+      );
+      const devtools = asDevtools(
+        expectOk(authorize('panel.data', pairDevtools(), extensionOrigin(EXTENSION_ID))),
+      );
+
+      for (const principal of [agent, devtools]) {
+        expectRefusal(admitProjectRoot(principal, workspace), 'project-out-of-scope');
+      }
+      // The server agent's own rule is unchanged: its one project, lexically.
+      expectOk(requireProjectScope(agent, workspace));
+    });
+
+    it('reconfirms an admitted root only while it still resolves to the directory it was admitted as', () => {
+      const { workspace, outside } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+      const root = join(workspace, 'web');
+      const elsewhereInside = join(workspace, 'packages', 'api');
+      mkdirSync(elsewhereInside, { recursive: true });
+      const admitted = expectOk(admitProjectRoot(principal, root));
+
+      expect(expectOk(reconfirmProjectRoot(principal, admitted))).toBe(admitted);
+
+      // Retargeted inside the workspace between admission and the act: still in
+      // scope, but not the directory it was admitted as, so it is refused.
+      unlinkSync(root);
+      symlinkSync(elsewhereInside, root, 'dir');
+      expectOk(requireProjectScope(principal, root));
+      const moved = expectRefusal(
+        reconfirmProjectRoot(principal, admitted),
+        'project-out-of-scope',
+      );
+      expect(moved.message).toBe(
+        'The project root no longer resolves to the directory it was admitted as.',
+      );
+
+      // Retargeted out of the workspace: refused by scope before identity.
+      unlinkSync(root);
+      symlinkSync(outside, root, 'dir');
+      expectRefusal(reconfirmProjectRoot(principal, admitted), 'project-out-of-scope');
+
+      // Pointed back where it was admitted, it is the same directory again.
+      unlinkSync(root);
+      symlinkSync(join(workspace, 'packages', 'web'), root, 'dir');
+      expect(expectOk(reconfirmProjectRoot(principal, admitted))).toBe(admitted);
+    });
+
+    it('admits a link that stays inside the workspace, and a tail that does not exist yet', () => {
+      const { workspace } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+
+      for (const inside of [
+        workspace,
+        join(workspace, 'packages'),
+        join(workspace, 'web'),
+        join(workspace, 'web', 'src'),
+        join(workspace, 'not', 'created', 'yet'),
+        join(workspace, 'web', 'not-created-yet'),
+      ]) {
+        expectOk(requireProjectScope(principal, inside));
+        expectOk(requireSessionAccess(principal, { id: newSessionId(), projectRoot: inside }));
+      }
+    });
+
+    it('admits roots under a workspace announced through a link, and still refuses the escape', () => {
+      const { workspace, linkedWorkspace } = linkedTree();
+      const principal = editorAnnouncing(linkedWorkspace);
+
+      expectOk(requireProjectScope(principal, linkedWorkspace));
+      expectOk(requireProjectScope(principal, join(linkedWorkspace, 'packages', 'web')));
+      expectOk(requireProjectScope(principal, join(linkedWorkspace, 'web')));
+      expectOk(requireProjectScope(principal, join(linkedWorkspace, 'not-created-yet')));
+      expectRefusal(
+        requireProjectScope(principal, join(linkedWorkspace, 'external')),
+        'project-out-of-scope',
+      );
+      // Canonical containment adds to the lexical check, never replaces it: the
+      // link's target is the same directory on disk, but it is not what the
+      // editor announced.
+      expectRefusal(
+        requireProjectScope(principal, join(workspace, 'packages')),
+        'project-out-of-scope',
+      );
+    });
+
+    it('requires both containments of the same announced folder, not one of each', () => {
+      const { workspace, outside } = linkedTree();
+      // The editor announced both directories. The root is inside `shop` by
+      // spelling and inside `private` on disk, but inside neither by both.
+      const principal = editorAnnouncing(workspace, outside);
+
+      expectOk(requireProjectScope(principal, outside));
+      expectOk(requireProjectScope(principal, join(outside, 'sub')));
+      expectOk(requireProjectScope(principal, join(workspace, 'packages')));
+      expectRefusal(
+        requireProjectScope(principal, join(workspace, 'external', 'sub')),
+        'project-out-of-scope',
+      );
+    });
+
+    it('refuses when the canonical path cannot be established, and never resolves a path outside every folder', () => {
+      const { workspace } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+
+      for (const code of ['EACCES', 'ELOOP', 'ENOTDIR']) {
+        const probe = failingResolver(code);
+        expectRefusal(
+          requireProjectScope(principal, join(workspace, 'packages'), probe.resolve),
+          'project-out-of-scope',
+        );
+        // Refused on the first failure that is not a missing component: no walk.
+        expect(probe.calls, code).toEqual([join(workspace, 'packages')]);
+      }
+
+      const untouched = failingResolver('EACCES');
+      expectRefusal(
+        requireProjectScope(principal, join(workspace, '..', 'private'), untouched.resolve),
+        'project-out-of-scope',
+      );
+      expectRefusal(
+        requireProjectScope(principal, `${workspace}-sibling`, untouched.resolve),
+        'project-out-of-scope',
+      );
+      expect(untouched.calls, 'a root outside every announced folder is never resolved').toEqual(
+        [],
+      );
+    });
+
+    it('walks up only past missing components, and refuses when nothing up to the root exists', () => {
+      const principal = editorAnnouncing('/work/shop');
+
+      const tree = tableResolver(
+        ['/work', '/work/shop', '/home', '/home/dev', '/home/dev/private'],
+        {
+          '/work/shop/external': '/home/dev/private',
+        },
+      );
+      expectOk(requireProjectScope(principal, '/work/shop/app/web', tree.resolve));
+      expect(tree.calls).toEqual([
+        '/work/shop/app/web',
+        '/work/shop/app',
+        '/work/shop',
+        // The folder's own canonical path.
+        '/work/shop',
+      ]);
+      expectRefusal(
+        requireProjectScope(principal, '/work/shop/external/app', tree.resolve),
+        'project-out-of-scope',
+      );
+
+      // A tree with nothing in it still has `/`, so a wholly missing root is kept as spelled.
+      expectOk(requireProjectScope(principal, '/work/shop/app', tableResolver([]).resolve));
+
+      // A resolver that cannot even resolve `/` establishes nothing.
+      const nothing = failingResolver('ENOENT');
+      expectRefusal(
+        requireProjectScope(principal, '/work/shop/app', nothing.resolve),
+        'project-out-of-scope',
+      );
+      expect(nothing.calls).toEqual(['/work/shop/app', '/work/shop', '/work', '/']);
+    });
+
+    it('refuses a resolver answer that is not an absolute local path', () => {
+      const principal = editorAnnouncing('/work/shop');
+
+      for (const answer of ['work/shop', 'C:', 'C:work', '//server/share/work']) {
+        expectRefusal(
+          requireProjectScope(principal, '/work/shop', () => answer),
+          'project-out-of-scope',
+        );
+      }
+      expectOk(requireProjectScope(principal, '/work/shop', (path) => path));
+    });
+
+    it('asks about a drive root as `C:/`, never the drive-relative `C:`', () => {
+      // Announced folders are stored in the one normalised spelling.
+      const principal = editorAnnouncing('C:/work/shop');
+      const calls: string[] = [];
+      const windowsResolver: RealPathResolver = (absolutePath) => {
+        calls.push(absolutePath);
+        if (absolutePath === 'C:/') {
+          return 'C:\\';
+        }
+        throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+      };
+
+      expectOk(requireProjectScope(principal, 'C:\\work\\shop\\app', windowsResolver));
+      expect(calls).toEqual([
+        'C:/work/shop/app',
+        'C:/work/shop',
+        'C:/work',
+        'C:/',
+        'C:/work/shop',
+        'C:/work',
+        'C:/',
+      ]);
+    });
+
+    it('refuses a drive-relative folder, which names no fixed directory, without resolving it', () => {
+      const principal = editorAnnouncing('C:work');
+      const probe = tableResolver([]);
+
+      expectRefusal(
+        requireProjectScope(principal, 'C:work\\app', probe.resolve),
+        'project-out-of-scope',
+      );
+      expect(probe.calls).toEqual([]);
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      'refuses a drive-rooted root on a host that is not Windows, whatever the working directory holds',
+      () => {
+        const principal = editorAnnouncing('C:/work/shop');
+
+        expectRefusal(
+          requireProjectScope(principal, 'C:\\work\\shop\\app'),
+          'project-out-of-scope',
+        );
+      },
+    );
   });
 
   it('keeps an announced folder while any connection announcing it is still open', () => {
@@ -2266,6 +2978,29 @@ function anotherCodeThan(code: string): string {
     .join('');
 }
 
+/**
+ * `code` with its first, third, fifth… letter lower-cased and the rest left
+ * upper-case: the same characters in a second, mixed spelling. Throws when the
+ * code holds no letter at all, so a case can never silently compare a code
+ * with itself.
+ */
+function mixedCase(code: string): string {
+  let letters = 0;
+  const respelled = [...code]
+    .map((character) => {
+      if (character.toLowerCase() === character) {
+        return character;
+      }
+      letters += 1;
+      return letters % 2 === 1 ? character.toLowerCase() : character;
+    })
+    .join('');
+  if (respelled === code) {
+    throw new Error('the pairing code holds no letter to re-spell');
+  }
+  return respelled;
+}
+
 /** Starts pairing on the primary service and remembers the code. */
 function startCode(): string {
   return remember(expectOk(harness.auth.startPairing()).code);
@@ -2306,9 +3041,22 @@ describe('pairing', () => {
     expect(issued).not.toHaveProperty('expiresAt');
     expect(Buffer.from(issued.token, 'base64url')).toHaveLength(CREDENTIAL_TOKEN_BYTES);
 
+    remember(issued.readProof);
+    expect(Buffer.from(issued.readProof, 'base64url')).toHaveLength(READ_PROOF_BYTES);
+    expect(issued.readProof).not.toBe(issued.token);
+
     const principal = asDevtools(expectOk(authorize('panel.data', issued.token, origin)));
     expect(principal.scope).toEqual({ kind: 'extension', extensionId: EXTENSION_ID });
-    expect(storedScope(rowFor(issued.token))).toEqual(principal.scope);
+    // The record keeps the proof's digest beside the scope, never the proof.
+    expect(storedScope(rowFor(issued.token))).toEqual({
+      ...principal.scope,
+      readProofDigest: sha256Hex(issued.readProof),
+    });
+    asDevtools(
+      expectOk(
+        authorizeWith('session.get', issued.token, { [READ_PROOF_HEADER]: issued.readProof }),
+      ),
+    );
     expect(pairingRows()[0]?.['used']).toBe(PAIRING_CODE_MAX_REDEMPTIONS);
 
     expectRefusal(harness.auth.completePairing({ code, origin }), 'pairing-used', [code]);
@@ -2320,12 +3068,55 @@ describe('pairing', () => {
     expect(credentialRows().filter((row) => row['role'] === principal.role)).toHaveLength(1);
   });
 
-  it('accepts the code the way a developer types it: lower case, with surrounding whitespace', () => {
+  it.each([
+    ['lower case', (code: string) => code.toLowerCase()],
+    ['mixed case', mixedCase],
+    ['leading spaces', (code: string) => `  ${code}`],
+    ['trailing spaces', (code: string) => `${code}  `],
+    ['a leading tab', (code: string) => `\t${code}`],
+    ['a trailing newline', (code: string) => `${code}\n`],
+    ['lower case padded on both sides', (code: string) => `  ${code.toLowerCase()}\t`],
+  ])('compares the code exactly: %s is a wrong code, and burns nothing', (_label, respell) => {
     const code = startCode();
-    const issued = expectOk(
-      harness.auth.completePairing({ code: `  ${code.toLowerCase()}\t`, origin }),
-    );
-    asDevtools(expectOk(authorize('panel.data', remember(issued.token), origin)));
+    const variant = respell(code);
+    expect(variant).not.toBe(code);
+
+    expectRefusal(harness.auth.completePairing({ code: variant, origin }), 'pairing-invalid', [
+      code,
+      variant,
+    ]);
+    expect(pairingRows()[0]?.['used']).toBe(0);
+    expect(credentialRows().filter((row) => row['role'] === 'devtools')).toHaveLength(0);
+
+    remember(expectOk(harness.auth.completePairing({ code, origin })).token);
+  });
+
+  it('counts every re-spelled submission as a failure: below the threshold the exact code still redeems', () => {
+    const code = startCode();
+    const variants = [code.toLowerCase(), ` ${code} `, `\t${code}`, mixedCase(code)];
+    expect(variants).toHaveLength(PAIRING_MAX_FAILURES - 1);
+
+    for (const variant of variants) {
+      expectRefusal(harness.auth.completePairing({ code: variant, origin }), 'pairing-invalid', [
+        code,
+      ]);
+    }
+    remember(expectOk(harness.auth.completePairing({ code, origin })).token);
+  });
+
+  it('locks pairing once re-spelled submissions reach the threshold, and refuses the exact code then', () => {
+    const code = startCode();
+    for (let attempt = 0; attempt < PAIRING_MAX_FAILURES; attempt += 1) {
+      const variant = attempt % 2 === 0 ? code.toLowerCase() : ` ${code}`;
+      expectRefusal(harness.auth.completePairing({ code: variant, origin }), 'pairing-invalid', [
+        code,
+      ]);
+    }
+
+    expectRefusal(harness.auth.completePairing({ code, origin }), 'pairing-locked', [code]);
+    expect(pairingRows()[0]?.['used']).toBe(0);
+    harness.clock.advance(PAIRING_LOCKOUT_MS);
+    remember(expectOk(harness.auth.completePairing({ code, origin })).token);
   });
 
   it('refuses a code from the instant its validity window closes', () => {
@@ -2379,8 +3170,10 @@ describe('pairing', () => {
     ).toBe(OTHER_EXTENSION_ID);
   });
 
-  it('locks an extension out after consecutive failures, refuses even the right code, then lifts the lock', () => {
+  it('locks pairing for every extension after consecutive failures, refuses even the right code, then lifts the lock', () => {
     const code = startCode();
+    const otherCode = startCode();
+    const otherOrigin = extensionOrigin(OTHER_EXTENSION_ID);
     const wrong = anotherCodeThan(code);
     for (let attempt = 0; attempt < PAIRING_MAX_FAILURES; attempt += 1) {
       expectRefusal(harness.auth.completePairing({ code: wrong, origin }), 'pairing-invalid', [
@@ -2393,75 +3186,123 @@ describe('pairing', () => {
       code,
     ]);
     expect(authErrorResponse(locked).status).toBe(AUTH_FAILURE_REASONS['pairing-locked'].status);
-    // The lockout burned nothing: the code is still unused.
-    expect(pairingRows()[0]?.['used']).toBe(0);
 
-    // Another extension is not affected by this one's lockout.
-    const otherCode = startCode();
-    remember(
-      expectOk(
-        harness.auth.completePairing({
-          code: otherCode,
-          origin: extensionOrigin(OTHER_EXTENSION_ID),
-        }),
-      ).token,
+    // The lockout is the service's, not the failing extension's: another
+    // extension presenting its own right code is refused too.
+    expectRefusal(
+      harness.auth.completePairing({ code: otherCode, origin: otherOrigin }),
+      'pairing-locked',
+      [otherCode],
     );
+    // The lockout burned nothing: both codes are still unused.
+    expect(pairingRows().map((row) => row['used'])).toEqual([0, 0]);
 
     harness.clock.advance(PAIRING_LOCKOUT_MS - 1);
     expectRefusal(harness.auth.completePairing({ code, origin }), 'pairing-locked', [code]);
     harness.clock.advance(1);
     remember(expectOk(harness.auth.completePairing({ code, origin })).token);
+    remember(
+      expectOk(harness.auth.completePairing({ code: otherCode, origin: otherOrigin })).token,
+    );
   });
 
-  it('forgets failures after a success and after a quiet window', () => {
+  it('shares one count across origins, and forgets it after a success and after a quiet window', () => {
     const below = PAIRING_MAX_FAILURES - 1;
+    let forgedIndex = 0;
+    // Each failure from a different forged id, so only a shared count can add
+    // them up.
     const failBelowThreshold = (wrong: string): void => {
       for (let attempt = 0; attempt < below; attempt += 1) {
-        expectRefusal(harness.auth.completePairing({ code: wrong, origin }), 'pairing-invalid', [
-          wrong,
-        ]);
-      }
-    };
-
-    const first = startCode();
-    failBelowThreshold(anotherCodeThan(first));
-    remember(expectOk(harness.auth.completePairing({ code: first, origin })).token);
-
-    const second = startCode();
-    failBelowThreshold(anotherCodeThan(second));
-    harness.clock.advance(PAIRING_LOCKOUT_MS + 1);
-    failBelowThreshold(anotherCodeThan(second));
-    remember(expectOk(harness.auth.completePairing({ code: second, origin })).token);
-  });
-
-  it('locks pairing for every origin once failures across forged extension ids reach the global ceiling', () => {
-    const code = startCode();
-    const wrong = anotherCodeThan(code);
-    const perOrigin = PAIRING_MAX_FAILURES - 1;
-    let failures = 0;
-    let forgedIndex = 0;
-    while (failures < PAIRING_GLOBAL_MAX_FAILURES) {
-      const forged = extensionOrigin(`forged-panel-${String(forgedIndex)}`);
-      for (
-        let attempt = 0;
-        attempt < perOrigin && failures < PAIRING_GLOBAL_MAX_FAILURES;
-        attempt += 1
-      ) {
+        const forged = extensionOrigin(`forged-panel-${String(forgedIndex)}`);
+        forgedIndex += 1;
         expectRefusal(
           harness.auth.completePairing({ code: wrong, origin: forged }),
           'pairing-invalid',
           [wrong],
         );
-        failures += 1;
       }
-      forgedIndex += 1;
-    }
-    // No forged origin reached its own threshold; the ceiling is what locked.
-    expect(forgedIndex).toBeGreaterThan(1);
+    };
 
-    expectRefusal(harness.auth.completePairing({ code, origin }), 'pairing-locked', [code]);
+    // Below the threshold, the genuine extension redeems — and the success
+    // clears the count.
+    const first = startCode();
+    failBelowThreshold(anotherCodeThan(first));
+    remember(expectOk(harness.auth.completePairing({ code: first, origin })).token);
+
+    // A fresh count of the same size, then a quiet window, then another: had
+    // either been kept, the second batch would have locked.
+    const second = startCode();
+    failBelowThreshold(anotherCodeThan(second));
+    harness.clock.advance(PAIRING_LOCKOUT_MS + 1);
+    failBelowThreshold(anotherCodeThan(second));
+    remember(expectOk(harness.auth.completePairing({ code: second, origin })).token);
+
+    // Without the quiet window, one more failure from yet another id is the
+    // one that locks.
+    const third = startCode();
+    failBelowThreshold(anotherCodeThan(third));
     harness.clock.advance(PAIRING_LOCKOUT_MS);
-    remember(expectOk(harness.auth.completePairing({ code, origin })).token);
+    expectRefusal(
+      harness.auth.completePairing({
+        code: anotherCodeThan(third),
+        origin: extensionOrigin('forged-panel-last'),
+      }),
+      'pairing-invalid',
+    );
+    expectRefusal(harness.auth.completePairing({ code: third, origin }), 'pairing-locked', [third]);
+  });
+
+  it('locks pairing for the genuine extension once failures spread over forged extension ids reach the threshold', () => {
+    const code = startCode();
+    const wrong = anotherCodeThan(code);
+    const forgedOrigins = Array.from({ length: PAIRING_MAX_FAILURES }, (_, index) =>
+      extensionOrigin(`forged-panel-${String(index)}`),
+    );
+    expect(new Set(forgedOrigins).size).toBe(PAIRING_MAX_FAILURES);
+    expect(forgedOrigins).not.toContain(origin);
+
+    // One failure per forged id: no id ever failed twice.
+    for (const forged of forgedOrigins) {
+      expectRefusal(
+        harness.auth.completePairing({ code: wrong, origin: forged }),
+        'pairing-invalid',
+        [wrong],
+      );
+    }
+    const lockedAt = harness.clock.now;
+
+    // Locked for the genuine extension's right code, and for a forged id never
+    // seen before.
+    expectRefusal(harness.auth.completePairing({ code, origin }), 'pairing-locked', [code]);
+    expectRefusal(
+      harness.auth.completePairing({ code: wrong, origin: extensionOrigin('forged-panel-fresh') }),
+      'pairing-locked',
+      [wrong],
+    );
+    expect(pairingRows()[0]?.['used']).toBe(0);
+
+    // Attempts during the lock are refused before they are counted, so a
+    // forger hammering it does not extend it: it lifts after exactly
+    // PAIRING_LOCKOUT_MS.
+    harness.clock.advance(PAIRING_LOCKOUT_MS - 1);
+    for (const forged of forgedOrigins) {
+      expectRefusal(
+        harness.auth.completePairing({ code: wrong, origin: forged }),
+        'pairing-locked',
+        [wrong],
+      );
+    }
+    expectRefusal(harness.auth.completePairing({ code, origin }), 'pairing-locked', [code]);
+    harness.clock.advance(1);
+    expect(harness.clock.now).toBe(lockedAt + PAIRING_LOCKOUT_MS);
+
+    // The credential is still scoped to the extension that redeemed it.
+    const issued = expectOk(harness.auth.completePairing({ code, origin }));
+    remember(issued.token);
+    expect(asDevtools(expectOk(authorize('panel.data', issued.token, origin))).scope).toEqual({
+      kind: 'extension',
+      extensionId: EXTENSION_ID,
+    });
   });
 
   it('lets exactly one of two racing redemptions of one code win', () => {

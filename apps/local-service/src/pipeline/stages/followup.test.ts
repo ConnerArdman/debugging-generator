@@ -371,6 +371,18 @@ const PANEL_V1: PanelSpec = {
   layout: [],
 };
 
+/**
+ * A panel another writer stored after the follow-up was decided against
+ * {@link PANEL_V1}: version 2 of the session's panels, superseding version 1.
+ */
+const PANEL_V2_ELSEWHERE: PanelSpec = {
+  ...PANEL_V1,
+  id: 'panel-v2-elsewhere',
+  panelVersion: 2,
+  supersedes: PANEL_V1.id,
+  title: 'Ledger totals, stored meanwhile',
+};
+
 /** Plan version 1's modification record on {@link INDEXED_FILE}: the chain head. */
 const RECORD_V1: ModificationRecord = {
   id: 'mod_000000000000000a',
@@ -1065,6 +1077,13 @@ interface Harness {
    * holds only it, and the ladder's newest entry once a regeneration appended.
    */
   readonly getLatestAnalysis: Mock<FollowUpStageDeps['panels']['getLatestAnalysis']>;
+  /**
+   * The latest-panel read: once for the panel the follow-up is decided
+   * against, and again on the existing-evidence path to prove that panel is
+   * still the latest before anything is regenerated. Answers the configured
+   * latest panel unless a test scripts another answer.
+   */
+  readonly getLatestPanel: Mock<FollowUpStageDeps['panels']['getLatestPanel']>;
   /** Every member name read on the panels repository; single-row reads only, never a whole ladder. */
   readonly panelReads: string[];
   /** Every member name read on the modifications repository; only the chain-head lookup may appear. */
@@ -1240,6 +1259,9 @@ function harness(options: HarnessOptions = {}): Harness {
   const getLatestAnalysis = vi.fn<FollowUpStageDeps['panels']['getLatestAnalysis']>(() =>
     ok(ladder.length > 1 ? ladder.at(-1) : latestAnalysis),
   );
+  const getLatestPanel = vi.fn<FollowUpStageDeps['panels']['getLatestPanel']>(() =>
+    ok(latestPanel),
+  );
 
   const deps: FollowUpStageDeps = {
     contextBuilder: builder,
@@ -1263,10 +1285,7 @@ function harness(options: HarnessOptions = {}): Harness {
     instrumentation: accessRecorded({ buildContext, install, restoreArming }, instrumentationReads),
     registry: options.registry ?? fakeRegistry(),
     sessions: { latestPlanVersion, getPlan, nextPlanVersion, get: getSession },
-    panels: accessRecorded(
-      { getAnalysis, getLatestAnalysis, getLatestPanel: () => ok(latestPanel) },
-      panelReads,
-    ),
+    panels: accessRecorded({ getAnalysis, getLatestAnalysis, getLatestPanel }, panelReads),
     modifications: accessRecorded({ latestRecordForFile }, modificationReads),
     sessionManager: accessRecorded(
       { appendFollowUp, recordFollowUpOutcome, recordPlan, patch },
@@ -1303,6 +1322,7 @@ function harness(options: HarnessOptions = {}): Harness {
     patch,
     getAnalysis,
     getLatestAnalysis,
+    getLatestPanel,
     panelReads,
     modificationReads,
     sessionManagerReads,
@@ -2145,7 +2165,8 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     expect(analysisContext?.followUpQuestion).toBe(FOLLOW_UP_QUESTION);
     expect(analysisContext?.captureId).toBe(CAPTURE_ID);
 
-    // The panel half: the new analysis, both questions and the recorded version.
+    // The panel half: the new analysis, both questions, the recorded version and
+    // the panel the follow-up was decided against as the one to supersede.
     expect(h.regenerate).toHaveBeenCalledTimes(1);
     const [panelRequest] = h.regenerate.mock.calls[0] ?? [];
     expect(panelRequest).toMatchObject({
@@ -2156,6 +2177,7 @@ describe('createFollowUpStage — the existing-evidence path', () => {
       analysis: value.analysis,
       summary: CAPTURE_SUMMARY,
       promptVersion: RECORDED_PROMPT_VERSIONS['generate-panel'],
+      expectedPredecessor: PANEL_V1.id,
     });
     expect(value.analysisPromptVersion).toBe(RECORDED_PROMPT_VERSIONS.analyze);
     expect(value.panelPromptVersion).toBe(RECORDED_PROMPT_VERSIONS['generate-panel']);
@@ -2422,6 +2444,10 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     expect(firstOrder(h.analysisRun)).toBeLessThan(firstOrder(h.getAnalysis));
     expect(value.analysis.id).toBe(h.ladder.at(-1)?.id);
 
+    // The latest panel by the same session index: once for the decision, once before regenerating.
+    expect(h.getLatestPanel).toHaveBeenCalledTimes(2);
+    expect(h.getLatestPanel).toHaveBeenLastCalledWith(SESSION_ID);
+
     // Nothing but single-row reads reached the panels repository: no ladder was listed.
     expect(new Set(h.panelReads)).toStrictEqual(
       new Set(['getLatestAnalysis', 'getLatestPanel', 'getAnalysis']),
@@ -2451,6 +2477,153 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     expect(h.progress.trail.at(-1)).toBe(`stageFailed:${GENERATE_PANEL}`);
     expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
   });
+
+  it('re-reads the latest panel once the path is chosen, before the analysis is regenerated', async () => {
+    const onPathChosen = vi.fn<NonNullable<FollowUpStageInput['onPathChosen']>>(() =>
+      Promise.resolve(ok(undefined)),
+    );
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const value = expectPath(
+      expectOk(await h.stage.run(h.context, followUpInput({ onPathChosen }))),
+      'existing-evidence',
+    );
+
+    // The read the follow-up is decided against, then the check after the path was chosen.
+    const [decidedAgainst, recheck, ...more] = h.getLatestPanel.mock.invocationCallOrder;
+    if (decidedAgainst === undefined || recheck === undefined) {
+      throw new Error('Expected the latest panel to be read twice.');
+    }
+    expect(more).toStrictEqual([]);
+    expect(decidedAgainst).toBeLessThan(firstOrder(h.provider.structured));
+    expect(recheck).toBeGreaterThan(firstOrder(onPathChosen));
+    expect(recheck).toBeLessThan(firstOrder(h.analysisRun));
+
+    // The regeneration supersedes exactly the panel the follow-up was decided against.
+    expect(h.regenerate.mock.calls[0]?.[0].expectedPredecessor).toBe(PANEL_V1.id);
+    expect(value.supersededPanelId).toBe(PANEL_V1.id);
+  });
+
+  it.each([
+    ['another panel was stored meanwhile', PANEL_V2_ELSEWHERE],
+    ['the session no longer holds a panel', undefined],
+  ] as const)(
+    'regenerates nothing and records no outcome when, after the decision, %s',
+    async (_label, latestNow) => {
+      const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+      // The first read is the panel the follow-up is decided against; the second is the check.
+      h.getLatestPanel.mockReturnValueOnce(ok(PANEL_V1)).mockReturnValueOnce(ok(latestNow));
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+      expect(error.code).toBe('SESSION_INVALID_STATE');
+      expect(reasonOf(error)).toBe('supersedes-stale');
+      expect(stageOf(error)).toBe(GENERATE_PANEL);
+      expect(error.details?.['latestPanelVersion']).toBe(latestNow?.panelVersion);
+      expect(h.getLatestPanel).toHaveBeenCalledTimes(2);
+
+      // Nothing was regenerated or stored, and the follow-up stays unanswered.
+      expect(h.analysisRun).not.toHaveBeenCalled();
+      expect(h.regenerate).not.toHaveBeenCalled();
+      expect(h.ladder).toStrictEqual([ANALYSIS_V1]);
+      expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+
+      // Filed under the panel step whose predecessor moved, with its own failed row.
+      expect(h.progress.trail).toStrictEqual([
+        `stageStarted:${FOLLOWUP}`,
+        `stageCompleted:${FOLLOWUP}`,
+        `stageStarted:${GENERATE_PANEL}`,
+        `stageFailed:${GENERATE_PANEL}`,
+      ]);
+      expect(recordsWith(h.log.records, 'Follow-up stage failed.').at(-1)?.fields).toMatchObject({
+        stage: GENERATE_PANEL,
+        code: 'SESSION_INVALID_STATE',
+        reason: 'supersedes-stale',
+      });
+    },
+  );
+
+  it('fails with the store’s own error, in the panel group, when the re-read of the latest panel fails', async () => {
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const failure = new DebuggenError('STORE_ERROR', 'A panel row is unreadable.', {
+      details: { reason: 'corrupt-row' },
+    });
+    h.getLatestPanel.mockReturnValueOnce(ok(PANEL_V1)).mockReturnValueOnce(err(failure));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(error.code).toBe('STORE_ERROR');
+    expect(error.message).toBe(failure.message);
+    expect(reasonOf(error)).toBe('corrupt-row');
+    expect(stageOf(error)).toBe(GENERATE_PANEL);
+    expect(h.analysisRun).not.toHaveBeenCalled();
+    expect(h.regenerate).not.toHaveBeenCalled();
+    expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+    expect(h.progress.trail.at(-1)).toBe(`stageFailed:${GENERATE_PANEL}`);
+  });
+
+  it('fails the panel group without recording an outcome when the panel port refuses the predecessor as stale', async () => {
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    // What the panel subsystem answers when the store found another panel stored before its insert.
+    const stale = new DebuggenError(
+      'SESSION_INVALID_STATE',
+      'The panel this generation was asked to supersede is no longer the latest panel of the session; nothing was stored or broadcast.',
+      { details: { stage: GENERATE_PANEL, reason: 'supersedes-stale' } },
+    );
+    h.regenerate.mockResolvedValueOnce(err(stale));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(error.code).toBe('SESSION_INVALID_STATE');
+    expect(error.message).toBe(stale.message);
+    expect(reasonOf(error)).toBe('supersedes-stale');
+    expect(stageOf(error)).toBe(GENERATE_PANEL);
+    expect(h.regenerate).toHaveBeenCalledTimes(1);
+    expect(h.regenerate.mock.calls[0]?.[0].expectedPredecessor).toBe(PANEL_V1.id);
+    expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+    expect(h.progress.trail.slice(-2)).toStrictEqual([
+      `stageStarted:${GENERATE_PANEL}`,
+      `stageFailed:${GENERATE_PANEL}`,
+    ]);
+  });
+
+  it.each([
+    ['names another panel', 'panel-elsewhere'],
+    ['names no predecessor', undefined],
+  ] as const)(
+    'fails, rather than delivers, a regenerated panel that %s',
+    async (_label, supersedes) => {
+      const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+      h.regenerate.mockImplementationOnce((request) =>
+        Promise.resolve(
+          ok({
+            panel: { ...nextPanel(request), supersedes },
+            fallback: false,
+            promptVersion: BUILDER_DEFAULT_VERSION,
+            attempts: 1,
+            repairs: 0,
+            broadcast: true,
+          }),
+        ),
+      );
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+      expect(error.code).toBe('STORE_ERROR');
+      expect(reasonOf(error)).toBe('panel-ladder-inconsistent');
+      expect(stageOf(error)).toBe(GENERATE_PANEL);
+      expect(error.details).toMatchObject({ panelVersion: 2, previousPanelVersion: 1 });
+      expect(serializeError(error)).not.toContain('panel-elsewhere');
+
+      // Never reported as the answer: the panel group fails and no outcome links are stamped.
+      expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+      expect(h.progress.trail.slice(-2)).toStrictEqual([
+        `stageStarted:${GENERATE_PANEL}`,
+        `stageFailed:${GENERATE_PANEL}`,
+      ]);
+      expect(recordsWith(h.log.records, 'Follow-up stage completed.')).toStrictEqual([]);
+      expect(recordsWith(h.log.records, 'Follow-up stage failed.').at(-1)?.fields).toMatchObject({
+        stage: GENERATE_PANEL,
+        code: 'STORE_ERROR',
+        reason: 'panel-ladder-inconsistent',
+      });
+    },
+  );
 
   it('needs the session’s understanding to re-analyse', async () => {
     const h = harness({

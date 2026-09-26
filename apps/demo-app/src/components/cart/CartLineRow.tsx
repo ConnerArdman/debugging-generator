@@ -38,11 +38,10 @@
  * "The same line cannot be committed twice while the server is still deciding" is `mutating`, a
  * `useRef` boolean that both handlers check and set before they do anything else and clear in
  * their `finally`. It has to be a ref: `pending` is state, and state a handler reads is the value
- * from the render that created it, so two presses dispatched inside one JavaScript task both read
- * `false` and both proceed - which is exactly what was measured here, two concurrent writes to one
- * line 12 ms apart, the second of which the server answers 404 because the first one had already
- * removed it. A ref is written the instant the first press is handled, so the second sees the
- * latch whatever React has or has not committed by then.
+ * from the render that created it, so two presses dispatched inside one JavaScript task would both
+ * read `false` and both proceed - two concurrent writes to one line, the second of which the server
+ * answers 404 because the first has already removed it. A ref is written the instant the first
+ * press is handled, so the second sees the latch whatever React has or has not committed by then.
  *
  * `pending` and the `disabled` it drives are presentation on top of that: they dim the row, hold
  * the controls and say why, and they are the only thing a shopper can see. They are kept because a
@@ -250,11 +249,8 @@ function focusTargetForRemoval(row: HTMLLIElement | null): HTMLElement | null {
 }
 
 /**
- * Props of `CartLineRow`, intentionally local and unexported, like every other props type in this
- * workspace: `packages/panel-renderer` publishes its own component catalog and this repository's
- * hardcoding guard harvests this workspace's multi-token identifiers into a policy no product file
- * may then contain, so this file puts exactly one new name - `CartLineRow` - into circulation. A
- * caller that needs this shape reads it back with `ComponentProps<typeof CartLineRow>`.
+ * Props of `CartLineRow`, local to this file. A caller that needs this shape reads it back with
+ * `ComponentProps<typeof CartLineRow>`.
  */
 interface Props {
   /**
@@ -354,9 +350,10 @@ export function CartLineRow({ line, className }: Props): ReactElement {
    * republished by the provider between those two moments and may have taken the neighbour as well.
    *
    * The latch is taken before anything else here too, and it is the same one the quantity commit
-   * takes: a double-click on this button used to send a second removal for a line the first had
-   * already taken out, which the server correctly answers 404 and which then surfaced as a failure
-   * notice for a removal the shopper had watched succeed.
+   * takes. It is set synchronously on the first press, so a second press before the removal
+   * settles is ignored rather than sending a second removal for a line the first has already taken
+   * out - which the server would answer 404, reported as a failure of a removal the shopper watched
+   * succeed.
    */
   async function handleLineRemove(): Promise<void> {
     if (mutating.current) {
@@ -451,12 +448,11 @@ export function CartLineRow({ line, className }: Props): ReactElement {
           // Unavailable while the removal is in flight, stated as ARIA rather than as the native
           // attribute, because this control is the one the shopper is standing on when it becomes
           // unavailable. A `disabled` element cannot hold focus, so writing the native attribute
-          // here moves focus to `<body>` the moment the request starts - outside the drawer's
-          // `aria-modal` dialog, which is the one place focus must never go. The success path hid
-          // that, because it moves focus to a neighbour anyway; the failure path did not, and left
-          // focus on `<body>` for good, since focus is deliberately not moved when a removal is
-          // refused. `aria-disabled` says exactly the same thing to assistive technology and picks
-          // up the same dimming and `not-allowed` cursor from the primitive's stylesheet, which
+          // here would move focus to `<body>` the moment the request starts - outside the drawer's
+          // `aria-modal` dialog, which is the one place focus must never go - and a refused removal
+          // would leave it there, since focus is deliberately not moved when a removal is refused.
+          // `aria-disabled` says exactly the same thing to assistive technology and picks up the
+          // same dimming and `not-allowed` cursor from the primitive's stylesheet, which
           // declares `[aria-disabled='true']` beside `:disabled`, and it additionally takes
           // `pointer-events` away, so a second mouse press cannot land. `Button` spreads `aria-*`
           // through to the element as its documented escape hatch for finer ARIA than its boolean.

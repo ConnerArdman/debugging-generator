@@ -106,10 +106,12 @@ import type { ModelRequest } from './types.js';
  * the authoritative deny list, so a rule invented here would refuse payloads
  * the product is entitled to send, and a class dropped from here would let one
  * through. Two of the eight classify a value by its *position* rather than by
- * its content (`sensitive-header` by the key it sits under,
- * `url-query-value` by being a query parameter's value) and one by the
- * *combination* of a name and a measurement (`high-entropy-secret`); the rest
- * are content shapes that identify themselves wherever they appear.
+ * its content (`sensitive-header` by the key it sits under or by following a
+ * denied header name and a colon inside text, `url-query-value` by being a
+ * query parameter's value, whether the URL is a whole field or a run embedded
+ * in prose) and one by the *combination* of a name and a measurement
+ * (`high-entropy-secret`); the rest are content shapes that identify
+ * themselves wherever they appear.
  *
  * Five ids — `provider-key`, `jwt`, `private-key`, `connection-string` and
  * `bearer-token` — are spelled exactly as `packages/telemetry`'s redaction
@@ -154,7 +156,7 @@ export type RedactionRuleId = (typeof REDACTION_RULE_IDS)[number];
  */
 export const REDACTION_RULE_REASONS: Readonly<Record<RedactionRuleId, string>> = Object.freeze({
   'sensitive-header':
-    'A denied header name carries a value other than the redaction marker; the ingest checkpoint replaces such a value while keeping the header present.',
+    'A denied header carries a value other than the redaction marker, either as a field under the header name or as a header line inside text; the ingest checkpoint replaces such a value while keeping the header present.',
   'provider-key':
     'A value matches the prefix shape of a provider API key, which identifies key material on its own.',
   'bearer-token': 'A value carries an HTTP bearer credential after its authentication scheme word.',
@@ -218,10 +220,41 @@ export const REDACTION_MARKER = '[redacted]';
  * AAP §0.5.2: query parameter values are "replaced with `?` per key" while the
  * path is retained, which keeps a URL diagnosable without keeping its data.
  * `packages/telemetry/src/redaction/url.ts` declares the same single character
- * as `REDACTION_MASK`; a query value that is neither empty nor this mask is a
- * `url-query-value` finding.
+ * as `REDACTION_MASK`; a query value that is not one of the masked forms of
+ * {@link MASKED_QUERY_VALUES} is a `url-query-value` finding.
  */
 export const URL_QUERY_MASK = '?';
+
+/**
+ * The marker every bounded preview in the product appends where it cut text.
+ *
+ * The telemetry layer's prop, state and attribute previews and the local
+ * service's context-builder caps all end a cut with this one character, so a
+ * masked query can reach a payload cut short after its mask (`?id=?\u2026`) or
+ * right after the `=` (`?id=\u2026`). Neither form carries a byte of the
+ * original value, which is why {@link MASKED_QUERY_VALUES} accepts both.
+ */
+export const TEXT_TRUNCATION_MARKER = '\u2026';
+
+/**
+ * The query parameter values that count as masked.
+ *
+ * Exactly four, and each is something the first checkpoint writes: the empty
+ * value it preserves verbatim (`a=` carries no data), {@link URL_QUERY_MASK},
+ * and each of those two cut short by {@link TEXT_TRUNCATION_MARKER}. Anything
+ * else — `ZIP42`, `!!!!`, `....`, a mask followed by punctuation such as `?.` —
+ * still carries bytes the page wrote, and is a finding. A bare flag (`?flag`)
+ * parses to the empty value and is therefore masked by construction.
+ *
+ * Frozen, because the guard reads it on every URL it inspects: a caller that
+ * could append to it could switch the rule off for the value it appended.
+ */
+export const MASKED_QUERY_VALUES: readonly string[] = Object.freeze([
+  '',
+  URL_QUERY_MASK,
+  TEXT_TRUNCATION_MARKER,
+  `${URL_QUERY_MASK}${TEXT_TRUNCATION_MARKER}`,
+]);
 
 // ---------------------------------------------------------------------------
 // Thresholds and defaults
@@ -355,8 +388,45 @@ export const SCAN_WINDOW_OVERLAP = 1_024;
  * not a document: four kibibytes is far past any real one, and refusing to parse
  * beyond it keeps a megabyte of prose from being handed to the parser on the
  * off-chance it is a link.
+ *
+ * The two halves of `url-query-value` apply it differently. A whole-field URL
+ * longer than this is not parsed at all by that half — which is why the
+ * embedded scan also reads every string: an `http(s)` or origin-relative
+ * field is one run to it. An embedded run that can carry a value (it has a `?`
+ * and an `=`) is parsed over its first `URL_PARSE_MAX_LENGTH` code units, so a
+ * value there is still reported, and a longer run records `max-url-length`:
+ * the remainder was not inspected, so the payload is refused rather than
+ * treated as clean. A real request target, masked by the first checkpoint, is a
+ * small fraction of the bound.
  */
 export const URL_PARSE_MAX_LENGTH = 4_096;
+
+/**
+ * Most URL runs embedded in one string that are handed to the parser.
+ *
+ * Only a run that can carry a value counts — one with a `?` and an `=` after
+ * it; a run without them is clean by construction and costs no parse. A
+ * rendered prompt listing every request of a capture carries tens or hundreds
+ * of such runs, so eight thousand is far past a real one, while a hostile
+ * string of a million short runs costs at most this many parses. Reaching the
+ * bound records `max-url-runs` and stops examining that string's runs, which
+ * makes the walk incomplete and the payload refused: runs past the bound were
+ * never looked at, and an uninspected payload is not a clean one.
+ */
+export const MAX_URL_RUNS_PER_STRING = 8_192;
+
+/**
+ * Most code units read back from an embedded absolute URL, on its own line, to
+ * decide whether it sits in a stack frame.
+ *
+ * A frame's prefix is indentation, `at`, and a function name — tens of
+ * characters, occasionally a few hundred for a long qualified name. A kibibyte
+ * bounds the look-back on a single-line megabyte string without shortening any
+ * real frame. Text further back is not read, and a run whose frame marker lies
+ * beyond the bound is judged as prose, which is the strict direction: a
+ * runtime-appended position is then reported rather than accepted.
+ */
+export const FRAME_CONTEXT_MAX_LENGTH = 1_024;
 
 /**
  * Longest path segment a finding's path will carry before it is shortened.
@@ -436,14 +506,20 @@ export interface RedactGuardFinding {
  * A bound that stopped part of an inspection.
  *
  * `max-findings` is a reporting cap and appears only alongside findings;
- * the other four mean some of the payload was never examined, which is why
+ * every other one means some of the payload was never examined, which is why
  * {@link RedactGuardReport.complete} is false whenever any of them is present
- * and why {@link assertOutboundSafe} refuses on that alone.
+ * and why {@link assertOutboundSafe} refuses on that alone. `max-url-runs` and
+ * `max-url-length` are the two bounds of the embedded-URL scan: more runs in
+ * one string than {@link MAX_URL_RUNS_PER_STRING}, and a run that can carry a
+ * value but is longer than {@link URL_PARSE_MAX_LENGTH}, so its remainder was
+ * never parsed.
  */
 export const REDACT_GUARD_LIMIT_IDS = [
   'max-depth',
   'max-nodes',
   'max-string-length',
+  'max-url-runs',
+  'max-url-length',
   'max-findings',
   'inspection-error',
 ] as const;
@@ -584,11 +660,15 @@ export interface RedactGuardOptions {
  *   pattern uses a backreference, so hostile input costs linear time. That
  *   matters here more than in most places: the strings being scanned come from
  *   a page the developer is debugging.
- * - **Every instance is non-global.** A global regular expression carries a
- *   mutable `lastIndex` between calls, so a shared instance would answer
- *   `true`, then `false`, then `true` for the same input. Detection is all this
- *   module does, `test` is all it calls, and no instance below has the `g`
- *   flag.
+ * - **No shared instance carries state between calls.** A global regular
+ *   expression keeps a mutable `lastIndex`, so a shared one read with `test`
+ *   or `exec` would answer `true`, then `false`, then `true` for the same
+ *   input. Every detection pattern is therefore non-global and read with
+ *   `test`. The two exceptions are the embedded-URL run patterns, which must
+ *   enumerate every run in a string: they carry the `g` flag and are read
+ *   **only** through `String.prototype.matchAll`, which iterates a private
+ *   clone and never moves the shared instance's `lastIndex`. Calling `test` or
+ *   `exec` on either of them would reintroduce the defect.
  * ------------------------------------------------------------------------ */
 
 /**
@@ -689,6 +769,16 @@ const PROVIDER_KEY_SOURCE =
  *
  * Applied case-insensitively, because the scheme word is written every way a
  * header, a code excerpt and a log line can write it.
+ *
+ * The eight-character minimum stays, deliberately, even though a real
+ * credential can be shorter. Unanchored, the scheme word is ordinary English
+ * and ordinary code: "a bearer token", "the Bearer scheme", `// bearer auth
+ * only`, `bearer mode` — a shorter minimum would refuse calls over a sentence
+ * about authentication, and a refusal fails a whole pipeline stage. A short
+ * credential is still caught where it is actually sent, in a header line
+ * (`Authorization: Bearer ‹short›`), by {@link HEADER_LINE_PATTERN}, which
+ * anchors on the header name and so needs no length to tell a credential from
+ * a word.
  */
 const BEARER_TOKEN_SOURCE = '\\b' + 'bearer' + '\\s+' + BEARER_CHARS + '{8,' + RUN_LIMIT + '}';
 
@@ -759,8 +849,10 @@ const CONNECTION_STRING_SOURCE =
  * a request, because a credential can arrive inside a bounded source excerpt
  * just as easily as inside an attribute. The two position-driven rules
  * (`sensitive-header`, `url-query-value`) and the name-driven one
- * (`high-entropy-secret`) are not here: they need more than a string to reach a
- * verdict.
+ * (`high-entropy-secret`) are not here: they decide from where a value sits —
+ * under which key, after which header name, in which query — rather than from
+ * the value alone. Their text forms are {@link HEADER_LINE_PATTERN} and the
+ * embedded-URL scan, both applied to the same strings.
  */
 const CONTENT_PATTERNS: readonly (readonly [RedactionRuleId, RegExp])[] = Object.freeze([
   Object.freeze(['provider-key', new RegExp(PROVIDER_KEY_SOURCE)] as const),
@@ -769,6 +861,191 @@ const CONTENT_PATTERNS: readonly (readonly [RedactionRuleId, RegExp])[] = Object
   Object.freeze(['private-key', new RegExp(PRIVATE_KEY_SOURCE)] as const),
   Object.freeze(['connection-string', new RegExp(CONNECTION_STRING_SOURCE)] as const),
 ]);
+
+/** The value grammar a header line of each denied header name is read with. */
+type HeaderLineShape = 'authorization' | 'cookie' | 'set-cookie' | 'token';
+
+/**
+ * Which value grammar each of the six {@link DENIED_HEADER_NAMES} is read with
+ * when it starts a header line inside text.
+ *
+ * Keyed by the full vocabulary, so a seventh name added to the list fails to
+ * compile here until someone decides what its value looks like — a header line
+ * this rule silently skipped would be a hole in the second checkpoint.
+ */
+const HEADER_LINE_SHAPES: Readonly<Record<DeniedHeaderName, HeaderLineShape>> = Object.freeze({
+  authorization: 'authorization',
+  cookie: 'cookie',
+  'set-cookie': 'set-cookie',
+  'x-api-key': 'token',
+  'x-auth-token': 'token',
+  'proxy-authorization': 'authorization',
+});
+
+/**
+ * The authentication scheme words an `Authorization` header line is recognised
+ * after: the registered schemes a developer's own traffic carries.
+ */
+const AUTHORIZATION_SCHEMES = ['bearer', 'basic', 'digest', 'negotiate', 'ntlm'] as const;
+
+/**
+ * A credential in a header line: an alphanumeric first character, then the
+ * token characters of {@link BEARER_CHARS} — the `b64token` alphabet of
+ * RFC 6750, which issued API keys are drawn from as well.
+ *
+ * The first character is what keeps code and placeholders out: a template
+ * (`${token}`), a string concatenation (`'Bearer ' + token`), a placeholder
+ * (`<token>`) and the compliant {@link REDACTION_MARKER} all start with
+ * something else. Any length of one or more counts — the anchor on the header
+ * name is what identifies a credential here, not its length.
+ */
+const HEADER_CREDENTIAL_SOURCE = '[A-Za-z0-9]' + BEARER_CHARS + '{0,' + RUN_LIMIT + '}';
+
+/**
+ * What must follow a header-line credential: the end of the text, whitespace,
+ * a quote, a backslash (a JSON- or string-escaped line break) or the `;`, `,`
+ * or `)` that closes a list or a call.
+ *
+ * Required rather than optional, because it is what tells a credential from
+ * code: `Authorization: await getToken()` and `Authorization: Basic btoa(x)`
+ * stop at a character a credential cannot end on, and backtracking cannot help
+ * them, since every shorter prefix is followed by another credential character.
+ */
+const HEADER_CREDENTIAL_END_SOURCE = '(?=$|[\\s"\'\\\\;,)])';
+
+/** A cookie name, as servers issue them. */
+const COOKIE_NAME_SOURCE = '[A-Za-z0-9_.-]{1,256}';
+
+/**
+ * A cookie pair that carries a value: a cookie name, `=`, an optional opening
+ * double quote (RFC 6265 allows a quoted value), and the first character of a
+ * non-empty value.
+ *
+ * The first value character is restricted to what a cookie value issued by a
+ * server starts with — alphanumerics, `%`-encoding, and the `.`, `_`, `~`, `+`,
+ * `/` and `-` of base64 and signed values — so that code which merely writes a
+ * cookie line (`session=${id}`, `sid="${id}"`, `sid=<id>`, `x=>x`, `a==b`) and
+ * the compliant {@link REDACTION_MARKER} are not read as one. Only one
+ * character is needed: the rule reports that a value is present, never what it
+ * is.
+ */
+const COOKIE_VALUED_PAIR_SOURCE = COOKIE_NAME_SOURCE + '="?[A-Za-z0-9%._~+/-]';
+
+/**
+ * The value of a `Cookie` header line: any number of pairs, up to 32, each
+ * ended by `;` and blanks, before a pair that carries a value. Every pair of a
+ * `Cookie` header is a cookie, so `session=; theme=abc` still carries one. An
+ * earlier pair's value stops at a backslash as well as at `;`, so an escaped
+ * line break in a JSON-rendered prompt ends the line here as it does in the
+ * raw text.
+ */
+const COOKIE_VALUE_SOURCE =
+  '(?:' + COOKIE_NAME_SOURCE + '=[^;\\r\\n\\\\]{0,256};[ \\t]*){0,32}' + COOKIE_VALUED_PAIR_SOURCE;
+
+/**
+ * The value of a `Set-Cookie` header line: its first pair only. What follows
+ * the first `;` of a `Set-Cookie` header is attributes — `Path=/`,
+ * `SameSite=Lax`, `Max-Age=3600` — which carry no secret, and a comment such as
+ * `// Set-Cookie: sid=<id>; Path=/; HttpOnly` must not be read as one.
+ */
+const SET_COOKIE_VALUE_SOURCE = COOKIE_VALUED_PAIR_SOURCE;
+
+/** The value grammar of each {@link HeaderLineShape}, as a pattern source. */
+const HEADER_LINE_VALUE_SOURCES: Readonly<Record<HeaderLineShape, string>> = Object.freeze({
+  authorization:
+    '(?:' +
+    AUTHORIZATION_SCHEMES.join('|') +
+    ')[ \\t]+' +
+    HEADER_CREDENTIAL_SOURCE +
+    HEADER_CREDENTIAL_END_SOURCE,
+  cookie: COOKIE_VALUE_SOURCE,
+  'set-cookie': SET_COOKIE_VALUE_SOURCE,
+  token: HEADER_CREDENTIAL_SOURCE + HEADER_CREDENTIAL_END_SOURCE,
+});
+
+/**
+ * A written whitespace escape — `\n`, `\r`, `\t`, `\f` or `\u000b` — as
+ * `JSON.stringify` writes a line break, a carriage return, a tab, a form feed
+ * or a vertical tab, and as a string literal in source writes them too.
+ *
+ * A stage renders its structured context into the prompt as JSON, so what
+ * starts a line in a raw string starts one after such an escape in the prompt.
+ * {@link HEADER_LINE_PATTERN} and {@link EMBEDDED_RELATIVE_URL_PATTERN} accept
+ * it wherever they accept whitespace, and the telemetry maskers accept the same
+ * escapes, so the guard stays a subset of what they mask.
+ */
+const JSON_WHITESPACE_ESCAPE_SOURCE = '\\\\(?:[nrtf]|u000[bB])';
+
+/**
+ * The header names of one {@link HeaderLineShape}, longest first, as an
+ * alternation — so `proxy-authorization` is tried before the `authorization`
+ * it ends with, and `set-cookie` before `cookie`.
+ */
+function headerNameAlternation(shape: HeaderLineShape): string {
+  return (DENIED_HEADER_NAMES as readonly DeniedHeaderName[])
+    .filter((name) => HEADER_LINE_SHAPES[name] === shape)
+    .sort((left, right) => right.length - left.length)
+    .join('|');
+}
+
+/**
+ * `sensitive-header` inside text: a header line that still carries its value.
+ *
+ * A denied header name, case-insensitively, at the start of the text or after
+ * a character that cannot be part of a header name; optional blanks, a colon
+ * and optional blanks; then the value grammar of its shape:
+ *
+ * - `authorization`, `proxy-authorization` — a scheme word of
+ *   {@link AUTHORIZATION_SCHEMES}, blanks, and a credential of any length
+ *   followed by {@link HEADER_CREDENTIAL_END_SOURCE};
+ * - `cookie` — any pair with a non-empty value ({@link COOKIE_VALUE_SOURCE});
+ * - `set-cookie` — a first pair with a non-empty value
+ *   ({@link SET_COOKIE_VALUE_SOURCE});
+ * - `x-api-key`, `x-auth-token` — a credential followed by the same end.
+ *
+ * This is what catches a short credential the length-bound
+ * {@link BEARER_TOKEN_SOURCE} cannot — `Authorization: Bearer ‹six
+ * characters›` — and a cookie line, which carries no scheme word at all, in a
+ * question, a log message or a JSON-rendered attribute
+ * (`{"note":"Authorization: Bearer …"}`).
+ *
+ * Narrow on purpose, and a subset of the first checkpoint, which replaces the
+ * whole value of any such line: the name must be followed directly by the
+ * colon, so a quoted object key (`'x-api-key': apiKey`) never matches, and the
+ * value must look like a credential rather than an expression, so none of
+ * ``Authorization: `Bearer ${token}` ``, `authorization: string;`,
+ * `authorization: z.string()`, `cookie: req.headers.cookie`,
+ * `Authorization: 'Bearer ' + token`, `Authorization: await getToken()` or
+ * `Authorization: Bearer <token>` is a finding. The compliant output —
+ * `Authorization: [redacted]`, `Cookie: [redacted]`, `Bearer [redacted]` — can
+ * never match, because {@link REDACTION_MARKER} starts with `[`.
+ *
+ * The name is also read after a written whitespace escape
+ * ({@link JSON_WHITESPACE_ESCAPE_SOURCE}): a stage renders structured context
+ * into the prompt with `JSON.stringify`, so a header line on the second line of
+ * an attribute arrives as `…\nAuthorization: Bearer …`. The telemetry rule
+ * masks a line after the same escapes, so its output is never refused here.
+ *
+ * Non-global and read with `test`, like the content patterns. Linear: every
+ * run is bounded by {@link RUN_LIMIT}, the name is a fixed alternation, and a
+ * failed credential end backtracks only within its own run.
+ */
+const HEADER_LINE_PATTERN = new RegExp(
+  '(?:(?<![A-Za-z0-9_-])|(?<=' +
+    JSON_WHITESPACE_ESCAPE_SOURCE +
+    '))(?:' +
+    (['authorization', 'cookie', 'set-cookie', 'token'] as const)
+      .map(
+        (shape) =>
+          '(?:' +
+          headerNameAlternation(shape) +
+          ')[ \\t]*:[ \\t]*' +
+          HEADER_LINE_VALUE_SOURCES[shape],
+      )
+      .join('|') +
+    ')',
+  'i',
+);
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -881,14 +1158,16 @@ function isRedactedHeaderValue(value: string): boolean {
 /**
  * Any whitespace, which is what separates prose from a credential.
  *
- * Read by the entropy rule only, and it is the same exclusion
- * `scripts/check-secrets.mjs` applies for the same reason: English prose
- * measures around four bits per character, right at the threshold, so measuring
- * a sentence under a credential-like name (`passwordHint`, `tokenNotes`) would
- * refuse legitimate calls while adding no credential class the rule could
- * otherwise see — a credential is issued as one unbroken token and never
- * carries a space. A credential *inside* a sentence is still found, by the
- * content rules, which read every string whatever it contains.
+ * Read by the entropy rule, and by the whole-field half of `url-query-value`
+ * to tell one URL from text that contains URLs. For the entropy rule it is the
+ * same exclusion `scripts/check-secrets.mjs` applies for the same reason:
+ * English prose measures around four bits per character, right at the
+ * threshold, so measuring a sentence under a credential-like name
+ * (`passwordHint`, `tokenNotes`) would refuse legitimate calls while adding no
+ * credential class the rule could otherwise see — a credential is issued as
+ * one unbroken token and never carries a space. A credential *inside* a
+ * sentence is still found, by the content rules, which read every string
+ * whatever it contains.
  */
 const WHITESPACE = /\s/;
 
@@ -962,8 +1241,125 @@ function appendQueryParameter(path: string, parameter: string): string {
 const RELATIVE_URL_PROBE_BASE = 'http://probe.invalid/';
 
 /**
- * The name of the first query parameter of `value` whose value is neither empty
- * nor {@link URL_QUERY_MASK}, or `undefined` when there is none.
+ * Parses `text` with the WHATWG URL parser, or returns `undefined` when the
+ * parser rejects it.
+ *
+ * The one place a URL parse is attempted, so "a value the parser rejects is not
+ * a URL" is one decision rather than one per call site, and the throw the
+ * parser uses to reject never escapes a module that must not throw.
+ *
+ * @param text - The candidate, already bounded by {@link URL_PARSE_MAX_LENGTH}.
+ * @param base - The base an origin-relative candidate is resolved against;
+ * omitted for an absolute one.
+ */
+function tryParseUrl(text: string, base?: string): URL | undefined {
+  try {
+    return base === undefined ? new URL(text) : new URL(text, base);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The value a parameter keeps inside a stack frame once the first checkpoint
+ * has masked it: empty or {@link URL_QUERY_MASK}, then the `:line` or
+ * `:line:column` position the runtime appended, then the closing bracket or
+ * punctuation of the frame, then possibly {@link TEXT_TRUNCATION_MARKER}.
+ *
+ * `packages/telemetry/src/redaction/url.ts` detaches a frame's position before
+ * it masks the URL and re-attaches it afterwards, because the source-map route
+ * needs the position to map a generated chunk back to TypeScript — so
+ * `at fn (http://127.0.0.1:3000/app.js?v=?:10:5)` is compliant output even
+ * though the parser reads the last value as `?:10:5)`. The digit groups allow
+ * zero digits so a position cut short by a preview bound still reads as one,
+ * and each is bounded at nine digits exactly as the telemetry layer bounds its
+ * own. Applied only where {@link isInStackFrame} holds: the same value outside
+ * a frame is a finding, since nothing but a frame licenses reading
+ * `:10:5` as a position rather than as data.
+ */
+const FRAME_MASKED_VALUE_PATTERN = /^\??(?::\d{0,9}){1,2}[)\]}>,;'".]*\u2026?$/;
+
+/**
+ * What must precede an embedded absolute URL, on its own line, for the text to
+ * be a stack frame rather than prose: the V8 `at` token (as a word) anywhere
+ * before it, or a SpiderMonkey `fn@` immediately before it.
+ *
+ * The `FRAME_CONTEXT_PATTERN` of `packages/telemetry/src/redaction/url.ts`
+ * (no import edge joins the two packages), with the two ways a JSON-rendered
+ * prompt section writes the start of a line added before `at`: the `"` that
+ * opens a string value (an initiator stack begins `at send (…)`), and a written
+ * whitespace escape ({@link JSON_WHITESPACE_ESCAPE_SOURCE}). A narrower pattern
+ * here would refuse the redactor's own output once it is rendered as JSON; the
+ * wider one only ever accepts a masked value followed by a position, which is
+ * digits and closing punctuation, never a value.
+ */
+const FRAME_CONTEXT_PATTERN = /(?:^|[\s("]|\\(?:[nrtf]|u000[bB]))at\s|@$/;
+
+/**
+ * Prefixed to a frame look-back that {@link FRAME_CONTEXT_MAX_LENGTH} cut short
+ * of its line start, so the `^` alternative of {@link FRAME_CONTEXT_PATTERN}
+ * cannot match at the cut: a cut landing just before the `at` of `format` must
+ * not read as a frame's `at`. It is neither whitespace nor `(`, and it never
+ * appears in a finding.
+ */
+const FRAME_CONTEXT_CUT_SENTINEL = '\u0000';
+
+/**
+ * Whether the absolute URL run starting at `offset` of `text` sits in a stack
+ * frame, judged by {@link FRAME_CONTEXT_PATTERN} on the text between the start
+ * of its line and the run, read back at most {@link FRAME_CONTEXT_MAX_LENGTH}
+ * code units.
+ *
+ * Only `\n` ends a line, which is what the telemetry layer uses for the same
+ * decision.
+ */
+function isInStackFrame(text: string, offset: number): boolean {
+  const from = Math.max(0, offset - FRAME_CONTEXT_MAX_LENGTH);
+  const before = text.slice(from, offset);
+  const newline = before.lastIndexOf('\n');
+  if (newline >= 0) {
+    return FRAME_CONTEXT_PATTERN.test(before.slice(newline + 1));
+  }
+  return FRAME_CONTEXT_PATTERN.test(from === 0 ? before : FRAME_CONTEXT_CUT_SENTINEL + before);
+}
+
+/**
+ * The name of the first parameter of `url` whose value is not masked, or
+ * `undefined` when every value is.
+ *
+ * A value is masked when it is one of {@link MASKED_QUERY_VALUES}, or — for a
+ * URL inside a stack frame — when it has the shape
+ * {@link FRAME_MASKED_VALUE_PATTERN} describes. Only the name is returned: it
+ * is structure a developer needs to find the field, and the value is the thing
+ * the rule objects to.
+ *
+ * @param url - A parsed URL.
+ * @param inFrame - Whether the URL was read from a stack frame.
+ */
+function firstUnmaskedParameter(url: URL, inFrame: boolean): string | undefined {
+  for (const [name, parameter] of url.searchParams) {
+    if (MASKED_QUERY_VALUES.includes(parameter)) {
+      continue;
+    }
+    if (inFrame && FRAME_MASKED_VALUE_PATTERN.test(parameter)) {
+      continue;
+    }
+    return name;
+  }
+  return undefined;
+}
+
+/**
+ * The name of the first query parameter of `value` whose value is not one of
+ * {@link MASKED_QUERY_VALUES}, when `value` as a whole is one URL; `undefined`
+ * when it is not a URL or carries no unmasked value.
+ *
+ * This is the **whole-field** half of `url-query-value`, for a string that is a
+ * URL and nothing else — a request target, a navigation URL, a resource name.
+ * URLs embedded in text are the other half, {@link scanEmbeddedUrls}, which
+ * every string the walk scans also goes through; the two overlap on an
+ * absolute `http(s)` or origin-relative URL that fills a field, and
+ * {@link record} reports such a field once.
  *
  * Structure is decided by the URL parser, never by a regular expression: a
  * pattern that tries to recognise a URL is wrong in ways that only show up on
@@ -971,21 +1367,18 @@ const RELATIVE_URL_PROBE_BASE = 'http://probe.invalid/';
  * the service use, and a value it rejects is not a URL. Both forms that reach a
  * payload are covered:
  *
- * - an **absolute** URL, parsed directly;
+ * - an **absolute** URL of any scheme, parsed directly — which is what this
+ *   half adds over the embedded scan, whose runs are `http(s)` only;
  * - an **origin-relative** URL (`/path?key=value`), parsed against
  *   {@link RELATIVE_URL_PROBE_BASE}. This form is not optional: the telemetry
  *   layer's own cross-checkpoint suite states the condition this rule enforces
  *   using origin-relative fixtures, because that is how a captured request
  *   target is usually spelled.
  *
- * Three bounds keep the rule from reporting things that are not URLs at all,
- * and they are the compromise this rule encodes:
+ * Three bounds keep this half to strings that are one URL:
  *
- * - The whole string must be one token: a value **containing whitespace is not
- *   examined**, so a URL embedded in prose is not checked here. That is a
- *   deliberate gap rather than an oversight — the prose in a request is rendered
- *   *from* the structured context, and the URL-valued fields of that context are
- *   each checked on their own, which is where a finding is actionable anyway.
+ * - A string containing whitespace is not one URL, so it is left to
+ *   {@link scanEmbeddedUrls}, which finds the runs inside it.
  * - A string with no `?` in it cannot carry a query and is skipped before the
  *   parser is reached.
  * - A string longer than {@link URL_PARSE_MAX_LENGTH} is not parsed.
@@ -1003,29 +1396,85 @@ function findUnmaskedQueryParameter(value: string): string | undefined {
   ) {
     return undefined;
   }
-  let parsed: URL | undefined;
-  try {
-    parsed = new URL(candidate);
-  } catch {
-    parsed = undefined;
-  }
+  let parsed = tryParseUrl(candidate);
   if (parsed === undefined && candidate.startsWith('/') && !candidate.startsWith('//')) {
-    try {
-      parsed = new URL(candidate, RELATIVE_URL_PROBE_BASE);
-    } catch {
-      parsed = undefined;
-    }
+    parsed = tryParseUrl(candidate, RELATIVE_URL_PROBE_BASE);
   }
-  if (parsed === undefined) {
-    return undefined;
-  }
-  for (const [name, parameter] of parsed.searchParams) {
-    if (parameter.length > 0 && parameter !== URL_QUERY_MASK) {
-      return name;
-    }
-  }
-  return undefined;
+  return parsed === undefined ? undefined : firstUnmaskedParameter(parsed, false);
 }
+
+/**
+ * An absolute `http`/`https` URL embedded in text.
+ *
+ * The run stops at whitespace, a quote, an angle bracket or a backtick, none
+ * of which a URL a runtime or a developer prints contains unescaped — the run
+ * grammar of the telemetry layer's `STACK_URL_PATTERN`, so on raw text both
+ * checkpoints see the same run. It deliberately does *not* stop at a closing
+ * parenthesis, a comma or a full stop: those are legal URL characters, and
+ * whether one ends the sentence or belongs to the last value is exactly the
+ * ambiguity the first checkpoint resolves by masking it. A value that still
+ * ends in one here was therefore not masked, and is reported.
+ *
+ * It also stops at a written escape of a character the raw run stops at: a
+ * whitespace escape ({@link JSON_WHITESPACE_ESCAPE_SOURCE}) or `\"`. A stage
+ * renders its structured context into the prompt with `JSON.stringify`, so a
+ * masked URL at the end of a line of an excerpt reaches this scan as
+ * `?page=?\nconst …`: the escape is the rendered line break or quote the raw
+ * run stopped at, not part of the value, and reading through it would refuse
+ * compliant output. Every other backslash stays in the run — an escaped
+ * backslash, `\b`, or a `\u` escape of anything but a vertical tab — so
+ * `?code=?\u005a`, whose value is not a mask, is reported. The telemetry
+ * layer's masker reads through every backslash, so it never writes a mask
+ * followed by a backslash, and a value it wrote is never split into an
+ * unmasked one.
+ *
+ * The scheme is matched in any letter case, so `HTTPS://` is read too; the
+ * case is spelled out rather than set with the `i` flag, which would also make
+ * `\N` or `\T` read as an escape. Global and read only through `matchAll`; see
+ * the pattern-table comment for why that matters.
+ */
+const EMBEDDED_ABSOLUTE_URL_PATTERN =
+  /[hH][tT][tT][pP][sS]?:\/\/(?:[^\s"'<>`\\]|\\(?!["nrtf]|u000[bB]))+/g;
+
+/**
+ * An origin-relative URL with a query, embedded in text.
+ *
+ * A `/` that starts the string or follows whitespace, a written whitespace
+ * escape or `(`, and is not itself
+ * followed by `/` (a protocol-relative reference, whose host the probe base
+ * would misread); then the path characters of RFC 3986 less the parenthesis
+ * and the quote; then `?`; then the query run, stopping where
+ * {@link EMBEDDED_ABSOLUTE_URL_PATTERN} stops.
+ *
+ * The left context is what keeps source code out of the rule. A path written
+ * in code is almost always the content of a string or template literal —
+ * `'/api/x?limit=20'`, `` fetch(`/api/x?a=${id}`) `` — where the `/` follows a
+ * quote or a backtick, and a regular-expression literal such as
+ * `/^(?=\S+$)…$/` cannot match because `^` is not a path character. Prose and
+ * rendered evidence, by contrast, put a request target after a space or an
+ * opening parenthesis: `Why is /reset?code=… slow?`, `(see /p?id=…)`. A
+ * written whitespace escape ({@link JSON_WHITESPACE_ESCAPE_SOURCE}) anchors a
+ * run as the whitespace it stands for does, so a run that starts a line of a
+ * JSON-rendered section is read; the telemetry masker anchors on the same
+ * escapes.
+ *
+ * Linear: the path class excludes `?`, the look-behind rejects every `/`
+ * inside a path run at once, and the two query-run alternatives are disjoint
+ * single code units, so each code unit is read by one attempt. Global and read
+ * only through `matchAll`.
+ */
+const EMBEDDED_RELATIVE_URL_PATTERN =
+  /(?<=^|[\s(]|\\(?:[nrtf]|u000[bB]))\/(?!\/)[A-Za-z0-9._~!$&*+,;=:@%/-]*\?(?:[^\s"'<>`\\]|\\(?!["nrtf]|u000[bB]))*/g;
+
+/**
+ * The two embedded-URL run patterns, each with the base its runs are parsed
+ * against — none for an absolute run — and whether a stack frame can hold it.
+ */
+const EMBEDDED_URL_PATTERNS: readonly (readonly [RegExp, string | undefined, boolean])[] =
+  Object.freeze([
+    Object.freeze([EMBEDDED_ABSOLUTE_URL_PATTERN, undefined, true] as const),
+    Object.freeze([EMBEDDED_RELATIVE_URL_PATTERN, RELATIVE_URL_PROBE_BASE, false] as const),
+  ]);
 
 /**
  * Internal tags of the built-in objects whose contents this walk does not
@@ -1145,6 +1594,27 @@ function scanWindows(
   return windows;
 }
 
+/**
+ * The code units of `value` that its {@link scanWindows} cover, as one string:
+ * the scanned region plus the {@link SCAN_WINDOW_OVERLAP} read past it, or the
+ * empty string when the region is empty.
+ *
+ * For the rules that judge a match by the text around it rather than by the
+ * match alone. They read exactly what the windowed patterns read — so the
+ * string bound means the same thing to every rule — but without the interior
+ * edges, which would otherwise read as a line or string start that the value
+ * does not have. Every pattern applied to it is linear, so reading it whole
+ * keeps the bound on work.
+ */
+function scannedText(value: string, maxStringLength: number): string {
+  const region = Math.min(value.length, Math.max(0, maxStringLength));
+  if (region === 0) {
+    return '';
+  }
+  const end = Math.min(value.length, region + SCAN_WINDOW_OVERLAP);
+  return end === value.length ? value : value.slice(0, end);
+}
+
 // ---------------------------------------------------------------------------
 // The walk
 // ---------------------------------------------------------------------------
@@ -1176,7 +1646,8 @@ function scanWindows(
  * defect, one rule along. `sensitive-header` reads a name too but not through
  * here: {@link checkDeniedHeader} is applied by the parent before the member is
  * walked at all, so it runs on every path to an aliased value whatever the memo
- * says.
+ * says. Its header-line form ({@link HEADER_LINE_PATTERN}) and the embedded-URL
+ * scan read the string alone, so they add no class either.
  */
 type NameContext = 'credential-like' | 'plain';
 
@@ -1349,14 +1820,103 @@ function record(state: WalkState, ruleId: RedactionRuleId, path: string): void {
 }
 
 /**
- * Applies every rule that needs only a string, plus the two that need a string
- * and its field name.
+ * Applies `url-query-value` to every URL embedded in `text`: the prose half of
+ * the rule, for a question that quotes a link, a rendered prompt, a captured
+ * label or an error message.
+ *
+ * Each run found by the two patterns of {@link EMBEDDED_URL_PATTERNS} is
+ * parsed with the URL parser — an absolute run directly, an origin-relative
+ * one against {@link RELATIVE_URL_PROBE_BASE} — and a run the parser rejects is
+ * skipped, since it is not a URL. The first parameter whose value is not
+ * masked is reported by name under `path`, once per rule and path however many
+ * runs repeat it; the value itself never leaves this function. An absolute run
+ * that {@link isInStackFrame} places in a stack frame also accepts the
+ * position the first checkpoint keeps on a frame
+ * ({@link FRAME_MASKED_VALUE_PATTERN}); an origin-relative one never does,
+ * because no runtime prints a frame that way.
+ *
+ * This is deliberately a **subset** of what the first checkpoint masks: the
+ * telemetry layer masks every `?name=value` in text, whatever precedes it,
+ * while this reads only runs shaped like a URL. Anything reported here is
+ * therefore something the redactor would have replaced, and code the redactor
+ * never sees — a bounded source excerpt — is refused only where it quotes a
+ * URL the way prose does.
+ *
+ * Bounded, and fail-closed at each bound:
+ *
+ * - `text` is the string's scanned region, the same code units the content
+ *   patterns' windows cover, so nothing past the string bound is read (that
+ *   bound records `max-string-length` itself).
+ * - A run is parsed over at most {@link URL_PARSE_MAX_LENGTH} code units, so a
+ *   value inside that prefix is still reported; a longer run records
+ *   `max-url-length`, because its remainder was never examined.
+ * - At most {@link MAX_URL_RUNS_PER_STRING} runs that can carry a value are
+ *   parsed; the next one records `max-url-runs` and ends the scan of this
+ *   string.
+ *
+ * Every recorded bound makes the report incomplete, so the payload is refused
+ * rather than sent.
+ *
+ * @param state - The walk this scan reports into.
+ * @param text - The scanned region of one string.
+ * @param path - Where that string sits in the payload.
+ */
+function scanEmbeddedUrls(state: WalkState, text: string, path: string): void {
+  if (!text.includes('?')) {
+    return;
+  }
+  let parsedRuns = 0;
+  for (const [pattern, base, framed] of EMBEDDED_URL_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      if (state.exhausted) {
+        return;
+      }
+      const run = match[0];
+      const queryStart = run.indexOf('?');
+      if (queryStart < 0 || !run.includes('=', queryStart)) {
+        // No query, or one whose every parameter is a bare flag: nothing here
+        // can carry a value, so the parser and the run budget are spared.
+        continue;
+      }
+      if (parsedRuns >= MAX_URL_RUNS_PER_STRING) {
+        noteLimit(state, 'max-url-runs', path);
+        return;
+      }
+      parsedRuns += 1;
+      const overLong = run.length > URL_PARSE_MAX_LENGTH;
+      if (overLong) {
+        // The remainder is never parsed, and a value that began before the cut
+        // can end after it, so no test on the remainder alone could prove it
+        // empty: the run was not inspected in full.
+        noteLimit(state, 'max-url-length', path);
+      }
+      const parsed = tryParseUrl(overLong ? run.slice(0, URL_PARSE_MAX_LENGTH) : run, base);
+      if (parsed === undefined) {
+        continue;
+      }
+      const inFrame = framed && isInStackFrame(text, match.index);
+      const parameter = firstUnmaskedParameter(parsed, inFrame);
+      if (parameter !== undefined) {
+        record(state, 'url-query-value', appendQueryParameter(path, parameter));
+      }
+    }
+  }
+}
+
+/**
+ * Applies every rule that reads a string: header lines of `sensitive-header`,
+ * the content patterns, both halves of `url-query-value`, and
+ * `high-entropy-secret`, the one that also needs the string's field name.
  *
  * Content patterns are applied window by window and each is dropped once it has
  * matched, so a ten-megabyte value costs at most one match per rule per window
  * and a repeated credential is reported once per field rather than once per
  * occurrence — a count of occurrences would be a measurement of the value,
- * which a finding may not carry.
+ * which a finding may not carry. The header-line pattern and the embedded-URL
+ * scan read the same code units in one piece ({@link scannedText}), because
+ * each judges a match by the text around it — the character that ends a
+ * credential, the line a URL run sits on — and a window edge would invent an
+ * end or a line start that is not in the value.
  */
 function scanString(state: WalkState, value: string, path: string, name: string): void {
   if (value.length === 0) {
@@ -1366,6 +1926,15 @@ function scanString(state: WalkState, value: string, path: string, name: string)
   if (value.length > maxStringLength) {
     noteLimit(state, 'max-string-length', path);
   }
+  const readsText = state.rules.has('sensitive-header') || state.rules.has('url-query-value');
+  const scanned = readsText ? scannedText(value, maxStringLength) : '';
+
+  // A header line inside text; the same rule under a denied *key* is applied
+  // by the parent, before this string is reached (see `checkDeniedHeader`).
+  if (state.rules.has('sensitive-header') && HEADER_LINE_PATTERN.test(scanned)) {
+    record(state, 'sensitive-header', path);
+  }
+
   const patterns = state.contentPatterns;
   if (patterns.length > 0) {
     const matched = new Set<RedactionRuleId>();
@@ -1388,6 +1957,9 @@ function scanString(state: WalkState, value: string, path: string, name: string)
     const parameter = findUnmaskedQueryParameter(value);
     if (parameter !== undefined) {
       record(state, 'url-query-value', appendQueryParameter(path, parameter));
+    }
+    if (!state.exhausted) {
+      scanEmbeddedUrls(state, scanned, path);
     }
   }
 

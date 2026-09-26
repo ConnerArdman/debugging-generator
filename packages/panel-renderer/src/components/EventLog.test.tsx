@@ -6,9 +6,10 @@
  * The log is the view with no opinion: it draws one page of records the
  * coordination service has already filtered, ordered and paged
  * (`POST /sessions/:id/panel-data` applies `filter`, `sort`, `limit` and
- * `offset` and answers with `total` and `nextOffset`, AAP 0.4.2), and it says
- * out loud how much of the capture that page covers. Six properties of that
- * contract are mechanical rather than cosmetic, and each has a case below:
+ * `offset` and answers with `total` and `nextOffset`; `docs/ARCHITECTURE.md`,
+ * "Panel data"), and it says out loud how much of the capture that page covers.
+ * Six properties of that contract are mechanical rather than cosmetic, and each
+ * has a case below:
  *
  *   - **the page is drawn as it arrived** — the rows appear in the provider's
  *     own order and none is dropped, so a local `.sort()` or `.slice()` added
@@ -32,31 +33,32 @@
  *     total or position they know, and only a total of zero (or no total from
  *     the first record) reads as "nothing was captured".
  *
- * Two further properties belong to the privacy model (AAP 0.5.2). Attribute
- * values arrive already redacted and already bounded to
- * {@link MAX_PREVIEW_LENGTH} characters, so this suite asserts that a preview
- * renders byte-for-byte as supplied — including one that already ends in the
- * upstream truncation marker — that no control offers to expand it, and that
- * the compact strip counts what it does not show instead of unpacking a
- * structured summary.
+ * Two further properties belong to the privacy model (`docs/SECURITY.md`,
+ * "Never captured"). Attribute values arrive already redacted and already
+ * bounded to {@link MAX_PREVIEW_LENGTH} characters, so this suite asserts that
+ * a preview renders byte-for-byte as supplied — including one that already
+ * ends in the upstream truncation marker — that no control offers to expand
+ * it, and that the compact strip counts what it does not show instead of
+ * unpacking a structured summary.
  *
- * Alongside those, AAP 0.8.3 asks every component suite here for the three
- * states of a query-backed view — loading, empty and error — and for the
+ * Alongside those, like every component suite here, this one covers the three
+ * states of a query-backed view — loading, empty and error — and the
  * click-to-source payload. Each state is driven through a stub `DataProvider`
  * that respectively never settles, resolves an empty page and rejects; the
- * payload cases assert what the host actually receives, because every hop after
- * this one acts blind on the object it is handed (AAP 0.4.2, hop 1 of five).
+ * payload cases assert what the host actually receives, because this component
+ * is the first hop of the click-to-source chain and every hop after it acts
+ * blind on the object it is handed (`docs/ARCHITECTURE.md`, "A click, end to end").
  *
  * ## The case that guards a layering boundary
  *
  * `renders exactly the kinds its data and its node name` is not a test of a
- * picker. `@debuggen/telemetry` is a **type-only** dependency of this package
- * (AAP 0.2.2), so the kind vocabulary — a runtime value of that package — may
- * not be imported here; the component discovers its options from the records
- * that arrived plus the kinds the panel's author named. An edit that reached
- * for the runtime vocabulary instead would pull zod-adjacent code into the
- * browser bundle, and the option list would grow from the handful the capture
- * can prove to the whole taxonomy. Asserting the option set *exactly* is the
+ * picker. `@debuggen/telemetry` is a **type-only** dependency of this package,
+ * so the kind vocabulary — a runtime value of that package — may not be
+ * imported here; the component discovers its options from the records that
+ * arrived plus the kinds the panel's author named. An edit that reached for the
+ * runtime vocabulary instead would pull zod-adjacent code into the browser
+ * bundle, and the option list would grow from the handful the capture can
+ * prove to the whole taxonomy. Asserting the option set *exactly* is the
  * cheapest place to catch that.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
@@ -80,11 +82,11 @@
  *   - **In-file synthetic builders, no fixture files.** {@link makeEvent} and
  *     {@link makeNode} take overrides; nothing here is read from disk or shared
  *     with another suite.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): record names, attribute
- *     keys, a file path and a symbol that belong to no application,
- *     demonstration or otherwise. The kinds are the product's own taxonomy.
- *     `scripts/check-no-hardcoding.mjs` scans this text with the rest of
- *     `packages/**`.
+ *   - **Generic fixture vocabulary only**: record names, attribute keys, a file
+ *     path and a symbol that belong to no application, demonstration or
+ *     otherwise. The kinds are the product's own taxonomy.
+ *     `scripts/check-no-hardcoding.mjs` skips test files, so this suite keeps
+ *     the product's neutral vocabulary by convention.
  *   - **Queries by role and accessible name.** The grid, its rows, the toolbar
  *     controls, the chips and the footer button are all reached that way; a
  *     class is read only off an element already obtained semantically, since no
@@ -137,10 +139,10 @@ import { EventLog } from './EventLog';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Every string below is application-neutral (AAP 0.5.4): no component, route,
- * service or symbol of any inspected project appears here, in the fixtures or
- * in the comments. The identifiers are shaped as a capture shapes them — a
- * 32-hex trace id, 16-hex span ids, epoch-millisecond start times, millisecond
+ * Every string below is application-neutral: no component, route, service or
+ * symbol of any inspected project appears here, in the fixtures or in the
+ * comments. The identifiers are shaped as a capture shapes them — a 32-hex
+ * trace id, 16-hex span ids, epoch-millisecond start times, millisecond
  * durations — because the component reads those fields and formats them.
  * ---------------------------------------------------------------------------
  */
@@ -494,7 +496,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -916,7 +918,7 @@ describe('EventLog states', () => {
     expect(busy.closest('.dg-event-log__loading')).not.toBeNull();
 
     // Nothing is drawn yet: no grid, therefore no rows, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -943,7 +945,7 @@ describe('EventLog states', () => {
 
     // Queried by a generic substring of the product's own copy rather than by a
     // restatement of the sentence: product vocabulary, naming no inspected
-    // project (AAP 0.5.4).
+    // project.
     const message = await screen.findByText(/no records were captured/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
 
@@ -1115,8 +1117,8 @@ describe('EventLog rows', () => {
 
   it('draws the page as the provider ordered it, and offers no local re-sort', async () => {
     // The page is deliberately not in start order while the node asks for
-    // `start_asc`: the service applied the ordering it was given (AAP 0.4.2),
-    // so a component that re-ranked the page locally would show an order no
+    // `start_asc`: the service applied the ordering it was given, so a
+    // component that re-ranked the page locally would show an order no
     // response ever reported.
     const stub = resolvingProvider('events', PROVIDER_ORDER, { total: PROVIDER_ORDER.length });
 
@@ -1178,9 +1180,9 @@ describe('EventLog kind filter', () => {
 
     // The union and nothing beyond it. This is the layering assertion of the
     // suite: the kind vocabulary is a runtime value of `@debuggen/telemetry`,
-    // which this package may use for types only (AAP 0.2.2), so an edit that
-    // enumerated it here would offer every kind the taxonomy defines — among
-    // them the two below, which this capture cannot prove exist.
+    // which this package may use for types only, so an edit that enumerated it
+    // here would offer every kind the taxonomy defines — among them the two
+    // below, which this capture cannot prove exist.
     expect(kindOptions()).toHaveLength(4);
 
     const labels = kindOptions().map((option) => option.label);
@@ -1446,7 +1448,7 @@ describe('EventLog text filter', () => {
   });
 });
 
-describe('EventLog announcements (B2-F10)', () => {
+describe('EventLog announcements', () => {
   /**
    * The region that announces the text filter's match count.
    *
@@ -1668,8 +1670,8 @@ describe('EventLog attributes', () => {
     await screen.findByRole('grid');
     const row = rowNamed(record.name);
 
-    // The fixture IS the bound (AAP 0.5.2), so this case fails if the bound
-    // moves rather than silently testing a shorter string.
+    // The fixture IS the bound, so this case fails if the bound moves rather
+    // than silently testing a shorter string.
     expect(BOUNDED_VALUE).toHaveLength(MAX_PREVIEW_LENGTH);
 
     // Byte for byte, with the key joined to it and nothing else done to it.
@@ -1769,7 +1771,8 @@ describe('EventLog attributes', () => {
   it('declares the strip layout that keeps the count visible, with no measured width', () => {
     // The chips start from nothing, grow no further than their own text, and
     // ellipsize at their own border; the count never shrinks. Structural forms
-    // and permitted literals only (AAP 0.6.4).
+    // and the literals the package permits (`0`, `none`, `auto`, `inherit`,
+    // `currentColor`, `transparent`) only.
     const chip = ruleOf('.dg-event-log__attr');
     for (const declaration of [
       'flex: 1 1 0;',
@@ -1863,7 +1866,7 @@ describe('EventLog interactions', () => {
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2).
+    // this one acts on the object it is handed.
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -1911,7 +1914,7 @@ describe('EventLog interactions', () => {
 
     // The captured status's own word, in a chip whose tone is a token class:
     // the meaning is in the label, so it survives the high-contrast theme and a
-    // reader who cannot distinguish the hues (AAP 0.6.3).
+    // reader who cannot distinguish the hues.
     const statusChip = within(row).getByText(formatStatusLabel('error'));
     expect(statusChip.classList.contains('dg-badge')).toBe(true);
     expect(statusChip.classList.contains('dg-badge--danger')).toBe(true);
@@ -1927,7 +1930,7 @@ describe('EventLog interactions', () => {
   });
 });
 
-describe('EventLog keyboard (B2-F19)', () => {
+describe('EventLog keyboard', () => {
   /** The reference a selection of `event` reports, in the shape the host receives. */
   function refOf(event: TelemetryEvent): PanelEventRef {
     return { eventId: event.id, spanId: event.spanId, traceId: event.traceId };
@@ -2148,8 +2151,7 @@ describe('EventLog paging', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     // A service that reported no total leaves this view unable to know whether
-    // more records exist, and saying only what it has is the truthful option
-    // (AAP 0.4.2).
+    // more records exist, and saying only what it has is the truthful option.
     const coverage = await screen.findByText(`${formatCount(1)} records loaded`);
     expect(coverage.textContent).not.toContain(' of ');
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
@@ -2531,14 +2533,16 @@ describe('EventLog empty pages', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The panel's shared selection (B2-F21, and the EventLog half of B2-F08)
+ * The panel's shared selection
  *
  * Under the panel host the selected line is the panel's one selection — the
- * record any view or evidence chip last selected — rather than a state of this
- * list (AAP 0.7.3: evidence chips "select the underlying events"), and it is
+ * record any view or evidence chip last selected, since an evidence chip
+ * selects the events it cites — rather than a state of this list, and it is
  * marked the way every selected grid row is: `aria-selected` plus the grid's
- * own `dg-is-selected`. These cases provide the selection directly through
- * `PanelSelectionContext`, which is exactly what the host mounts.
+ * own `dg-is-selected`. A line activated here only reports its record; the
+ * mark moves when the host's selection does. These cases provide the selection
+ * directly through `PanelSelectionContext`, which is exactly what the host
+ * mounts.
  * ---------------------------------------------------------------------------
  */
 

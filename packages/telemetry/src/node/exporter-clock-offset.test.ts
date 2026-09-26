@@ -1,8 +1,9 @@
 // @vitest-environment node
 /**
- * Tests for the Node preload's per-process `clockOffsetMs` (AAP 0.2.3: "a
- * recorded per-producer `clockOffsetMs` (server `Date` header versus local
- * clock, informational)"), measured and stamped by `./exporter.ts`.
+ * Tests for the Node preload's per-process `clockOffsetMs` — a recorded
+ * per-producer estimate of the server `Date` header versus the local clock,
+ * informational only (`docs/ARCHITECTURE.md` §5.2) — measured and stamped by
+ * `./exporter.ts`.
  *
  * ## What these cases pin
  *
@@ -58,9 +59,8 @@ import type { CaptureGate } from './exporter.js';
  * ---------------------------------------------------------------------------
  * Fixtures
  *
- * Neutral vocabulary (AAP 0.5.4); the credential is assembled from fragments
- * because `scripts/check-secrets.mjs` measures long literals bound to key-like
- * names.
+ * Neutral vocabulary; the credential is assembled from fragments because
+ * `scripts/check-secrets.mjs` measures long literals bound to key-like names.
  * ---------------------------------------------------------------------------
  */
 

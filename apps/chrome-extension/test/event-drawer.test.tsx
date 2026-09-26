@@ -25,6 +25,14 @@
  *   the details that continues the search from where it stopped); or the
  *   stored capture could not supply a tail-only event's ancestors (with a
  *   retry that reads the trace again).
+ * - **A lookup reads the capture its evidence belongs to.** A selection bound
+ *   to a panel sends the panel's id with every page, so it is answered from
+ *   that panel's capture while the store shows a newer one — even when the
+ *   live tail holds the same event id — and its parent chain is built only
+ *   from events of the selected event's own capture: a live-tail event of
+ *   another capture that shares the trace and a span id never stands in for a
+ *   missing ancestor. An unbound selection is read live. Which binding a
+ *   selection gets follows from where it was raised (`drawerEvidencePanel`).
  * - **A lookup never outlives its session.** Changing the session aborts the
  *   earlier lookup's request, and its late answer is never rendered.
  *
@@ -40,7 +48,8 @@
  */
 
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
 
 import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT } from '@debuggen/panel-schema';
 import type { DataQuery, EventRef } from '@debuggen/panel-schema';
@@ -48,15 +57,15 @@ import type { DataResultFor, TelemetryEvent } from '@debuggen/protocol';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 
-import { EventDrawer } from '../src/panel/App';
-import type { EventDrawerProps } from '../src/panel/App';
+import { drawerEvidencePanel, EventDrawer } from '../src/panel/App';
+import type { EventDrawerProps, SelectionProvenance } from '../src/panel/App';
 import type { DevtoolsPanelActions } from '../src/panel/actions';
 import {
   createPanelDataProvider,
   EVENT_RESOLUTION_MAX_EVENTS,
   EVENT_RESOLUTION_PAGE_BUDGET,
 } from '../src/panel/data-provider';
-import type { PanelDataRequestFunction } from '../src/panel/data-provider';
+import type { PanelDataProvider, PanelDataRequestFunction } from '../src/panel/data-provider';
 
 /*
  * ===========================================================================
@@ -73,6 +82,10 @@ type PanelDataAnswer = Awaited<ReturnType<PanelDataRequestFunction>>;
 const SESSION_A = 'session-drawer-a';
 const SESSION_B = 'session-drawer-b';
 const CAPTURE_ID = 'capture-drawer-1';
+const CAPTURE_ID_B = 'capture-drawer-2';
+
+/** The rendered panel: generated from {@link CAPTURE_ID}. */
+const PANEL_ID = 'panel-drawer-a';
 
 /** The epoch the synthetic events start at. */
 const BASE_TIME_MS = 1_700_000_000_000;
@@ -236,6 +249,8 @@ type RequestHandler = (payload: SentPayload) => Promise<PanelDataAnswer>;
 /** The fake store and connection the provider's getters read, mutable mid-test. */
 interface DrawerState {
   shownSession: string | undefined;
+  /** The capture the store shows: `getCaptureId()`'s answer. */
+  captureId: string | undefined;
   handler: RequestHandler;
 }
 
@@ -252,7 +267,11 @@ function servingFrom(capture: readonly TelemetryEvent[]): RequestHandler {
 
 function createDrawerHarness(capture: readonly TelemetryEvent[]): DrawerHarness {
   const sent: SentRequest[] = [];
-  const state: DrawerState = { shownSession: SESSION_A, handler: servingFrom(capture) };
+  const state: DrawerState = {
+    shownSession: SESSION_A,
+    captureId: CAPTURE_ID,
+    handler: servingFrom(capture),
+  };
   const request: PanelDataRequestFunction = (_kind, payload, options) => {
     sent.push({ payload, signal: options?.signal });
     return state.handler(payload);
@@ -260,7 +279,7 @@ function createDrawerHarness(capture: readonly TelemetryEvent[]): DrawerHarness 
   const provider = createPanelDataProvider({
     request,
     getSessionId: () => state.shownSession,
-    getCaptureId: () => CAPTURE_ID,
+    getCaptureId: () => state.captureId,
     canServeCached: (sessionId) => sessionId === state.shownSession,
   });
   return { provider, sent, state };
@@ -275,7 +294,10 @@ function createActions(): DevtoolsPanelActions {
   };
 }
 
-/** The props of one render: the harness's provider, no tail, session A. */
+/**
+ * The props of one render: the harness's provider, no tail, session A, and
+ * a live (unbound) lookup.
+ */
 function drawerProps(harness: DrawerHarness, overrides: Partial<EventDrawerProps> = {}) {
   return {
     selected: { eventId: TARGET.id },
@@ -283,6 +305,7 @@ function drawerProps(harness: DrawerHarness, overrides: Partial<EventDrawerProps
     actions: createActions(),
     dataProvider: harness.provider,
     sessionId: SESSION_A,
+    panelId: undefined,
     ...overrides,
   } satisfies EventDrawerProps;
 }
@@ -406,12 +429,6 @@ afterEach(() => {
   cleanup();
 });
 
-/*
- * ===========================================================================
- * Reaching any stored event (FE-F07, PERF-F22)
- * ===========================================================================
- */
-
 describe('EventDrawer — resolving a selection against the stored capture', () => {
   it('shows a traceless selection on the first pass’s last page with its ancestors from page one', async () => {
     // The target is the 50 000th stored event: on the page at offset 45 000.
@@ -501,12 +518,6 @@ describe('EventDrawer — resolving a selection against the stored capture', () 
     expectNoChainGap();
   });
 });
-
-/*
- * ===========================================================================
- * An incomplete chain is stated, never dropped (FE-F07)
- * ===========================================================================
- */
 
 describe('EventDrawer — an incomplete parent chain', () => {
   it('says that some ancestors were never captured, with nothing to retry', async () => {
@@ -632,6 +643,306 @@ describe('EventDrawer — an incomplete parent chain', () => {
     expect(queriesFrom(harness, sentBefore)).toEqual([
       { source: 'events', filter: { traceId: TRACE_T }, limit: DATA_QUERY_MAX_LIMIT, offset: 0 },
     ]);
+  });
+});
+
+/** The names of {@link NEWER_TAIL}'s events, which no chain of the first capture may list. */
+const NEWER_CAPTURE_NAME = /newer-capture/u;
+
+/**
+ * The live tail of the newer capture {@link CAPTURE_ID_B}: events of the same
+ * trace under the span ids of {@link TARGET}'s parent and root — a parent span
+ * that ended after the store moved on is stored under the newer capture.
+ */
+const NEWER_TAIL: readonly TelemetryEvent[] = [
+  { ...ROOT, id: 'event-root-b', name: 'Synthetic newer-capture root', captureId: CAPTURE_ID_B },
+  {
+    ...PARENT,
+    id: 'event-parent-b',
+    name: 'Synthetic newer-capture parent',
+    captureId: CAPTURE_ID_B,
+  },
+];
+
+describe('EventDrawer — which capture a lookup reads', () => {
+  it('reads the rendered panel’s capture for its evidence while the store shows a newer capture', async () => {
+    // Panel A was generated from the first capture; the store has since moved
+    // to capture B, whose live tail is empty. The service answers a lookup
+    // bound to the panel from the panel's capture, and a live one from B's.
+    const panelCapture = [ROOT, PARENT, ...fillerEvents(DATA_QUERY_MAX_LIMIT + 10, 1_000), TARGET];
+    const harness = createDrawerHarness([]);
+    harness.state.captureId = CAPTURE_ID_B;
+    harness.state.handler = (payload) =>
+      Promise.resolve(
+        serveEvents(payload.query.panelId === PANEL_ID ? panelCapture : [], payload.query),
+      );
+
+    render(<EventDrawer {...drawerProps(harness, { panelId: PANEL_ID })} />);
+
+    await renderedChain();
+    expect(screen.getByText('Synthetic selected step', { selector: 'p' })).toBeTruthy();
+    // The find pass's two capture pages and the ancestry pass's trace page.
+    expect(queriesFrom(harness)).toEqual([
+      { source: 'events', limit: DATA_QUERY_MAX_LIMIT, offset: 0, panelId: PANEL_ID },
+      {
+        source: 'events',
+        limit: DATA_QUERY_MAX_LIMIT,
+        offset: DATA_QUERY_MAX_LIMIT,
+        panelId: PANEL_ID,
+      },
+      {
+        source: 'events',
+        filter: { traceId: TRACE_T },
+        limit: DATA_QUERY_MAX_LIMIT,
+        offset: 0,
+        panelId: PANEL_ID,
+      },
+    ]);
+  });
+
+  it('keeps a panel-bound lookup bound when the live tail holds the same event', async () => {
+    // The tail holds the selection but not its ancestors, so a stored lookup is
+    // sent — and an event id the tail also shows does not turn it live.
+    const harness = createDrawerHarness([]);
+    harness.state.handler = (payload) =>
+      Promise.resolve(
+        serveEvents(
+          payload.query.panelId === PANEL_ID ? [ROOT, PARENT, TARGET] : [],
+          payload.query,
+        ),
+      );
+
+    render(<EventDrawer {...drawerProps(harness, { liveTail: [TARGET], panelId: PANEL_ID })} />);
+
+    await renderedChain();
+    expect(queriesFrom(harness)).toEqual([
+      {
+        source: 'events',
+        filter: { traceId: TRACE_T },
+        limit: DATA_QUERY_MAX_LIMIT,
+        offset: 0,
+        panelId: PANEL_ID,
+      },
+    ]);
+  });
+
+  it('never completes a panel event’s chain with a newer capture’s tail events', async () => {
+    // Panel A's capture holds the selection and the root, but never stored the
+    // parent span. The store has moved to capture B, whose live tail streamed
+    // events of the same trace under the parent's and the root's span ids.
+    const panelCapture = [ROOT, TARGET];
+    const harness = createDrawerHarness([]);
+    harness.state.captureId = CAPTURE_ID_B;
+    harness.state.handler = (payload) =>
+      Promise.resolve(
+        serveEvents(payload.query.panelId === PANEL_ID ? panelCapture : NEWER_TAIL, payload.query),
+      );
+
+    render(
+      <EventDrawer
+        {...drawerProps(harness, {
+          selected: { eventId: TARGET.id, traceId: TRACE_T },
+          liveTail: NEWER_TAIL,
+          panelId: PANEL_ID,
+        })}
+      />,
+    );
+
+    expect(await screen.findByText(PARENT_NEVER_CAPTURED)).toBeTruthy();
+    expect(screen.getByText('Synthetic selected step', { selector: 'p' })).toBeTruthy();
+    // Every page was read from the panel's capture.
+    expect(harness.sent.length).toBeGreaterThan(0);
+    for (const request of harness.sent) {
+      expect(request.payload.query.panelId).toBe(PANEL_ID);
+    }
+    // Neither of capture B's look-alikes is listed as an ancestor of A's event.
+    const region = parentChainRegion();
+    expect(within(region).queryByRole('button', { name: NEWER_CAPTURE_NAME })).toBeNull();
+    expect(within(region).queryByText(NEWER_CAPTURE_NAME)).toBeNull();
+    expect(within(region).getByText(MISSING_SPAN_LABEL).parentElement?.textContent).toContain(
+      PARENT.spanId,
+    );
+  });
+
+  it('never treats a tail event’s chain as complete from another capture’s events', async () => {
+    // The tail holds the selection of the first capture beside the second
+    // capture's events under its ancestors' span ids: those events do not make
+    // the chain complete, so the stored lookup is sent and its chain shown.
+    const harness = createDrawerHarness([ROOT, PARENT, TARGET]);
+
+    render(<EventDrawer {...drawerProps(harness, { liveTail: [...NEWER_TAIL, TARGET] })} />);
+
+    await renderedChain();
+    expect(queriesFrom(harness)).toEqual([
+      { source: 'events', filter: { traceId: TRACE_T }, limit: DATA_QUERY_MAX_LIMIT, offset: 0 },
+    ]);
+    const region = parentChainRegion();
+    expect(within(region).queryByText(NEWER_CAPTURE_NAME)).toBeNull();
+  });
+
+  it('names no panel on any page of a live lookup', async () => {
+    const harness = createDrawerHarness([ROOT, PARENT, TARGET]);
+
+    render(
+      <EventDrawer
+        {...drawerProps(harness, { selected: { eventId: TARGET.id, traceId: TRACE_T } })}
+      />,
+    );
+
+    await renderedChain();
+    expect(queriesFrom(harness)).toEqual([
+      { source: 'events', filter: { traceId: TRACE_T }, limit: DATA_QUERY_MAX_LIMIT, offset: 0 },
+    ]);
+  });
+});
+
+describe('drawerEvidencePanel — whose evidence a selection is', () => {
+  const OTHER_PANEL_ID = 'panel-drawer-b';
+
+  /** A selection of {@link TARGET} raised by the panel `panelId`. */
+  function raisedByPanel(panelId: string): SelectionProvenance {
+    return { eventId: TARGET.id, origin: 'panel', panelId };
+  }
+
+  /** A selection of {@link TARGET} raised by the live tail while it streamed `captureId`. */
+  function raisedByTail(captureId: string | undefined): SelectionProvenance {
+    return { eventId: TARGET.id, origin: 'live', captureId };
+  }
+
+  it('binds a panel-raised selection to that panel, whatever is rendered or streamed now', () => {
+    expect(drawerEvidencePanel(TARGET.id, raisedByPanel(PANEL_ID), PANEL_ID, CAPTURE_ID)).toBe(
+      PANEL_ID,
+    );
+    // A newer panel version replaced it and the store moved to another capture.
+    expect(
+      drawerEvidencePanel(TARGET.id, raisedByPanel(PANEL_ID), OTHER_PANEL_ID, CAPTURE_ID_B),
+    ).toBe(PANEL_ID);
+    // No panel is rendered any more: the selection is still that panel's evidence.
+    expect(drawerEvidencePanel(TARGET.id, raisedByPanel(PANEL_ID), undefined, CAPTURE_ID_B)).toBe(
+      PANEL_ID,
+    );
+  });
+
+  it('reads a tail-raised selection live while its capture is the store’s, whatever panel is rendered', () => {
+    expect(
+      drawerEvidencePanel(TARGET.id, raisedByTail(CAPTURE_ID), PANEL_ID, CAPTURE_ID),
+    ).toBeUndefined();
+    expect(
+      drawerEvidencePanel(TARGET.id, raisedByTail(CAPTURE_ID), undefined, CAPTURE_ID),
+    ).toBeUndefined();
+  });
+
+  it('binds a tail-raised selection to the rendered panel once the store shows another capture', () => {
+    expect(drawerEvidencePanel(TARGET.id, raisedByTail(CAPTURE_ID), PANEL_ID, CAPTURE_ID_B)).toBe(
+      PANEL_ID,
+    );
+    // With no panel rendered there is nothing to name, and the read stays live.
+    expect(
+      drawerEvidencePanel(TARGET.id, raisedByTail(CAPTURE_ID), undefined, CAPTURE_ID_B),
+    ).toBeUndefined();
+  });
+
+  it('reads a selection with no recorded provenance as the rendered panel’s evidence, else live', () => {
+    expect(drawerEvidencePanel(TARGET.id, undefined, PANEL_ID, CAPTURE_ID)).toBe(PANEL_ID);
+    expect(drawerEvidencePanel(TARGET.id, undefined, undefined, CAPTURE_ID)).toBeUndefined();
+  });
+
+  it('ignores provenance recorded for another event', () => {
+    const otherEvent = { ...raisedByTail(CAPTURE_ID), eventId: PARENT.id };
+    expect(drawerEvidencePanel(TARGET.id, otherEvent, PANEL_ID, CAPTURE_ID)).toBe(PANEL_ID);
+    const otherPanelEvent = { ...raisedByPanel(OTHER_PANEL_ID), eventId: PARENT.id };
+    expect(drawerEvidencePanel(TARGET.id, otherPanelEvent, undefined, CAPTURE_ID)).toBeUndefined();
+  });
+});
+
+/**
+ * A provider whose every lookup rejects with `cause`, a plain `Error` — the
+ * one way a value other than a typed product error can reach the drawer.
+ */
+function rejectingProvider(cause: Error): PanelDataProvider {
+  return {
+    query: () => Promise.reject(new DebuggenError('INTERNAL', 'This suite answers no query.')),
+    resolveEvent: () => Promise.reject(cause),
+    rejectAllPending: () => 0,
+    pendingCount: () => 0,
+  };
+}
+
+describe('EventDrawer — an unexpected lookup failure', () => {
+  /**
+   * A credential-shaped value, assembled from pieces so that the repository's
+   * secret scan does not read this fixture as a committed credential.
+   */
+  const CREDENTIAL_SHAPED = ['gh', 'p_', 'x'.repeat(36)].join('');
+  const PRIVATE_PATH = '/home/dev/.env';
+  const PRIVATE_SQL = 'SELECT password FROM users';
+  const PRIVATE_TEXT = `${PRIVATE_PATH}: ${PRIVATE_SQL} WHERE token='${CREDENTIAL_SHAPED}'`;
+  const FIXED_MESSAGE =
+    'The selected event could not be looked up: an unexpected error stopped the lookup in the Debug Generator panel.';
+  const FIXED_HINT = 'Retry; if it keeps failing, reopen Chrome DevTools.';
+
+  let consoleWarn: MockInstance;
+
+  beforeEach(() => {
+    consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    consoleWarn.mockRestore();
+  });
+
+  /** Whether `text` holds any part of {@link PRIVATE_TEXT}. */
+  function leaksPrivateText(text: string): boolean {
+    return [PRIVATE_TEXT, PRIVATE_PATH, PRIVATE_SQL, CREDENTIAL_SHAPED].some((part) =>
+      text.includes(part),
+    );
+  }
+
+  /** The panel logged the closed code once, and nothing of the cause. */
+  function expectClosedCodeLogged(): void {
+    expect(consoleWarn).toHaveBeenCalledTimes(1);
+    expect(consoleWarn).toHaveBeenCalledWith(expect.stringMatching(/^\[panel\] /u), {
+      code: 'INTERNAL',
+    });
+    expect(leaksPrivateText(JSON.stringify(consoleWarn.mock.calls))).toBe(false);
+  }
+
+  it('shows fixed copy with its retry for a selection the tail does not hold', async () => {
+    const harness = createDrawerHarness([]);
+
+    render(
+      <EventDrawer
+        {...drawerProps(harness, { dataProvider: rejectingProvider(new Error(PRIVATE_TEXT)) })}
+      />,
+    );
+
+    expect(await screen.findByText(FIXED_MESSAGE)).toBeTruthy();
+    expect(screen.getByText(FIXED_HINT)).toBeTruthy();
+    expect(screen.getByRole('button', { name: RETRY_LABEL })).toBeTruthy();
+    expect(leaksPrivateText(document.body.textContent)).toBe(false);
+    expectClosedCodeLogged();
+  });
+
+  it('states a tail event’s parent chain as unavailable in fixed copy', async () => {
+    const harness = createDrawerHarness([]);
+
+    render(
+      <EventDrawer
+        {...drawerProps(harness, {
+          liveTail: [TARGET],
+          dataProvider: rejectingProvider(new Error(PRIVATE_TEXT)),
+        })}
+      />,
+    );
+
+    expect(await screen.findByText(UNAVAILABLE)).toBeTruthy();
+    const region = parentChainRegion();
+    expect(within(region).getByText(FIXED_MESSAGE)).toBeTruthy();
+    expect(within(region).getByText(FIXED_HINT)).toBeTruthy();
+    // The event itself is still shown, from the tail.
+    expect(screen.getByText('Synthetic selected step', { selector: 'p' })).toBeTruthy();
+    expect(leaksPrivateText(document.body.textContent)).toBe(false);
+    expectClosedCodeLogged();
   });
 });
 

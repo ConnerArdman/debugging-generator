@@ -1,6 +1,6 @@
 /**
  * `EventLog` — every captured record in sequence, as a filterable, virtualized
- * list (AAP 0.6.2).
+ * list.
  *
  * This module is the component behind the node catalog's `eventLog` type. It is
  * the view with no opinion: no grouping, no ranking, no aggregation, no
@@ -15,8 +15,8 @@
  * list: under the panel host a record selected anywhere — a table row, a chart
  * bar, an evidence chip — marks its line here (`aria-selected` plus the grid's
  * own `dg-is-selected`, and the grid scrolls it into its viewport), and a line
- * activated here marks the same record in every other view (AAP 0.7.3). Outside
- * a host the list falls back to marking the line last activated in it.
+ * activated here marks the same record in every other view. Outside a host the
+ * list falls back to marking the line last activated in it.
  *
  * ## THE FIELDS IT READS ARE THE CATALOG'S, NOT THIS FILE'S
  *
@@ -35,7 +35,8 @@
  *
  * The node's `DataQuery` goes to `../host/useQuery`, which resolves it through
  * whatever `DataProvider` the host mounted. There is no `fetch`, no socket, no
- * message port and no host API in this file (AAP 0.1.2, 0.4.2): the DevTools
+ * message port and no host API in this file — a panel component never touches
+ * a transport (`docs/ARCHITECTURE.md`, "The renderer contract"): the DevTools
  * panel proxies the query through its service worker and the editor webview
  * through host messaging, and this component cannot tell the difference.
  * Interactions leave the same way — through the `PanelActions` of the nearest
@@ -44,11 +45,12 @@
  *
  * ## WHAT IT SHOWS IS ONE PAGE, AND IT SAYS SO
  *
- * The panel-data contract pages every array-valued source (AAP 0.4.2): a
- * request carries `limit` (200 by default, 5 000 at most) and `offset`, and the
- * response carries `total` and `nextOffset`. A log that quietly showed 200 of
- * 4 000 records would misrepresent the capture, so this component states two
- * ratios and offers the one control that changes them:
+ * The panel-data contract pages every array-valued source
+ * (`docs/ARCHITECTURE.md`, "Panel data"): a request carries `limit` (200 by
+ * default, 5 000 at most) and `offset`, and the response carries `total` and
+ * `nextOffset`. A log that quietly showed 200 of 4 000 records would
+ * misrepresent the capture, so this component states two ratios and offers the
+ * one control that changes them:
  *
  *   - **loaded against total**, in the footer, beside a "load more" control
  *     that advances the offset and appends the next page to what is already on
@@ -88,15 +90,15 @@
  * ## REDACTION AND TRUNCATION ARE UPSTREAM GUARANTEES, HONOURED HERE
  *
  * Attribute values arrive already redacted and already bounded to 120
- * characters with key-name-plus-summary semantics (AAP 0.5.2). This component
- * displays them as given: it never expands, re-parses, pretty-prints, joins or
- * reconstructs a value, offers no "show raw" affordance, and passes every
- * string through this package's own truncation helper so that the rendered text
- * can only ever be shorter than what the producer was permitted to capture.
- * The compact attribute column shows at most {@link MAX_ATTRIBUTE_PAIRS}
- * primitive pairs and counts everything else — a structured summary, an
- * overflowing pair — as "more", so a reader knows the record carries more
- * without this view unpacking it.
+ * characters with key-name-plus-summary semantics (`docs/SECURITY.md`,
+ * "Never captured"). This component displays them as given: it never expands,
+ * re-parses, pretty-prints, joins or reconstructs a value, offers no "show raw"
+ * affordance, and passes every string through this package's own truncation
+ * helper so that the rendered text can only ever be shorter than what the
+ * producer was permitted to capture. The compact attribute column shows at most
+ * {@link MAX_ATTRIBUTE_PAIRS} primitive pairs and counts everything else — a
+ * structured summary, an overflowing pair — as "more", so a reader knows the
+ * record carries more without this view unpacking it.
  *
  * ## VIRTUALIZATION, GRID SEMANTICS AND KEYBOARD OPERATION BELONG TO DataTable
  *
@@ -122,17 +124,16 @@
  *
  * ## THREE STATES, IN ONE FIXED ORDER
  *
- * Loading, then error, then empty, then the table — the precedence AAP 0.6.2
- * requires of a query-backed view, each in its own `__loading`, `__error` and
- * `__empty` box. An empty page and a failed request are kept apart:
- * `useQuery`'s `"success"` with no rows reads as an empty state, while a
- * rejection carries the failure, its code and the serialised query into an
- * error state with a working retry (AAP 0.5.5 — a failure is never presented as
- * a result), worded by the host's one error-state contract
- * (`queryFailureProps` in `../host/useQuery`) so it reads like every other
- * failed node in the panel. An empty page is not always an empty capture, and
- * the empty state says which one it is, from the counters the same response
- * carried:
+ * Loading, then error, then empty, then the table — the precedence every
+ * query-backed view follows, each state here in its own `__loading`, `__error`
+ * and `__empty` box. An empty page and a failed request are kept apart, because
+ * a failure is never presented as a result: `useQuery`'s `"success"` with no
+ * rows reads as an empty state, while a rejection carries the failure, its code
+ * and the serialised query into an error state with a working retry, worded by
+ * the host's one error-state contract (`queryFailureProps` in
+ * `../host/useQuery`) so it reads like every other failed node in the panel. An
+ * empty page is not always an empty capture, and the empty state says which one
+ * it is, from the counters the same response carried:
  *
  *   - a count-only query (`limit: 0`) asked for a total and no rows, and states
  *     that total — or that none was reported;
@@ -150,7 +151,7 @@
  * table's own empty slot — beside a control that clears the filter and returns
  * focus to its field.
  *
- * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE (AAP 0.6.4)
+ * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE
  *
  * This file declares class names and nothing else: no inline style object, no
  * colour, no length, no literal CSS value. The kind chip's colour arrives as a
@@ -277,8 +278,8 @@ const EVENT_LOG_SOURCE = 'events' as const satisfies DataQuerySource;
  * Bounds and vocabulary
  *
  * Counts and copy only. Nothing here is a length, a colour or any other visual
- * value (AAP 0.6.4), and no string names a symbol, component, route or table of
- * an inspected project (AAP 0.5.4).
+ * value, and no string names a symbol, component, route or table of an
+ * inspected project.
  * ---------------------------------------------------------------------------
  */
 
@@ -548,15 +549,15 @@ function clampPageLimit(limit: number | undefined): number {
  * The offset the page sequence starts at: the authored offset as a whole,
  * non-negative number, or the contract's default when none was authored.
  *
- * The authored offset is honoured exactly (AAP 0.4.2): a node that asks for the
- * records from position 201 onwards must be shown those, not the first page,
- * and an offset past the end of the source is an empty page the service
- * answers, never an error this view invents. It has no upper bound in the
- * schema — only the service knows how many records exist — so the only ceiling
- * applied is the largest integer a number represents exactly, which keeps an
- * unvalidated, enormous value from turning into a request the resolver cannot
- * echo back. Like {@link clampPageLimit}, total over the shape: a fractional,
- * negative or non-finite value still yields a request that can be answered.
+ * The authored offset is honoured exactly: a node that asks for the records
+ * from position 201 onwards must be shown those, not the first page, and an
+ * offset past the end of the source is an empty page the service answers,
+ * never an error this view invents. It has no upper bound in the schema — only
+ * the service knows how many records exist — so the only ceiling applied is the
+ * largest integer a number represents exactly, which keeps an unvalidated,
+ * enormous value from turning into a request the resolver cannot echo back.
+ * Like {@link clampPageLimit}, total over the shape: a fractional, negative or
+ * non-finite value still yields a request that can be answered.
  *
  * @param offset The authored `offset`, or `undefined` when the node omitted one.
  * @returns A whole number in `[DATA_QUERY_DEFAULT_OFFSET, Number.MAX_SAFE_INTEGER]`.
@@ -817,10 +818,10 @@ function describeEmptyPage(
  *
  * Primitive values only, and that is a privacy decision rather than a
  * convenience: a structured value — a captured prop summary, a changed-key list
- * — is already a bounded summary produced upstream (AAP 0.5.2), and unpacking
- * one into a row would be this renderer expanding what a producer deliberately
- * collapsed. Those values are counted as "more" instead, and the host's detail
- * drawer is where a reader opens the record in full.
+ * — is already a bounded summary produced upstream, and unpacking one into a
+ * row would be this renderer expanding what a producer deliberately collapsed.
+ * Those values are counted as "more" instead, and the host's detail drawer is
+ * where a reader opens the record in full.
  *
  * Strings go through this package's truncation helper, whose default budget is
  * the 120-character bound the producer was held to, so the rendered text can
@@ -922,12 +923,12 @@ function buildSearchIndex(
  * The earliest start among the loaded records, which every offset is measured
  * from.
  *
- * The canonical time base is epoch milliseconds as a double (AAP 0.2.3), and
- * epoch text beside an interaction would be noise, so the log shows offsets.
- * The origin is the earliest record this view has loaded — which is the
- * capture's own start whenever the first page arrived in ascending order, and
- * is in every case an origin the reader can see on the first row, since that
- * row's offset is zero.
+ * The canonical time base is epoch milliseconds as a double
+ * (`docs/ARCHITECTURE.md`, "Time base"), and epoch text beside an interaction
+ * would be noise, so the log shows offsets. The origin is the earliest record
+ * this view has loaded — which is the capture's own start whenever the first
+ * page arrived in ascending order, and is in every case an origin the reader
+ * can see on the first row, since that row's offset is zero.
  *
  * Non-finite when there are no records, which is what makes every offset read
  * as the package's "not available" label rather than as a measured zero.
@@ -973,8 +974,8 @@ function buildRowModel(event: TelemetryEvent, originEpochMs: number): EventLogRo
  * The row models for a page, in the order the resolver returned it.
  *
  * The order is never touched: the data layer applied the filter, the ordering
- * and the paging (AAP 0.4.2), and a client that re-sorted a page would disagree
- * with the `total` and `nextOffset` it was handed.
+ * and the paging, and a client that re-sorted a page would disagree with the
+ * `total` and `nextOffset` it was handed.
  *
  * @param events Every record loaded so far, earlier pages first.
  * @returns One row model per record, in that same order.
@@ -1009,8 +1010,8 @@ function compareKinds(left: TelemetryKind, right: TelemetryKind): number {
  * The kinds the picker offers.
  *
  * The kind vocabulary is a runtime value of `@debuggen/telemetry`, which this
- * package may use for types only (AAP 0.2.2), so the option set is discovered
- * rather than enumerated, from four sources whose union is what a reader needs:
+ * package may use for types only, so the option set is discovered rather than
+ * enumerated, from four sources whose union is what a reader needs:
  *
  *   1. the kinds present in the loaded records — the ones this capture can
  *      prove exist;
@@ -1120,10 +1121,9 @@ function selectedEventLogRowKey(
  * the module and a row's cells depend on the row alone.
  *
  * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
- * in `../primitives/DataTable`, AAP 0.6.4): `DataTable` resolves each role to
- * a track built from the design system's column floor and share tokens, the
- * same track every other table gives content of that kind. The roles follow
- * the content:
+ * in `../primitives/DataTable`): `DataTable` resolves each role to a track
+ * built from the design system's column floor and share tokens, the same track
+ * every other table gives content of that kind. The roles follow the content:
  *
  * - the sequence number is `ordinal`, the fixed role of a position number, so
  *   the figures down the column never drift as the panel widens;
@@ -1170,7 +1170,7 @@ function renderOffsetCell(row: EventLogRow): ReactNode {
  * The colour arrives as a `var(--dg-kind-*)` reference from `../utils/color`
  * and lands on the chip's fill, while the chip's own label carries the meaning
  * — which is what keeps the kind readable in the high-contrast theme and to a
- * reader who cannot distinguish the hues (AAP 0.6.3, 0.6.4).
+ * reader who cannot distinguish the hues.
  */
 function renderKindCell(row: EventLogRow): ReactNode {
   const { kind } = row.event;
@@ -1215,9 +1215,9 @@ function renderNameCell(row: EventLogRow): ReactNode {
  * A compact strip of the record's attributes, and an honest count of the rest.
  *
  * Values are shown exactly as they arrived — already redacted, already bounded
- * — and nothing here expands, re-parses or reconstructs one (AAP 0.5.2). What
- * is not shown is counted rather than dropped, so the strip never implies that
- * a record carries less than it does.
+ * — and nothing here expands, re-parses or reconstructs one. What is not shown
+ * is counted rather than dropped, so the strip never implies that a record
+ * carries less than it does.
  *
  * The strip is one line inside a cell that is often narrower than its chips,
  * so what fits is decided by the stylesheet, never by a measured width: every
@@ -1263,7 +1263,7 @@ function renderAttributesCell(row: EventLogRow): ReactNode {
  * No column is sortable and no `onSortChange` is offered: the ordering is the
  * one the node's query asked the resolver for, and a control that re-ordered
  * the loaded page locally would disagree with the paging counters the same
- * response carried (AAP 0.4.2).
+ * response carried.
  */
 const EVENT_LOG_COLUMNS: readonly DataTableColumn<EventLogRow>[] = Object.freeze([
   { key: 'seq', header: COLUMN_HEADER_SEQ, align: 'end', width: 'ordinal', cell: renderSeqCell },
@@ -1570,11 +1570,11 @@ export function EventLog(props: EventLogProps): ReactElement {
     selectedKind === ALL_KINDS_VALUE
   );
 
-  // The four bodies, in the order AAP 0.6.2 fixes: busy, failed, absent, then
-  // the grid. An empty page and a failed request are different answers and are
-  // never merged - `"success"` with no rows is an absence phrased from the
-  // response's own counters (see `describeEmptyPage`), while a rejection is a
-  // failure with a retry (AAP 0.5.5).
+  // The four bodies, in the fixed order every query-backed view follows: busy,
+  // failed, absent, then the grid. An empty page and a failed request are
+  // different answers and are never merged - `"success"` with no rows is an
+  // absence phrased from the response's own counters (see `describeEmptyPage`),
+  // while a rejection is a failure with a retry, never presented as a result.
   let body: ReactNode;
 
   if (status === 'loading') {

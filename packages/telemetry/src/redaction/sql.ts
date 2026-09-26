@@ -407,8 +407,8 @@ interface ScanOutcome {
  * comment emits one separator, and in neither case is the partially scanned
  * text emitted.
  *
- * @param text - Statement text, already cut to {@link SQL_MAX_LENGTH}.
- * @param mode - `redact` to preserve layout and `$n` placeholders,
+ * @param text Statement text, already cut to {@link SQL_MAX_LENGTH}.
+ * @param mode `redact` to preserve layout and `$n` placeholders,
  * `normalize` to collapse whitespace and unify placeholders.
  */
 function scanStatement(text: string, mode: ScanMode): ScanOutcome {
@@ -706,7 +706,7 @@ function scanStatement(text: string, mode: ScanMode): ScanOutcome {
  *   Non-string input is normalised by `asScannableText` and then redacted like
  *   any other statement, so evidence is masked rather than erased.
  *
- * @param sql - Statement text as captured from the database tier. Declared
+ * @param sql Statement text as captured from the database tier. Declared
  * `unknown` because a span attribute is untyped at runtime; see
  * {@link redactSqlStatementWithFindings} for how a non-string value is handled.
  * @returns The statement with every inline literal replaced.
@@ -743,7 +743,7 @@ export function redactSqlStatement(sql: unknown): string {
  * including the bound and its credential-aware cut, because the normalised
  * text takes exactly the same path as text that arrived as a string.
  *
- * @param sql - Statement text as captured from the database tier, or any other
+ * @param sql Statement text as captured from the database tier, or any other
  * value an untrusted producer supplied in its place.
  */
 export function redactSqlStatementWithFindings(sql: unknown): SqlRedactionFindings {
@@ -832,7 +832,7 @@ export function redactSqlStatementWithFindings(sql: unknown): SqlRedactionFindin
  * normalised into text there and a malformed `db.statement` yields a key
  * rather than an exception in the aggregate that is grouping by it.
  *
- * @param sql - Statement text as captured from the database tier, or any other
+ * @param sql Statement text as captured from the database tier, or any other
  * value an untrusted producer supplied in its place.
  * @returns The grouping key: redacted, placeholder-unified, whitespace-
  * collapsed statement text.

@@ -24,10 +24,10 @@
  *   field below is read and none is written.
  * - **It reaches no transport.** The evidence behind a node arrives through that
  *   component's own `useQuery` against the ambient `DataProvider`, and an
- *   interaction leaves through the ambient `PanelActions` (AAP 0.1.2, 0.4.2).
- *   There is no `fetch`, no socket, no message port and no host API in this
- *   file, and no provider or callback prop either — the host mounts the
- *   contexts once, around the whole panel.
+ *   interaction leaves through the ambient `PanelActions`. There is no
+ *   `fetch`, no socket, no message port and no host API in this file, and no
+ *   provider or callback prop either — the host mounts the contexts once,
+ *   around the whole panel.
  * - **It holds no React state.** The dispatch itself has no state, no hook and
  *   no effect; the one effect in this file belongs to the node frame, which
  *   holds a DOM focus keeper and nothing React renders from (see "Focus
@@ -50,9 +50,8 @@
  * top of the panel. Pressing **Retry** is the everyday case: the query returns
  * to loading, the view swaps its `ErrorState` for a `LoadingState`, and the
  * button that was pressed is gone a moment before a fresh error or the
- * recovered view takes its place (B1-F14, B2-F12). A paging control disabled
- * while its page loads, or removed once the last page has arrived, loses focus
- * the same way.
+ * recovered view takes its place. A paging control disabled while its page
+ * loads, or removed once the last page has arrived, loses focus the same way.
  *
  * The cure lives here because the wrapper this module emits around every node
  * is the one element that outlives every state its node passes through, and
@@ -82,22 +81,22 @@
  *
  * ## A node type with no component is an error ON SCREEN, never a blank area
  *
- * AAP 0.6.2 is explicit: "a node type with no component is a validation failure
- * raised by `packages/panel-schema/src/validate.ts` before rendering, never a
- * blank area". Both halves bind this file. The first says a miss here cannot
- * happen through the supported path — an unknown node type is rejected by the
- * validator — so the remaining ways to reach one are all defects: a stored
- * panel written by a newer vocabulary and read back, a caller that rendered a
- * specification it never validated, or a catalogue entry added without a
- * registry component. The second says what a defect must look like: this module
- * renders {@link ErrorState}, naming the node type and the node's id, inside a
- * wrapper whose stylesheet rule gives it the room the visualization would have
- * occupied.
+ * The renderer contract has two halves: a node type with no component is a
+ * validation failure raised by `packages/panel-schema/src/validate.ts` before
+ * rendering, and it is never a blank area. Both bind this file. The first says a
+ * miss here cannot happen through the supported path — an unknown node type is
+ * rejected by the validator — so the remaining ways to reach one are all
+ * defects: a stored panel written by a newer vocabulary and read back, a caller
+ * that rendered a specification it never validated, or a catalogue entry added
+ * without a registry component. The second says what a defect must look like:
+ * this module renders {@link ErrorState}, naming the node type and the node's
+ * id, inside a wrapper whose stylesheet rule gives it the room the
+ * visualization would have occupied.
  *
  * It must not return `null`, an empty fragment or a substituted component, and
  * it must not read as "no data": a failure is never presented as a successful
- * result (AAP 0.5.5). "No data" belongs to a component whose query legitimately
- * resolved to nothing, which is that component's own empty state.
+ * result. "No data" belongs to a component whose query legitimately resolved to
+ * nothing, which is that component's own empty state.
  *
  * There is deliberately no error boundary. One that rendered nothing would
  * dress a failure as success, and one that rendered a message would absorb the
@@ -195,11 +194,13 @@
  *
  * There is no inline style, no colour, no length and no font in this file, and
  * no raw interactive, tabular or heading element: the heading of a labelled leaf
- * is `../layout/Section`'s, and the failure is `../primitives/ErrorState`'s
- * (AAP 0.6.4). The focus keeper adds no class either: it *reads* the frame
- * class and `Section`'s heading class as selectors, and the only attribute it
- * ever writes is a temporary `tabindex="-1"`, so a parked focus is drawn by the
- * stylesheet's one `:focus-visible` ring like any other.
+ * is `../layout/Section`'s, and the failure is `../primitives/ErrorState`'s,
+ * because every visual value in the renderer resolves to a token and every
+ * control, table and heading to a library primitive. The focus keeper adds no
+ * class either: it *reads* the frame class and `Section`'s heading class as
+ * selectors, and the only attribute it ever writes is a temporary
+ * `tabindex="-1"`, so a parked focus is drawn by the stylesheet's one
+ * `:focus-visible` ring like any other.
  *
  * Relative specifiers are extensionless, as everywhere under `src/**` of this
  * package: it resolves with `moduleResolution: "bundler"`, unlike the
@@ -269,7 +270,7 @@ const FAILURE_CODE: DebuggenErrorCode = 'PANEL_INVALID';
  *
  * The block holds the node's own definition — the JSON this renderer could not
  * draw — and no data query, so the error primitive's default name ("Failing
- * query") would tell a screen-reader user it is something it is not (B1-F16).
+ * query") would tell a screen-reader user it is something it is not.
  */
 const FAILURE_BLOCK_LABEL = 'Node definition';
 
@@ -1008,7 +1009,7 @@ function renderNodeFailure(node: PanelNode, message: string, diagnosticPath: str
  * Three, and the last two are positioning rather than content: the node is the
  * whole of what is drawn, and the data provider, the session and the action
  * contract are ambient — the host mounts them once around the panel, so they are
- * not props here and must not become them (AAP 0.1.2).
+ * not props here and must not become them.
  *
  * Every optional member spells `| undefined` explicitly, because
  * `exactOptionalPropertyTypes` is in force repository-wide and a caller
@@ -1081,7 +1082,7 @@ function sameNodeRendererProps(previous: NodeRendererProps, next: NodeRendererPr
  * the registry declares. A container's children are rendered through
  * {@link renderPanelNodes} and handed over as an array; a labelled leaf is
  * wrapped in `../layout/Section`; a type the registry has no component for
- * renders a visible failure rather than nothing (AAP 0.6.2, 0.5.5).
+ * renders a visible failure rather than nothing.
  *
  * Presentational: no state, no effect and no hook of its own. Every branch
  * draws its node inside a {@link NodeFrame}, whose one effect installs the
@@ -1159,7 +1160,7 @@ function NodeRendererView(props: NodeRendererProps): ReactElement {
   // whose title is whitespace is not given an empty container to sit in. Only
   // the two labels and the outline level are passed: the frame and the spacing
   // stay at the container's own defaults, because a specification carries no
-  // field for either and this file may not invent one (AAP 0.6.4).
+  // field for either and this file may not invent one.
   if (hasText(node.title) || hasText(node.description)) {
     return (
       <NodeFrame className={NODE_CLASS} diagnosticPath={diagnosticPath}>

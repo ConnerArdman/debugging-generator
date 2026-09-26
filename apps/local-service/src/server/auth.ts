@@ -61,13 +61,27 @@
  * One DevTools case carries no `Origin` at all: Chrome sends the header on an
  * extension's `POST` and on its WebSocket upgrade, but not on a `GET` its
  * service worker makes to a host the extension holds a host permission for
- * (`http://127.0.0.1/*`). A DevTools credential is therefore also accepted
- * from no origin on a `GET` route — the read-only ones: `session.get`,
- * `panel.get`, `panel.getById` and `modifications.list` — and nowhere else:
- * every state-changing request and the `client.hello` still need the issuing
- * extension's origin. This admits nothing a web page can use: a page's own
- * cross-origin request names its origin (refused above), and the no-origin
- * requests a page can provoke cannot carry an `Authorization` header.
+ * (`http://127.0.0.1/*`). And an `Origin` is a claim: a local process holding
+ * the credential can write the extension's origin itself. So the DevTools
+ * reads — `session.get`, `panel.get`, `panel.getById` and
+ * `modifications.list` — are bound to the pairing by a **read proof**: 32
+ * CSPRNG bytes drawn when the one-time code is redeemed, returned exactly once
+ * with the credential, and stored only as a SHA-256 digest inside the
+ * credential's own record. Every DevTools read must present it as
+ * {@link READ_PROOF_HEADER}, whether it arrives with no `Origin` or with the
+ * issuing extension's; nothing sent on a connection registers or replaces it.
+ * Every state-changing request and the `client.hello` still need the issuing
+ * extension's origin.
+ *
+ * A read without the proof is `missing-credential`, one with a malformed or
+ * repeated header `malformed-credential`, and one whose proof is not the
+ * credential's — including a credential stored before proofs existed —
+ * `unknown-credential`: all `UNAUTHORIZED` (401), which the extension answers
+ * by dropping its pairing so the developer pairs again, because the pair it
+ * holds cannot read. A proof on anything but a DevTools read — a write, an
+ * exempt operation, another role's request — is `role-not-permitted`. The
+ * plaintext proof is never logged, compared only by digest, and deleted with
+ * the credential on rotation.
  *
  * No `Access-Control-Allow-Origin` header is ever set by this module or by the
  * middleware it builds. Its absence is load-bearing: it is why a browser page
@@ -110,7 +124,9 @@
  *
  * ## Failure reporting
  *
- * Every fallible operation returns a `Result`; nothing here throws. Every
+ * Every fallible operation returns a `Result`; nothing here throws to its
+ * caller (the one deliberate throw, the host path resolver's, is the
+ * {@link RealPathResolver} contract and is caught where it is called). Every
  * refusal is a `DebuggenError` whose code comes from the closed
  * `DEBUGGEN_ERROR_CODES` set and whose `details.reason` names one entry of
  * {@link AUTH_FAILURE_REASONS}, which fixes its HTTP status (400, 401, 403 or
@@ -121,9 +137,12 @@
  * ## State and lifetime
  *
  * Durable state is the two tables `credentials` and `pairing_codes`, reached
- * through the injected {@link Store}'s statement cache, and `auth.json`. The
- * only in-memory state is the pairing lockout ledger and the workspace
- * announcements, both bounded, both dropped by {@link AuthService.close}. This
+ * through the injected {@link Store}'s statement cache, and `auth.json`; a
+ * DevTools credential's read-proof digest lives in its own `credentials` row.
+ * The only in-memory state is the one service-wide pairing lockout ledger and
+ * the workspace announcements, both bounded, both dropped by
+ * {@link AuthService.close} (the announcements by {@link AuthService.rotateAll}
+ * as well). This
  * module starts no timer and opens no socket: lockouts and workspace leases
  * expire lazily against the injected clock, and an expired lease is pruned by
  * the scope read that finds it expired.
@@ -160,7 +179,7 @@
  */
 
 import { randomBytes as cryptoRandomBytes, timingSafeEqual } from 'node:crypto';
-import { unlinkSync } from 'node:fs';
+import { lstatSync, realpathSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import type { MiddlewareHandler } from 'hono';
@@ -172,12 +191,15 @@ import {
   CLIENT_KINDS,
   HTTP_ROUTES,
   PROTOCOL_VERSION,
+  READ_PROOF_BYTES,
+  READ_PROOF_HEADER,
   WS_CLOSE_UNAUTHORIZED,
   clientHelloPayloadSchema,
   describeZodIssues,
   formatBearer,
   isAuthExemptOperation,
   isCompatibleProtocolVersion,
+  isReadProof,
   parseActingTabHeader,
   toErrorPayload,
 } from '@debuggen/protocol';
@@ -189,17 +211,20 @@ import type {
 } from '@debuggen/protocol';
 import {
   DebuggenError,
+  basenamePosix,
+  dirnamePosix,
   err,
   isAbsolutePosix,
   isErr,
   isWindowsAbsolute,
   isWithin,
+  joinPosix,
   normalizePosix,
   nowEpochMs,
   ok,
   toPosix,
 } from '@debuggen/shared';
-import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
+import type { DebuggenErrorCode, Logger, RealPathResolver, Result } from '@debuggen/shared';
 import {
   SECURE_FILE_MODE,
   ensureSecureDir,
@@ -282,8 +307,28 @@ export const PAIRING_CODE_TTL_MS = 5 * 60 * 1000;
 export const PAIRING_CODE_MAX_REDEMPTIONS = 1;
 
 /**
- * How many consecutive failed redemptions from one presenting origin trigger a
- * lockout of that origin.
+ * How many failed redemptions — each within {@link PAIRING_LOCKOUT_MS} of the
+ * one before it — lock pairing **for every caller at once** for
+ * {@link PAIRING_LOCKOUT_MS}.
+ *
+ * The count is service-wide, never per caller, because nothing about a caller
+ * of `POST /pair/complete` can be trusted to tell callers apart. Its only
+ * identifying input is the `Origin` header, which a local process sets to any
+ * `chrome-extension://…` value it likes, so a ledger keyed by origin would hand
+ * a forger five fresh guesses per invented id. And every client reaches this
+ * loopback-only service from the same address, so there is no peer address to
+ * key on either: the one ledger *is* the trusted-peer throttle. At most this
+ * many wrong guesses therefore fit in any lockout window, however many origins
+ * they are spread over. Pairing is a rare, developer-initiated action, so a
+ * forger pausing it for a minute costs the developer nothing a retry does not
+ * recover.
+ *
+ * During a lockout even the right code is refused (`pairing-locked`, 429) and
+ * nothing is burned: the code stays unused and redeems once the lock lifts. A
+ * successful redemption clears the count, and so does a quiet window of
+ * {@link PAIRING_LOCKOUT_MS} with no failure. The credential a redemption
+ * issues is still scoped to the redeeming extension's id; only the throttle is
+ * shared.
  */
 export const PAIRING_MAX_FAILURES = 5;
 
@@ -292,28 +337,6 @@ export const PAIRING_MAX_FAILURES = 5;
  * further failure follows it: sixty seconds.
  */
 export const PAIRING_LOCKOUT_MS = 60 * 1000;
-
-/**
- * How many failed redemptions across **all** origins within one
- * {@link PAIRING_LOCKOUT_MS} window lock pairing globally for that window.
- *
- * The per-origin ledger alone is not a brute-force defence against a local
- * process, which can put any `chrome-extension://…` value in its `Origin`
- * header and so earn five fresh attempts per invented id. This ceiling bounds
- * what such a process can try per window regardless of how many origins it
- * forges. Pairing is a rare, developer-initiated action, so a forger locking it
- * for a minute costs nothing an honest client cannot recover from by retrying.
- */
-export const PAIRING_GLOBAL_MAX_FAILURES = PAIRING_MAX_FAILURES * 4;
-
-/**
- * The most presenting origins the lockout ledger remembers at once.
- *
- * A bound on memory, not a policy: entries expire on their own after
- * {@link PAIRING_LOCKOUT_MS}, and the global ceiling above stops a forger long
- * before this many ids have been tried.
- */
-const MAX_TRACKED_PAIRING_ORIGINS = 1024;
 
 /** How many times generation retries when a fresh value collides with a stored one. */
 const MAX_GENERATION_ATTEMPTS = 4;
@@ -509,13 +532,24 @@ export interface ServerAgentPrincipal extends PrincipalBase {
 export type Principal = EditorPrincipal | DevtoolsPrincipal | ServerAgentPrincipal;
 
 /**
- * A freshly issued credential: the **only** type in the service that carries a
- * plaintext token. It is returned exactly once per issuance, to the one caller
- * that hands it to its client, and never persisted.
+ * A freshly issued credential: with {@link IssuedDevtoolsCredential}, the
+ * **only** type in the service that carries a plaintext secret. It is returned
+ * exactly once per issuance, to the one caller that hands it to its client,
+ * and never persisted.
  */
 export interface IssuedCredential {
   readonly token: string;
   readonly expiresAt?: number;
+}
+
+/**
+ * A freshly issued DevTools credential and the read proof issued with it
+ * ({@link READ_PROOF_HEADER}). Both are plaintext secrets returned exactly
+ * once; the service keeps only their SHA-256 digests, the proof's inside the
+ * credential's stored scope.
+ */
+export interface IssuedDevtoolsCredential extends IssuedCredential {
+  readonly readProof: string;
 }
 
 /**
@@ -696,7 +730,10 @@ export interface PairingCode {
 
 /** The input of {@link AuthService.completePairing}. */
 export interface PairingCompletionRequest {
-  /** The code the developer typed. */
+  /**
+   * The code as submitted. Compared exactly — never trimmed or case-folded —
+   * so it must already be the eight upper-case characters the editor showed.
+   */
   readonly code: string;
   /** The `Origin` of the redeeming request; must be `chrome-extension://<id>`. */
   readonly origin: string | undefined;
@@ -801,8 +838,9 @@ interface AuthFailureDescriptor {
  *
  * The table is the single place a refusal's status is decided: 400 when the
  * acting-tab header is not a tab id, 401 when the caller is not (or no longer)
- * authenticated, 403 when it is authenticated but the origin, role, scope or
- * acting tab does not permit the act, 429 during a pairing lockout.
+ * authenticated — which includes a DevTools read without the read proof issued
+ * with its credential —, 403 when it is authenticated but the origin, role,
+ * scope or acting tab does not permit the act, 429 during a pairing lockout.
  * `details.reason` on every refusal names its entry, so
  * {@link authFailureStatus} can map an error back to its status without parsing
  * a message.
@@ -947,21 +985,26 @@ function isAuthFailureReason(value: string): value is AuthFailureReason {
 }
 
 /**
- * Builds the refusal for one reason. The message is the table's constant unless
- * the caller supplies a more specific one, which must be a constant too: no
- * presented value is ever interpolated into it.
+ * Builds the refusal for one reason. The message and hint are the table's
+ * constants unless the caller supplies more specific ones, which must be
+ * constants too: no presented value is ever interpolated into either.
  */
-function authFailure(reason: AuthFailureReason, message?: string): DebuggenError {
+function authFailure(reason: AuthFailureReason, message?: string, hint?: string): DebuggenError {
   const descriptor: AuthFailureDescriptor = AUTH_FAILURE_REASONS[reason];
+  const next = hint ?? descriptor.hint;
   return new DebuggenError(descriptor.code, message ?? descriptor.message, {
     details: { reason },
-    ...(descriptor.hint === undefined ? {} : { hint: descriptor.hint }),
+    ...(next === undefined ? {} : { hint: next }),
   });
 }
 
 /** {@link authFailure} as an `Err`, typed for whichever `Result` the caller returns. */
-function refuse<T>(reason: AuthFailureReason, message?: string): Result<T, DebuggenError> {
-  return err(authFailure(reason, message));
+function refuse<T>(
+  reason: AuthFailureReason,
+  message?: string,
+  hint?: string,
+): Result<T, DebuggenError> {
+  return err(authFailure(reason, message, hint));
 }
 
 /**
@@ -1176,28 +1219,80 @@ function presentationOf(operation: HttpOperationId): CredentialPresentation {
   return HTTP_ROUTES[operation].method === 'GET' ? 'read' : 'write';
 }
 
+/** What the origin rule decides for one presentation of a credential. */
+type OriginDecision = 'permitted' | 'refused';
+
 /**
  * Whether a credential of this principal's role may be presented from this
  * origin: editor credentials from Node or a VS Code webview, DevTools
- * credentials from the extension they were issued to — or from no origin on a
- * `read`, because Chrome omits the header on the extension's `GET`s —
- * server-agent credentials only from Node.
+ * credentials from the extension they were issued to, server-agent credentials
+ * only from Node.
+ *
+ * A DevTools `read` is also permitted from no origin, because Chrome omits the
+ * header on the `GET`s the extension's service worker sends; every other
+ * origin-less DevTools presentation — a write, a hello — is refused. An
+ * `Origin` is only a claim, so the origin rule is never what admits a DevTools
+ * read on its own: every one of them must also carry the read proof issued
+ * with its credential, checked when the credential is authenticated.
  */
-function originPermitsPrincipal(
+function originDecisionFor(
   origin: OriginClass,
   principal: Principal,
   presentation: CredentialPresentation,
-): boolean {
+): OriginDecision {
   switch (principal.role) {
     case 'vscode':
-      return origin.kind === 'absent' || origin.kind === 'vscode-webview';
+      return origin.kind === 'absent' || origin.kind === 'vscode-webview' ? 'permitted' : 'refused';
     case 'devtools':
-      return origin.kind === 'absent'
-        ? presentation === 'read'
-        : origin.kind === 'chrome-extension' && origin.extensionId === principal.scope.extensionId;
+      if (
+        origin.kind === 'chrome-extension' &&
+        origin.extensionId === principal.scope.extensionId
+      ) {
+        return 'permitted';
+      }
+      return origin.kind === 'absent' && presentation === 'read' ? 'permitted' : 'refused';
     case 'server-agent':
-      return origin.kind === 'absent';
+      return origin.kind === 'absent' ? 'permitted' : 'refused';
   }
+}
+
+/*
+ * The constant messages of the read-proof refusals — see the module's origin
+ * policy for the reason each one reuses. None of them carries the presented
+ * value.
+ */
+const READ_PROOF_REQUIRED_MESSAGE = `A DevTools read must carry the read proof issued with its credential in the ${READ_PROOF_HEADER} header.`;
+const READ_PROOF_MALFORMED_MESSAGE = `The ${READ_PROOF_HEADER} header must be exactly one well-formed read proof.`;
+const READ_PROOF_MISMATCH_MESSAGE =
+  'The read proof is not the one issued with this DevTools credential.';
+const READ_PROOF_NOT_PERMITTED_MESSAGE = `Only a DevTools read carries a read proof; this request may not carry the ${READ_PROOF_HEADER} header.`;
+
+/**
+ * The next step for every refused read proof, in place of the reused reason's
+ * bearer-header hint: only a new pairing issues a proof.
+ */
+const READ_PROOF_HINT =
+  'Pair the Debug Generator DevTools extension again: pairing issues the read proof its reads carry.';
+
+/**
+ * The read-proof header rule outside the one case that consults the proof: a
+ * {@link READ_PROOF_HEADER} is refused on a request whose principal is not a
+ * DevTools one, on an auth-exempt operation (`principal` `null`) and on a write,
+ * whatever its value — only a DevTools read presents the proof. A DevTools
+ * read that carries one is let through here; whether it is the credential's
+ * proof was decided when the credential was authenticated.
+ */
+function decideReadProofHeader(
+  principal: Principal | null,
+  presentation: CredentialPresentation,
+  header: HeaderRead,
+): Result<void, DebuggenError> {
+  if (header.kind === 'absent') {
+    return ok(undefined);
+  }
+  return principal?.role === 'devtools' && presentation === 'read'
+    ? ok(undefined)
+    : refuse('role-not-permitted', READ_PROOF_NOT_PERMITTED_MESSAGE);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1231,6 +1326,144 @@ function normalizeRoot(path: string): string | undefined {
 /** Whether two normalised roots name the same directory, by the shared containment predicate. */
 function sameRoot(left: string, right: string): boolean {
   return isWithin(left, right) && isWithin(right, left);
+}
+
+/**
+ * Whether this host reads a drive-rooted path (`C:/work`) as a filesystem
+ * location. Only Windows does: elsewhere `realpath('C:/work')` treats `C:` as a
+ * relative name under the process's working directory.
+ */
+const HOST_RESOLVES_DRIVE_PATHS = process.platform === 'win32';
+
+/** A drive-letter prefix, with or without the separator that makes it absolute. */
+const DRIVE_PREFIX = /^[A-Za-z]:/;
+
+/**
+ * A drive letter followed by a separator (`C:/…`, `C:\…`). The drive-relative
+ * `C:dir`, which Windows resolves against that drive's current directory, does
+ * not match.
+ */
+const DRIVE_ABSOLUTE_PREFIX = /^[A-Za-z]:[\\/]/;
+
+/**
+ * A normalised root that is only a drive — what {@link normalizeRoot} makes of
+ * `C:/` and `C:\`. It names the drive's root, and is asked about as `C:/`,
+ * because a Windows resolver answers the bare `C:` with that drive's current
+ * directory instead.
+ */
+const BARE_DRIVE = /^[A-Za-z]:$/;
+
+/** The one resolver failure {@link canonicalRoot} answers by trying the parent. */
+const MISSING_COMPONENT_ERRNO = 'ENOENT';
+
+/**
+ * The resolver {@link requireProjectScope} uses when its caller injects none:
+ * the host's own `realpath`, which follows every link in the path.
+ *
+ * A drive-rooted path on a host that is not Windows names no directory, so it
+ * is refused the way the {@link RealPathResolver} contract has a resolver refuse
+ * any path it cannot resolve — by throwing. The thrown error's `code` is
+ * `PATH_OUTSIDE_PROJECT`, not `ENOENT`, so {@link canonicalRoot} refuses at once
+ * rather than walking up through `C:`. That makes the refusal independent of
+ * the working directory, which could otherwise hold an entry named `C:`.
+ *
+ * `realpath` answers `ENOENT` both for a path that does not exist and for a
+ * **dangling** symbolic link — one whose target does not exist yet. Only the
+ * first is a missing component {@link canonicalRoot} may re-append as spelled:
+ * a dangling link would be kept under the workspace in spelling and then lead
+ * wherever its target is later created. So an `ENOENT` is re-checked with
+ * `lstat`, which does not follow a final link: an entry that is there is a
+ * link `realpath` could not follow, and it is refused with a non-`ENOENT`
+ * failure. A `lstat` failure other than a missing entry (`ENOTDIR`, `EACCES`)
+ * propagates as it is, and is refused the same way.
+ */
+function resolveHostRealPath(absolutePath: string): string {
+  if (!HOST_RESOLVES_DRIVE_PATHS && DRIVE_PREFIX.test(absolutePath)) {
+    throw new DebuggenError(
+      'PATH_OUTSIDE_PROJECT',
+      'A drive-rooted path names no directory on this host.',
+    );
+  }
+  try {
+    return realpathSync.native(absolutePath);
+  } catch (cause) {
+    if (
+      resolverFailureCode(cause) === MISSING_COMPONENT_ERRNO &&
+      lstatSync(absolutePath, { throwIfNoEntry: false }) !== undefined
+    ) {
+      throw new DebuggenError(
+        'PATH_OUTSIDE_PROJECT',
+        'A symbolic link on this path points at nothing that exists, so where it leads cannot be established.',
+        { cause },
+      );
+    }
+    throw cause;
+  }
+}
+
+/** The errno a resolver failure carries (`ENOENT`, `EACCES`, …), read structurally. */
+function resolverFailureCode(cause: unknown): unknown {
+  return typeof cause === 'object' && cause !== null && 'code' in cause ? cause.code : undefined;
+}
+
+/**
+ * The canonical form of a root {@link normalizeRoot} accepted — every symbolic
+ * link in the part of it that exists resolved, the part that does not exist yet
+ * re-appended as spelled — or `undefined` when that cannot be established.
+ *
+ * The resolver is asked about the whole root; each `ENOENT` sets the final
+ * component aside and asks about the parent instead, up to the filesystem root
+ * (`/`, or the drive's root). The first answer is the canonical form of the
+ * longest existing ancestor, and the set-aside components follow it in order.
+ *
+ * Tolerating a missing tail is what lets an editor name a project it is about to
+ * create, and every root a test names without creating it, and it opens no
+ * escape: a component that does not exist is not a link, so it redirects
+ * nothing, every component that does exist has been resolved, and the root was
+ * normalised first, so no `..` in the tail climbs back out. That holds because
+ * the resolver's `ENOENT` means "no entry at all": the host resolver
+ * ({@link resolveHostRealPath}) turns a dangling link — an entry `realpath`
+ * cannot follow — into a different failure, so it is refused rather than
+ * re-appended.
+ *
+ * `undefined` — which every caller turns into the one refusal
+ * `project-out-of-scope`, so no answer here becomes a probe of the disk — for:
+ * a drive-relative root (`C:dir`); a resolver failure other than `ENOENT`
+ * (`EACCES`, `ENOTDIR`, `ELOOP`, the host resolver's drive-path refusal, a
+ * throw with no errno); `ENOENT` all the way to the filesystem root; and an
+ * answer that is not an absolute local path — a relative or drive-relative
+ * answer, or a network share (which {@link normalizeRoot} refuses as a root in
+ * any case, so a workspace on a Windows drive mapped to a share is refused
+ * rather than contained against a spelling the product never accepts).
+ */
+function canonicalRoot(root: string, resolveRealPath: RealPathResolver): string | undefined {
+  if (DRIVE_PREFIX.test(root) && !BARE_DRIVE.test(root) && !DRIVE_ABSOLUTE_PREFIX.test(root)) {
+    return undefined;
+  }
+
+  const missing: string[] = [];
+  let existing = root;
+  for (;;) {
+    let resolved: string;
+    try {
+      resolved = resolveRealPath(BARE_DRIVE.test(existing) ? `${existing}/` : existing);
+    } catch (cause) {
+      const atFilesystemRoot = existing === '/' || BARE_DRIVE.test(existing);
+      if (resolverFailureCode(cause) !== MISSING_COMPONENT_ERRNO || atFilesystemRoot) {
+        return undefined;
+      }
+      missing.unshift(basenamePosix(existing));
+      existing = dirnamePosix(existing);
+      continue;
+    }
+
+    const canonical = normalizeRoot(resolved);
+    const driveRelative = DRIVE_PREFIX.test(resolved) && !DRIVE_ABSOLUTE_PREFIX.test(resolved);
+    if (canonical === undefined || driveRelative) {
+      return undefined;
+    }
+    return missing.length === 0 ? canonical : joinPosix(canonical, ...missing);
+  }
 }
 
 /**
@@ -1398,6 +1631,17 @@ const storedScopeSchema = z.discriminatedUnion('kind', [
   z.strictObject({
     kind: z.literal('extension'),
     extensionId: z.string().regex(EXTENSION_ID_PATTERN),
+    /**
+     * The SHA-256 digest, lowercase hex, of the read proof issued with the
+     * credential ({@link READ_PROOF_HEADER}). Written once, when the credential
+     * is inserted, and never updated. Optional only so a credential stored
+     * before read proofs existed still parses as a DevTools credential — one
+     * whose every read is refused until the extension pairs again.
+     */
+    readProofDigest: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/)
+      .optional(),
   }),
   z.strictObject({
     kind: z.literal('project'),
@@ -1634,8 +1878,12 @@ export interface AuthService {
    */
   ensureEditorCredential(): Result<EditorCredentialState, DebuggenError>;
 
-  /** Issues a DevTools credential scoped to one extension id. */
-  issueDevtoolsCredential(extensionId: string): Result<IssuedCredential, DebuggenError>;
+  /**
+   * Issues a DevTools credential scoped to one extension id, with the read
+   * proof its reads must carry ({@link READ_PROOF_HEADER}); the stored record
+   * keeps only the proof's digest.
+   */
+  issueDevtoolsCredential(extensionId: string): Result<IssuedDevtoolsCredential, DebuggenError>;
 
   /**
    * Issues a server-agent credential scoped to one project root, for the
@@ -1710,9 +1958,11 @@ export interface AuthService {
 
   /**
    * The HTTP middleware core: origin policy first, then the exemption, then the
-   * bearer credential and the operation's role table, and last the
-   * {@link ACTING_TAB_HEADER} rule — only a DevTools principal may name an
-   * acting tab, and only as one well-formed tab id.
+   * bearer credential — with, for every DevTools read, the
+   * {@link READ_PROOF_HEADER} issued with that credential at pairing — and the
+   * operation's role table, then the read-proof header rule (only on a DevTools
+   * read) and last the {@link ACTING_TAB_HEADER} rule — only a DevTools
+   * principal may name an acting tab, and only as one well-formed tab id.
    *
    * @returns The principal, or `null` for an auth-exempt operation.
    */
@@ -1722,7 +1972,8 @@ export interface AuthService {
    * Authenticates a `client.hello`: payload shape, protocol version, origin,
    * credential, and the claims the hello makes against the credential's role
    * and scope. An editor principal returned here carries the workspace folder
-   * its hello announced.
+   * its hello announced. A DevTools hello is accepted only from the issuing
+   * extension's origin; no hello carries or registers a read proof.
    */
   authorizeHello(request: HelloAuthorizationRequest): Result<Principal, DebuggenError>;
 
@@ -1739,9 +1990,15 @@ export interface AuthService {
 
   /**
    * Redeems a pairing code for a DevTools credential scoped to the redeeming
-   * extension's id: single use, time-limited and rate-limited.
+   * extension's id: single use, time-limited and rate-limited by one
+   * service-wide lockout ({@link PAIRING_MAX_FAILURES}) that no choice of
+   * `Origin` escapes. The code is compared exactly as submitted. The credential
+   * is issued with a fresh read proof, returned here once and stored only as a
+   * digest.
    */
-  completePairing(request: PairingCompletionRequest): Result<IssuedCredential, DebuggenError>;
+  completePairing(
+    request: PairingCompletionRequest,
+  ): Result<IssuedDevtoolsCredential, DebuggenError>;
 
   /**
    * Deletes every credential and pairing code, regenerates `auth.json`, and
@@ -1812,7 +2069,10 @@ export interface AuthService {
    */
   requireLiveCredential(principal: Principal): Result<void, DebuggenError>;
 
-  /** Drops the in-memory lockout ledger and announcements. Owns no timer or socket. */
+  /**
+   * Drops the in-memory lockout ledger, announcements and registered read
+   * proofs. Owns no timer or socket.
+   */
   close(): void;
 }
 
@@ -1863,7 +2123,7 @@ const SECURE_CREDENTIAL_FILE_SYSTEM: CredentialFileSystem = Object.freeze({
   },
 });
 
-/** One origin's (or the global) pairing-failure record. */
+/** The service-wide pairing-failure record ({@link PAIRING_MAX_FAILURES}). */
 interface PairingLedgerEntry {
   /** Failures since the last success, decayed after a quiet lockout window. */
   failures: number;
@@ -1878,7 +2138,12 @@ function newLedgerEntry(): PairingLedgerEntry {
   return { failures: 0, lastFailureAt: Number.NEGATIVE_INFINITY, lockedUntil: 0 };
 }
 
-/** Whether a normalised code has the exported length and uses only the exported alphabet. */
+/**
+ * Whether a submitted code, exactly as sent, is {@link PAIRING_CODE_LENGTH}
+ * characters of {@link PAIRING_CODE_ALPHABET}. Nothing is trimmed or
+ * case-folded first: whitespace and lower-case letters are outside the
+ * alphabet, so a padded or lower-case submission is not well formed.
+ */
 function isWellFormedPairingCode(code: string): boolean {
   if (code.length !== PAIRING_CODE_LENGTH) {
     return false;
@@ -1934,11 +2199,11 @@ class CredentialAuthority implements AuthService {
 
   readonly #files: CredentialFileSystem;
 
-  /** Pairing failures per presenting origin, in insertion (oldest-first) order. */
-  readonly #ledger = new Map<string, PairingLedgerEntry>();
-
-  /** Pairing failures across every origin. */
-  #globalLedger: PairingLedgerEntry = newLedgerEntry();
+  /**
+   * The one service-wide pairing-failure record ({@link PAIRING_MAX_FAILURES}):
+   * every failed redemption counts here, whatever origin presented it.
+   */
+  #pairingLedger: PairingLedgerEntry = newLedgerEntry();
 
   /**
    * Announced workspace folders per editor credential digest: each folder's
@@ -2028,6 +2293,24 @@ class CredentialAuthority implements AuthService {
       return bytes;
     }
     return ok(Buffer.from(bytes.value).toString('base64url'));
+  }
+
+  /**
+   * A fresh DevTools read proof: {@link READ_PROOF_BYTES} random bytes as
+   * unpadded base64url, the {@link READ_PROOF_HEADER} value the credential's
+   * reads must carry. Drawn from the same source as the credential, and
+   * checked against the wire shape before it can be issued.
+   */
+  #mintReadProof(): Result<string, DebuggenError> {
+    const bytes = this.#draw(READ_PROOF_BYTES);
+    if (isErr(bytes)) {
+      return bytes;
+    }
+    const proof = Buffer.from(bytes.value).toString('base64url');
+    if (!isReadProof(proof)) {
+      return err(new DebuggenError('INTERNAL', 'A minted read proof did not have the wire shape.'));
+    }
+    return ok(proof);
   }
 
   /**
@@ -2155,13 +2438,21 @@ class CredentialAuthority implements AuthService {
   /**
    * Resolves a presented credential to the principal its stored row describes:
    * bounds, digest lookup, constant-time digest comparison, row validation,
-   * expiry, and finally whether the credential's role may be presented from
-   * this origin in this way ({@link originPermitsPrincipal}).
+   * expiry, whether the credential's role may be presented from this origin in
+   * this way ({@link originDecisionFor}) and, when the caller demands it for a
+   * read, the read proof `readProof` carries against the one issued with a
+   * DevTools credential ({@link #requireReadProof}).
+   *
+   * @param readProof The request's {@link READ_PROOF_HEADER} when the operation
+   * is a read a DevTools credential may make, which demands the proof of a
+   * DevTools principal; `undefined` when nothing demands one (every write, and
+   * every hello).
    */
   #authenticate(
     token: string,
     origin: OriginClass,
     presentation: CredentialPresentation,
+    readProof?: HeaderRead,
   ): Result<Principal, DebuggenError> {
     if (!presentedCredentialSchema.safeParse(token).success) {
       return refuse('malformed-credential');
@@ -2191,10 +2482,56 @@ class CredentialAuthority implements AuthService {
     if (isErr(principal)) {
       return principal;
     }
-    if (!originPermitsPrincipal(origin, principal.value, presentation)) {
+    if (originDecisionFor(origin, principal.value, presentation) === 'refused') {
       return refuse('origin-not-permitted-for-role');
     }
+    if (principal.value.role === 'devtools' && readProof !== undefined) {
+      const stored = parseStoredScope(row.data.scope);
+      const proven = this.#requireReadProof(
+        stored?.kind === 'extension' ? stored.readProofDigest : undefined,
+        readProof,
+      );
+      if (isErr(proven)) {
+        return proven;
+      }
+    }
     return principal;
+  }
+
+  /**
+   * The read-proof rule of a DevTools read, `Origin` or not: the request must
+   * carry exactly one well-formed {@link READ_PROOF_HEADER} whose SHA-256 digest
+   * is the one stored with the credential when it was issued.
+   *
+   * - no header — `missing-credential`;
+   * - several headers, or one that is not a read proof — `malformed-credential`;
+   * - a well-formed proof whose digest is not the stored one, or a credential
+   *   stored before read proofs existed (no digest) — `unknown-credential`.
+   *
+   * Each carries {@link READ_PROOF_HINT}, to pair the extension again.
+   *
+   * All three are `UNAUTHORIZED` (401): the proof is half of what the pairing
+   * issued, and a read without the right half is not authenticated. The digest
+   * is compared in constant time, and the header's value is never logged or
+   * interpolated.
+   *
+   * @param storedDigest The digest stored with the credential, if any.
+   * @param header The request's {@link READ_PROOF_HEADER}.
+   */
+  #requireReadProof(
+    storedDigest: string | undefined,
+    header: HeaderRead,
+  ): Result<void, DebuggenError> {
+    if (header.kind === 'absent') {
+      return refuse('missing-credential', READ_PROOF_REQUIRED_MESSAGE, READ_PROOF_HINT);
+    }
+    if (header.kind === 'ambiguous' || !isReadProof(header.value)) {
+      return refuse('malformed-credential', READ_PROOF_MALFORMED_MESSAGE, READ_PROOF_HINT);
+    }
+    if (storedDigest === undefined || !digestsEqual(storedDigest, sha256Hex(header.value))) {
+      return refuse('unknown-credential', READ_PROOF_MISMATCH_MESSAGE, READ_PROOF_HINT);
+    }
+    return ok(undefined);
   }
 
   /** Logs a refusal by its reason; never by anything the client presented. */
@@ -2736,7 +3073,7 @@ class CredentialAuthority implements AuthService {
    * Issuing and revoking
    * ------------------------------------------------------------------------------------------- */
 
-  issueDevtoolsCredential(extensionId: string): Result<IssuedCredential, DebuggenError> {
+  issueDevtoolsCredential(extensionId: string): Result<IssuedDevtoolsCredential, DebuggenError> {
     if (!EXTENSION_ID_PATTERN.test(extensionId)) {
       return refuse(
         'pairing-origin-required',
@@ -2747,13 +3084,17 @@ class CredentialAuthority implements AuthService {
     if (isErr(token)) {
       return token;
     }
+    const readProof = this.#mintReadProof();
+    if (isErr(readProof)) {
+      return readProof;
+    }
     const tokenHash = sha256Hex(token.value);
     const issuedAt = this.#now();
     const stored = this.#guard('issue-devtools-credential', () => {
       this.#insertCredential(
         tokenHash,
         'devtools',
-        { kind: 'extension', extensionId },
+        { kind: 'extension', extensionId, readProofDigest: sha256Hex(readProof.value) },
         issuedAt,
         null,
       );
@@ -2762,7 +3103,7 @@ class CredentialAuthority implements AuthService {
       return stored;
     }
     this.#logger.info('issued a DevTools credential', { extensionId });
-    return ok(Object.freeze({ token: token.value }));
+    return ok(Object.freeze({ token: token.value, readProof: readProof.value }));
   }
 
   issueServerAgentCredential(
@@ -3041,12 +3382,18 @@ class CredentialAuthority implements AuthService {
     }
 
     // 2. The exemption: no bearer credential for `health` and `pair.complete` —
-    //    and, with no principal, no acting tab either.
+    //    and, with no principal, no acting tab and no read proof either.
     const { operation } = request;
+    const presentation = presentationOf(operation);
     const actingTab = readHeader(request.headers, ACTING_TAB_HEADER);
+    const readProof = readHeader(request.headers, READ_PROOF_HEADER);
     if (isExemptOperation(operation)) {
       const exemptTab = decideActingTab(null, actingTab);
-      return isErr(exemptTab) ? exemptTab : ok(null);
+      if (isErr(exemptTab)) {
+        return exemptTab;
+      }
+      const exemptProof = decideReadProofHeader(null, presentation, readProof);
+      return isErr(exemptProof) ? exemptProof : ok(null);
     }
 
     // 3. Exactly one well-formed bearer credential.
@@ -3062,9 +3409,20 @@ class CredentialAuthority implements AuthService {
       return refuse('malformed-credential');
     }
 
-    // 4. The stored row decides the principal, and its role must be one the
-    //    operation admits.
-    const principal = this.#authenticate(token, origin, presentationOf(operation));
+    // 4. The stored row decides the principal — a DevTools read, `Origin` or
+    //    not, only with the read proof issued with its credential — and its
+    //    role must be one the operation admits. The proof is demanded only on
+    //    the reads a DevTools credential may make, so a DevTools credential on
+    //    any other operation is refused by its role, as before.
+    const demandsReadProof =
+      presentation === 'read' &&
+      (OPERATION_ROLES[operation] as readonly PrincipalRole[]).includes('devtools');
+    const principal = this.#authenticate(
+      token,
+      origin,
+      presentation,
+      demandsReadProof ? readProof : undefined,
+    );
     if (isErr(principal)) {
       return principal;
     }
@@ -3073,7 +3431,13 @@ class CredentialAuthority implements AuthService {
       return refuse('role-not-permitted');
     }
 
-    // 5. An acting tab only from a DevTools principal, and only one tab id.
+    // 5. A read proof only on a DevTools read.
+    const proofHeader = decideReadProofHeader(principal.value, presentation, readProof);
+    if (isErr(proofHeader)) {
+      return proofHeader;
+    }
+
+    // 6. An acting tab only from a DevTools principal, and only one tab id.
     //    Whether the tab is bound to the session the route acts on is the
     //    route's check (`requireBoundSession`), which needs the session id.
     const tab = decideActingTab(principal.value, actingTab);
@@ -3346,7 +3710,9 @@ class CredentialAuthority implements AuthService {
     );
   }
 
-  completePairing(request: PairingCompletionRequest): Result<IssuedCredential, DebuggenError> {
+  completePairing(
+    request: PairingCompletionRequest,
+  ): Result<IssuedDevtoolsCredential, DebuggenError> {
     const decision = this.#redeemPairingCode(request);
     if (isErr(decision)) {
       this.#logRefusal('refused a pairing attempt', decision.error);
@@ -3355,7 +3721,9 @@ class CredentialAuthority implements AuthService {
   }
 
   /** {@link completePairing} without the logging. */
-  #redeemPairingCode(request: PairingCompletionRequest): Result<IssuedCredential, DebuggenError> {
+  #redeemPairingCode(
+    request: PairingCompletionRequest,
+  ): Result<IssuedDevtoolsCredential, DebuggenError> {
     // The origin decides, before the code is looked at: web origins are refused
     // outright, and only the Chrome extension can redeem, because the extension
     // id in its origin becomes the scope of the credential it receives.
@@ -3366,18 +3734,28 @@ class CredentialAuthority implements AuthService {
     if (origin.kind !== 'chrome-extension') {
       return refuse('pairing-origin-required');
     }
+    // The extension id scopes the credential this redemption issues, and
+    // nothing else: the throttle below is service-wide, because the id is
+    // whatever the caller wrote in its `Origin` header.
     const { extensionId } = origin;
-    const ledgerKey = `chrome-extension://${extensionId}`;
     const now = this.#now();
 
-    // A lockout refuses even the correct code; that is what makes it a lockout.
-    if (this.#isLockedOut(ledgerKey, now)) {
+    // A lockout refuses even the correct code, and burns nothing; that is what
+    // makes it a lockout.
+    if (this.#isPairingLocked(now)) {
       return refuse('pairing-locked');
     }
 
-    const code = request.code.trim().toUpperCase();
+    // The code is judged exactly as it was sent: no trimming, no case folding.
+    // A code is eight characters of one alphabet and nothing else, so a padded,
+    // lower-case or otherwise re-spelled submission is not that code — it is a
+    // wrong guess, counted like any other. Tidying what the developer typed is
+    // the client's job (the DevTools pair dialog upper-cases and trims before it
+    // submits); accepting several spellings here would only widen what a guess
+    // may look like.
+    const { code } = request;
     if (!isWellFormedPairingCode(code)) {
-      return this.#pairingFailure(ledgerKey, now, 'pairing-invalid');
+      return this.#pairingFailure(now, 'pairing-invalid');
     }
     const codeHash = sha256Hex(code);
 
@@ -3389,20 +3767,32 @@ class CredentialAuthority implements AuthService {
     }
     const row = pairingRowSchema.safeParse(raw.value);
     if (raw.value === undefined || !row.success || !digestsEqual(row.data.code_hash, codeHash)) {
-      return this.#pairingFailure(ledgerKey, now, 'pairing-invalid');
+      return this.#pairingFailure(now, 'pairing-invalid');
     }
     if (row.data.used >= PAIRING_CODE_MAX_REDEMPTIONS) {
-      return this.#pairingFailure(ledgerKey, now, 'pairing-used');
+      return this.#pairingFailure(now, 'pairing-used');
     }
     if (row.data.expires_at <= now) {
-      return this.#pairingFailure(ledgerKey, now, 'pairing-expired');
+      return this.#pairingFailure(now, 'pairing-expired');
     }
 
     const token = this.#mintToken();
     if (isErr(token)) {
       return token;
     }
+    // The read proof is drawn here, with the credential, and reaches only the
+    // caller that redeemed the code: no later request, hello or origin can
+    // obtain or replace it.
+    const readProof = this.#mintReadProof();
+    if (isErr(readProof)) {
+      return readProof;
+    }
     const tokenHash = sha256Hex(token.value);
+    const scope: StoredScope = {
+      kind: 'extension',
+      extensionId,
+      readProofDigest: sha256Hex(readProof.value),
+    };
 
     // Marking the code used and issuing the credential are one transaction, and
     // the UPDATE only succeeds while the code is still unused and unexpired, so
@@ -3418,13 +3808,7 @@ class CredentialAuthority implements AuthService {
         if (changes !== 1) {
           return false;
         }
-        this.#insertCredential(
-          tokenHash,
-          'devtools',
-          { kind: 'extension', extensionId },
-          now,
-          null,
-        );
+        this.#insertCredential(tokenHash, 'devtools', scope, now, null);
         return true;
       }),
     );
@@ -3432,70 +3816,41 @@ class CredentialAuthority implements AuthService {
       return redeemed;
     }
     if (!redeemed.value) {
-      return this.#pairingFailure(ledgerKey, now, 'pairing-used');
+      return this.#pairingFailure(now, 'pairing-used');
     }
 
-    this.#ledger.delete(ledgerKey);
+    // A success clears the service-wide count: the failures before it were the
+    // developer's own typos as likely as anyone's guesses.
+    this.#pairingLedger = newLedgerEntry();
     this.#logger.info('paired a DevTools client', { extensionId });
-    return ok(Object.freeze({ token: token.value }));
+    return ok(Object.freeze({ token: token.value, readProof: readProof.value }));
   }
 
-  /** Forgets ledger entries that are neither locked nor holding a recent failure. */
-  #pruneLedger(now: number): void {
-    for (const [key, entry] of this.#ledger) {
-      if (entry.lockedUntil <= now && now - entry.lastFailureAt > PAIRING_LOCKOUT_MS) {
-        this.#ledger.delete(key);
-      }
-    }
-  }
-
-  /** Whether pairing is locked for this origin, or globally, at `now`. */
-  #isLockedOut(ledgerKey: string, now: number): boolean {
-    this.#pruneLedger(now);
-    if (this.#globalLedger.lockedUntil > now) {
-      return true;
-    }
-    const entry = this.#ledger.get(ledgerKey);
-    return entry !== undefined && entry.lockedUntil > now;
+  /** Whether pairing is locked, for every caller, at `now`. */
+  #isPairingLocked(now: number): boolean {
+    return this.#pairingLedger.lockedUntil > now;
   }
 
   /**
-   * Counts one failure against an entry: a failure after a quiet window starts
-   * the count again, and reaching the threshold locks the entry for
-   * {@link PAIRING_LOCKOUT_MS}.
+   * Records one failed redemption in the service-wide ledger and returns the
+   * refusal. A failure more than {@link PAIRING_LOCKOUT_MS} after the previous
+   * one starts the count again; the {@link PAIRING_MAX_FAILURES}th locks
+   * pairing for {@link PAIRING_LOCKOUT_MS} and starts the count again for the
+   * window after the lock.
    */
-  #countFailure(entry: PairingLedgerEntry, now: number, threshold: number): void {
-    if (now - entry.lastFailureAt > PAIRING_LOCKOUT_MS) {
-      entry.failures = 0;
-    }
-    entry.failures += 1;
-    entry.lastFailureAt = now;
-    if (entry.failures >= threshold) {
-      entry.lockedUntil = now + PAIRING_LOCKOUT_MS;
-      entry.failures = 0;
-    }
-  }
-
-  /** Records a failed redemption for the origin and globally, and returns the refusal. */
   #pairingFailure(
-    ledgerKey: string,
     now: number,
     reason: 'pairing-invalid' | 'pairing-used' | 'pairing-expired',
-  ): Result<IssuedCredential, DebuggenError> {
-    let entry = this.#ledger.get(ledgerKey);
-    if (entry === undefined) {
-      if (this.#ledger.size >= MAX_TRACKED_PAIRING_ORIGINS) {
-        const oldest = this.#ledger.keys().next();
-        if (oldest.done !== true) {
-          this.#ledger.delete(oldest.value);
-        }
-      }
-      entry = newLedgerEntry();
-      this.#ledger.set(ledgerKey, entry);
+  ): Result<IssuedDevtoolsCredential, DebuggenError> {
+    const ledger = this.#pairingLedger;
+    if (now - ledger.lastFailureAt > PAIRING_LOCKOUT_MS) {
+      ledger.failures = 0;
     }
-    this.#countFailure(entry, now, PAIRING_MAX_FAILURES);
-    this.#countFailure(this.#globalLedger, now, PAIRING_GLOBAL_MAX_FAILURES);
-    if (entry.lockedUntil > now || this.#globalLedger.lockedUntil > now) {
+    ledger.failures += 1;
+    ledger.lastFailureAt = now;
+    if (ledger.failures >= PAIRING_MAX_FAILURES) {
+      ledger.lockedUntil = now + PAIRING_LOCKOUT_MS;
+      ledger.failures = 0;
       this.#logger.warn('pairing is locked after repeated failures', {
         lockedForMs: PAIRING_LOCKOUT_MS,
       });
@@ -3662,8 +4017,7 @@ class CredentialAuthority implements AuthService {
   }
 
   close(): void {
-    this.#ledger.clear();
-    this.#globalLedger = newLedgerEntry();
+    this.#pairingLedger = newLedgerEntry();
     this.#announcements.clear();
   }
 }
@@ -3751,27 +4105,62 @@ export function requireRole(
  * `..` traversal or a sibling that merely shares a string prefix never passes.
  *
  * - An editor principal is confined to the workspace folders its connections
- *   announced: the root must be one of them or lie beneath one.
+ *   announced, on disk as well as in spelling. For **one** announced folder
+ *   both must hold: the root is that folder or lies beneath it as a string,
+ *   and the root's canonical path — every symbolic link resolved, a tail that
+ *   does not exist yet kept as spelled — is the folder's canonical path or
+ *   lies beneath it. So `/work/shop/external`, a link to `/home/dev/private`,
+ *   is refused under an announced `/work/shop`, while a link that stays inside
+ *   the folder, and a folder that is itself announced through a link, are
+ *   admitted. The string check runs first, so no path outside every announced
+ *   folder is ever resolved, and a root or folder whose canonical path cannot
+ *   be established (`EACCES`, a link loop, a dangling link whose target does
+ *   not exist yet, a drive-rooted path on a host that is not Windows) is
+ *   refused rather than admitted on its spelling.
  * - A server-agent principal is confined to its one project: the root must be
- *   that project root.
+ *   that project root. That is identity with the root the service minted the
+ *   credential for — a root an editor's session was admitted with by the rule
+ *   above — and no link makes one string equal another, so it stays lexical.
  * - A DevTools principal carries no project scope and acts only through its
  *   bound session ({@link requireBoundSession}), so it is always refused here.
  *
+ * Every route that takes a project root calls this — from an editor, session
+ * creation and listing and dev-server launch, stop and credentials; from a
+ * server agent, telemetry ingest — and {@link requireSessionAccess} re-runs it
+ * on every request that names a session, so a caller inherits the canonical
+ * check without passing anything.
+ *
+ * The canonical check is true at the moment it runs, not afterwards: a link
+ * created or retargeted inside the workspace after this returns is not seen
+ * here. What bounds that residue is downstream — the next request on the
+ * session re-runs this check through {@link requireSessionAccess}, and the
+ * patcher re-derives the containment of every file it writes from the
+ * project's own canonical root (`resolveRealPathWithinProject`). A caller that
+ * acts on the root after an `await` keeps the identity the root was admitted
+ * under with {@link admitProjectRoot} and re-proves it with
+ * {@link reconfirmProjectRoot} immediately before it acts.
+ *
+ * @param principal The authenticated principal.
+ * @param projectRoot The requested project root, as the caller sent it.
+ * @param resolveRealPath The canonicaliser, `realpathSync.native` by default;
+ * injected by tests. It follows the {@link RealPathResolver} contract, and a
+ * throw whose `code` is `ENOENT` means only that the component does not exist.
  * @returns `ok`, or `PATH_OUTSIDE_PROJECT` (`project-out-of-scope`, 403).
  */
 export function requireProjectScope(
   principal: Principal,
   projectRoot: string,
+  resolveRealPath: RealPathResolver = resolveHostRealPath,
 ): Result<void, DebuggenError> {
   const root = normalizeRoot(projectRoot);
   if (root === undefined) {
     return refuse('project-out-of-scope', 'A project root must be an absolute path.');
   }
   switch (principal.role) {
-    case 'vscode':
-      return principal.scope.workspaceFolders.some((folder) => isWithin(folder, root))
-        ? ok(undefined)
-        : refuse('project-out-of-scope');
+    case 'vscode': {
+      const admitted = admitProjectRoot(principal, root, resolveRealPath);
+      return isErr(admitted) ? err(admitted.error) : ok(undefined);
+    }
     case 'server-agent':
       return sameRoot(principal.scope.projectRoot, root)
         ? ok(undefined)
@@ -3782,6 +4171,119 @@ export function requireProjectScope(
         'A DevTools credential carries no project scope; it acts only through the session its tab is bound to.',
       );
   }
+}
+
+/**
+ * A project root an editor principal was admitted to act on, and the canonical
+ * identity it was admitted under.
+ *
+ * {@link requireProjectScope} answers whether a root is in scope when it runs.
+ * A caller that acts on the root only after an `await` — spawning a dev server
+ * in it, indexing or patching it — keeps this value from
+ * {@link admitProjectRoot} and passes it to {@link reconfirmProjectRoot},
+ * synchronously, immediately before it acts: a link on the path retargeted in
+ * between, even to another directory inside the workspace, is then refused
+ * rather than followed.
+ *
+ * @example
+ * ```ts
+ * const admitted = admitProjectRoot(principal, body.projectRoot);
+ * if (isErr(admitted)) return answer(admitted.error);
+ * await prepare(admitted.value.projectRoot);
+ * const still = reconfirmProjectRoot(principal, admitted.value);
+ * if (isErr(still)) return answer(still.error);
+ * spawnIn(still.value.canonicalRoot); // no await between the two
+ * ```
+ */
+export interface AdmittedProjectRoot {
+  /** The root, absolute and normalised, exactly as it was judged. */
+  readonly projectRoot: string;
+  /** Its canonical path when it was admitted: every symbolic link resolved. */
+  readonly canonicalRoot: string;
+}
+
+/** The refusal of a root whose canonical path changed after it was admitted. */
+const PROJECT_ROOT_MOVED_MESSAGE =
+  'The project root no longer resolves to the directory it was admitted as.';
+
+/**
+ * {@link requireProjectScope}'s editor rule, returning what the root was judged
+ * on: for **one** announced workspace folder, the root lies under it both as a
+ * normalised path and after both are resolved with `realpath`. The resolved
+ * root is returned as {@link AdmittedProjectRoot.canonicalRoot}.
+ *
+ * Only an editor principal is admitted to a project by its workspace folders:
+ * a server-agent principal's scope is its one project, checked by
+ * {@link requireProjectScope}, and a DevTools principal has no project scope,
+ * so both are refused here.
+ *
+ * @param principal The authenticated principal; must be an editor one.
+ * @param projectRoot The requested project root, as the caller sent it.
+ * @param resolveRealPath The canonicaliser, `realpathSync.native` by default.
+ * @returns The admitted root and its canonical path, or `PATH_OUTSIDE_PROJECT`
+ * (`project-out-of-scope`, 403).
+ */
+export function admitProjectRoot(
+  principal: Principal,
+  projectRoot: string,
+  resolveRealPath: RealPathResolver = resolveHostRealPath,
+): Result<AdmittedProjectRoot, DebuggenError> {
+  const root = normalizeRoot(projectRoot);
+  if (root === undefined) {
+    return refuse('project-out-of-scope', 'A project root must be an absolute path.');
+  }
+  if (principal.role !== 'vscode') {
+    return refuse(
+      'project-out-of-scope',
+      'Only an editor credential is admitted to a project by its workspace folders.',
+    );
+  }
+  const claimingFolders = principal.scope.workspaceFolders.filter((folder) =>
+    isWithin(folder, root),
+  );
+  if (claimingFolders.length === 0) {
+    return refuse('project-out-of-scope');
+  }
+  const canonicalProjectRoot = canonicalRoot(root, resolveRealPath);
+  if (canonicalProjectRoot === undefined) {
+    return refuse('project-out-of-scope');
+  }
+  return claimingFolders.some((folder) => {
+    const canonicalFolder = canonicalRoot(folder, resolveRealPath);
+    return canonicalFolder !== undefined && isWithin(canonicalFolder, canonicalProjectRoot);
+  })
+    ? ok(Object.freeze({ projectRoot: root, canonicalRoot: canonicalProjectRoot }))
+    : refuse('project-out-of-scope');
+}
+
+/**
+ * Re-proves an admitted root immediately before a caller acts on it: the root
+ * must still be in the principal's scope ({@link admitProjectRoot} again, so a
+ * withdrawn workspace folder or an outward link is refused) **and** still
+ * resolve to the canonical path it was admitted under, so a link retargeted
+ * since — inside the workspace or out of it — is refused instead of followed.
+ *
+ * Synchronous, and meant to run with no `await` between it and the act it
+ * guards; the residue is then the time a synchronous call takes.
+ *
+ * @param principal The principal the root was admitted for.
+ * @param admitted What {@link admitProjectRoot} returned.
+ * @param resolveRealPath The canonicaliser, `realpathSync.native` by default.
+ * @returns `admitted`, unchanged, or `PATH_OUTSIDE_PROJECT`
+ * (`project-out-of-scope`, 403).
+ */
+export function reconfirmProjectRoot(
+  principal: Principal,
+  admitted: AdmittedProjectRoot,
+  resolveRealPath: RealPathResolver = resolveHostRealPath,
+): Result<AdmittedProjectRoot, DebuggenError> {
+  const again = admitProjectRoot(principal, admitted.projectRoot, resolveRealPath);
+  if (isErr(again)) {
+    return again;
+  }
+  return sameRoot(again.value.canonicalRoot, admitted.canonicalRoot)
+    ? ok(admitted)
+    : refuse('project-out-of-scope', PROJECT_ROOT_MOVED_MESSAGE);
 }
 
 /**

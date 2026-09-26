@@ -1,8 +1,8 @@
 /**
  * The **adapter registry** of `@debuggen/instrumentation`: the single place
- * adapter identity is enumerated, and the extension point that makes AAP
- * §0.4.2's promise literal — *adding an adapter means implementing
- * {@link InstrumentationAdapter} and registering it, no orchestrator change.*
+ * adapter identity is enumerated, and the extension point: *adding an adapter
+ * means implementing {@link InstrumentationAdapter} and registering it, with
+ * no orchestrator change.*
  *
  * ## What this module owns, and what it deliberately does not
  *
@@ -94,7 +94,7 @@ import { REACT_ADAPTER_ID, createReactAdapter } from './adapters/react.js';
 // ---------------------------------------------------------------------------
 // Adapter identity
 //
-// The one enumeration of adapter identity in the product (AAP §0.4.2). Every
+// The one enumeration of adapter identity in the product. Every
 // member is imported from the module that implements it rather than spelled
 // again here, so an id that moved is a compile error in this file instead of a
 // plan whose actions resolve to an adapter the installer cannot look up.
@@ -111,7 +111,7 @@ import { REACT_ADAPTER_ID, createReactAdapter } from './adapters/react.js';
  *
  * 1. `'react'`, `'browser-performance'`, `'fetch'` — the page-agent adapters.
  *    Every signal they claim is a runtime hook, so they write nothing to a
- *    developer's working tree (AAP §0.5.1) and come first for that reason.
+ *    developer's working tree and come first for that reason.
  * 2. `'nextjs'` — the framework adapter, whose claims install as recorded,
  *    reversible patches and therefore cost a modification record.
  * 3. `'prisma'`, `'postgres'` — the database adapters, which claim the same
@@ -303,7 +303,7 @@ export interface AdapterRegistry extends PlanAdapterResolver {
   /**
    * Adds an adapter to the end of the registry.
    *
-   * This is the extension point of AAP §0.4.2: a framework adapter that
+   * This is the adapter extension point: a framework adapter that
    * implements {@link InstrumentationAdapter} and declares its `claims` becomes
    * available to the planner, the installer and cleanup through this one call,
    * and no orchestrator module changes. {@link registerAdapter} is the same
@@ -366,7 +366,7 @@ export interface AdapterRegistry extends PlanAdapterResolver {
    * **Total and non-throwing.** An action type no adapter claims — and one no
    * *applicable* adapter claims, when a context narrowed the candidates —
    * resolves to `undefined`, which normalisation turns into a rejection of the
-   * whole plan (AAP §0.2.3) and the feasibility gate reports per action. That
+   * whole plan and the feasibility gate reports per action. That
    * distinction matters here: normalisation runs on a model's output, where a
    * thrown exception is an unretryable product defect rather than a rejection
    * the planner can act on, so this method does not throw — not for an
@@ -393,7 +393,7 @@ export interface AdapterRegistry extends PlanAdapterResolver {
   /**
    * Every adapter with something to offer this project, in registration order.
    *
-   * The capability probe of AAP §0.2.3 applied across the registry: the
+   * The `canHandle` capability probe applied across the registry: the
    * planning stage builds its capability catalog from this list, and the
    * readiness gate aggregates a readiness report from each member. It
    * is a question about the project's *shape* — does the code graph carry
@@ -495,9 +495,9 @@ const C1_CONTROL_MAX = 0x9f;
  * `./schema/readiness.ts`, which keep theirs module-private. It has to be
  * enforced here as well: an id longer than those schemas store would register,
  * resolve action types and then fail every plan routed to it as `PLAN_INVALID`
- * — the unretryable product-defect path of AAP §0.5.3 — and every readiness
- * report naming it, rather than being refused once, where the adapter's author
- * can act on it.
+ * — a product defect, logged and never retried against the model — and every
+ * readiness report naming it, rather than being refused once, where the
+ * adapter's author can act on it.
  */
 const MAX_ADAPTER_ID_LENGTH = 64;
 
@@ -1007,8 +1007,8 @@ export function createAdapterRegistry(options: CreateAdapterRegistryOptions = {}
 }
 
 /**
- * Registers an adapter with a registry — the extension point of AAP §0.4.2 as
- * one call.
+ * Registers an adapter with a registry — the adapter extension point as one
+ * call.
  *
  * Exactly {@link AdapterRegistry.register}, as a free function: the adapter
  * extension guide in `docs/ARCHITECTURE.md` reads

@@ -1,6 +1,7 @@
 /**
- * Acceptance test 3 — **Cleanup** (AAP §0.8.4): the product's reversibility
- * guarantee (AAP §0.5.1) in executable form.
+ * The **Cleanup** acceptance test: the product's reversibility guarantee
+ * (`docs/ARCHITECTURE.md`, "Instrumentation model and reversibility") in
+ * executable form.
  *
  * A real session instruments the demo for the slow-interaction question, a real
  * capture runs, and the session is ended through the product's own path. The
@@ -35,7 +36,7 @@
  * session so no patch leaks into the next spec. Nothing here repairs the tree
  * after a failure — a failed cleanup must fail this spec.
  *
- * ## What this spec never does (AAP §0.5.1, §0.5.2)
+ * ## What this spec never does
  *
  * - It never writes, patches or truncates a file under `apps/demo-app`, and
  *   never fabricates a modification record: instrumentation is installed only
@@ -58,9 +59,10 @@
  * no-span-created proof (`packages/telemetry/src/node/control.test.ts`) and the
  * fixture app's restoration (`generalization.spec.ts`).
  *
- * `tests/e2e/**` is exempt from the no-hardcoding gate (AAP §0.5.4), which is
- * why the demo's routes and controls may be named below. Which demo files the
- * plan instruments is the product's decision and is never asserted by name.
+ * `tests/e2e/**` is exempt from the no-hardcoding gate, which scans product
+ * source only; that is why the demo's routes and controls may be named below.
+ * Which demo files the plan instruments is the product's decision and is never
+ * asserted by name.
  *
  * @module tests/e2e/cleanup.spec
  */
@@ -98,9 +100,10 @@ import type {
 // ---------------------------------------------------------------------------
 
 /**
- * The developer's question, verbatim from AAP §0.6.5's first demonstrated
- * panel. It is the question whose plan times named server functions, which is
- * what makes this session apply patch-mode modifications to restore.
+ * The developer's question, verbatim as the first walkthrough of
+ * `docs/DEMO.md` asks it. It is the question whose plan times named server
+ * functions, which is what makes this session apply patch-mode modifications
+ * to restore.
  */
 const QUESTION = 'Why is this button slow?';
 
@@ -590,7 +593,8 @@ test.describe('cleanup — ending a session leaves the demo exactly as it was', 
         if (record.diff.length === 0 || !record.diff.includes('@@')) {
           problems.push(`${label}: the recorded unified diff is empty or has no hunk`);
         }
-        // A file patched by a chain of records (AAP §0.4.2) holds its newest record's bytes.
+        // A file patched by a chain of records (`docs/ARCHITECTURE.md`, "Follow-up plan
+        // versions and record chains") holds its newest record's bytes.
         if (chainHeads.get(record.file) === record) {
           const current = await demoApp.hashFile(record.file);
           if (current !== record.instrumentedHash) {

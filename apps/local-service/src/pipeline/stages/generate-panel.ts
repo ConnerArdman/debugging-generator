@@ -31,16 +31,22 @@
  *    session id and question from the context (the stored session record is the
  *    single source of truth), the capture, the validated analysis, the optional
  *    summary, the prompt version — the caller's, else the one the session
- *    recorded — and the context's cancellation signal.
+ *    recorded — the panel the caller expects to be superseded, as the
+ *    request's `expectedPredecessor`, and the context's cancellation signal.
  * 2. **Delegate.** `generate` for a new panel; `regenerate` on the follow-up
  *    existing-evidence path (AAP §0.4.2, Follow-up row), which stores the next
  *    panel version superseding the previous one rather than touching a row.
+ *    An expected predecessor is enforced by the panel subsystem and the store
+ *    before anything is stored; a panel that moved on is the subsystem's typed
+ *    refusal, never a stored panel.
  * 3. **Translate out and report.** The generator's result is projected
  *    field for field onto {@link GeneratePanelStageResult}; its typed `Err` is
  *    returned unchanged, so the developer-facing sentence of the failing
- *    subsystem survives (AAP §0.5.5). The `generate-panel` progress rows are
- *    this file's own responsibility — the panel subsystem deliberately emits
- *    none and writes no session status.
+ *    subsystem survives (AAP §0.5.5). A returned panel that does not
+ *    supersede the expected predecessor breaks the subsystem's contract and
+ *    fails the stage rather than being reported as success. The
+ *    `generate-panel` progress rows are this file's own responsibility — the
+ *    panel subsystem deliberately emits none and writes no session status.
  *
  * ## A fallback panel is a success
  *
@@ -55,7 +61,8 @@
  * ## Boundaries
  *
  * - The panel is an opaque, validated artifact: only its identity fields (`id`,
- *   `panelVersion`, `supersedes`) are read, to report them; nothing is mutated.
+ *   `panelVersion`, `supersedes`) are read, to report and check them; nothing
+ *   is mutated.
  * - Session status is never written: the orchestrator performs the transition
  *   through the session manager, its only writer.
  * - No hardcoded behaviour (AAP §0.5.4): the question is passed through
@@ -166,10 +173,16 @@ export interface GeneratePanelStageInput {
    */
   readonly regenerate?: boolean | undefined;
   /**
-   * The id of the panel the caller expects the new one to supersede. The stored
-   * link is always the one the panel subsystem assigns from the store; a
-   * disagreement is logged at `warn`, never turned into a failure of a panel
-   * that is already stored and delivered.
+   * The id of the panel the caller decided against, which the new panel must
+   * supersede. Handed to the panel subsystem as the request's
+   * `expectedPredecessor`: a session whose latest panel is no longer this one
+   * is refused before the model is called, and again by the store inside its
+   * insert transaction, with `SESSION_INVALID_STATE` and
+   * `details.reason: 'supersedes-stale'` — nothing is stored or broadcast, and
+   * the stage fails with that error. A returned panel that supersedes any other
+   * panel fails the stage with `STORE_ERROR` and
+   * `details.reason: 'panel-ladder-inconsistent'`. Absent, the new panel
+   * supersedes whatever panel is latest when it is generated.
    */
   readonly supersedes?: string | undefined;
 }
@@ -214,7 +227,8 @@ export interface GeneratePanelStage {
    * follow-up question, recorded prompt versions, logger, clock and signal).
    * @param input The capture, its validated analysis and the follow-up options.
    * @returns `Ok` with the stored panel — a fallback panel included — or `Err`
-   * with the failing subsystem's typed error, unchanged. Never rejects.
+   * with the failing subsystem's typed error, unchanged, or with this stage's
+   * own precondition or ladder error. Never rejects.
    */
   run(
     context: PipelineStageContext,
@@ -223,9 +237,10 @@ export interface GeneratePanelStage {
 }
 
 /* -------------------------------------------------------------------------------------------------
- * Failures this stage raises itself — preconditions only, before the generator is called. Every
- * other failure is the panel subsystem's error, passed through unchanged. Details carry the stage
- * and an enumerated reason, never a payload value (AAP §0.5.2).
+ * Failures this stage raises itself — preconditions before the generator is called, and the one
+ * post-condition it checks on the generator's answer. Every other failure is the panel subsystem's
+ * error, passed through unchanged. Details carry the stage and an enumerated reason, never a
+ * payload value (AAP §0.5.2).
  * ---------------------------------------------------------------------------------------------- */
 
 /** The capture named by the input is not the capture the pipeline run was started for. */
@@ -248,6 +263,24 @@ function missingFollowUpError(): DebuggenError {
     {
       hint: 'Ask the follow-up question again; the panel is regenerated to answer it.',
       details: { stage: GENERATE_PANEL_STAGE, reason: 'missing-follow-up-question' },
+    },
+  );
+}
+
+/**
+ * The generator answered with a panel that does not supersede the panel the
+ * caller named. Unreachable while the panel subsystem and the store keep their
+ * contract — both refuse such a panel before it is stored — so reaching it
+ * means a port broke that contract, and the stage fails rather than report a
+ * panel whose version chain describes a different question.
+ */
+function panelLadderError(): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'The generated panel was not stored as the next version superseding the panel this stage was asked to supersede.',
+    {
+      hint: 'Ask again once the session is no longer changing.',
+      details: { stage: GENERATE_PANEL_STAGE, reason: 'panel-ladder-inconsistent' },
     },
   );
 }
@@ -300,6 +333,7 @@ function toRequest(
     analysis: input.analysis,
     summary: input.summary,
     promptVersion: input.promptVersion ?? context.promptVersions[GENERATE_PANEL_STAGE],
+    expectedPredecessor: input.supersedes,
     signal: context.signal,
   };
 }
@@ -464,12 +498,19 @@ export function createGeneratePanelStage(deps: GeneratePanelStageDeps): Generate
     }
     const result = toStageResult(generated.value);
 
+    // The expected predecessor was enforced before the panel was stored; a panel that still names
+    // another one means a port broke that contract, and it is never reported as a success.
     if (input.supersedes !== undefined && input.supersedes !== result.supersedes) {
-      log.warn('The stored panel supersedes a different panel than the caller expected.', {
-        panelId: result.panelId,
-        expectedSupersedes: input.supersedes,
-        supersedes: result.supersedes ?? null,
-      });
+      log.error(
+        'The panel subsystem returned a panel that does not supersede the expected panel; the stage fails.',
+        {
+          panelId: result.panelId,
+          panelVersion: result.panelVersion,
+          expectedSupersedes: input.supersedes,
+          supersedes: result.supersedes ?? null,
+        },
+      );
+      return fail(context, log, panelLadderError(), startedAt, group.opened);
     }
 
     // Completed with degradation, never failed: the banner sentence comes from its one owner.

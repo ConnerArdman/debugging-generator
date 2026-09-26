@@ -1,6 +1,6 @@
 /**
- * The single import surface of the Playwright `e2e` project (AAP §0.8.3
- * "End-to-end demo"): the extended `test` and `expect` every spec under
+ * The single import surface of the Playwright `e2e` project (`pnpm test:e2e`,
+ * the end-to-end demo suite): the extended `test` and `expect` every spec under
  * `tests/e2e/**` imports, the fixtures that compose this folder's eight sibling
  * modules, the ordered and exception-safe teardown that owns their lifecycle,
  * the fixture-level timeout budgets, and the curated re-export of the folder's
@@ -125,7 +125,8 @@
  *
  * This file declares no `test(...)` or `describe(...)` block, never sleeps,
  * writes nothing under `apps/demo-app` or `tests/fixtures/sample-next-app`
- * (AAP §0.5.1), and contains no credential (AAP §0.5.2, `pnpm check:secrets`).
+ * (helpers read, the product writes), and contains no credential
+ * (`pnpm check:secrets` enforces it).
  *
  * @module tests/e2e/helpers/fixtures
  */

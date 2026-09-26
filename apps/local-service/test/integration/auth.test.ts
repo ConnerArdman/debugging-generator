@@ -24,11 +24,15 @@
  * ## What this suite owns, and what it leaves to others
  *
  * `src/server/auth.test.ts` pins `createAuthService`'s internals against a bare
- * store — racing redemptions, a failing random source, the lower-case code a
- * developer types, the global forged-origin ceiling. None of that is repeated
- * here: every assertion below needs a running server, because what it pins is
- * that the HTTP middleware, the route modules, the WebSocket upgrade gate and
- * the hello handshake actually *apply* those rules to real requests. The
+ * store — racing redemptions, a failing random source, every re-spelling of a
+ * code the exact comparison refuses and how each counts toward the lockout, the
+ * exact edges of the one service-wide lockout. None of that is repeated here:
+ * every assertion below needs a running server, because what it pins is that
+ * the HTTP middleware, the route modules, the WebSocket upgrade gate and the
+ * hello handshake actually *apply* those rules to real requests — for pairing,
+ * that `POST /pair/complete` hands the code to the service exactly as it
+ * arrived, and that failures under any number of forged `Origin`s share one
+ * lockout. The
  * exhaustive traversal table of click-to-source belongs to `source-open.test.ts`;
  * this file asserts only its role-and-scope half.
  *
@@ -61,7 +65,7 @@
  */
 
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, symlink } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import type { IncomingHttpHeaders } from 'node:http';
 import { basename, dirname, join, relative } from 'node:path';
@@ -77,6 +81,8 @@ import {
   HTTP_ROUTES,
   PROTOCOL_VERSION,
   PROTOCOL_VERSION_MAJOR,
+  READ_PROOF_BYTES,
+  READ_PROOF_HEADER,
   SESSION_PURGE_MAX_REPORTED_SESSIONS,
   WS_CLOSE_UNAUTHORIZED,
   buildPath,
@@ -430,6 +436,27 @@ function expectNoCorsGrant(response: RawFetchResponse): void {
 }
 
 /**
+ * {@link RawFetchInit} plus the read proof a DevTools client holds. Like the
+ * extension's HTTP client, {@link fetchRaw} sends it as the read-proof header
+ * only on a `GET`: a DevTools write is bound by its `Origin` and refuses the
+ * header, so one init can present a credential to both kinds of operation.
+ */
+interface SuiteFetchInit extends RawFetchInit {
+  readonly readProof?: string | undefined;
+}
+
+/** The method a raw-fetch target is sent with, as the harness resolves it. */
+function methodOf(target: RawFetchTarget, init: RawFetchInit): string {
+  if (init.method !== undefined) {
+    return init.method;
+  }
+  if (typeof target === 'string') {
+    return HTTP_ROUTES[target].method;
+  }
+  return 'operation' in target ? HTTP_ROUTES[target.operation].method : 'GET';
+}
+
+/**
  * The harness's raw fetch, with two checks applied to **every** response this
  * suite reads: no CORS grant header, and no tracked secret echoed in the body.
  * (A success that issues a code or a credential carries a *new* value, which is
@@ -437,9 +464,14 @@ function expectNoCorsGrant(response: RawFetchResponse): void {
  */
 async function fetchRaw(
   target: RawFetchTarget,
-  init: RawFetchInit = {},
+  init: SuiteFetchInit = {},
 ): Promise<RawFetchResponse> {
-  const response = await harness.rawFetch(target, init);
+  const { readProof, ...rest } = init;
+  const sent: RawFetchInit =
+    readProof !== undefined && methodOf(target, rest) === 'GET'
+      ? { ...rest, headers: { ...rest.headers, [READ_PROOF_HEADER]: readProof } }
+      : rest;
+  const response = await harness.rawFetch(target, sent);
   expectNoCorsGrant(response);
   expect(leaksIn(response.text), `a ${String(response.status)} reply echoes a secret`).toEqual([]);
   inspectedResponses += 1;
@@ -498,17 +530,19 @@ function expectSuccess(response: RawFetchResponse, operation: HttpOperationId, s
 }
 
 /**
- * The request options that present a DevTools credential from the extension it
- * was issued to — acting for `tabId` when one is given, as the service worker
- * names the inspected tab on every session request.
+ * The request options that present a DevTools credential as the extension does:
+ * from the extension it was issued to, with the read proof issued with it on
+ * every read ({@link SuiteFetchInit}) — acting for `tabId` when one is given,
+ * as the service worker names the inspected tab on every session request.
  */
 function presenting(
   credential: DevtoolsCredential,
   tabId?: number,
-): Pick<RawFetchInit, 'token' | 'origin' | 'headers'> {
+): Pick<SuiteFetchInit, 'token' | 'origin' | 'headers' | 'readProof'> {
   return {
     token: credential.token,
     origin: credential.origin,
+    readProof: credential.readProof,
     ...(tabId === undefined ? {} : { headers: { [ACTING_TAB_HEADER]: String(tabId) } }),
   };
 }
@@ -804,23 +838,36 @@ async function redeem(code: string, origin?: string): Promise<RawFetchResponse> 
   return response;
 }
 
-/** Asserts a successful redemption and returns its DevTools credential, tracked. */
-function redeemedToken(response: RawFetchResponse): string {
+/**
+ * Asserts a successful redemption and returns the DevTools credential and the
+ * read proof issued with it, both tracked.
+ */
+function redeemedCredential(response: RawFetchResponse): {
+  readonly token: string;
+  readonly readProof: string;
+} {
   expect(response.status, 'pair.complete: status').toBe(200);
   const parsed = pairCompleteResponseSchema.safeParse(response.json);
   if (!parsed.success) {
     throw new Error('The pair.complete reply does not satisfy its schema.');
   }
   expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
-  return track('paired devtools credential', parsed.data.token);
+  return {
+    token: track('paired devtools credential', parsed.data.token),
+    readProof: track('paired read proof', parsed.data.readProof),
+  };
+}
+
+/** Asserts a successful redemption and returns its DevTools credential, tracked. */
+function redeemedToken(response: RawFetchResponse): string {
+  return redeemedCredential(response).token;
 }
 
 /** The whole pairing flow over HTTP: the editor starts it, the extension's origin redeems it. */
 async function pairExtension(extensionId: string = newExtensionId()): Promise<DevtoolsCredential> {
   const code = await pairStart();
   const origin = chromeExtensionOrigin(extensionId);
-  const token = redeemedToken(await redeem(code, origin));
-  return { extensionId, origin, token };
+  return { extensionId, origin, ...redeemedCredential(await redeem(code, origin)) };
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1125,21 +1172,70 @@ describe('origin policy', () => {
       'the editor credential from an extension',
     );
 
-    // A DevTools credential: from the extension it was issued to — and, on a GET,
-    // from no origin, because Chrome sends no `Origin` on the extension's GETs.
+    // A DevTools credential: from the extension it was issued to …
     const devtools = await bindDevtools(TABS.acceptedOrigin, sessionB);
     const target = targetFor('session.get', sessionB.id);
     expectSuccess(
       await fetchRaw(target, presenting(devtools.credential, TABS.acceptedOrigin)),
       'session.get',
     );
+
+    // … and, on a GET — which Chrome sends without an `Origin` — from no origin
+    // as well, but only with the read proof pairing issued with the credential.
+    // A stolen copy of the credential and the bound tab reads nothing without
+    // it, whether it sends no origin or writes the issuing extension's itself.
+    const originless = {
+      ...presenting(devtools.credential, TABS.acceptedOrigin),
+      origin: undefined,
+    };
+    expectSuccess(await fetchRaw(target, originless), 'session.get');
+    for (const origin of [undefined, devtools.credential.origin]) {
+      const refused = expectRefusal(
+        await fetchRaw(target, { ...originless, origin, readProof: undefined }),
+        'missing-credential',
+        `a DevTools session.get from ${origin ?? 'no origin'} without the read proof`,
+      );
+      expect(refused.code).toBe('UNAUTHORIZED');
+    }
+
+    // A proof of the holder's own choosing is not the one pairing issued …
+    const chosen = track('read proof', randomBytes(READ_PROOF_BYTES).toString('base64url'));
+    const guessing = { ...originless, readProof: chosen };
+    expectRefusal(
+      await fetchRaw(target, guessing),
+      'unknown-credential',
+      'a DevTools session.get with a read proof pairing did not issue',
+    );
+
+    // … and no socket can make it one. A Node process holding the credential
+    // writes the issuing extension's origin on its own upgrade: its hello is
+    // admitted — an origin is all a hello can be judged by — but a hello
+    // carries no proof, and one that tries is refused outright.
+    const hostile = await harness.ws({
+      client: 'devtools',
+      token: devtools.credential.token,
+      origin: devtools.credential.origin,
+    });
+    expect(hostile.authenticated, hostile.describe()).toBe(true);
+    await expectHelloRefused(
+      { ...hello('devtools', devtools.credential.token), readProof: chosen } as ClientHelloPayload,
+      devtools.credential.origin,
+    );
+    for (const origin of [undefined, devtools.credential.origin]) {
+      expectRefusal(
+        await fetchRaw(target, { ...guessing, origin }),
+        'unknown-credential',
+        `a chosen read proof from ${origin ?? 'no origin'} after a forged-origin hello`,
+      );
+    }
+    await hostile.close();
+    // The proof pairing issued reads, with or without the extension's origin.
     expectSuccess(
-      await fetchRaw(target, {
-        ...presenting(devtools.credential, TABS.acceptedOrigin),
-        origin: undefined,
-      }),
+      await fetchRaw(target, presenting(devtools.credential, TABS.acceptedOrigin)),
       'session.get',
     );
+    expectSuccess(await fetchRaw(target, originless), 'session.get');
+
     for (const origin of [webview, extension]) {
       expectRefusal(
         await fetchRaw(target, { token: devtools.credential.token, origin }),
@@ -1380,8 +1476,9 @@ describe('pairing', () => {
     const extensionId = newExtensionId();
     const origin = chromeExtensionOrigin(extensionId);
     const code = await pairStart();
-    const token = redeemedToken(await redeem(code, origin));
-    const credential: DevtoolsCredential = { extensionId, origin, token };
+    const redeemed = redeemedCredential(await redeem(code, origin));
+    const { token } = redeemed;
+    const credential: DevtoolsCredential = { extensionId, origin, ...redeemed };
 
     // The credential works on a DevTools operation: it authenticates, binds its
     // tab and reads the session that tab is bound to.
@@ -1417,8 +1514,44 @@ describe('pairing', () => {
     );
   });
 
-  it('locks an origin out after repeated failures, refusing even a valid code, then recovers', async () => {
-    const lockedOrigin = chromeExtensionOrigin(newExtensionId());
+  it('compares the code exactly: a padded or lower-case code is a wrong code over HTTP, and the exact code then redeems', async () => {
+    const origin = chromeExtensionOrigin(newExtensionId());
+    // A code of digits alone has no lower-case spelling; the CSPRNG draws one
+    // about once in 65 000 codes, so a bounded redraw keeps the case exact.
+    let code = await pairStart();
+    for (let draw = 0; draw < 4 && code.toLowerCase() === code; draw += 1) {
+      code = await pairStart();
+    }
+    expect(code.toLowerCase(), 'the code has a letter to fold').not.toBe(code);
+    const logMark = harness.logger.records.length;
+
+    const respelled = [
+      [` ${code}\t`, 'a whitespace-padded code'],
+      [`${code}\n`, 'a code with a trailing newline'],
+      [code.toLowerCase(), 'a lower-case code'],
+    ] as const;
+    const invalid = AUTH_FAILURE_REASONS['pairing-invalid'];
+    for (const [variant, label] of respelled) {
+      const response = await redeem(variant, origin);
+      expectRefusal(response, 'pairing-invalid', label);
+      // The very reply a wrong code gets: nothing tells a re-spelling apart.
+      expect(refusalShape(response), label).toEqual({
+        status: invalid.status,
+        code: invalid.code,
+        message: invalid.message,
+      });
+    }
+    // Each re-spelling was judged, and counted, as a wrong code.
+    const verdicts = harness.logger.records
+      .slice(logMark)
+      .filter((record) => record.fields['reason'] === 'pairing-invalid');
+    expect(verdicts).toHaveLength(respelled.length);
+
+    redeemedToken(await redeem(code, origin));
+  });
+
+  it('locks pairing for every origin after repeated failures, refusing even a valid code, then recovers', async () => {
+    const failingOrigin = chromeExtensionOrigin(newExtensionId());
     const code = await pairStart();
     // A code some other extension has already redeemed.
     const spent = await pairStart();
@@ -1426,7 +1559,7 @@ describe('pairing', () => {
 
     for (let attempt = 1; attempt <= PAIRING_MAX_FAILURES; attempt += 1) {
       expectRefusal(
-        await redeem(randomPairingCode(), lockedOrigin),
+        await redeem(randomPairingCode(), failingOrigin),
         'pairing-invalid',
         `failed attempt ${String(attempt)}`,
       );
@@ -1434,15 +1567,18 @@ describe('pairing', () => {
 
     // Locked: a valid, a wrong and a spent code get the very same answer, so a
     // lockout reveals nothing about any code. The lockout is its own verdict —
-    // a rate limit the caller's own failures earned, decided before the code is
-    // looked at — which is why it is the one pairing refusal that differs from
-    // the uniform "invalid code" reply the next case pins.
-    const withValid = await redeem(code, lockedOrigin);
-    const withWrong = await redeem(randomPairingCode(), lockedOrigin);
-    const withSpent = await redeem(spent, lockedOrigin);
+    // a rate limit the failures earned, decided before the code is looked at —
+    // which is why it is the one pairing refusal that differs from the uniform
+    // "invalid code" reply the next case pins. And it is the service's, not
+    // the failing origin's: an origin that never failed gets it too.
+    const withValid = await redeem(code, failingOrigin);
+    const withWrong = await redeem(randomPairingCode(), failingOrigin);
+    const withSpent = await redeem(spent, failingOrigin);
+    const fromAnother = await redeem(code, chromeExtensionOrigin(newExtensionId()));
     expectRefusal(withValid, 'pairing-locked', 'the valid code during a lockout');
+    expectRefusal(fromAnother, 'pairing-locked', 'another origin during the lockout');
     const locked = AUTH_FAILURE_REASONS['pairing-locked'];
-    for (const response of [withValid, withWrong, withSpent]) {
+    for (const response of [withValid, withWrong, withSpent, fromAnother]) {
       expect(refusalShape(response)).toEqual({
         status: locked.status,
         code: locked.code,
@@ -1450,16 +1586,64 @@ describe('pairing', () => {
       });
     }
 
-    // The lockout is the origin's, not everyone's.
-    expectRefusal(
-      await redeem(randomPairingCode(), chromeExtensionOrigin(newExtensionId())),
-      'pairing-invalid',
-      'another origin during the lockout',
-    );
-
     // Once the window passes, the still-valid code redeems.
     requireClock().advance(PAIRING_LOCKOUT_MS + 1);
-    redeemedToken(await redeem(code, lockedOrigin));
+    redeemedToken(await redeem(code, failingOrigin));
+  });
+
+  it('counts failures under rotating forged Origins as one caller: five forged ids lock the genuine extension out', async () => {
+    const genuine = newExtensionId();
+    const genuineOrigin = chromeExtensionOrigin(genuine);
+    const code = await pairStart();
+
+    // One wrong guess per invented extension id — the most a per-origin ledger
+    // would ever have seen from any single caller.
+    const forgedOrigins = Array.from({ length: PAIRING_MAX_FAILURES }, () =>
+      chromeExtensionOrigin(newExtensionId()),
+    );
+    expect(new Set([genuineOrigin, ...forgedOrigins]).size).toBe(PAIRING_MAX_FAILURES + 1);
+    for (const [index, forged] of forgedOrigins.entries()) {
+      expectRefusal(
+        await redeem(randomPairingCode(), forged),
+        'pairing-invalid',
+        `a guess from forged id ${String(index + 1)}`,
+      );
+    }
+
+    // The genuine extension's right code is refused, and so is a guess from
+    // yet another invented id.
+    expectRefusal(await redeem(code, genuineOrigin), 'pairing-locked', 'the genuine extension');
+    expectRefusal(
+      await redeem(randomPairingCode(), chromeExtensionOrigin(newExtensionId())),
+      'pairing-locked',
+      'a fresh forged id',
+    );
+
+    // Every read of the harness clock moves it one step, so the lock's exact
+    // edge is pinned by `src/server/auth.test.ts`; here it is crossed from well
+    // inside — still locked half a window later, however hard it was hammered
+    // meanwhile — to just past it, where the code it held back still redeems,
+    // for a credential scoped to the genuine extension alone.
+    requireClock().advance(PAIRING_LOCKOUT_MS / 2);
+    for (const forged of forgedOrigins) {
+      expectRefusal(await redeem(randomPairingCode(), forged), 'pairing-locked', 'mid-lock guess');
+    }
+    expectRefusal(await redeem(code, genuineOrigin), 'pairing-locked', 'half a window later');
+    requireClock().advance(PAIRING_LOCKOUT_MS / 2 + 1);
+    const token = redeemedToken(await redeem(code, genuineOrigin));
+    // From the genuine origin the credential authenticates, and is then held to
+    // its role (DevTools may not list sessions); from a forged id it does not
+    // get that far.
+    expectRefusal(
+      await fetchRaw('session.list', { token, origin: genuineOrigin }),
+      'role-not-permitted',
+      'the paired credential from its own extension',
+    );
+    expectRefusal(
+      await fetchRaw('session.list', { token, origin: forgedOrigins[0] }),
+      'origin-not-permitted-for-role',
+      'the paired credential from a forged id',
+    );
   });
 
   it('answers a wrong, a used and an expired code with one uniform refusal', async () => {
@@ -1702,8 +1886,7 @@ describe('authorization by role and scope', () => {
     // principal may name a tab at all.
     expectRefusal(
       await fetchRaw(targetFor('session.get', first.id), {
-        token: credential.token,
-        origin: credential.origin,
+        ...presenting(credential),
         headers: { [ACTING_TAB_HEADER]: `${String(TABS.muxFirst)}.5` },
       }),
       'acting-tab-invalid',
@@ -2089,6 +2272,46 @@ describe('authorization by role and scope', () => {
       'project-out-of-scope',
       'session.create after the lease of the closed connection passed',
     );
+  });
+
+  it('refuses a root that a link inside an announced folder carries out of it', async () => {
+    // A fresh copy announced by its own editor connection, so no pipeline of
+    // this suite ever walks the link. The link's target is a sibling of the
+    // copy inside its own temporary container: outside the workspace, and
+    // removed with the copy at teardown.
+    const copy = await harness.copyFixtureProject();
+    const workspace = copy.root;
+    const outside = join(copy.container, 'private');
+    const escape = join(workspace, 'external');
+    await mkdir(join(outside, 'app'), { recursive: true });
+    await symlink(outside, escape, 'dir');
+
+    const announcing = await harness.ws({ client: 'vscode', projectRoot: workspace });
+    try {
+      expect(announcing.authenticated).toBe(true);
+      // The workspace itself is in scope, so each refusal below is the link's.
+      await mintDevServerCredential(workspace);
+
+      const serverAgentRowsBefore = credentialRowsOf('server-agent').length;
+      for (const projectRoot of [escape, join(escape, 'app'), join(escape, 'not-created-yet')]) {
+        expectRefusal(
+          await fetchRaw('session.create', { body: { projectRoot, question: QUESTION } }),
+          'project-out-of-scope',
+          'session.create through a link out of the announced workspace',
+        );
+        expectRefusal(
+          await fetchRaw('devServer.credential', { body: { projectRoot } }),
+          'project-out-of-scope',
+          'a dev-server credential through a link out of the announced workspace',
+        );
+      }
+      expect(credentialRowsOf('server-agent'), 'a refused root minted a credential').toHaveLength(
+        serverAgentRowsBefore,
+      );
+    } finally {
+      await announcing.close();
+      await rm(escape, { force: true });
+    }
   });
 
   it('checks source.open against the stored project root of the session bound to the tab', async () => {

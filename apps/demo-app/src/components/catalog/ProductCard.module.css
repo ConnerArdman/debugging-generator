@@ -56,13 +56,9 @@
 }
 
 /*
- * An expanded tile. The outline is an accent on top of the specs list itself, the toggle's label
- * and its `aria-expanded` state, so the colour is never the only thing that reports the state.
- *
- * BLITZY [A11Y]: --ls-accent (#f59e0b) measures 2.15:1 against --ls-surface, below the 3:1
- * recommendation for a non-text indicator. Implemented with the shared token the design contract
- * assigns to a selected surface rather than silently darkened, exactly as `app/globals.css`
- * records for the same token. Flagged for design review.
+ * An expanded tile. The outline uses --ls-accent, the shared token for a selected surface, and is
+ * supplementary to the specs list itself, the toggle's label and its `aria-expanded` state, so the
+ * colour is never the only thing that reports the state.
  */
 .selected {
   outline: var(--catalog-accent-width, 2px) solid var(--ls-accent, #f59e0b);
@@ -101,10 +97,11 @@
  * wherever it is given room, and explicit that the component placing it is the one that owes it
  * that room. This card cannot always give it: a card in the narrowest grid is about as wide as
  * the longest in-stock label, and a flex item's automatic minimum size is its single-line width,
- * so without this rule the label stayed at its full width, ignored the maximum above, and the
- * artwork box's `overflow: hidden` sliced the count mid-glyph. The label is the wrapper's only
- * child, so letting it shrink past that minimum and wrap keeps the whole count legible inside the
- * rounded corner at every card width, and changes nothing about the label on any other surface. */
+ * so without this rule the label would keep its full width, ignore the maximum above, and have
+ * its count sliced mid-glyph by the artwork box's `overflow: hidden`. The label is the wrapper's
+ * only child, so letting it shrink past that minimum and wrap keeps the whole count legible inside
+ * the rounded corner at every card width, and changes nothing about the label on any other
+ * surface. */
 .stock > * {
   min-inline-size: 0;
   max-inline-size: var(--catalog-card-fill, 100%);
@@ -166,11 +163,10 @@
 /* Product codes carry no break opportunity of their own, so one is granted here rather than
  * letting an unbroken run reach past the tile.
  *
- * The leading is stated rather than inherited. The body's 1.5 gave a 12px code an 18px line box
- * here while the cart row's own `.sku` declares 1.4 and the product page's specification list now
- * does too, so the same code occupied a different height on each of the three surfaces that print
- * it. 1.4 is the value the other two already use, and at the smallest type step it is the leading
- * a single line of code wants - the body's is set for paragraphs. */
+ * The leading is stated rather than inherited: the cart row's `.sku` and the product page's
+ * specification list also declare 1.4, so the same code occupies the same height on each of the
+ * three surfaces that print it. At the smallest type step 1.4 is the leading a single line of code
+ * wants - the body's 1.5 is set for paragraphs. */
 .sku {
   margin: 0;
   min-inline-size: 0;
@@ -247,9 +243,10 @@
  * stretched button centres its label, so that padding buys nothing visually here - and at `lg` it
  * costs 48px, which is more than the narrowest card column can spare: in the two-up grid at the
  * smallest width the column's content box is about 128px against a label that wants 100px, so the
- * label was ellipsised to "Add to ..." on every card. One space step leaves the label whole there,
- * while the height, type size and colour - the things that make this the tile's primary action and
- * tie it to the product page's control - stay exactly as `Button` sets them.
+ * full padding would ellipsise the label to "Add to ..." on every card. One space step leaves the
+ * label whole there, while the height, type size and colour - the things that make this the
+ * tile's primary action and tie it to the product page's control - stay exactly as `Button` sets
+ * them.
  *
  * The selector is this specific on purpose. `Button` states its padding as a class plus the size
  * attribute, so a bare `.add` is a specificity step below it and would lose however the two

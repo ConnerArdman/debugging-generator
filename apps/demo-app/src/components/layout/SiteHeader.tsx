@@ -65,10 +65,10 @@ import styles from './SiteHeader.module.css';
  * lockup reads; "logo" would describe the picture instead of replacing it.
  *
  * SEARCH NAVIGATES, AND NEVER FETCHES
- * The field sends the reader to the catalog with the term in the URL. This bar asks the server for
- * nothing and renders no results: the catalog page reads the term from its own search parameters
- * and is the single place a product query is run, so a second reader of that endpoint up here
- * would put two answers to one question on the page.
+ * The field sends the reader to the catalog with the term in the URL. The search form asks the
+ * server for nothing and renders no results: the catalog page reads the term from its own search
+ * parameters and is the single place a product query is run, so a second reader of that endpoint
+ * up here would put two answers to one question on the page.
  *
  * It navigates twice over, from one set of rules. A submit goes immediately, which is also the
  * path a reader without JavaScript takes - the field's native `name` is the submitted key, so the
@@ -168,17 +168,16 @@ import styles from './SiteHeader.module.css';
  * against `.cartButton` exactly as the stylesheet intends.
  *
  * THE SUGGESTIONS STRIP
- * A product page is a descendant of this bar, so what that page knows cannot reach up here through
- * context, and the route carries a slug where the strip needs the id the endpoint identifies a
- * product by. `@/components/product/active-product-store` bridges the two: the page publishes the
- * id it resolved and this bar reads it with `useSyncExternalStore`, whose three arguments are that
- * module's own exports and are therefore already stable.
+ * A product page renders beside this bar under the same layout rather than inside it, so what that
+ * page knows cannot reach up here through context, and the route carries a slug where the strip
+ * needs the product's id. `@/components/product/active-product-store` bridges the two: the page
+ * publishes the id it resolved and this bar reads it with `useSyncExternalStore`, whose three
+ * arguments are that module's own exports and are therefore already stable.
  *
  * `getServerSnapshot()` answers `null`, which is also what React uses for the first render in the
  * browser, so the strip is absent from the markup the server sent and from the markup hydration
  * produces - the two agree, and it appears a moment later, once the page has published. How many
- * suggestions to read is `RecommendationsRail`'s to state and not this bar's to pass, which is what
- * keeps a reader seeing the same suggestions for a product wherever they meet them on the page.
+ * suggestions to read is `RecommendationsRail`'s to state and not this bar's to pass.
  *
  * THE HEIGHT INVARIANT
  * `PageContainer` offsets the document's single `<main>` by `--ls-header-height`, so this bar is
@@ -358,8 +357,8 @@ function destination(search: string, term: string): string {
 }
 
 /**
- * Props of this component, kept local to it: nothing outside needs to name this shape, and a
- * second, exported name for "an optional class" would spend vocabulary for nothing.
+ * Props of this component, kept local to it: nothing outside this file names this shape, and a
+ * second, exported name for "an optional class" would buy nothing.
  */
 interface Props {
   /** Extra class for the `<header>` element, composed after the module's own `root` class. */
@@ -437,8 +436,7 @@ export function SiteHeader(props: Props): ReactElement {
 
   // The route the focus effect below has already accounted for, seeded with the route this bar
   // mounted on. A ref rather than state: it records what that effect has done and is never read
-  // while markup is being produced, so writing it must not - and does not - schedule a render on a
-  // bar that already re-renders several times a second.
+  // while markup is being produced, so writing it schedules no render.
   const previous = useRef(pathname);
 
   // The cart's figures, summed in one place for every surface that quotes them - or, where its
@@ -459,9 +457,7 @@ export function SiteHeader(props: Props): ReactElement {
   // same distinction `CartLineList` draws when it shows a failure notice rather than "your cart is
   // empty", said in the words a control can carry. Singular or plural is decided on the figure
   // itself rather than on the string printed from it, so a grouped "1,000" is still "items" and a
-  // plain "1" is an "item". Short, single-token locals throughout this component: the repository's
-  // hardcoding guard harvests every multi-token name this workspace declares into a policy the
-  // debugging product may then not use, so the bar spends none of that vocabulary on a local.
+  // plain "1" is an "item".
   let detail: string;
   if (!summary.contentsKnown) {
     detail = summary.unknownReason === 'loading' ? CART_LOADING_DETAIL : CART_UNAVAILABLE_DETAIL;
@@ -517,9 +513,8 @@ export function SiteHeader(props: Props): ReactElement {
   // screen, so it takes the focus and leaves the scrolling alone.
   //
   // The dependency is the pathname and nothing else, and the body closes over no value this
-  // component recreates, for the same reason the debounce below does: this bar re-renders several
-  // times a second on the cart provider's ticker, and an effect re-armed on those renders would
-  // pull focus out from under a reader who had put it somewhere themselves.
+  // component recreates, so after its first run the effect runs again only on a route change, and
+  // an ordinary re-render never pulls focus from a reader who had put it somewhere themselves.
   useEffect(() => {
     if (previous.current === pathname) {
       return;
@@ -540,12 +535,10 @@ export function SiteHeader(props: Props): ReactElement {
   // stops typing, so a term reaches the catalog without one navigation per keystroke.
   //
   // Every value this effect depends on is a primitive or an identity React itself keeps stable, and
-  // its body calls nothing declared inside this component. That is load-bearing rather than tidy:
-  // this bar re-renders several times a second, because the cart provider above it republishes its
-  // value on a ticker, and an effect that depended on a function defined in the component body
-  // would be torn down and re-armed on every one of those renders - the delay would never elapse
-  // and the navigation would never happen. The timer is therefore driven by the draft, the pending
-  // intent, the route and the router, and by nothing else.
+  // its body calls nothing declared inside this component, so a re-render that leaves the draft,
+  // the pending intent, the route and the router as they were neither tears the timer down nor
+  // re-arms it, and the delay runs from the last keystroke. The timer is driven by those four
+  // values and by nothing else.
   useEffect(() => {
     // Nothing outstanding: no keystroke has asked for a navigation since the last one was carried
     // out, which is also the state of a draft the reader never touched.
@@ -560,6 +553,7 @@ export function SiteHeader(props: Props): ReactElement {
     // merely skipped, so returning to that route later does not revive an instruction from before
     // the reader left it. Their next keystroke asks again, and the submit control asks immediately.
     if (intent !== pathname) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIntent(null);
 
       return;
@@ -739,9 +733,7 @@ export function SiteHeader(props: Props): ReactElement {
           </div>
         </form>
 
-        {/* The strip, on a product route and once the page has published which product it is. Both
-            conditions matter: the route is what makes suggestions relevant, and the id is what the
-            endpoint identifies a product by. */}
+        {/* The suggestions strip, on a product route once the product on screen is known. */}
         {isProductRoute(pathname) && activeProductId !== null ? (
           <div className={styles.miniRail}>
             <RecommendationsRail productId={activeProductId} variant="compact" />

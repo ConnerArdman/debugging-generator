@@ -1,44 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
   <title>Safety gear</title>
-  <!-- One of the object tiles of this folder: a hard hat, with a pair of safety glasses set on the
-       shelf below it. The four frame elements that follow - the rounded paper panel and the three
-       mist shelf strokes - are copied from product-placeholder.svg unchanged, as is the 400 x 300
-       view box, so a catalog card or the product gallery can swap any tile here for another without
-       reflowing. The intrinsic width and height sit on the root beside the view box because these
-       files are referenced by their string path alone - an img element, or a next/image with a
-       literal src - and so offer no import from which a size could be inferred. -->
+  <!-- Every tile here shares this panel, shelf, view box and intrinsic size, so tiles referenced
+       by path swap without reflow. Colours are explicit hex, as an img inherits none. Mist stays
+       background and amber only fills outlines: neither reads on the panel alone. -->
   <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
   <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
   <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
   <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <!-- The brim, drawn first. Its top edge is the line the crown closes along, so the two strokes
-         coincide there and the length of brim that passes behind the hat needs no drawing of its
-         own; what is left of it reads as two wings flaring out either side. The band itself stays
-         unfilled, as the carton face of the placeholder tile does, and only the crown is amber. 168
-         units across, centred on x 200: the same span that tile's carton occupies, which keeps the
-         widest element of every tile in this folder the same width. -->
     <rect x="116" y="146" width="168" height="20" rx="10" stroke="#0F172A" stroke-width="8" />
-    <!-- The crown: two mirrored cubics rising from the brim line to an apex on x 200 and closed
-         back along that line, so the ink outline encloses the fill on every side and its lower edge
-         lands exactly on the brim's own top stroke. The fill is the single amber in the file, and
-         the only large field of amber anywhere in this folder, spent here because a hard hat is
-         yellow and nowhere else. At 2.05:1 against the panel the hue carries nothing on its own -
-         the outline is what makes the shape read - so the amber is neither stroked by itself nor
-         repeated on the brim. -->
     <path d="M152 146 C152 104 172 88 200 88 C228 88 248 104 248 146 Z" fill="#F59E0B" stroke="#0F172A" stroke-width="8" />
-    <!-- Two ridge lines over the crown, following its curve at the lighter slate weight. Both ends
-         of each are held clear of the outline rather than merely short of it: a 6-unit round-capped
-         line needs its centre 7 units off an 8-unit stroke just to avoid touching, so the upper end
-         sits about 10 units off the crown's centre line and the lower end stops 11 units above the
-         brim line - 4 clear of its stroke - leaving amber showing at either end. -->
     <path d="M186 100 C178 111 174 122 173 135" stroke="#475569" stroke-width="6" />
     <path d="M214 100 C222 111 226 122 227 135" stroke="#475569" stroke-width="6" />
-    <!-- The glasses. Temples and bridge first, at the slate weight, each end tucked under a lens
-         outline that has yet to be drawn; then the two lenses, filled white inside an ink frame,
-         since white reads only where something darker bounds it. The pair, temples included, stays
-         inside the width of the brim and carries none of the amber, so the hat remains the subject
-         of the tile, and the lowest edge stops four units short of the shelf stroke. -->
     <path d="M140 193 L124 186" stroke="#475569" stroke-width="6" />
     <path d="M260 193 L276 186" stroke="#475569" stroke-width="6" />
     <path d="M192 195 Q200 185 208 195" stroke="#475569" stroke-width="6" />

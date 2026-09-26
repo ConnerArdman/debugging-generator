@@ -68,10 +68,8 @@ const COUNTER_SHARE = 0.8;
 /**
  * The field's props.
  *
- * Kept local and deliberately not exported under any name. A `FormFieldProps` declared here would
- * become demo vocabulary that `scripts/check-no-hardcoding.mjs --update` harvests into
- * `scripts/no-hardcoding.policy.json`, after which no product file may contain that literal. A
- * caller that needs this shape writes `ComponentProps<typeof FormField>`.
+ * Kept local and deliberately not exported under any name: a caller that needs this shape writes
+ * `ComponentProps<typeof FormField>`.
  *
  * `hint` and `error` are optional rather than `ReactNode | undefined` properties because
  * `ReactNode` already includes `undefined`: `error={problem}` with a `string | undefined` value is

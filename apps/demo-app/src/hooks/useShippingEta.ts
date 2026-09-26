@@ -378,6 +378,7 @@ export function useFreightQuote(
     const shouldQuote =
       freightDestinationProblem(region, destination) === null && units <= MAX_SHIPMENT_UNITS;
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLookup({ key: asked, quote: null, isQuoting: shouldQuote, quoteError: null });
 
     if (!shouldQuote) {

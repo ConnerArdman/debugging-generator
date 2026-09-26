@@ -166,8 +166,9 @@ export interface PanelViewProps {
    * How the views beneath `PanelHost` resolve their data queries. Stable
    * identity. Bound here to the rendered specification's `id` before it
    * reaches `PanelHost`, so every node reads the capture that panel was
-   * generated from; the provider passed in is not modified and keeps serving
-   * the composition root's live reads.
+   * generated from. The provider passed in is not modified: the composition
+   * root's own callers, such as the event drawer, name the panel per call
+   * when they read its evidence and read live evidence otherwise.
    */
   dataProvider: DataProvider;
 

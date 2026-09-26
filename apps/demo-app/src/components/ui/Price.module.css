@@ -87,15 +87,9 @@
 
 /* The highlighted figure - a promotional price, the amount a savings callout is about.
  *
- * BLITZY [A11Y]: implemented as ink text with an amber underline rather than amber text. The
- * brand amber measures ~1.9:1 against the white surface (globals.css records 2.15:1 against
- * `--ls-surface` and states that amber is a fill or decorative accent, never a text colour on a
- * light surface), so amber text here would fail WCAG AA at every size this component renders -
- * and a price is the last value in a storefront that may be hard to read. The accent is carried
- * by a decoration instead: the text keeps the 17.9:1 ink colour, and the amber line marks the
- * figure without being the thing the reader has to decipher. The underline is also a non-colour
- * indicator, so the tone does not rely on hue alone. Thickness comes from the font so it scales
- * with `data-size`. Flagged for design review. */
+ * Ink text with an amber underline, because amber is a fill and accent colour, not a text colour
+ * on a light surface. The underline is a non-colour indicator, so the tone does not rely on hue
+ * alone, and its thickness comes from the font so it scales with `data-size`. */
 .root[data-tone='accent'] {
   color: var(--ls-ink, #0f172a);
   text-decoration-line: underline;

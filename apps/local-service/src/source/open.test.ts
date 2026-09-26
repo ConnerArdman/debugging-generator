@@ -8,7 +8,9 @@
  * that: the authorization matrix (an editor only inside the workspace folders it
  * announced; a DevTools panel only for the session bound to its own tab; the page
  * agent and the dev-server agent never), the happy path forwarding exactly one
- * `source.open` envelope whose location equals the input byte for byte, the
+ * `source.open` envelope whose location equals the input byte for byte and whose
+ * `pinned` names the canonical file with its exact `bigint` device and inode, a
+ * request that already carries a pin refused unechoed, the
  * `delivered: false` answer when no editor is connected, that the handler never
  * throws or rejects, and the privacy rule that no error payload or log record
  * carries an absolute path, a symbolic-link target, file contents or a
@@ -51,6 +53,7 @@ import {
   readdirSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -108,8 +111,11 @@ import type {
   SourceOpenDelivered,
   SourceOpenDeps,
   SourceOpenEditorResult,
+  SourceOpenFileStats,
   SourceOpenHandler,
+  SourceOpenLstat,
   SourceOpenOutcome,
+  SourceOpenPin,
   SourceOpenPrincipal,
   SourceOpenRealPath,
   SourceOpenTimers,
@@ -295,6 +301,7 @@ interface HarnessOptions {
   readonly binding?: SourceOpenBinding | undefined;
   readonly useBindingPort?: boolean;
   readonly realpath?: SourceOpenRealPath;
+  readonly lstat?: SourceOpenLstat;
   readonly verifyExists?: boolean;
   readonly asyncPorts?: boolean;
   readonly logger?: Logger;
@@ -356,6 +363,7 @@ function harness(options: HarnessOptions): Harness {
     logger: options.logger ?? capturingLogger(entries),
     now: () => FIXED_NOW,
     ...(options.realpath === undefined ? {} : { realpath: options.realpath }),
+    ...(options.lstat === undefined ? {} : { lstat: options.lstat }),
     ...(options.verifyExists === undefined ? {} : { verifyExists: options.verifyExists }),
     ...(options.timers === undefined ? {} : { timers: options.timers }),
     ...(options.editorResultTimeoutMs === undefined
@@ -517,6 +525,39 @@ function tableRealpath(
     }
     return table[path] ?? path;
   };
+}
+
+/**
+ * The pin an editor must match for a file: `file` relative to the canonical
+ * `root`, and the device and inode of a non-following `bigint` `lstat` of it,
+ * in canonical decimal. `root` must itself be canonical.
+ */
+function pinFor(root: string, file: string): SourceOpenPin {
+  const stats = lstatSync(join(root, file), { bigint: true });
+  return { file, dev: String(stats.dev), ino: String(stats.ino) };
+}
+
+/** An inspector answer for a regular file with the given identity. */
+function fileStats(dev: unknown, ino: unknown): SourceOpenFileStats {
+  return hostile<SourceOpenFileStats>({
+    dev,
+    ino,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  });
+}
+
+/** The payload of the one `source.open` a harness sent, failing the test for anything else. */
+function sentPayloadOf(sent: readonly SentMessage[]): SourceOpenPayload {
+  const [only, ...others] = sent;
+  if (only === undefined || others.length > 0) {
+    throw new Error(`expected exactly one sent message, received ${String(sent.length)}`);
+  }
+  const { message } = only;
+  if (!isMessageOfType(message, 'source.open')) {
+    throw new Error(`expected a source.open message, received ${message.type}`);
+  }
+  return message.payload;
 }
 
 /**
@@ -995,7 +1036,7 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
   });
 
   describe('SourceOpenOutcome — forwarding and delivery outcomes', () => {
-    it('sends exactly one source.open envelope to the editor, with the location unchanged', async () => {
+    it('sends exactly one source.open envelope to the editor, with the location unchanged and the target pinned', async () => {
       const h = harness({ session: sessionRecordFor(project) });
       // A confidence that differs from the resolver's default, so a handler
       // that re-stamped the location would be caught.
@@ -1032,13 +1073,15 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
       if (!isMessageOfType(message, 'source.open')) {
         throw new Error(`expected a source.open message, received ${message.type}`);
       }
-      expect(valueOf(parseSourceOpenPayload(message.payload))).toEqual(input);
+      // The location as sent, and beside it the canonical file and its identity.
+      const pinned = pinFor(project, LEGIT_FILE);
+      expect(valueOf(parseSourceOpenPayload(message.payload))).toEqual({ ...input, pinned });
       expect(message.sessionId).toBe(SESSION_ID);
       expect(message.ts).toBe(FIXED_NOW);
       expect(Number.isSafeInteger(message.ts) && message.ts > 0).toBe(true);
       expect(typeof message.id).toBe('string');
       expect(message.id.length).toBeGreaterThan(0);
-      expect(message.payload).toEqual(input);
+      expect(message.payload).toStrictEqual({ ...input, pinned });
       expect(message.payload.location.resolvedBy).toBe('source-map');
       expect(message.payload.location.confidence).toBe(0.42);
       expect(JSON.stringify(message.payload.location)).toBe(JSON.stringify(input.location));
@@ -1125,7 +1168,7 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
     });
 
     it.skipIf(!CAN_CREATE_SYMLINKS)(
-      'opens a file reached through a link that stays inside the project, forwarding the location as sent',
+      'opens a file reached through a link that stays inside the project, forwarding the location as sent and pinning the canonical file',
       async () => {
         const h = harness({ session: sessionRecordFor(project) });
         const location = locationOf('src/alias.ts');
@@ -1138,13 +1181,111 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
           location,
           file: LEGIT_FILE,
         });
-        const message = h.sent[0]?.message;
-        expect(message?.type === 'source.open' && message.payload.location.file).toBe(
-          'src/alias.ts',
-        );
+        const payload = sentPayloadOf(h.sent);
+        // The location names the link, exactly as sent ...
+        expect(payload.location.file).toBe('src/alias.ts');
+        // ... and the pin names the file the link resolves to, with that file's
+        // identity: not the link's own inode, which a following open never reaches.
+        expect(payload.pinned).toEqual(pinFor(project, LEGIT_FILE));
+        const real = lstatSync(realpathSync(join(project, 'src', 'alias.ts')), { bigint: true });
+        expect(payload.pinned?.dev).toBe(String(real.dev));
+        expect(payload.pinned?.ino).toBe(String(real.ino));
+        const link = lstatSync(join(project, 'src', 'alias.ts'), { bigint: true });
+        expect(link.isSymbolicLink()).toBe(true);
+        expect(payload.pinned?.ino).not.toBe(String(link.ino));
         expectSandboxUntouched();
       },
     );
+
+    it('pins the identity of the file, so a file replaced at the same path pins differently', async () => {
+      const h = harness({ session: sessionRecordFor(project) });
+      const input: SourceOpenPayload = { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) };
+      const target = join(project, LEGIT_FILE);
+
+      valueOf(await h.handle(input, editor));
+      const before = sentPayloadOf(h.sent).pinned;
+
+      // Same path, same bytes, a different file: the pin an editor holds from the
+      // first forward no longer matches what the path now names. The copy is
+      // renamed over the original, so both inodes exist at once and cannot coincide.
+      const replacement = join(project, 'src', 'replacement.ts');
+      writeFileSync(replacement, readFileSync(target));
+      renameSync(replacement, target);
+      const replaced = lstatSync(target, { bigint: true });
+      expect(String(replaced.ino)).not.toBe(before?.ino);
+
+      const again = harness({ session: sessionRecordFor(project) });
+      valueOf(await again.handle(input, editor));
+      const after = sentPayloadOf(again.sent).pinned;
+
+      expect(before?.file).toBe(LEGIT_FILE);
+      expect(after).toEqual(pinFor(project, LEGIT_FILE));
+      expect(after?.ino).not.toBe(before?.ino);
+    });
+
+    it('pins a device and inode beyond 2^53 exactly, as canonical decimal', async () => {
+      const virtualRoot = '/virtual/app';
+      const principal: SourceOpenPrincipal = { client: 'vscode', projectRoots: [virtualRoot] };
+      const inspected: string[] = [];
+      const lstat: SourceOpenLstat = (path) => {
+        inspected.push(path);
+        return fileStats(2n ** 64n - 1n, 2n ** 53n + 1n);
+      };
+      const h = harness({
+        session: sessionRecordFor(virtualRoot),
+        realpath: tableRealpath({ '/virtual/app/src/alias.ts': '/virtual/app/src/real.ts' }),
+        lstat,
+      });
+
+      valueOf(
+        await h.handle({ sessionId: SESSION_ID, location: locationOf('src/alias.ts') }, principal),
+      );
+
+      // The canonical target is what is inspected and what is pinned.
+      expect(inspected).toEqual(['/virtual/app/src/real.ts']);
+      const payload = sentPayloadOf(h.sent);
+      expect(payload.pinned).toEqual({
+        file: 'src/real.ts',
+        dev: '18446744073709551615',
+        ino: '9007199254740993',
+      });
+      // A `number` would have rounded this inode onto its neighbour.
+      expect(String(Number(2n ** 53n + 1n))).not.toBe(payload.pinned?.ino);
+      // And the frame is one the editor's own parser accepts.
+      expect(valueOf(parseSourceOpenPayload(payload)).pinned).toEqual(payload.pinned);
+    });
+
+    it('never forwards a target it could not identify exactly', async () => {
+      const virtualRoot = '/virtual/app';
+      const principal: SourceOpenPrincipal = { client: 'vscode', projectRoots: [virtualRoot] };
+      const answers: readonly unknown[] = [
+        fileStats(1, 2n),
+        fileStats(1n, 2),
+        fileStats(-1n, 2n),
+        fileStats(1n, 2n ** 64n),
+        fileStats(undefined, undefined),
+        null,
+        'a file',
+        { dev: 1n, ino: 2n },
+      ];
+      for (const answer of answers) {
+        const h = harness({
+          session: sessionRecordFor(virtualRoot),
+          realpath: tableRealpath({}),
+          lstat: () => hostile<SourceOpenFileStats>(answer),
+        });
+
+        const error = refusalOf(
+          await h.handle({ sessionId: SESSION_ID, location: locationOf('src/a.ts') }, principal),
+        );
+
+        expect(error.code).toBe(CODES.unsafePath);
+        expect(sourceOpenRejectionOf(error)).toBe('unsafe-path');
+        expect(error.details?.['reason']).toBe('identity-unavailable');
+        expect(h.sent).toEqual([]);
+        expectPrivate(error, [virtualRoot]);
+      }
+    });
 
     it('is deterministic: the same request twice yields the same answer and one frame each', async () => {
       const h = harness({ session: sessionRecordFor(project) });
@@ -1359,12 +1500,25 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
       const principal: SourceOpenPrincipal = { client: 'vscode', projectRoots: [virtualRoot] };
       const location = locationOf('src/a.ts');
 
-      const unchecked = harness({ session, realpath: tableRealpath({}), verifyExists: false });
+      const inspected: string[] = [];
+      const unchecked = harness({
+        session,
+        realpath: tableRealpath({}),
+        lstat: (path) => {
+          inspected.push(path);
+          return fileStats(1n, 2n);
+        },
+        verifyExists: false,
+      });
       expect(
         withoutCorrelation(
           valueOf(await unchecked.handle({ sessionId: SESSION_ID, location }, principal)),
         ),
       ).toEqual({ delivered: true, clients: 1, location, file: 'src/a.ts' });
+      // Nothing was inspected, so there is no identity to pin: the frame goes
+      // unpinned, and an editor that requires the pin refuses it.
+      expect(inspected).toEqual([]);
+      expect(Object.hasOwn(sentPayloadOf(unchecked.sent), 'pinned')).toBe(false);
 
       const checked = harness({ session, realpath: tableRealpath({}) });
       const missing = refusalOf(
@@ -1430,6 +1584,46 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
         expect(h.sent).toEqual([]);
         expectPrivate(error, [...forbidden(), marker]);
       }
+    });
+
+    it('refuses a request that already carries a pin, whatever it names, and echoes none of it', async () => {
+      const location = locationOf(LEGIT_FILE);
+      // Distinctive, well-formed identities: none may surface in an error or a log.
+      const devMarker = '918273645546372819';
+      const inoMarker = '5647382910019283746';
+      const nominated: SourceOpenPin = { file: 'src/nominated.ts', dev: devMarker, ino: inoMarker };
+      // Even a pin that truthfully describes the requested file is not the sender's to give.
+      const truthful = pinFor(project, LEGIT_FILE);
+      const inputs: unknown[] = [
+        { sessionId: SESSION_ID, location, pinned: nominated },
+        { sessionId: SESSION_ID, location, pinned: truthful },
+        { sessionId: SESSION_ID, location, pinned: undefined },
+        createEnvelope('source.open', { sessionId: SESSION_ID, location, pinned: nominated }),
+        encodeMessage(
+          createEnvelope('source.open', { sessionId: SESSION_ID, location, pinned: nominated }),
+        ),
+      ];
+
+      for (const input of inputs) {
+        const h = harness({ session: sessionRecordFor(project) });
+
+        const error = refusalOf(await h.handle(input, editor));
+
+        expect(error.code).toBe(CODES.invalidMessage);
+        expect(sourceOpenRejectionOf(error)).toBe('invalid-payload');
+        expect(error.details?.['reason']).toBe('pin-not-permitted');
+        // Refused on decoding: no session was looked up and nothing was sent.
+        expect(h.lookups).toEqual([]);
+        expect(h.sent).toEqual([]);
+        expectPrivate(error, [...forbidden(), devMarker, inoMarker, nominated.file]);
+        const logged = JSON.stringify(h.entries);
+        for (const value of [devMarker, inoMarker, nominated.file]) {
+          expect(logged).not.toContain(value);
+        }
+        expect(h.entries.map((entry) => entry.fields['reason'])).toEqual(['pin-not-permitted']);
+        expectPrivateLogs(h.entries);
+      }
+      expectSandboxUntouched();
     });
   });
 

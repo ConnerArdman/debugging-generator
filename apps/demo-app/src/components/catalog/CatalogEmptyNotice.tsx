@@ -49,12 +49,9 @@
  * the filter state. Keyboard users reach that control and nothing else here, because nothing else
  * here is focusable.
  *
- * WORDING AND NAMING
- * Every string the reader sees is declared in `NOTICE_COPY` below, keyed by `reason`, so a third
- * situation cannot be added without the compiler demanding its wording. The component's name is
- * deliberately specific to this folder rather than a generic name for an empty block: the
- * debugging product's own component library owns the generic names, and every name declared in
- * this application is harvested into the shared policy that keeps the two vocabularies apart.
+ * WORDING
+ * Every string the reader sees is declared in `NOTICE_COPY` below, keyed by `reason`, so a new
+ * situation cannot be added without the compiler demanding its wording.
  */
 
 import type { ReactNode } from 'react';

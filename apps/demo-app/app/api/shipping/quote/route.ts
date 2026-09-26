@@ -2,62 +2,15 @@
  * `GET /api/shipping/quote` - which services can carry a shipment to a
  * destination, what each costs and how long each takes.
  *
- * The checkout form asks this endpoint while the customer is still filling it
- * in, through `requestShippingQuote` in `@/lib/api-client`, and the handler does
- * what a route handler in this workspace does and nothing else: it parses the
- * query string with the schema that declares it, hands the parsed shipment and
- * the origin the request arrived on to the service that answers it, and
- * serializes that answer as it stands. There is no tariff arithmetic here, no
- * carrier call, no database access and no second copy of the query rules: the
- * parameters live in `@/server/validation/shipping`, the work lives in
- * `@/server/services/shipping.service`, and this module is where the request and
- * that work meet.
- *
- * Four decisions are worth stating, because a reader would otherwise reasonably
- * expect the opposite:
- *
- * 1. **No parameter is defaulted here, and no rejection is answered here.**
- *    Every parameter this endpoint accepts is declared, bounded and defaulted
- *    once, in `shippingQuoteQuerySchema`, which is why a request naming a
- *    destination and nothing else - the only request the browser makes - parses
- *    to a complete shipment. That schema is also where the destination's two
- *    halves are paired: a postal code that is not a complete one for the
- *    country given with it is rejected there, not rated, because a rate taken
- *    on an unfinished code prices a different place from the buyer's. The
- *    throwing `parse` is used deliberately: the
- *    `ZodError` it raises propagates to the single mapper in `@/server/errors`,
- *    which answers 400 in the one envelope every endpoint of this application
- *    uses and names the parameters it rejected without repeating what was
- *    received, because a postal code is somebody's address even when it is
- *    malformed. Quietly substituting a default for a rejected parameter would
- *    quote a shipment nobody described.
- * 2. **The origin is read off the request rather than configured.** The service
- *    reaches the carrier over HTTP and needs an absolute address to reach it at,
- *    and the one place that address is known is the request being served: a host
- *    written into this file or read from the environment would be a second
- *    description of where this application answers, and would be wrong the first
- *    time it was served on another port. A request's authority is chosen by
- *    whoever sent it, so it is checked before anything is addressed to it - by
- *    the service, against `@/server/origin`, which is also the module that
- *    builds the address. This handler passes the value on and judges nothing
- *    about it.
- * 3. **Nothing is cached, and nothing is written.** A rate is quoted for the
- *    shipment and the moment it was asked about, so the segment is dynamic,
- *    every response says `no-store`, and nothing is memoized at module scope or
- *    de-duplicated in flight: one request from the browser is one quote, and two
- *    identical requests are two. A destination the customer has since corrected
- *    is a different question, and a rate served again from a cache would answer
- *    the earlier one. The other half of that is that asking costs nothing
- *    permanent: the service records a quote only against the cart it was taken
- *    for, and this endpoint quotes a destination, so a browser, a prefetcher or
- *    a retry may repeat the request freely without accumulating rows nothing
- *    will ever reference.
- * 4. **The payload is passed through untouched.** The service already stated the
- *    quote in the shapes of `@/lib/types` - money as an integer count of US
- *    cents in its `*Cents` fields, transit time as a whole number of business
- *    days, the instant it was quoted at as an ISO-8601 UTC string - so
- *    re-labelling, re-rounding or reordering anything here could only introduce
- *    a disagreement between this endpoint and the picker that reads it.
+ * `shippingQuoteQuerySchema` in `@/server/validation/shipping` declares and
+ * bounds every parameter and defaults all but the destination postal code, so
+ * that code alone is a complete request. The origin the carrier is reached at
+ * is read off the request rather than configured, and the service checks it
+ * against `@/server/origin` before addressing anything to it. The
+ * `ShippingQuoteResult` from `@/server/services/shipping.service` is returned
+ * as it stands. A rate holds only for the moment it was quoted, so the segment
+ * is dynamic, every response is `no-store` and nothing is memoized at module
+ * scope.
  */
 
 import type { ShippingQuoteResult } from '@/lib/types';
@@ -79,18 +32,14 @@ export const dynamic = 'force-dynamic';
  * @param request The incoming request. Its query string carries the destination
  * postal code and, optionally, the country that code is in, what the shipment
  * weighs, how many units travel in it and which tier of service to quote
- * around; `shippingQuoteQuerySchema` owns which of those are required, what
- * they are bounded to and what they default to, so a request carrying a
- * domestic destination alone is a perfectly good one. Its URL is also read for
- * the origin the carrier is reached on.
+ * around.
  * @returns 200 with a `ShippingQuoteResult` - the services on offer, the
  * destination they were quoted for and the instant they were quoted at, with
  * `id: null` because a quote taken for a destination rather than for a cart is
- * not recorded - and `no-store`, so neither the dev server nor the browser
- * serves the rates again. This endpoint is therefore safe to repeat: it writes
- * nothing, which is what a `GET` a browser, a prefetch or a retry may replay has
- * to be. A destination with no service offered to it is answered with no
- * options, which is a result rather than a failure. Any failure is answered by
+ * not recorded. This endpoint is therefore safe to repeat: it writes nothing,
+ * which is what a `GET` a browser, a prefetch or a retry may replay has to be.
+ * A destination with no service offered to it is answered with no options,
+ * which is a result rather than a failure. Any failure is answered by
  * `storefrontErrorResponse` in the one envelope every endpoint of this
  * application uses: 400 for a query the schema rejected - including a postal
  * code that is not a complete one for its country - or a request that was not

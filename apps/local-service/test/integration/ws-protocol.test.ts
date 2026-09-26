@@ -28,7 +28,13 @@
  *   records at `debug`);
  * - a DevTools socket that drops mid-capture keeps its session, binding and
  *   capture, and a reconnect with the same credential carries the traffic
- *   again without a re-bind (the MV3 service-worker suspension of §0.5.5).
+ *   again without a re-bind (the MV3 service-worker suspension of §0.5.5);
+ * - the upgrade gate admits unauthenticated sockets only within its per-peer,
+ *   global and open-socket quotas — past them an upgrade is answered 429 or
+ *   503 over bare HTTP, with `Retry-After`, and no WebSocket is created — and
+ *   every reservation is given back when a hello authenticates, a socket
+ *   closes or times out, or `ws` aborts a handshake, so the counters read zero
+ *   after `close()`.
  *
  * It deliberately does not restate what other suites pin: the envelope and
  * payload schemas are `packages/protocol/src/__tests__/*`, the handshake's
@@ -58,19 +64,25 @@
  * `randomSecretLike` at run time, and every malformed frame is built at run
  * time from strings and bytes — nothing credential-shaped or binary is
  * committed; imports stay inside the workspace's dependency set (`@debuggen/*`
- * except the panel renderer, `ws` types and `node:*`), with no `zod` and no DOM
+ * except the panel renderer, `ws` — its types, and the bare client the
+ * admission block opens sockets with — and `node:*`), with no `zod` and no DOM
  * types.
  */
 
 import { randomBytes } from 'node:crypto';
 import { rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import type { Server } from 'node:http';
+import { connect as connectTcp } from 'node:net';
 import { isDeepStrictEqual } from 'node:util';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { WebSocket as NodeWebSocket } from 'ws';
 import type { RawData } from 'ws';
 
 import {
   BINDING_REASONS,
+  CLIENT_HELLO_TIMEOUT_MS,
   CLIENT_KINDS,
   HTTP_ONLY_PAYLOAD_NAMES,
   MESSAGE_TYPES,
@@ -86,7 +98,10 @@ import {
   errorPayloadSchema,
   isMessageOfType,
   parseMessage,
+  resolveWsUrl,
   telemetryEventPayloadSchema,
+  WS_CLOSE_UNAUTHORIZED,
+  WS_PATH,
 } from '@debuggen/protocol';
 import type {
   BindingReason,
@@ -110,7 +125,9 @@ import type {
   TelemetryTier,
 } from '@debuggen/protocol';
 import {
+  DebuggenError,
   ID_PREFIXES,
+  err,
   isErr,
   newEventId,
   newId,
@@ -120,9 +137,29 @@ import {
   newSpanId,
   newTraceId,
 } from '@debuggen/shared';
-import type { DebuggenError, DebuggenErrorCode, Result } from '@debuggen/shared';
+import type { DebuggenErrorCode, Result } from '@debuggen/shared';
 
-import { MAX_WS_MESSAGE_BYTES } from '../../src/server/ws.js';
+import {
+  DEFAULT_MAX_CLIENTS,
+  WS_CLOSE_GOING_AWAY,
+  createClientRegistry,
+} from '../../src/server/clients.js';
+import type { ClientRegistry } from '../../src/server/clients.js';
+import {
+  CLOSE_HANDSHAKE_GRACE_MS,
+  DEFAULT_MAX_OPEN_CONNECTIONS,
+  DEFAULT_MAX_PENDING_HANDSHAKES,
+  DEFAULT_MAX_PENDING_HANDSHAKES_PER_PEER,
+  MAX_WS_MESSAGE_BYTES,
+  createWsServer,
+} from '../../src/server/ws.js';
+import type {
+  UpgradeListener,
+  UpgradeSource,
+  WsServer,
+  WsServerDeps,
+  WsServerStats,
+} from '../../src/server/ws.js';
 import {
   HARNESS_TIMEOUTS,
   createHarnessClock,
@@ -255,17 +292,23 @@ const CODE = Object.freeze({
   unauthorized: 'UNAUTHORIZED',
   transportDisconnected: 'TRANSPORT_DISCONNECTED',
   internal: 'INTERNAL',
+  configInvalid: 'CONFIG_INVALID',
 } as const satisfies Readonly<Record<string, DebuggenErrorCode>>);
 
 /**
  * The HTTP statuses this suite reads: a healthy `GET /health`, a refused body,
  * a refused role, a refused capture or target request, and a bound tab whose
- * connection is offline.
+ * connection is offline — and on the upgrade gate, an admitted upgrade, an
+ * off-route one and the two admission refusals (429 for the unauthenticated
+ * share, 503 for the open-socket cap).
  */
+const HTTP_SWITCHING_PROTOCOLS = 101;
 const HTTP_OK = 200;
 const HTTP_BAD_REQUEST = 400;
 const HTTP_FORBIDDEN = 403;
+const HTTP_NOT_FOUND = 404;
 const HTTP_CONFLICT = 409;
+const HTTP_TOO_MANY_REQUESTS = 429;
 const HTTP_UNAVAILABLE = 503;
 
 /**
@@ -2612,6 +2655,749 @@ describe('an install that fails outright', () => {
     expect(await editor.flush()).toBe(true);
     expect(editor.errorsFor(frame.id).map((error) => error.code)).toEqual([CODE.invalidMessage]);
     proved.refusedWhenSentByClient.add(T.failed);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 6a. Admission before the hello
+ *
+ * The quotas are proved on a WebSocket server of their own, built with
+ * `createWsServer` over the harness's real access boundary and a fresh client
+ * registry, because the bounds that make a quota observable in a few sockets
+ * (and a hello window short enough to wait out) are injected options the
+ * service's composition root leaves at their defaults. The last test drives
+ * the harness's own service, so the refusal headers are proved on the
+ * production wiring as well.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The upgrade header the admission rig's relay reads to present an upgrade
+ * under another peer address. Only the rig's relay honours it; the service's
+ * gate reads nothing but the TCP remote address.
+ */
+const PEER_HEADER = 'x-debuggen-admission-peer';
+
+/**
+ * The peers the rig presents upgrades under, besides the real loopback
+ * address every test socket connects from. Real loopback aliases cannot stand
+ * in portably — IPv6 is disabled on some CI hosts and `127.0.0.2` does not
+ * exist on others — so the relay presents these instead. The IPv4-mapped
+ * spelling of the real address proves the gate folds it into the same bucket.
+ */
+const PEER = Object.freeze({
+  ipv6Loopback: '::1',
+  mappedLoopback: '::FFFF:127.0.0.1',
+  third: '127.0.0.2',
+});
+
+/**
+ * The record message of an admission refusal (`src/server/ws.ts`). The suite
+ * matches it to read the record's fields — counts, limits and the closed
+ * refusal category — and to prove no peer address reached it.
+ */
+const ADMISSION_REFUSED_LOG = 'refused a WebSocket upgrade past its admission quota';
+
+/** The refusal categories those records carry, in the gate's order of checking. */
+const REFUSAL = Object.freeze({
+  peer: 'peer-quota',
+  pending: 'pending-quota',
+  capacity: 'capacity',
+});
+
+/** The constant refusal of every inbound frame port the admission rig never routes a frame to. */
+const UNROUTED_MESSAGE = 'The admission rig routes no frame past the hello.';
+
+/** The ports of the admission rig: every frame after the hello is refused, since none is sent. */
+function unrouted(): Promise<Result<never, DebuggenError>> {
+  return Promise.resolve(err(new DebuggenError('INTERNAL', UNROUTED_MESSAGE)));
+}
+
+/**
+ * The `Retry-After` an admission refusal carries for a hello window: the
+ * window plus the closing grace, in whole seconds rounded up — the longest a
+ * pending reservation can be held.
+ */
+function retryAfterFor(helloTimeoutMs: number): string {
+  return String(Math.ceil((helloTimeoutMs + CLOSE_HANDSHAKE_GRACE_MS) / 1_000));
+}
+
+/** What {@link rawUpgrade} sends. */
+interface RawUpgradeOptions {
+  /** The request target; defaults to protocol's `WS_PATH`. */
+  readonly path?: string | undefined;
+  /** An `Origin` header; omitted, none — a Node client's upgrade. */
+  readonly origin?: string | undefined;
+  /** The `Sec-WebSocket-Key`; omitted, a valid random one. */
+  readonly key?: string | undefined;
+  /** The peer the admission rig's relay presents the upgrade under. */
+  readonly peer?: string | undefined;
+}
+
+/** The head of the service's answer to one bare upgrade. */
+interface RawUpgradeResponse {
+  readonly status: number;
+  /** Header values by lower-cased name. */
+  readonly headers: ReadonlyMap<string, string>;
+  /** The response head verbatim, for "nothing the client sent" assertions. */
+  readonly head: string;
+  /** Whether the service hung up after answering, as every refusal does. */
+  readonly closedByService: boolean;
+}
+
+/** Parses an HTTP/1.1 response head (the bytes before the blank line). */
+function parseResponseHead(head: string): Omit<RawUpgradeResponse, 'closedByService'> {
+  const [statusLine = '', ...lines] = head.split('\r\n');
+  const status = Number(statusLine.split(' ')[1]);
+  const headers = new Map<string, string>();
+  for (const line of lines) {
+    const colon = line.indexOf(':');
+    if (colon > 0) {
+      headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
+    }
+  }
+  return { status, headers, head };
+}
+
+/**
+ * Sends one WebSocket upgrade over bare TCP and reads the answer's head — the
+ * view of a refusal a WebSocket client does not give, and the only way to send
+ * a handshake `ws` itself refuses. An upgrade that is admitted (101) is hung
+ * up on at once: this helper never holds a WebSocket.
+ */
+function rawUpgrade(
+  host: string,
+  port: number,
+  options: RawUpgradeOptions = {},
+): Promise<RawUpgradeResponse> {
+  return new Promise<RawUpgradeResponse>((resolve, reject) => {
+    const socket = connectTcp({ host, port });
+    const failures: string[] = [];
+    let received = Buffer.alloc(0);
+    let answer: Omit<RawUpgradeResponse, 'closedByService'> | undefined;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(
+        new Error(
+          `No answer to a bare upgrade within ${String(HARNESS_TIMEOUTS.message)} ms (${failures.join('; ')}).`,
+        ),
+      );
+    }, HARNESS_TIMEOUTS.message);
+    socket.on('connect', () => {
+      const lines = [
+        `GET ${options.path ?? WS_PATH} HTTP/1.1`,
+        `Host: ${host}:${String(port)}`,
+        'Connection: Upgrade',
+        'Upgrade: websocket',
+        'Sec-WebSocket-Version: 13',
+        `Sec-WebSocket-Key: ${options.key ?? randomBytes(16).toString('base64')}`,
+        ...(options.origin === undefined ? [] : [`Origin: ${options.origin}`]),
+        ...(options.peer === undefined ? [] : [`${PEER_HEADER}: ${options.peer}`]),
+      ];
+      socket.write(`${lines.join('\r\n')}\r\n\r\n`);
+    });
+    socket.on('data', (chunk: Buffer) => {
+      if (answer !== undefined) {
+        return;
+      }
+      received = Buffer.concat([received, chunk]);
+      const end = received.indexOf('\r\n\r\n');
+      if (end === -1) {
+        return;
+      }
+      answer = parseResponseHead(received.subarray(0, end).toString('latin1'));
+      if (answer.status === HTTP_SWITCHING_PROTOCOLS) {
+        clearTimeout(timer);
+        socket.destroy();
+        resolve({ ...answer, closedByService: false });
+      }
+    });
+    socket.on('error', (error: Error) => {
+      failures.push(error.message);
+    });
+    socket.on('close', () => {
+      clearTimeout(timer);
+      if (answer === undefined) {
+        reject(
+          new Error(
+            `The service hung up without answering a bare upgrade (${failures.join('; ')}).`,
+          ),
+        );
+        return;
+      }
+      resolve({ ...answer, closedByService: true });
+    });
+  });
+}
+
+/**
+ * Asserts a bare refusal of the upgrade gate: the status, a closed
+ * connection, and exactly the constant headers — `nosniff`, `no-store`, an
+ * empty body and, for an admission refusal, `Retry-After` — so nothing else,
+ * and nothing the client sent, is in the answer.
+ */
+function expectBareRefusal(
+  response: RawUpgradeResponse,
+  status: number,
+  retryAfter: string | undefined,
+): void {
+  expect(response.status, response.head).toBe(status);
+  expect(response.closedByService).toBe(true);
+  expect(Object.fromEntries(response.headers)).toEqual({
+    connection: 'close',
+    'content-length': '0',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    ...(retryAfter === undefined ? {} : { 'retry-after': retryAfter }),
+  });
+}
+
+/** A bare WebSocket to the admission rig that sends nothing until a test tells it to. */
+interface AdmissionSocket {
+  readonly socket: NodeWebSocket;
+  /** `true` once upgraded; `false` when the upgrade was refused or the socket closed first. */
+  readonly opened: Promise<boolean>;
+  /** The close code, once the socket has closed. */
+  readonly closed: Promise<number>;
+  /** Transport failures, verbatim — a refused upgrade's `Unexpected server response`. */
+  readonly errors: readonly string[];
+}
+
+/**
+ * An {@link UpgradeSource} over a real `node:http` server that presents each
+ * upgrade carrying {@link PEER_HEADER} under that peer address, by shadowing
+ * the TCP socket's `remoteAddress` before the gate reads it. Everything else —
+ * the socket, the head, the handshake — is the real server's.
+ */
+function createPeerRelay(server: Server): UpgradeSource {
+  const relays = new Map<UpgradeListener, UpgradeListener>();
+  return {
+    on(event, listener) {
+      const relay: UpgradeListener = (request, socket, head) => {
+        const peer = request.headers[PEER_HEADER];
+        if (typeof peer === 'string') {
+          Object.defineProperty(request.socket, 'remoteAddress', {
+            value: peer,
+            configurable: true,
+          });
+        }
+        listener(request, socket, head);
+      };
+      relays.set(listener, relay);
+      return server.on(event, relay);
+    },
+    off(event, listener) {
+      const relay = relays.get(listener);
+      if (relay === undefined) {
+        return server;
+      }
+      relays.delete(listener);
+      return server.off(event, relay);
+    },
+  };
+}
+
+/** The admission bounds and hello window one rig's server is built with. */
+type AdmissionOptions = Pick<
+  WsServerDeps,
+  'maxOpenConnections' | 'maxPendingHandshakes' | 'maxPendingHandshakesPerPeer' | 'helloTimeoutMs'
+>;
+
+/** A WebSocket server of the admission block's own, on a listener of its own. */
+interface AdmissionRig {
+  /** The listener's host, the harness service's own. */
+  readonly host: string;
+  readonly port: number;
+  readonly ws: WsServer;
+  /** Opens a bare WebSocket, presented under `peer` when one is named. */
+  open(peer?: string): AdmissionSocket;
+  /** Sends one bare upgrade to the rig; see {@link rawUpgrade}. */
+  upgrade(options?: RawUpgradeOptions): Promise<RawUpgradeResponse>;
+  /** Sends an editor hello on `client` and waits until the server counts it authenticated. */
+  authenticate(client: AdmissionSocket): Promise<void>;
+  /** Waits until the server's counters satisfy `predicate`. */
+  until(predicate: (stats: WsServerStats) => boolean, description: string): Promise<WsServerStats>;
+  /**
+   * Closes the WebSocket server, the registry and the listener, then asserts
+   * every counter read zero once `close()` resolved and the server closed its
+   * source-navigation port exactly once.
+   */
+  close(): Promise<void>;
+}
+
+/** Everything but the admission tuning: the harness's access boundary, a fresh registry, refusing ports. */
+function admissionDeps(
+  h: Harness,
+  clients: ClientRegistry,
+  onSourceClose: () => void,
+): WsServerDeps {
+  return {
+    auth: h.auth,
+    clients,
+    binding: {
+      handleSessionBind: unrouted,
+      handleTabNavigated: unrouted,
+      handleSessionUnbind: unrouted,
+    },
+    telemetry: { handleTelemetryEventFrame: unrouted },
+    readiness: { agentReady: unrouted },
+    targets: { selected: unrouted },
+    sourceOpen: { handle: unrouted, acceptEditorResult: unrouted, close: onSourceClose },
+    logger: h.logger.root,
+    heartbeatIntervalMs: 0,
+    offlineGraceMs: 0,
+  };
+}
+
+/** Builds and starts an {@link AdmissionRig} on the harness service's host. */
+async function startAdmissionRig(h: Harness, options: AdmissionOptions): Promise<AdmissionRig> {
+  const host = new URL(h.url).hostname;
+  const clients = createClientRegistry({ logger: h.logger.root });
+  let sourceCloses = 0;
+  const ws = unwrap(
+    createWsServer({
+      ...admissionDeps(h, clients, () => {
+        sourceCloses += 1;
+      }),
+      ...options,
+    }),
+    'creating the admission server',
+  );
+  const listener = createServer((_request, response) => {
+    response.statusCode = HTTP_NOT_FOUND;
+    response.end();
+  });
+  unwrap(ws.attach(createPeerRelay(listener)), 'attaching the admission server');
+  await new Promise<void>((resolveListen, rejectListen) => {
+    listener.once('error', rejectListen);
+    listener.listen(0, host, () => {
+      resolveListen();
+    });
+  });
+  const address = listener.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('The admission rig listener has no TCP port.');
+  }
+  const port = address.port;
+  const wsUrl = unwrap(resolveWsUrl(`http://${host}:${String(port)}`), 'resolving the rig URL');
+  const sockets: AdmissionSocket[] = [];
+
+  const until = async (
+    predicate: (stats: WsServerStats) => boolean,
+    description: string,
+  ): Promise<WsServerStats> => {
+    try {
+      return await waitUntil(() => {
+        const stats = ws.stats();
+        return predicate(stats) ? stats : undefined;
+      }, description);
+    } catch (cause) {
+      // The counters when the wait gave up, which is what a failure needs.
+      throw new Error(`${description}; last counters ${JSON.stringify(ws.stats())}`, { cause });
+    }
+  };
+
+  return {
+    host,
+    port,
+    ws,
+    open(peer) {
+      const socket = new NodeWebSocket(wsUrl, [], {
+        handshakeTimeout: HARNESS_TIMEOUTS.message,
+        headers: peer === undefined ? {} : { [PEER_HEADER]: peer },
+      });
+      const errors: string[] = [];
+      socket.on('error', (error: Error) => {
+        errors.push(error.message);
+      });
+      const opened = new Promise<boolean>((resolveOpen) => {
+        socket.once('open', () => {
+          resolveOpen(true);
+        });
+        socket.once('close', () => {
+          resolveOpen(false);
+        });
+      });
+      const closed = new Promise<number>((resolveClose) => {
+        socket.once('close', (code: number) => {
+          resolveClose(code);
+        });
+      });
+      const client: AdmissionSocket = { socket, opened, closed, errors };
+      sockets.push(client);
+      return client;
+    },
+    upgrade: (upgradeOptions) => rawUpgrade(host, port, upgradeOptions),
+    async authenticate(client) {
+      const before = ws.stats().authenticated;
+      const hello = createEnvelope(T.hello, {
+        client: KIND.editor,
+        projectRoot: h.requireProject().root,
+        version: PROTOCOL_VERSION,
+        token: h.editorToken,
+      });
+      client.socket.send(encodeMessage(hello));
+      await until(
+        (stats) => stats.authenticated === before + 1,
+        'the hello authenticated the connection',
+      );
+    },
+    until,
+    async close() {
+      await ws.close();
+      const after = ws.stats();
+      clients.closeAll();
+      listener.closeAllConnections();
+      await new Promise<void>((resolveClose) => {
+        listener.close(() => {
+          resolveClose();
+        });
+      });
+      await Promise.all(sockets.map((client) => client.closed));
+      expect(after).toMatchObject({
+        open: 0,
+        awaitingHello: 0,
+        authenticated: 0,
+        pendingFrames: 0,
+        offlineRetained: 0,
+        admitted: 0,
+        pendingHandshakes: 0,
+        pendingPeers: 0,
+        attached: 0,
+        heartbeatActive: false,
+        closed: true,
+      });
+      expect(sourceCloses).toBe(1);
+    },
+  };
+}
+
+describe('admission before the hello', () => {
+  const harness = useHarness();
+
+  it('keeps its default bounds generous, nested, and inside the HTTP server’s connection share', () => {
+    expect(DEFAULT_MAX_OPEN_CONNECTIONS).toBe(DEFAULT_MAX_CLIENTS + DEFAULT_MAX_PENDING_HANDSHAKES);
+    // The composition root sizes the HTTP server's own connection limit above
+    // this cap, so the total WebSocket share must stay within it.
+    expect(DEFAULT_MAX_OPEN_CONNECTIONS).toBeLessThanOrEqual(320);
+    expect(DEFAULT_MAX_PENDING_HANDSHAKES_PER_PEER).toBeLessThanOrEqual(
+      DEFAULT_MAX_PENDING_HANDSHAKES,
+    );
+    expect(DEFAULT_MAX_PENDING_HANDSHAKES).toBeLessThan(DEFAULT_MAX_OPEN_CONNECTIONS);
+  });
+
+  it('refuses admission bounds that are not nested integers within the ceiling', async () => {
+    const h = harness();
+    const clients = createClientRegistry();
+    const invalid: readonly AdmissionOptions[] = [
+      { maxOpenConnections: DEFAULT_MAX_OPEN_CONNECTIONS + 1 },
+      { maxOpenConnections: 0 },
+      { maxOpenConnections: 3, maxPendingHandshakes: 4 },
+      { maxPendingHandshakes: 2, maxPendingHandshakesPerPeer: 3 },
+      { maxPendingHandshakes: 1.5 },
+      { maxPendingHandshakesPerPeer: 0 },
+    ];
+    for (const options of invalid) {
+      const created = createWsServer({ ...admissionDeps(h, clients, () => undefined), ...options });
+      expect(isErr(created) && created.error.code, JSON.stringify(options)).toBe(
+        CODE.configInvalid,
+      );
+    }
+    // A smaller open-socket cap pulls the pending defaults down with it
+    // rather than being refused for sitting below them.
+    const lowered = createWsServer({
+      ...admissionDeps(h, clients, () => undefined),
+      maxOpenConnections: 2,
+    });
+    expect(isErr(lowered)).toBe(false);
+    if (!isErr(lowered)) {
+      await lowered.value.close();
+    }
+    clients.closeAll();
+  });
+
+  it('answers 429 over bare HTTP once a peer holds its unauthenticated share, admitting another peer meanwhile', async () => {
+    const rig = await startAdmissionRig(harness(), {
+      maxOpenConnections: 8,
+      maxPendingHandshakes: 3,
+      maxPendingHandshakesPerPeer: 2,
+    });
+    try {
+      // The IPv4-mapped spelling of the loopback address is the same peer.
+      const first = rig.open();
+      const second = rig.open(PEER.mappedLoopback);
+      expect(await Promise.all([first.opened, second.opened])).toEqual([true, true]);
+      expect(rig.ws.stats()).toMatchObject({
+        open: 2,
+        awaitingHello: 2,
+        admitted: 2,
+        pendingHandshakes: 2,
+        pendingPeers: 1,
+        refusedUpgrades: 0,
+      });
+
+      const refused = await rig.upgrade();
+      expectBareRefusal(refused, HTTP_TOO_MANY_REQUESTS, retryAfterFor(CLIENT_HELLO_TIMEOUT_MS));
+      // Refused before `ws` saw it: no connection, no reservation.
+      expect(rig.ws.stats()).toMatchObject({
+        open: 2,
+        admitted: 2,
+        pendingHandshakes: 2,
+        refusedUpgrades: 1,
+      });
+
+      // The same refusal reaches a WebSocket client as a failed upgrade.
+      const turnedAway = rig.open();
+      expect(await turnedAway.opened).toBe(false);
+      expect(turnedAway.errors.join(' ')).toContain(String(HTTP_TOO_MANY_REQUESTS));
+
+      const other = rig.open(PEER.ipv6Loopback);
+      expect(await other.opened).toBe(true);
+      expect(rig.ws.stats()).toMatchObject({
+        open: 3,
+        admitted: 3,
+        pendingHandshakes: 3,
+        pendingPeers: 2,
+        refusedUpgrades: 2,
+      });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('answers 429 once every peer together holds the unauthenticated share, and files counts only', async () => {
+    const h = harness();
+    const rig = await startAdmissionRig(h, {
+      maxOpenConnections: 8,
+      maxPendingHandshakes: 3,
+      maxPendingHandshakesPerPeer: 2,
+    });
+    const from = h.logger.records.length;
+    try {
+      const held = [rig.open(), rig.open(), rig.open(PEER.ipv6Loopback)];
+      expect(await Promise.all(held.map((client) => client.opened))).toEqual([true, true, true]);
+      expect(rig.ws.stats()).toMatchObject({ pendingHandshakes: 3, pendingPeers: 2 });
+
+      // A peer holding nothing is refused for the global share …
+      const global = await rig.upgrade({ peer: PEER.third });
+      expectBareRefusal(global, HTTP_TOO_MANY_REQUESTS, retryAfterFor(CLIENT_HELLO_TIMEOUT_MS));
+      // … and a peer at its own share for that, which the gate checks first.
+      const perPeer = await rig.upgrade();
+      expectBareRefusal(perPeer, HTTP_TOO_MANY_REQUESTS, retryAfterFor(CLIENT_HELLO_TIMEOUT_MS));
+      expect(rig.ws.stats()).toMatchObject({
+        admitted: 3,
+        pendingHandshakes: 3,
+        refusedUpgrades: 2,
+      });
+
+      const refusals = h.logger.records
+        .slice(from)
+        .filter((record) => record.message === ADMISSION_REFUSED_LOG);
+      // The first refusal of the interval is a warning; the next is filed at
+      // debug and counted into the warning after it.
+      expect(refusals.map((record) => [record.level, record.fields['refusal']])).toEqual([
+        ['warn', REFUSAL.pending],
+        ['debug', REFUSAL.peer],
+      ]);
+      expect(refusals[0]?.fields).toMatchObject({
+        subsystem: WS_LOG_SUBSYSTEM,
+        status: HTTP_TOO_MANY_REQUESTS,
+        admitted: 3,
+        pendingHandshakes: 3,
+        peerPendingHandshakes: 0,
+        maxOpenConnections: 8,
+        maxPendingHandshakes: 3,
+        maxPendingHandshakesPerPeer: 2,
+        suppressed: 0,
+      });
+      expect(refusals[1]?.fields).toMatchObject({ peerPendingHandshakes: 2 });
+      for (const record of refusals) {
+        for (const leaked of [PEER.third, PEER.ipv6Loopback, rig.host, PEER_HEADER, WS_PATH]) {
+          expect(record.line).not.toContain(leaked);
+        }
+      }
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('answers 503 once the service holds its most sockets in any phase, and admits again when one closes', async () => {
+    const rig = await startAdmissionRig(harness(), {
+      maxOpenConnections: 3,
+      maxPendingHandshakes: 2,
+      maxPendingHandshakesPerPeer: 2,
+    });
+    try {
+      const editors = [rig.open(), rig.open()];
+      expect(await Promise.all(editors.map((client) => client.opened))).toEqual([true, true]);
+      for (const editor of editors) {
+        await rig.authenticate(editor);
+      }
+      const pending = rig.open(PEER.ipv6Loopback);
+      expect(await pending.opened).toBe(true);
+      expect(rig.ws.stats()).toMatchObject({
+        open: 3,
+        authenticated: 2,
+        awaitingHello: 1,
+        admitted: 3,
+        pendingHandshakes: 1,
+      });
+
+      const refused = await rig.upgrade({ peer: PEER.third });
+      expectBareRefusal(refused, HTTP_UNAVAILABLE, retryAfterFor(CLIENT_HELLO_TIMEOUT_MS));
+      expect(rig.ws.stats()).toMatchObject({ open: 3, admitted: 3, refusedUpgrades: 1 });
+
+      // An authenticated socket closing gives its slot back.
+      editors[0]?.socket.close();
+      await editors[0]?.closed;
+      await rig.until((stats) => stats.admitted === 2, 'the closed editor gave its slot back');
+      const next = rig.open(PEER.third);
+      expect(await next.opened).toBe(true);
+      expect(rig.ws.stats()).toMatchObject({ admitted: 3, pendingHandshakes: 2 });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('gives the pending share back when a hello authenticates, so the next upgrade is admitted', async () => {
+    const rig = await startAdmissionRig(harness(), {
+      maxOpenConnections: 8,
+      maxPendingHandshakes: 2,
+      maxPendingHandshakesPerPeer: 2,
+    });
+    try {
+      const [first, second] = [rig.open(), rig.open()];
+      expect(await Promise.all([first.opened, second.opened])).toEqual([true, true]);
+      expectBareRefusal(
+        await rig.upgrade(),
+        HTTP_TOO_MANY_REQUESTS,
+        retryAfterFor(CLIENT_HELLO_TIMEOUT_MS),
+      );
+
+      await rig.authenticate(first);
+      expect(rig.ws.stats()).toMatchObject({
+        authenticated: 1,
+        awaitingHello: 1,
+        admitted: 2,
+        pendingHandshakes: 1,
+      });
+      const third = rig.open();
+      expect(await third.opened).toBe(true);
+      expect(rig.ws.stats()).toMatchObject({ admitted: 3, pendingHandshakes: 2 });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('gives the slot back when an unauthenticated socket times out or drops', async () => {
+    const helloTimeoutMs = 1_000;
+    const rig = await startAdmissionRig(harness(), {
+      maxOpenConnections: 8,
+      maxPendingHandshakes: 1,
+      maxPendingHandshakesPerPeer: 1,
+      helloTimeoutMs,
+    });
+    try {
+      const silent = rig.open();
+      expect(await silent.opened).toBe(true);
+      expectBareRefusal(
+        await rig.upgrade({ peer: PEER.third }),
+        HTTP_TOO_MANY_REQUESTS,
+        retryAfterFor(helloTimeoutMs),
+      );
+
+      expect(await silent.closed).toBe(WS_CLOSE_UNAUTHORIZED);
+      await rig.until(
+        (stats) =>
+          stats.admitted === 0 && stats.pendingHandshakes === 0 && stats.pendingPeers === 0,
+        'the timed-out socket gave its slot back',
+      );
+
+      const dropped = rig.open();
+      expect(await dropped.opened).toBe(true);
+      dropped.socket.terminate();
+      await dropped.closed;
+      await rig.until(
+        (stats) => stats.admitted === 0 && stats.pendingHandshakes === 0,
+        'the dropped socket gave its slot back',
+      );
+
+      const next = rig.open();
+      expect(await next.opened).toBe(true);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('gives the slot back when ws aborts a handshake the gate admitted', async () => {
+    const rig = await startAdmissionRig(harness(), {
+      maxOpenConnections: 8,
+      maxPendingHandshakes: 1,
+      maxPendingHandshakesPerPeer: 1,
+    });
+    try {
+      // The gate admits it; `ws` then refuses the malformed key itself and
+      // never creates a WebSocket, so only the TCP close can free the slot.
+      const aborted = await rig.upgrade({ key: 'not-a-websocket-key' });
+      expect(aborted.status).toBe(HTTP_BAD_REQUEST);
+      expect(aborted.closedByService).toBe(true);
+      await rig.until(
+        (stats) =>
+          stats.admitted === 0 && stats.pendingHandshakes === 0 && stats.pendingPeers === 0,
+        'the aborted handshake gave its slot back',
+      );
+      expect(rig.ws.stats()).toMatchObject({ open: 0, refusedUpgrades: 0 });
+
+      // With a quota of one, a leaked reservation would refuse this.
+      const next = rig.open();
+      expect(await next.opened).toBe(true);
+      expect(rig.ws.stats()).toMatchObject({ admitted: 1, pendingHandshakes: 1 });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('reads zero on every admission counter once close() resolves, whatever phase its sockets were in', async () => {
+    const rig = await startAdmissionRig(harness(), {
+      maxOpenConnections: 8,
+      maxPendingHandshakes: 4,
+      maxPendingHandshakesPerPeer: 4,
+    });
+    const authenticated = rig.open();
+    const awaiting = rig.open(PEER.ipv6Loopback);
+    expect(await Promise.all([authenticated.opened, awaiting.opened])).toEqual([true, true]);
+    await rig.authenticate(authenticated);
+    expect(rig.ws.stats()).toMatchObject({
+      admitted: 2,
+      pendingHandshakes: 1,
+      pendingPeers: 1,
+      authenticated: 1,
+      awaitingHello: 1,
+    });
+
+    // `close` asserts every counter read zero once `ws.close()` resolved.
+    await rig.close();
+    expect(await Promise.all([authenticated.closed, awaiting.closed])).toEqual([
+      WS_CLOSE_GOING_AWAY,
+      WS_CLOSE_GOING_AWAY,
+    ]);
+  });
+
+  it('answers the running service’s refused upgrades with nosniff and no-store, and nothing the client sent', async () => {
+    const h = harness();
+    const host = new URL(h.url).hostname;
+    const marker = newMarker();
+
+    const offRoute = await rawUpgrade(host, h.port, { path: `/elsewhere?probe=${marker}` });
+    expectBareRefusal(offRoute, HTTP_NOT_FOUND, undefined);
+    const webOrigin = await rawUpgrade(host, h.port, { origin: `https://${marker}.example` });
+    expectBareRefusal(webOrigin, HTTP_FORBIDDEN, undefined);
+    for (const response of [offRoute, webOrigin]) {
+      expect(response.head).not.toContain(marker);
+    }
+
+    // The service's defaults admit an ordinary upgrade.
+    const admitted = await rawUpgrade(host, h.port);
+    expect(admitted.status).toBe(HTTP_SWITCHING_PROTOCOLS);
   });
 });
 

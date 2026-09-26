@@ -33,8 +33,8 @@
  * this page to name before an address has been filled in: the services on offer are the ones
  * `GET /api/shipping/quote` answers with for the destination in the fields, and until it has
  * answered the group shows none and says why. A list of list rates here would be a priced,
- * selectable offer the order would never be charged at - which is what it was, and what a buyer
- * could place an order on while an alert beside it said no service had been quoted.
+ * selectable offer the order would never be charged at, and one a buyer could place an order on
+ * while an alert beside it said no service had been quoted.
  *
  * Everything else belongs to what it composes - the contact and destination fields with
  * their inline messages, the service group, the place-order control, the receipt that replaces the
@@ -48,8 +48,8 @@
  * for them, because it changes in the browser long after this page has finished rendering. So the
  * page mounts the channel around both columns and holds nothing itself: the form publishes the
  * chosen service and its quoted rate, the review column reads them, and this file never learns
- * either. The provider renders no element of its own, which is why the two columns' wrappers and
- * the class contract below are exactly what they were without it.
+ * either. The provider renders no element of its own, so it adds nothing to the two columns'
+ * wrappers or to the class contract below.
  *
  * WHY EACH COMPONENT IS PASSED SO LITTLE
  * `CheckoutSummaryPanel` is passed nothing at all: its defaults - the "Order review" heading and
@@ -97,12 +97,6 @@ import type { CustomerContact, ShippingAddress } from '@/lib/types';
 
 /* ---------------------------------------------------------------------------
  * Copy
- *
- * Upper-case by convention, and the convention earns its keep:
- * `scripts/check-no-hardcoding.mjs` harvests this workspace's declared names
- * with two or more camel-case tokens into the vocabulary no product file may
- * then mention, and drops a name with no camel boundary. A constant spelled
- * this way costs the product nothing.
  * ------------------------------------------------------------------------- */
 
 /** The page's heading, the tab's title and the final crumb, declared once so the three agree. */
@@ -187,8 +181,7 @@ const ORDER_NOTICE_TITLE = 'Order';
  * against the account it derives from the submitted contact email, so an order placed from this
  * form is listed under `?customerId=` for that account and not on the history's default page. A
  * notice that said otherwise would be this page asserting a reachability the storefront does not
- * currently have; the link below is offered as somewhere to go rather than as a guarantee of what
- * is there.
+ * have; the link below is offered as somewhere to go rather than as a guarantee of what is there.
  */
 const ORDER_NOTICE_BODY =
   'This page is the address of that order, so reloading it, copying it or bookmarking it keeps ' +
@@ -345,8 +338,8 @@ export default async function CheckoutPage({ searchParams }: Props): Promise<Rea
         </div>
       )}
 
-      {/* The charge channel wraps both columns and contributes no element, so the split below is
-          the page's own DOM unchanged - see the note in the header. */}
+      {/* The charge channel wraps both columns and contributes no element, so the split below sits
+          directly in the page's own DOM - see the note in the header. */}
       <CheckoutChargesProvider>
         <div className="ls-split">
           <div className="ls-split-main">

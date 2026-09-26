@@ -36,11 +36,10 @@
  * the width of its own values - the column edges would then wander from row to row and match no
  * header. Fractions are safe in the same situation and are what the tracks use, because a
  * fraction is resolved from the container and the strip and the rows are laid out in boxes of
- * exactly the same width. The seam properties survive as the fractions' floors, so a track never
- * shrinks below the content it holds; the alternative, three fixed trailing tracks, left the
- * whole surplus of a page-wide row inside the first track as an empty band, which is the
- * arrangement this template replaces. `minmax(0, 2fr)` on the first track is what lets a long
- * order reference truncate instead of widening its track.
+ * exactly the same width. The seam properties are the fractions' floors, so a track never shrinks
+ * below the content it holds, and the fractions divide a wide row's surplus across all four
+ * columns, so no track holds an empty band. `minmax(0, 2fr)` on the first track is what lets a
+ * long order reference truncate instead of widening its track.
  */
 
 .root {
@@ -239,9 +238,8 @@
  * Height: the chip carries the pointer-target floor of WCAG 2.5.5 / 2.5.8 (`--ls-target-min`). It
  * is a `min-block-size`, so the designed padding and type step still decide how the chip reads and
  * only its box is raised; the two directions sit on their own row at the foot of the list, where
- * 44px costs the page nothing. Measured before the floor: 46.53x29.5px, which is short on the
- * block axis while the inline axis was already clear. The disabled twin below takes the identical
- * floor - see the note there.
+ * 44px costs the page nothing. The disabled twin below takes the identical floor - see the note
+ * there.
  *
  * Direction is never carried by colour alone: the component supplies the label, the border and
  * background carry the affordance, and the unavailable direction is not an anchor at all.
@@ -321,9 +319,9 @@
  * same kind of control, one at the end of a populated list and one in the middle of an empty one.
  *
  * What it does not borrow is the pager's density. The pager's chips sit in a table footer, where
- * `.pagerLink` documents its sub-44px height as a deliberate cost of that density; this control
- * stands alone in the middle of a page with nothing to be dense about, so the padding is a step
- * larger and the box is floored at 44x44 - the touch-target recommendation, and the same floor the
+ * `.pagerLink` keeps the tighter padding and floors only the block axis; this control stands
+ * alone in the middle of a page with nothing to be dense about, so the padding is a step larger
+ * and the box is floored at 44x44 - the touch-target recommendation, and the same floor the
  * inventory dashboard's own blank-slate recovery link sets. The minimum only ever grows the box,
  * so the padding above still decides how the chip looks.
  */

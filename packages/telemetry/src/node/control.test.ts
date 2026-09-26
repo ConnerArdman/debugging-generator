@@ -3193,10 +3193,10 @@ describe('the control socket handshake', () => {
  * ---------------------------------------------------------------------------
  * The service's authoritative config, replayed on every (re)connect
  *
- * The protocol carries no producer acknowledgement (AAP §0.4.2), so the
- * service keeps this process in step by replaying: on every `server-agent`
- * connection it sends the authoritative `server-agent.config` — the open
- * capture's armed config again, or a capture-less one when no capture is open,
+ * The protocol carries no producer acknowledgement, so the service keeps this
+ * process in step by replaying: on every `server-agent` connection it sends
+ * the authoritative `server-agent.config` — the open capture's armed config
+ * again, or a capture-less one when no capture is open,
  * which is what a service that restarted mid-capture sends. The preload keeps
  * its capture across an ordinary outage (see "keeps the capture running across
  * an ordinary disconnect and reconnects with backoff"), so the replay is what

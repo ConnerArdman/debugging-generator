@@ -6,7 +6,8 @@
  *
  * It renders the head of a panel, and it is the visible form of the product's
  * central guarantee: what the capture *shows* and what the analysis *infers*
- * are kept apart, and prose can never masquerade as evidence (AAP 0.8.4).
+ * are kept apart, and prose can never masquerade as evidence
+ * (`docs/ARCHITECTURE.md` states the rule for the analysis as a whole).
  * Three registers arrive on one object, {@link PanelSummary}, and they are
  * rendered in three structurally distinct places:
  *
@@ -17,9 +18,10 @@
  * | `summary.likelyCauses` | the validated analysis       | the `Likely cause` region: a confidence badge, the statement, its evidence chips and an optional source chip |
  *
  * **This component invents, derives and filters nothing.** Every string it
- * renders is either a field of `summary`, one of the two region labels AAP
- * 0.8.4 mandates by name, or the one sentence that states an empty observed
- * register ({@link NO_FACTS_TEXT}). It computes no statistic, drops no evidence
+ * renders is either a field of `summary`, one of the two region labels the
+ * product fixes by name ({@link OBSERVED_LABEL}, {@link LIKELY_CAUSE_LABEL}), or
+ * the one sentence that states an empty observed register
+ * ({@link NO_FACTS_TEXT}). It computes no statistic, drops no evidence
  * reference, deduplicates nothing, re-words nothing and reorders nothing — the
  * single exception is {@link SummaryHeaderProps.sortByConfidence}, which sorts
  * a *copy* of the hypothesis list with the schema package's own comparator and
@@ -32,7 +34,7 @@
  * `@debuggen/panel-schema`'s normaliser stores that string as
  * `summary.headline` precisely so that it can never become a `Fact`: facts are
  * copied only from the validated analysis, and every one of them carries at
- * least one evidence reference by schema construction (AAP 0.2.3). Rendering
+ * least one evidence reference by schema construction. Rendering
  * that prose among the observations — as a list item, with a fact's typography,
  * or beside evidence chips it did not cite — would undo the guarantee in the
  * one place the developer actually looks. So the headline is a single element
@@ -46,7 +48,7 @@
  * consumed here. Both interactions leave through plain props — `selectEvent` and
  * `openSource` — which keeps the module graph acyclic (the host renders this
  * component, never the other way round) and lets the editor webview reuse this
- * component with no provider and no transport in scope (AAP 0.4.2, 0.7.3).
+ * component with no provider and no transport in scope.
  *
  * The two props are spelled, and typed, as the host form of the panel action
  * contract: `selectEvent(eventId, coordinates?)` over the schema's own
@@ -78,7 +80,7 @@
  * defect even when the markup is correct. The two region variants carry the
  * observed/inferred distinction in the visual register, and the region headings
  * and separate landmarks carry it for assistive technology, so the distinction
- * is never colour alone (AAP 0.6.4).
+ * is never colour alone.
  *
  * No value in this file is a CSS literal, and there is no `style` prop, no
  * inline style and no `--dgc-*` property: appearance is selected by class name
@@ -134,16 +136,16 @@ import { Text } from '../primitives/Text';
 /**
  * The label of the region that lists what the capture shows.
  *
- * One of the two region labels this module owns. Both are product copy the
- * specification fixes by name — AAP 0.8.4 requires that likely causes are
- * "rendered under a separate 'Likely cause' heading by `SummaryHeader`", and
- * AAP 0.7.3 names the observed region "**Observed**" — so they are declared
- * here as constants rather than written twice. The only other string this file
- * owns is {@link NO_FACTS_TEXT}; no other caption or hint is invented here.
+ * One of the two region labels this module owns. Both are fixed product copy:
+ * the observed facts sit under an "Observed" heading and the likely causes
+ * under a separate "Likely cause" heading, in the DevTools panel and in the
+ * editor webview alike — so they are declared here as constants rather than
+ * written twice. The only other string this file owns is {@link NO_FACTS_TEXT};
+ * no other caption or hint is invented here.
  */
 const OBSERVED_LABEL = 'Observed';
 
-/** The label of the region that lists what the analysis infers (AAP 0.8.4). */
+/** The label of the separate region that lists what the analysis infers. */
 const LIKELY_CAUSE_LABEL = 'Likely cause';
 
 /**
@@ -155,7 +157,7 @@ const LIKELY_CAUSE_LABEL = 'Likely cause';
  * below — the shape a deterministic fallback panel over an empty capture
  * takes. It is a statement about the register, not a fact: it names no event,
  * carries no evidence chip and is never a list item. Generic product wording,
- * naming nothing of an inspected project (AAP 0.5.4).
+ * naming nothing of an inspected project.
  */
 const NO_FACTS_TEXT = 'No facts were observed.';
 
@@ -181,7 +183,7 @@ const DEFAULT_HEADING_LEVEL: HeadingLevel = 2;
  * informational → accent instead, which reads as increasing emphasis without
  * borrowing a status colour. The level word is always rendered as the badge's
  * text and every level has a glyph of its own shape ({@link CONFIDENCE_ICON}),
- * so the ranking is never carried by colour alone (AAP 0.6.3, 0.6.4).
+ * so the ranking is never carried by colour alone.
  *
  * Typed as a `Record` over the closed union rather than derived from the
  * schema's runtime vocabulary, matching how `../utils/color.ts` types its kind
@@ -201,7 +203,7 @@ const CONFIDENCE_TONE: Record<ConfidenceLevel, BadgeTone> = {
  * badges differ by **shape** as well as by tone: two tones that a reader cannot
  * tell apart (a colour-vision deficiency, a monochrome screen, the
  * high-contrast theme) still leave the levels distinguishable at a glance,
- * beside the level word that names them (AAP 0.6.4). The glyph is decorative —
+ * beside the level word that names them. The glyph is decorative —
  * `Badge` keeps its box `aria-hidden` — because the word already is the
  * accessible text. Each is rendered with the global `dg-icon` class, which
  * sizes it to the badge's type role and paints it in `currentColor`, so the
@@ -330,7 +332,7 @@ interface EvidenceChipsProps {
  * carries. What each item holds depends on whether anything can act on it:
  *
  * - **With a selection handler**, one `Button` per chip: the design system
- *   requires its own control primitive in place of a raw element (AAP 0.6.4),
+ *   requires its own control primitive in place of a raw element,
  *   and a `span` with a click handler would lose keyboard operation and the
  *   focus ring that `../styles/base.css` applies to every `:focus-visible`
  *   element.
@@ -600,8 +602,7 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
         // A second, sibling region with its own heading and its own
         // `aria-labelledby` — never a subsection of the observed region and
         // never a continuation of its list. Two separately labelled regions are
-        // what make the observed/inferred separation audible as well as visible
-        // (AAP 0.8.4).
+        // what make the observed/inferred separation audible as well as visible.
         <section
           className="dg-summary-header__region dg-summary-header__region--causes"
           aria-labelledby={causesHeadingId}

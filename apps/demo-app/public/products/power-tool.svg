@@ -1,55 +1,26 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
   <title>Power tools</title>
-  <!-- A cordless drill in side profile, chuck to the right and battery at the base. The four frame
-       elements below - the rounded paper panel and the three mist shelf strokes - and the 400 x 300
-       view box are identical in every tile of this folder, so a catalog card or the product gallery
-       can swap one tile for another without reflowing, and the intrinsic width and height sit on
-       the root beside the view box because consumers reference this file by its string path alone
-       and so have no import from which a size could be inferred. -->
-  <!-- Palette, written as explicit hex because an image loaded through an img element inherits no
-       colour from the page: ink #0F172A for the silhouette, slate #475569 for secondary line work,
-       mist #CBD5E1 for the shelf behind the subject and nothing in front of it, paper #F8FAFC for
-       the panel, and one amber #F59E0B accent, filled and bounded by the ink outline enclosing it
-       rather than stroked on its own - at 1.42:1 and 2.05:1 against the panel, a mist silhouette or
-       an amber line would leave the tile looking blank at card size. Round caps and joins sit on
-       the wrapping group, so every stroke of the subject inherits them. -->
+  <!-- Every tile here shares this panel, shelf, view box and intrinsic size, so tiles referenced
+       by path swap without reflow. Colours are explicit hex, as an img inherits none. Mist stays
+       background and amber only fills outlines: neither reads on the panel alone. -->
   <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
   <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
   <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
   <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <!-- Motor housing: a 116 x 56 rounded body on the axis y 130, its corner radius chosen so the
-         right edge runs straight between y 122 and 138 - the segment the chuck collar closes over.
-         Three slate vents over the motor end are the only detail on it; this is the busiest subject
-         in the folder, and at the roughly 0.7 scale of a catalog card one clear silhouette reads
-         further than a full set of seams would. -->
     <rect x="118" y="102" width="116" height="56" rx="20" stroke="#0F172A" stroke-width="8" />
     <path d="M140 118 V140" stroke="#475569" stroke-width="6" />
     <path d="M158 118 V140" stroke="#475569" stroke-width="6" />
     <path d="M176 118 V140" stroke="#475569" stroke-width="6" />
-    <!-- Chuck and bit, on the same axis: an ink collar stepped in off the nose, the jaw seam down
-         its centre line, then a straight bit raked by three flute ticks. The ticks are spaced 12
-         apart, twice their own weight, so each stays a separate mark rather than fusing with its
-         neighbour into a blur at card size, and the tip stops at 300 so its round cap keeps clear
-         of the right margin. -->
     <rect x="234" y="113" width="30" height="34" rx="8" stroke="#0F172A" stroke-width="8" />
     <path d="M249 120 V140" stroke="#475569" stroke-width="6" />
     <path d="M264 130 H300" stroke="#475569" stroke-width="6" />
     <path d="M270 121 L274 139" stroke="#475569" stroke-width="6" />
     <path d="M282 121 L286 139" stroke="#475569" stroke-width="6" />
     <path d="M294 121 L298 139" stroke="#475569" stroke-width="6" />
-    <!-- Pistol grip: two parallel ink edges dropping 34 units and raked 12 back from the chuck,
-         starting inside the housing's underside and ending inside the battery outline so both
-         joints read as solid rather than butted. The slate bulge is the trigger, set at mid-grip
-         with both ends on the front edge's centre line: drawn any higher it would meet the ink
-         corner above it and read as a snag on the housing rather than a paddle on the grip. -->
     <path d="M180 154 L168 188" stroke="#0F172A" stroke-width="8" />
     <path d="M138 154 L126 188" stroke="#0F172A" stroke-width="8" />
     <path d="M176 166 Q187 172 171 179" stroke="#475569" stroke-width="6" />
-    <!-- Battery pack: a squared block wider than the grip it carries, overhanging it evenly front
-         and back, its base a unit clear of the shelf stroke so the tool is seated rather than
-         floating, and inside that outline the one accent - a charge band filled amber and held
-         clear of all four sides. -->
     <rect x="108" y="188" width="76" height="36" rx="8" stroke="#0F172A" stroke-width="8" />
     <rect x="120" y="198" width="52" height="14" rx="4" fill="#F59E0B" />
   </g>

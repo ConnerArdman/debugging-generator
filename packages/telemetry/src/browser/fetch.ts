@@ -43,8 +43,8 @@
  * 6. **Samples the dev server's clock.** A same-origin response the server
  *    produced just then carries its `Date`, which {@link sampleServerClock}
  *    hands to `./transport.ts` for the document's informational
- *    `clockOffsetMs` (AAP 0.2.3). Nothing about the request or its event
- *    changes.
+ *    `clockOffsetMs` (`docs/ARCHITECTURE.md` §5.2). Nothing about the
+ *    request or its event changes.
  *
  * ## The rules this module will not break
  *
@@ -2180,7 +2180,7 @@ function xhrOutcome(xhr: XMLHttpRequest, record: RequestRecord): RequestOutcome 
 /**
  * Offer a settled response's `Date` header to the document's clock-offset
  * estimate — `./transport.ts`'s `observeServerClock`, behind the informational
- * per-producer `clockOffsetMs` of AAP 0.2.3.
+ * per-producer `clockOffsetMs` (`docs/ARCHITECTURE.md` §5.2).
  *
  * Only a response the dev server produced for this request, just now, says
  * anything about the dev server's clock, so a sample is taken only when all of

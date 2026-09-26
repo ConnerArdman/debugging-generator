@@ -432,11 +432,11 @@ function catalogSourcesOf(type: QueryBackedNodeType): readonly DataQuerySource[]
  * The three model-facing messages one node type's source schemas report.
  *
  * Built from the node type and its catalog sources only — a closed vocabulary,
- * never the rejected value (AAP 0.5.2) — because these are the messages the
- * model provider's repair loop quotes back to the model, beside the path, for
- * the ways a data request can be wrong. Each names the whole remedy: the
- * sources the type can read and, for a missing one, both places it may be
- * written.
+ * never the rejected value, which can carry developer data — because these are
+ * the messages the model provider's repair loop quotes back to the model,
+ * beside the path, for the ways a data request can be wrong. Each names the
+ * whole remedy: the sources the type can read and, for a missing one, both
+ * places it may be written.
  */
 interface SourceMessages {
   /** For a node that names no source in either spelling. */
@@ -615,8 +615,8 @@ const IMPLIED_SOURCE_QUERY_DESCRIPTION =
  * Every one of them pins its own `type` literal, which is what the
  * discriminated union at the bottom of this module keys on, and that is what
  * makes a malformed node fail against one schema with one clear issue path
- * instead of against sixteen at once (AAP 0.8.3 requires that an unknown node
- * type fails).
+ * instead of against sixteen at once. An unknown node type must fail, and
+ * does: it matches none of those literals.
  *
  * Eleven of them must name a source, and their catalog entries declare no
  * default one; each is a union of its two spellings, built by
@@ -1269,9 +1269,9 @@ const NODE_TYPE_MESSAGE_SEPARATOR = '|';
  * vocabulary.
  *
  * Built from the vocabulary tuple — a closed, product-owned list and never the
- * rejected value (AAP 0.5.2) — because this is the line the model provider's
- * repair loop quotes back to the model for the failure, and "invalid input"
- * leaves the model to guess which types exist.
+ * rejected value, which can carry developer data — because this is the line the
+ * model provider's repair loop quotes back to the model for the failure, and
+ * "invalid input" leaves the model to guess which types exist.
  *
  * **Worded to fit the repair loop's line budget.** The loop renders each issue
  * as `path: message` and cuts a line longer than 200 characters
@@ -2292,8 +2292,9 @@ function preflightNodePositions(value: unknown): NodePreflightOutcome {
  * Classifying needs the value the schema rejected — whether a type is a known
  * one misplaced or no type at all, whether a source is absent or wrong — so it
  * reads the raw input at the issue's path, with ordinary property access, as
- * the schema library read it. It never *reports* a value: every field it
- * writes is a path, a code or a member of a closed vocabulary (AAP 0.5.2).
+ * the schema library read it. It never *reports* a value, since one can carry
+ * developer data: every field it writes is a path, a code or a member of a
+ * closed vocabulary.
  * ---------------------------------------------------------------------------
  */
 

@@ -20,7 +20,10 @@
  * {@link PanelDataProvider.resolveEvent} resolves a selected event and the
  * stored events of its parent chain, however far into the capture they lie, by
  * paging `events` through this provider's own `query` — each of its two passes
- * within a page budget of its own, and resumable where it stopped.
+ * within a page budget of its own, and resumable where it stopped. A lookup for
+ * a rendered panel's evidence names that panel, exactly as the panel's nodes
+ * do, so every one of its pages is answered from the capture that panel was
+ * generated from.
  *
  * ## The seam, one-directional
  *
@@ -104,11 +107,14 @@
  *   capture — needs none: the answer a joining caller receives was still
  *   outstanding when it asked, for the capture it asked under, so it is never
  *   older than one round trip. (The drawer's trace cache behind
- *   {@link PanelDataProvider.resolveEvent} is the one bounded exception. It is
- *   scoped by session, capture and trace — observing another current capture
- *   empties it — and it answers only while the panel's own tab is bound to the
- *   session and connected, so a cached trace never outlives its capture, the
- *   binding that authorised it, or the port it arrived on.)
+ *   {@link PanelDataProvider.resolveEvent} is the one bounded exception. Each
+ *   entry is scoped by session, evidence scope and trace — the evidence scope
+ *   being the panel a panel-bound lookup names, or the store's current capture
+ *   for a live one — so observing another current capture drops the live
+ *   entries, and a lookup bound to another panel drops every other panel's. It
+ *   answers only while the panel's own tab is bound to the session and
+ *   connected, so a cached trace never outlives the evidence it was read from,
+ *   the binding that authorised it, or the port it arrived on.)
  * - **A failure is never data.** Every path that is not a checked answer ends
  *   in a rejected promise carrying a `DebuggenError` — which is what makes
  *   `useQuery` render its error state with a retry (AAP §0.5.5). No path
@@ -319,12 +325,14 @@ export interface PanelDataProviderOptions {
    * snapshot: the running capture, or the most recent one after it stopped.
    *
    * Read on every call, because a new capture changes it without changing the
-   * session, while the service answers each call from the session's active
-   * (or latest) capture. It is part of every request's identity (see
-   * {@link panelDataRequestKey}) and the scope of every trace-cache entry.
-   * Omitted, returning a blank value, or throwing (logged, never rethrown),
-   * the capture counts as **unknown**: requests are then coalesced only with
-   * others issued while it was unknown, and the trace cache answers nothing.
+   * session, while the service answers each live call from the session's
+   * active (or latest) capture. It is part of every request's identity (see
+   * {@link panelDataRequestKey}) and the evidence scope of every trace-cache
+   * entry a **live** lookup writes; a panel-bound lookup is scoped by its
+   * panel instead, whose capture its id fixes. Omitted, returning a blank
+   * value, or throwing (logged, never rethrown), the capture counts as
+   * **unknown**: requests are then coalesced only with others issued while it
+   * was unknown, and the trace cache answers no live lookup.
    */
   readonly getCaptureId?: (() => CaptureId | undefined) | undefined;
   /**
@@ -406,6 +414,18 @@ export interface PanelEventResolveOptions {
    * `reason: "aborted"` failure an aborted `query` rejects with.
    */
   readonly signal?: AbortSignal | undefined;
+  /**
+   * The rendered panel the selection belongs to — the `PanelSpec`'s own `id`.
+   * Every `events` page of the lookup, on both passes, is sent with it, so the
+   * service answers from the capture that panel was generated from, and the
+   * lookup reads and writes only trace-cache entries of that panel. Omitted,
+   * the lookup is a **live** read: the session's open capture, else its most
+   * recent one, cached under the capture the store shows. A present value that
+   * is not a string with a visible character rejects with `PANEL_INVALID`
+   * before the cache is consulted or anything is sent — the same refusal
+   * `query` applies, so a panel-bound lookup never silently turns live.
+   */
+  readonly panelId?: string | undefined;
   /**
    * Resume a find pass that stopped at its page budget: the find pass starts
    * at this offset — an earlier `budget-exhausted` answer's `resumeOffset` —
@@ -506,23 +526,33 @@ export interface PanelDataProvider extends DataProvider {
    * `resumeFrom` for the find pass, `resumeAncestry` for the ancestry pass —
    * so no stored event is beyond reach, however large the capture.
    *
+   * Every page carries the lookup's `panelId` when it names one (see
+   * {@link PanelEventResolveOptions.panelId}), so a panel's evidence is read
+   * from that panel's capture however many captures the session has since
+   * started; a lookup naming none reads live evidence.
+   *
    * Before any page is requested, a bounded least-recently-used cache of trace
-   * pools (keyed by session, capture and trace) is consulted, and it answers
-   * **only** when it holds the event and its complete chain *and* the cache is
-   * authorised (see {@link PanelDataProviderOptions.canServeCached}): stored
-   * events are immutable once written, so such an answer is exactly what a
-   * scan would find, whereas a pool missing the event or an ancestor may be
-   * missing something the growing capture now holds, and is re-queried.
+   * pools (keyed by session, evidence scope and trace — the scope being the
+   * lookup's panel, or for a live lookup the capture the store shows) is
+   * consulted, and it answers **only** from an entry of the lookup's own
+   * session and scope, when that entry holds the event and its complete chain
+   * *and* the cache is authorised (see
+   * {@link PanelDataProviderOptions.canServeCached}): stored events are
+   * immutable once written, so such an answer is exactly what a scan would
+   * find, whereas a pool missing the event or an ancestor may be missing
+   * something the growing capture now holds, and is re-queried. A live lookup
+   * under an unknown capture neither reads nor writes the cache.
    *
    * @param sessionId The session the selection belongs to. Missing, blank or
    * foreign to the panel's store, the call rejects with `TAB_NOT_BOUND`
    * exactly as `query` does — before the cache is consulted.
    * @param target The selected event's id and, when known, its trace.
-   * @param options The lookup's abort signal, and where to resume a pass an
-   * earlier call stopped at its budget.
+   * @param options The lookup's abort signal, the panel it is bound to, and
+   * where to resume a pass an earlier call stopped at its budget.
    * @returns What the stored capture says about the event. Rejects with a
    * `DebuggenError` — never an empty success — when a page cannot be read, the
-   * target names no event, or the call is aborted.
+   * target names no event, the `panelId` cannot name a panel, or the call is
+   * aborted.
    */
   resolveEvent(
     sessionId: SessionId | undefined,
@@ -715,12 +745,43 @@ export function buildEventParentChain(
 }
 
 /**
- * Where the drawer's trace cache holds one trace of one capture of one
- * session. Every part is JSON-quoted, so the triple is self-delimiting (see
- * {@link panelDataRequestKey}); compared only, never logged.
+ * Which evidence one drawer lookup reads, and so which cached traces it may
+ * use:
+ *
+ * - `panel` — a lookup bound to a rendered panel: its pages carry `panelId`,
+ *   and the service answers from the capture that panel was generated from.
+ *   The id fixes that capture, so the scope needs no capture of its own.
+ * - `live` — a lookup naming no panel: the service answers from the session's
+ *   open capture, else its most recent one, which is the capture the store
+ *   shows (`captureId`) when the lookup starts.
+ *
+ * Holds a panel id or a capture id, so it is compared only, never logged.
  */
-function traceCacheKey(sessionId: SessionId, captureId: CaptureId, traceId: string): string {
-  return `${JSON.stringify(sessionId)}:${JSON.stringify(captureId)}:${JSON.stringify(traceId)}`;
+type EvidenceScope =
+  | { readonly kind: 'panel'; readonly panelId: string }
+  | { readonly kind: 'live'; readonly captureId: CaptureId };
+
+/** The id an evidence scope is keyed by: its panel's, or its capture's. */
+function evidenceScopeId(scope: EvidenceScope): string {
+  return scope.kind === 'panel' ? scope.panelId : scope.captureId;
+}
+
+/** Whether two evidence scopes read the same evidence: same kind, same id. */
+function sameEvidenceScope(left: EvidenceScope, right: EvidenceScope): boolean {
+  return left.kind === right.kind && evidenceScopeId(left) === evidenceScopeId(right);
+}
+
+/**
+ * Where the drawer's trace cache holds one trace of one evidence scope of one
+ * session. Every part — the session, the scope's kind, the scope's id and the
+ * trace — is JSON-quoted, so the key is self-delimiting (see
+ * {@link panelDataRequestKey}) and a panel and a capture that share an id
+ * never share an entry; compared only, never logged.
+ */
+function traceCacheKey(sessionId: SessionId, scope: EvidenceScope, traceId: string): string {
+  return [sessionId, scope.kind, evidenceScopeId(scope), traceId]
+    .map((part) => JSON.stringify(part))
+    .join(':');
 }
 
 /** A usable timer delay: `candidate` when finite and positive, else `fallback`. */
@@ -1003,8 +1064,10 @@ interface SharedRequest {
  *
  * {@link PanelDataProvider.resolveEvent}, the drawer's lookup, reads the
  * capture through this same `query` — so its pages are guarded, coalesced and
- * bounded exactly like any node's — and keeps its trace cache per provider,
- * scoped by session, capture and trace, authorised at every read and write by
+ * bounded exactly like any node's, and carry the lookup's `panelId` exactly as
+ * a node's carry its panel's — and keeps its trace cache per provider, scoped
+ * by session, evidence scope (the lookup's panel, or for a live lookup the
+ * store's capture) and trace, authorised at every read and write by
  * `getSessionId` and `canServeCached`, and emptied on port loss.
  *
  * @param options The injected request function, session and capture getters,
@@ -1026,8 +1089,14 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
   const inFlight = new Map<string, SharedRequest>();
   const traceCache = createTraceCache(EVENT_TRACE_CACHE_MAX_TRACES, EVENT_TRACE_CACHE_MAX_EVENTS);
   // The capture the provider last read from the store. Reading any other one
-  // empties the trace cache, so no entry outlives the capture it was read from.
+  // drops the live-scoped traces, so no live entry outlives the capture it was
+  // read from; panel-scoped traces stay, because their panel fixes their
+  // capture.
   let observedCapture: CaptureId | undefined;
+  // The panel the last panel-bound lookup named. A lookup naming another one
+  // drops the traces of every other panel: the drawer reads one rendered panel
+  // at a time, so those entries could only crowd out the current panel's.
+  let observedPanel: string | undefined;
   let unsubscribeDisconnect: (() => void) | undefined;
 
   function rejectAllPending(error?: DebuggenError): number {
@@ -1096,12 +1165,31 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
    * Empty the trace cache, and drop the port-loss subscription when nothing
    * else holds it. Logged with a fixed reason word only.
    */
-  function clearTraceCache(reason: 'port-lost' | 'capture-changed' | 'not-authorised'): void {
+  function clearTraceCache(reason: 'port-lost' | 'not-authorised'): void {
     if (traceCache.size() === 0) {
       return;
     }
     traceCache.clear();
     logger.debug("Emptied the event drawer's trace cache.", { reason });
+    syncDisconnectWatch();
+  }
+
+  /**
+   * Drop the cached traces whose evidence no lookup can use any more — the
+   * live ones once the store shows another capture, another panel's once a
+   * lookup names a new one — and drop the port-loss subscription when nothing
+   * else holds it. Logged with a fixed reason word and the count only, never
+   * an id.
+   */
+  function evictTraces(
+    reason: 'capture-changed' | 'panel-changed',
+    unusable: (entry: CachedTrace) => boolean,
+  ): void {
+    const count = traceCache.evict(unusable);
+    if (count === 0) {
+      return;
+    }
+    logger.debug('Dropped cached traces the event drawer can no longer use.', { reason, count });
     syncDisconnectWatch();
   }
 
@@ -1305,7 +1393,9 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
    * The capture the panel's store shows right now, or `undefined` when it is
    * unknown: no getter was injected, it answered a blank or non-string value,
    * or it threw (logged with the error's name only). Reading a capture other
-   * than the one last read empties the trace cache.
+   * than the one last read drops every live-scoped trace from the cache; the
+   * traces of panel-bound lookups stay, since each panel's id fixes the
+   * capture it is answered from.
    */
   function readCurrentCapture(): CaptureId | undefined {
     let candidate: unknown;
@@ -1320,9 +1410,40 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
     const captureId = isFilledString(candidate) ? candidate : undefined;
     if (captureId !== observedCapture) {
       observedCapture = captureId;
-      clearTraceCache('capture-changed');
+      evictTraces('capture-changed', (entry) => entry.scope.kind === 'live');
     }
     return captureId;
+  }
+
+  /**
+   * Record that a lookup is bound to `panelId`. When it names a panel other
+   * than the last panel-bound lookup did, the cached traces of every other
+   * panel are dropped; live-scoped traces are left to the capture rule.
+   */
+  function observePanel(panelId: string): void {
+    if (panelId === observedPanel) {
+      return;
+    }
+    observedPanel = panelId;
+    evictTraces(
+      'panel-changed',
+      (entry) => entry.scope.kind === 'panel' && entry.scope.panelId !== panelId,
+    );
+  }
+
+  /**
+   * The evidence scope of one lookup: its panel, when it is bound to one
+   * (recorded through {@link observePanel}), otherwise the capture the store
+   * shows as it starts — or `undefined` when that capture is unknown, in which
+   * case the lookup neither reads nor writes the cache.
+   */
+  function lookupScope(panelId: string | undefined): EvidenceScope | undefined {
+    if (panelId !== undefined) {
+      observePanel(panelId);
+      return { kind: 'panel', panelId };
+    }
+    const captureId = readCurrentCapture();
+    return captureId === undefined ? undefined : { kind: 'live', captureId };
   }
 
   /**
@@ -1346,12 +1467,13 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
 
   /**
    * Whether the trace cache may be read or written right now for one lookup's
-   * session and capture — the fail-closed rule of
+   * session and evidence scope — the fail-closed rule of
    * {@link PanelDataProviderOptions.canServeCached}, evaluated at every access
    * and never remembered:
    *
-   * 1. the lookup's capture is known and is still the store's current capture
-   *    (reading another one has already emptied the cache);
+   * 1. for a live scope, its capture is still the store's current capture
+   *    (reading another one has already dropped the live entries); a panel
+   *    scope needs no such check, because its panel's id fixes its capture;
    * 2. `getSessionId()` returns exactly the lookup's session — `undefined`
    *    included, a store showing no session authorises nothing; and
    * 3. `canServeCached` answers `true` for it.
@@ -1359,8 +1481,8 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
    * A failure of 2 or 3 empties the whole cache, so what was cached under an
    * authorisation that has since lapsed is gone rather than merely skipped.
    */
-  function traceCacheUsable(sessionId: SessionId, captureId: CaptureId | undefined): boolean {
-    if (captureId === undefined || readCurrentCapture() !== captureId) {
+  function traceCacheUsable(sessionId: SessionId, scope: EvidenceScope): boolean {
+    if (scope.kind === 'live' && readCurrentCapture() !== scope.captureId) {
       return false;
     }
     const shown = readShownSession(
@@ -1375,26 +1497,27 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
 
   /**
    * The trace cache as one lookup sees it: scoped to the lookup's session and
-   * capture, and authorised by {@link traceCacheUsable} at every read and
-   * every write, so a lookup that outlives its authorisation or its capture
-   * neither reads nor records anything more.
+   * evidence scope, and authorised by {@link traceCacheUsable} at every read
+   * and every write, so a lookup that outlives its authorisation or its live
+   * capture neither reads nor records anything more. With no scope — a live
+   * lookup under an unknown capture — it reads and records nothing at all.
    */
   function scopedTraceCache(
     sessionId: SessionId,
-    captureId: CaptureId | undefined,
+    scope: EvidenceScope | undefined,
   ): ScopedTraceCache {
     return {
       lookup(eventId, traceId) {
-        if (captureId === undefined || !traceCacheUsable(sessionId, captureId)) {
+        if (scope === undefined || !traceCacheUsable(sessionId, scope)) {
           return undefined;
         }
-        return traceCache.lookup(sessionId, captureId, eventId, traceId);
+        return traceCache.lookup(sessionId, scope, eventId, traceId);
       },
       write(traceId, pool) {
-        if (captureId === undefined || !traceCacheUsable(sessionId, captureId)) {
+        if (scope === undefined || !traceCacheUsable(sessionId, scope)) {
           return;
         }
-        traceCache.write(sessionId, captureId, traceId, pool);
+        traceCache.write(sessionId, scope, traceId, pool);
         syncDisconnectWatch();
       },
     };
@@ -1471,20 +1594,25 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
     target: PanelEventTarget,
     resolveOptions?: PanelEventResolveOptions,
   ): Promise<PanelEventResolution> {
-    // The same guard every page applies, run first so a cache hit can never
-    // answer for a session this panel is not showing.
+    // The same guards every page applies, run first so a cache hit can never
+    // answer for a session this panel is not showing, nor turn a lookup whose
+    // panel identity is unusable into a live one.
     const session = resolveSession(sessionId, 'events');
+    const panelId = resolvePanelId(resolveOptions?.panelId, 'events');
     if (!isFilledString(target.eventId)) {
       throw unidentifiedEventError();
     }
     const signal = resolveOptions?.signal;
     throwIfAborted(signal, DATA_QUERY_DEFAULT_OFFSET);
 
-    // The lookup's capture scope: the one the store shows as it starts. Its
-    // cache reads and writes stop the moment the store shows another one.
-    const cache = scopedTraceCache(session, readCurrentCapture());
+    // The lookup's evidence scope: its panel, or the capture the store shows
+    // as it starts. A live scope's cache reads and writes stop the moment the
+    // store shows another capture; a panel scope's hold for that panel.
+    const cache = scopedTraceCache(session, lookupScope(panelId));
+    // Both passes page through here, so every page — find and ancestry alike —
+    // is sent with the lookup's panel, and a live lookup's with none.
     const page: EventPageQuery = (eventsQuery, pageSignal) =>
-      query(session, eventsQuery, { signal: pageSignal });
+      query(session, eventsQuery, { signal: pageSignal, panelId });
     const resume: LookupResume = {
       from: normalizePanelDataOffset(resolveOptions?.resumeFrom),
       ancestry: resolveOptions?.resumeAncestry,
@@ -1516,7 +1644,10 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
  * ===========================================================================
  */
 
-/** One `events` page request: the provider's own `query`, bound to the lookup's session. */
+/**
+ * One `events` page request: the provider's own `query`, bound to the lookup's
+ * session and to its panel, when it has one.
+ */
 type EventPageQuery = (
   eventsQuery: DataQuery & { source: 'events' },
   signal: AbortSignal | undefined,
@@ -1528,42 +1659,52 @@ interface CachedEvent {
   readonly pool: readonly TelemetryEvent[];
 }
 
-/** One cached trace: the session and capture it belongs to, and its collected stored events. */
+/**
+ * One cached trace: the session and evidence scope it belongs to, and its
+ * collected stored events.
+ */
 interface CachedTrace {
   readonly sessionId: SessionId;
-  readonly captureId: CaptureId;
+  readonly scope: EvidenceScope;
   readonly pool: readonly TelemetryEvent[];
 }
 
 /**
  * The drawer's bounded, least-recently-used cache of stored trace pools, keyed
- * by session, capture and trace. Pure storage: whether it may be read or
- * written at all is the provider's decision (see `scopedTraceCache`).
+ * by session, evidence scope and trace. Pure storage: whether it may be read
+ * or written at all is the provider's decision (see `scopedTraceCache`).
  */
 interface TraceCache {
   /**
-   * The cached event with `eventId` of `sessionId`'s capture `captureId` —
-   * within `traceId`'s pool when the trace is known, otherwise within any of
-   * that capture's pools — but only when that pool also holds the event's
-   * complete parent chain. A hit becomes the most recently used entry.
+   * The cached event with `eventId` of `sessionId`'s evidence `scope` —
+   * within `traceId`'s pool when the trace is known, otherwise within any pool
+   * of that same session and scope — but only when that pool also holds the
+   * event's complete parent chain. A hit becomes the most recently used entry.
    */
   lookup(
     sessionId: SessionId,
-    captureId: CaptureId,
+    scope: EvidenceScope,
     eventId: string,
     traceId: string | undefined,
   ): CachedEvent | undefined;
   /**
-   * Hold `pool` as the trace's collected events, replacing any earlier pool of
-   * that trace, then evict least recently used traces until both bounds hold.
-   * An empty pool, or one larger than the event bound, is not held.
+   * Hold `pool` as the trace's collected events within `sessionId`'s evidence
+   * `scope`, replacing any earlier pool of that trace in that scope, then
+   * evict least recently used traces until both bounds hold. An empty pool, or
+   * one larger than the event bound, is not held.
    */
   write(
     sessionId: SessionId,
-    captureId: CaptureId,
+    scope: EvidenceScope,
     traceId: string,
     pool: readonly TelemetryEvent[],
   ): void;
+  /**
+   * Forget every trace for which `unusable` answers `true`.
+   *
+   * @returns How many traces were forgotten.
+   */
+  evict(unusable: (entry: CachedTrace) => boolean): number;
   /** How many traces are held. */
   size(): number;
   /** Forget every trace. */
@@ -1571,14 +1712,14 @@ interface TraceCache {
 }
 
 /**
- * The trace cache as one lookup sees it: its session and capture are fixed,
- * and every read and write is authorised afresh by the provider — an
+ * The trace cache as one lookup sees it: its session and evidence scope are
+ * fixed, and every read and write is authorised afresh by the provider — an
  * unauthorised read misses, and an unauthorised write records nothing.
  */
 interface ScopedTraceCache {
-  /** See {@link TraceCache.lookup}, within the lookup's session and capture. */
+  /** See {@link TraceCache.lookup}, within the lookup's session and evidence scope. */
   lookup(eventId: string, traceId: string | undefined): CachedEvent | undefined;
-  /** See {@link TraceCache.write}, within the lookup's session and capture. */
+  /** See {@link TraceCache.write}, within the lookup's session and evidence scope. */
   write(traceId: string, pool: readonly TelemetryEvent[]): void;
 }
 
@@ -1610,9 +1751,9 @@ function createTraceCache(maxTraces: number, maxEvents: number): TraceCache {
   }
 
   return {
-    lookup(sessionId, captureId, eventId, traceId) {
+    lookup(sessionId, scope, eventId, traceId) {
       if (traceId !== undefined) {
-        const key = traceCacheKey(sessionId, captureId, traceId);
+        const key = traceCacheKey(sessionId, scope, traceId);
         const entry = entries.get(key);
         const hit = entry === undefined ? undefined : completeHit(entry, eventId);
         if (entry !== undefined && hit !== undefined) {
@@ -1620,8 +1761,11 @@ function createTraceCache(maxTraces: number, maxEvents: number): TraceCache {
         }
         return hit;
       }
+      // A traceless walk: only pools of the lookup's own session and evidence
+      // scope may answer, so a live lookup never borrows a panel's trace, nor
+      // one panel another's.
       for (const [key, entry] of entries) {
-        if (entry.sessionId !== sessionId || entry.captureId !== captureId) {
+        if (entry.sessionId !== sessionId || !sameEvidenceScope(entry.scope, scope)) {
           continue;
         }
         const hit = completeHit(entry, eventId);
@@ -1634,8 +1778,8 @@ function createTraceCache(maxTraces: number, maxEvents: number): TraceCache {
       return undefined;
     },
 
-    write(sessionId, captureId, traceId, pool) {
-      const key = traceCacheKey(sessionId, captureId, traceId);
+    write(sessionId, scope, traceId, pool) {
+      const key = traceCacheKey(sessionId, scope, traceId);
       const previous = entries.get(key);
       if (previous !== undefined) {
         entries.delete(key);
@@ -1644,7 +1788,7 @@ function createTraceCache(maxTraces: number, maxEvents: number): TraceCache {
       if (pool.length === 0 || pool.length > maxEvents) {
         return;
       }
-      entries.set(key, { sessionId, captureId, pool });
+      entries.set(key, { sessionId, scope, pool });
       held += pool.length;
       for (const [staleKey, stale] of entries) {
         if (entries.size <= maxTraces && held <= maxEvents) {
@@ -1653,6 +1797,19 @@ function createTraceCache(maxTraces: number, maxEvents: number): TraceCache {
         entries.delete(staleKey);
         held -= stale.pool.length;
       }
+    },
+
+    evict(unusable) {
+      let evicted = 0;
+      // Deleting the entry just visited is safe during a `Map` walk.
+      for (const [key, entry] of entries) {
+        if (unusable(entry)) {
+          entries.delete(key);
+          held -= entry.pool.length;
+          evicted += 1;
+        }
+      }
+      return evicted;
     },
 
     size() {
@@ -2050,8 +2207,9 @@ async function resolveAcrossCapture(
  * The lookup behind {@link PanelDataProvider.resolveEvent}; see its
  * documentation for the passes, the budgets, resumption and the cache rule.
  *
- * @param deps The provider's page request (bound to the guarded session), the
- * trace cache scoped to that session and the lookup's capture, and the logger.
+ * @param deps The provider's page request (bound to the guarded session and
+ * the lookup's panel), the trace cache scoped to that session and the lookup's
+ * evidence scope, and the logger.
  * @param target The selection; its `eventId` is already known to be filled.
  * @param resume Where the find pass starts, and the ancestry pass to continue.
  * @param signal The lookup's abort signal.

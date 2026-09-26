@@ -51,13 +51,13 @@
  *
  * Two halves. The first removes what a fieldset arrives with - the browser's border, its padding,
  * its margin and the `min-inline-size: min-content` that would otherwise stop the field grid
- * shrinking with the column. The second reproduces exactly what `.root`'s column gave these groups
- * before this element sat between them: the same direction and the same 32px step, so the vertical
- * rhythm, the hairline `.section + .section` draws between consecutive groups (they are still
- * siblings, now of this element) and the field grid's container query are all unchanged - `.root`
- * keeps `container-type`, and a fieldset establishes no containment of its own, so `.grid` still
- * resolves against the form. No `legend` is rendered: each group states its own subject in the
- * heading it already has, and a second caption here would be the form naming the same thing twice.
+ * shrinking with the column. The second lays the groups out in the same direction and at the same
+ * 32px step as `.root`'s column. The vertical rhythm, the hairline `.section + .section` draws
+ * between consecutive groups (siblings inside this fieldset) and the field grid's container query
+ * all hold: `.root` keeps `container-type`, and a fieldset establishes no containment of its own,
+ * so `.grid` resolves against the form. No `legend` is rendered: each group states its own subject
+ * in the heading it already has, and a second caption here would be the form naming the same thing
+ * twice.
  *
  * Nothing about the disabled appearance is declared here. `../ui/Input.module.css` and
  * `../ui/Select.module.css` each carry their own `:disabled` treatment, which is what a reader
@@ -177,10 +177,8 @@
  * is the pairing `app/globals.css` documents for that token; the global `a` reset removes the
  * browser's own underline, so the line is declared here.
  *
- * BLITZY [A11Y]: the amber underline measures about 2.15:1 against --ls-surface, below the 3:1
- * recommendation for a non-text indicator - `globals.css` carries the same note against
- * --ls-accent. It is never the only marking: the text is underlined, sits at full strength on this
- * surface and takes the --ls-focus ring when focused. Flagged for design review. */
+ * The accent colour is never the only thing marking the link: the text is underlined and sits at
+ * full strength on this surface, and it takes the --ls-focus ring when focused. */
 .noticeLink {
   border-radius: var(--ls-radius-sm, 4px);
   color: var(--ls-text, #0f172a);

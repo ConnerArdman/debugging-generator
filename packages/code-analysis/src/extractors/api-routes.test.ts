@@ -898,6 +898,8 @@ function scratchTextOf(file: string): string {
 /** Whether the corpus opened, asserted by the first case rather than assumed. */
 let corpusOpened = false;
 
+// A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+// machine can push past the 10 s hook default and so fail every case below.
 beforeAll(async () => {
   const opened = openProject({ projectRoot: FIXTURE_ROOT });
   corpusOpened = opened.ok;
@@ -920,7 +922,7 @@ beforeAll(async () => {
 
   scratchRoot = createScratchProject();
   scratchProject = openPrepared(scratchRoot);
-});
+}, 30_000);
 
 afterAll(() => {
   if (scratchRoot !== undefined) {

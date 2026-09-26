@@ -84,6 +84,7 @@ import {
   DEV_SERVER_FRAMEWORKS,
   DEV_SERVER_IDENTITY_EVIDENCE,
   DEV_SERVER_PRELOAD_REASONS,
+  FRAMEWORK_DEV_CLIS,
   LAUNCH_DEV_SERVER_COMMAND_TITLE,
   MAX_MANIFEST_BYTES,
   MAX_PROBE_TIMEOUT_MS,
@@ -3013,5 +3014,187 @@ describe('detectDevServer', () => {
         expect.stringMatching(/is a symbolic link; it is not followed/),
       );
     });
+  });
+});
+
+describe('detectDevServer: the dev-server script names', () => {
+  it('lists only the scripts that start a dev server, frozen, never a command', async () => {
+    const detection = await detectDevServer({ projectRoot: PROJECT_ROOT }, portalDeps());
+
+    // `build`, `start` and `lint` are declared too, but none starts a dev server.
+    expect(detection.devServerScripts).toStrictEqual(['dev']);
+    expect(Object.isFrozen(detection.devServerScripts)).toBe(true);
+    const serialised = JSON.stringify(detection.devServerScripts);
+    for (const command of Object.values(PORTAL_MANIFEST.scripts)) {
+      expect(serialised).not.toContain(command);
+    }
+  });
+
+  it('holds the selected dev script and every script running next dev, never deploy, lint or postinstall', async () => {
+    const readManifest = servingManifest({
+      scripts: {
+        dev: 'next dev',
+        'dev:web': 'next dev',
+        deploy: 'vercel deploy --prod',
+        lint: 'eslint .',
+        postinstall: 'node ./scripts/setup.js',
+      },
+      dependencies: { next: '16.1.0' },
+    });
+
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT },
+      portalDeps({ readManifest }),
+    );
+
+    expect(detection.devServerScripts).toStrictEqual(['dev', 'dev:web']);
+    expect(detection.devScript).toStrictEqual({ name: 'dev', command: 'next dev' });
+  });
+
+  it('counts the selected dev script even when it was chosen by its name alone', async () => {
+    const readManifest = servingManifest({
+      scripts: {
+        dev: 'node ./scripts/serve.mjs',
+        'web:dev': 'cross-env PORT=4000 next dev',
+        build: 'next build',
+      },
+      dependencies: { next: '16.1.0' },
+    });
+
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT },
+      portalDeps({ readManifest }),
+    );
+
+    expect(detection.devScript?.name).toBe('dev');
+    expect(detection.devServerScripts).toStrictEqual(['dev', 'web:dev']);
+  });
+
+  it('skips blank and non-string scripts and orders names by code unit, not by locale', async () => {
+    const readManifest = servingManifest({
+      scripts: {
+        'web:dev': 'next dev',
+        Zeta: 'next dev --turbopack',
+        alpha: 'eslint .',
+        '~local': 'cross-env PORT=4000 next dev',
+        build: 'next build',
+        blank: '   ',
+        empty: '',
+        count: 3,
+        nested: { dev: 'next dev' },
+      },
+      dependencies: { next: '16.1.0' },
+    });
+
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT },
+      portalDeps({ readManifest }),
+    );
+
+    expect(detection.devServerScripts).toStrictEqual(['Zeta', 'web:dev', '~local']);
+    expect(detection.devScript).toStrictEqual({ name: 'Zeta', command: 'next dev --turbopack' });
+  });
+
+  it('is present and empty for a manifest that declares no runnable script', async () => {
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT },
+      portalDeps({ readManifest: servingManifest({ name: 'acme-portal', scripts: {} }) }),
+    );
+
+    expect(detection.devServerScripts).toStrictEqual([]);
+    expect(detection.canLaunch).toBe(false);
+  });
+
+  it('is present and empty for a manifest whose scripts start no dev server', async () => {
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT },
+      portalDeps({
+        readManifest: servingManifest({
+          name: 'acme-portal',
+          scripts: { build: 'next build', start: 'next start', deploy: 'vercel deploy' },
+        }),
+      }),
+    );
+
+    expect(detection.devServerScripts).toStrictEqual([]);
+    expect(detection).not.toHaveProperty('devScript');
+    expect(detection.canLaunch).toBe(false);
+  });
+
+  it.each([
+    { label: 'unreadable', code: 'EACCES' },
+    { label: 'missing', code: 'ENOENT' },
+  ])('is absent when package.json is $label', async ({ code }) => {
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT },
+      portalDeps({
+        readManifest: () => {
+          throw Object.assign(new Error('not available'), { code });
+        },
+      }),
+    );
+
+    expect('devServerScripts' in detection).toBe(false);
+  });
+
+  it('is absent from the degraded answer of an unanticipated failure', async () => {
+    const deps: DevServerDetectDeps = {
+      ...portalDeps(),
+      get serverAgents(): ServerAgentPresence | undefined {
+        throw new Error('registry wiring failed');
+      },
+    };
+
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+      deps,
+    );
+
+    expect(detection.preloadReason).toBe('unknown');
+    expect('devServerScripts' in detection).toBe(false);
+  });
+
+  it('reads the names from a real package.json on disk', async () => {
+    const root = makeSandbox();
+    writeManifest(root, {
+      scripts: { 'web:dev': 'next dev --port 4200', build: 'next build' },
+      dependencies: { next: '16.1.0' },
+    });
+
+    const detection = await detectDevServer(
+      { projectRoot: root },
+      { config: SERVICE_CONFIG, preloadPath: PRELOAD_PATH },
+    );
+
+    expect(detection.devServerScripts).toStrictEqual(['web:dev']);
+    expect(JSON.parse(JSON.stringify(detection))).toStrictEqual(detection);
+  });
+});
+
+describe('FRAMEWORK_DEV_CLIS', () => {
+  it('is the frozen table of framework dev CLIs the launcher and selectDevScript share', () => {
+    expect(Object.isFrozen(FRAMEWORK_DEV_CLIS)).toBe(true);
+    expect(FRAMEWORK_DEV_CLIS).toStrictEqual([
+      { framework: 'next', binary: 'next', subcommand: 'dev', packageBin: 'next/dist/bin/next' },
+    ]);
+    for (const entry of FRAMEWORK_DEV_CLIS) {
+      expect(Object.isFrozen(entry)).toBe(true);
+      expect(DEV_SERVER_FRAMEWORKS).toContain(entry.framework);
+    }
+  });
+
+  it("drives selectDevScript: each entry's CLI, bare or run by Node from node_modules, selects a script", () => {
+    for (const entry of FRAMEWORK_DEV_CLIS) {
+      for (const command of [
+        `${entry.binary} ${entry.subcommand}`,
+        `node node_modules/${entry.packageBin} ${entry.subcommand}`,
+      ]) {
+        expect(selectDevScript({ scripts: { web: command } })).toStrictEqual({
+          name: 'web',
+          command,
+        });
+      }
+      expect(selectDevScript({ scripts: { web: `${entry.binary} build` } })).toBeUndefined();
+    }
   });
 });

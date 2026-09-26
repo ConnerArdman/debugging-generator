@@ -8,7 +8,7 @@
  * 1. *Does this project reach PostgreSQL through the raw driver?* — decided
  *    from the code graph's `db-call` nodes and the project summary's database
  *    access style, never from a table name, a handle variable, a statement or
- *    an import specifier written as a literal here (AAP §0.5.4).
+ *    an import specifier written as a literal here.
  * 2. *Which functions would the plan name as its anchors?* — the enclosing
  *    functions the graph's `queries` edges start at, ranked deterministically
  *    against the problem understanding's own entities and search hints. A
@@ -23,8 +23,7 @@
  *    `server-agent` facts the service observed, because the driver's query
  *    spans are produced by `@opentelemetry/instrumentation-pg` inside the
  *    dev-server preload (`packages/telemetry/src/node/register.ts`) and no
- *    amount of planning substitutes for that process being attached
- *    (AAP §0.5.1).
+ *    amount of planning substitutes for that process being attached.
  *
  * ## Why this adapter installs nothing
  *
@@ -61,7 +60,7 @@
  * `DbCallNodeData` may carry a capped statement *shape* with its literals
  * already replaced. Nothing in this module reads it into a sentence, a hint or
  * a log field: what reaches a developer or a log line is a project-relative
- * file path, a declared symbol name, a signal name and a count (AAP §0.5.2).
+ * file path, a declared symbol name, a signal name and a count.
  * No SQL, no connection string, no row content — not even the shape.
  *
  * ## Extension
@@ -69,7 +68,7 @@
  * This file stands alone. It imports no sibling adapter, no registry, no
  * installer and no cleanup module, and it shares no private helper with the
  * Prisma adapter, so a seventh adapter is a new file plus a `registerAdapter()`
- * call and nothing here has to change (AAP §0.4.2).
+ * call, and neither this file nor any orchestrator has to change.
  */
 
 import {
@@ -170,7 +169,7 @@ const CLAIMED_ACTION_TYPE: InstrumentationActionType = 'db-query-tracking';
  * The mode the claimed type installs in, written exactly once.
  *
  * `'runtime'`: the driver's spans come from the preload's instrumentation, so no
- * file is modified and no modification record exists (AAP §0.5.1).
+ * file is modified and no modification record exists.
  */
 const CLAIMED_MODE: InstrumentationMode = 'runtime';
 
@@ -272,8 +271,8 @@ const POSTGRES_RUNTIME_HOOKS: readonly string[] = Object.freeze(['PostgreSQL dri
  * names the editor command instead of a shell command.
  *
  * Nothing here is ever read from the environment, and no path inside this
- * repository is ever written into it (AAP §0.5.4): a relaunch instruction is
- * about the developer's project, not about the tool's checkout.
+ * repository is ever written into it: a relaunch instruction is about the
+ * developer's project, not about the tool's checkout.
  */
 export interface PostgresRelaunchDescriptor {
   /**
@@ -807,10 +806,10 @@ const URL_ENTITY_KINDS = Object.freeze(['route', 'url']);
  *
  * Built from the understanding's own `entities` and `searchHints` through the
  * bounded query surface — `findSymbol` for an entity that carried a file,
- * `findByName` for every name, `routeForUrl` for an entity that reads as a URL
- * — which is the mechanism AAP §0.5.4 requires: a target is promoted because
- * the graph has a declaration for the name a developer's question produced,
- * never because this module recognised the name.
+ * `findByName` for every name, `routeForUrl` for an entity that reads as a URL.
+ * A target is promoted because the graph has a declaration for the name a
+ * developer's question produced — never because this module recognised the
+ * name.
  *
  * @param understanding The validated problem understanding.
  * @param queries The project's read-only query surface.
@@ -1197,7 +1196,7 @@ function devCommandFor(summary: ProjectSummary): string | undefined {
  *
  * Every form names the project root, so a developer with several projects open
  * knows which dev server to relaunch, and no form contains a path inside this
- * repository (AAP §0.5.4) or a value read from the environment.
+ * repository or a value read from the environment.
  *
  * @param context The session's context.
  * @param relaunch The caller's relaunch descriptor, possibly empty.
@@ -1352,11 +1351,10 @@ const DATABASE_CAPTURE_SIGNALS = Object.freeze([
  *
  * A question that asks for incoming-request, route-handler or function spans is
  * a question about where server time goes, and in a project that reaches
- * PostgreSQL through the driver, database time is part of that answer — the
- * slow multi-tier interaction of AAP §0.8.4's first acceptance test is exactly
- * this case. Treating them as a database request is therefore not an
- * over-reach; it is what keeps a latency question from producing a trace whose
- * deepest span is the route handler.
+ * PostgreSQL through the driver, database time is part of that answer — a
+ * slow multi-tier interaction is exactly this case. Treating them as a
+ * database request is therefore not an over-reach; it is what keeps a latency
+ * question from producing a trace whose deepest span is the route handler.
  */
 const SERVER_TIER_CAPTURE_SIGNALS = Object.freeze([
   'http',
@@ -1543,7 +1541,7 @@ function rankOwner(owner: PgQuerySiteOwner, inputs: RankingInputs): RankedOwner 
  * has to know to read the plan correctly: the instrumentation is process-wide,
  * so the anchor is a query site the investigation found and **not** a change to
  * the named file. It carries a file, a symbol and a count — never a statement,
- * never a statement shape, never a connection string (AAP §0.5.2).
+ * never a statement shape, never a connection string.
  *
  * @param owner The owner the anchor names.
  * @returns The bounded, single-line rationale.
@@ -1709,9 +1707,10 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
       const serverRequested = requests(understanding, SERVER_TIER_CAPTURE_SIGNALS);
 
       if (!databaseRequested && !serverRequested) {
-        // AAP §0.5.1's guarantee, enforced at the point the plan is proposed: a
-        // question about the page has not asked this product to read the
-        // project's queries, so no database action is offered for it.
+        // An unrelated plan collects no database telemetry, enforced at the
+        // point the plan is proposed: a question about the page has not asked
+        // this product to read the project's queries, so no database action is
+        // offered for it.
         log.debug('proposing nothing: the question asks for no database or server-tier evidence', {
           sessionId: context.sessionId,
           category: understanding.category,
@@ -1734,8 +1733,8 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
 
       // A seed, migration, script, test or configuration module runs in a
       // process of its own rather than in the dev server the preload
-      // instruments (AAP §0.5.1), so none of its queries can reach a capture
-      // and an anchor on it would promise evidence that never arrives.
+      // instruments, so none of its queries can reach a capture and an anchor
+      // on it would promise evidence that never arrives.
       const owners = collected.filter((owner) => !isToolingModulePath(owner.file));
       const toolingOwners = collected.length - owners.length;
 
@@ -1816,8 +1815,8 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
      * {@link UnavailableSignal} whose hint is the exact relaunch instruction for
      * this project.
      *
-     * Never rejects. A missing signal is data, not a failure (AAP §0.5.5), and
-     * there is no write here whose outcome could be unknowable.
+     * Never rejects. A missing signal is data, not a failure, and there is no
+     * write here whose outcome could be unknowable.
      */
     install(
       actions: readonly InstrumentationAction[],
@@ -1907,7 +1906,7 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
      * `server-agent.config` with no `captureId`; that makes
      * `packages/telemetry/src/node/control.ts` call `disable()` on its driver
      * instrumentation, unwrapping the client methods it had patched so the
-     * application keeps serving with nothing observing it (AAP §0.5.1).
+     * application keeps serving with nothing observing it.
      *
      * Idempotent, and safe to call again after a crash or a reconnect. A
      * `'reconcile'` reports no disabled hook: the process that held it is gone,

@@ -24,10 +24,11 @@
  *    follow from how the agent's modules are wired rather than from any prose,
  *    and a capture that lost either would still look successful.
  *
- * 3. **Conservative server gating is a promise, not an optimisation.** AAP
- *    §0.5.1 says an unrelated plan collects no backend or database telemetry,
- *    so a purely browser-side plan must produce the disabled signal set — the
- *    `browser-only plan` case below is the assertion that keeps that promise.
+ * 3. **Conservative server gating is a promise, not an optimisation.** A plan
+ *    that does not ask for the server tier collects no backend or database
+ *    telemetry, so a purely browser-side plan must produce the disabled signal
+ *    set — the purely browser-side plan case of `deriveServerAgentSignals`
+ *    below is the assertion that keeps that promise.
  *
  * Two conventions in here are deliberate.
  *
@@ -408,8 +409,8 @@ describe('readinessSignalSchema', () => {
   it('declares the three statuses, from fully ready to not collected at all', () => {
     // The three-way split is what lets readiness gate a capture without
     // blocking it for a partial signal: `degraded` still captures, with a
-    // stated limitation, and only `unavailable` is AAP §0.5.5's "Could not
-    // enable ‹signal›: ‹reason›." being reported.
+    // stated limitation, and only `unavailable` is reported as the
+    // developer-facing "Could not enable ‹signal›: ‹reason›." message.
     expect([...READINESS_STATUSES]).toEqual(['available', 'degraded', 'unavailable']);
   });
 
@@ -471,8 +472,9 @@ describe('readinessSignalSchema', () => {
     expect(readinessSignalSchema.safeParse(readinessRow({ hint: hintAt })).success).toBe(true);
     expect(readinessSignalSchema.safeParse(readinessRow({ hint: hintOver })).success).toBe(false);
 
-    // A hint is wider than a reason because it carries a command (AAP §0.5.5):
-    // a hint past the reason's bound is still a hint.
+    // A hint is wider than a reason because it carries a command — the exact
+    // relaunch command when the dev server was started without the preload —
+    // so a hint past the reason's bound is still a hint.
     expect(readinessSignalSchema.safeParse(readinessRow({ hint: reasonOver })).success).toBe(true);
   });
 });
@@ -759,7 +761,7 @@ describe('agentHookConfigSchema', () => {
   });
 
   it('survives the JSON round trip it makes on the way to the page', () => {
-    // This exact value is the AAP §0.4.2 / §0.5.1 payload that returns the
+    // This exact value is the `agent.config` hooks payload that returns the
     // agent to dormant — listeners detached, `fetch`/`XMLHttpRequest`
     // restored, fiber handlers unsubscribed — and it reaches the agent over a
     // WebSocket and a `window.postMessage` hop, so it has to be JSON-clean.
@@ -974,8 +976,9 @@ describe('deriveAgentHookConfig', () => {
     // `.../browser/interaction.ts` is what opens that context and mints the
     // trace root. Without the interaction hook the requests go out untraced,
     // the server's spans start a trace of their own, and the browser↔server
-    // correlation of AAP §0.4.2 breaks *silently* — the capture still fills
-    // with events and the timeline still renders, as two unrelated trees.
+    // correlation the cross-tier timeline is built on breaks *silently* — the
+    // capture still fills with events and the timeline still renders, as two
+    // unrelated trees.
     const derived = deriveAgentHookConfig([action({ type: 'fetch-tracking' })]);
 
     expect(derived.fetch).toBe(true);
@@ -1082,9 +1085,9 @@ describe('deriveAgentHookConfig', () => {
 
 describe('deriveServerAgentSignals', () => {
   it('collects nothing on the server tier for a purely browser-side plan', () => {
-    // AAP §0.5.1: "an unrelated plan collects no backend or database
-    // telemetry". A render question must not read anyone's SQL, and this is
-    // the assertion that keeps the promise: the preload gate in
+    // A plan that does not ask for the server tier collects no backend or
+    // database telemetry. A render question must not read anyone's SQL, and
+    // this is the assertion that keeps the promise: the preload gate in
     // `packages/telemetry/src/node/control.ts` resolves this set into the kinds
     // it will admit and drops every span outside them, so an all-false set is
     // what makes it collect nothing rather than collect quietly.

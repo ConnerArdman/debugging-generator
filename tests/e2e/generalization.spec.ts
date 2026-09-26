@@ -1,13 +1,14 @@
 /**
- * Acceptance test 4, "Generalization" (AAP §0.8.4): the spec that proves no demo knowledge is
- * baked into the product.
+ * The "Generalization" acceptance test: the spec that proves no demo knowledge is baked into the
+ * product.
  *
  * It runs the slow-interaction workflow of `demo-slow-interaction.spec.ts` — the same question,
  * the same real pipeline — against `tests/fixtures/sample-next-app`, a Next.js App Router project
  * that shares no symbol name and no route with the demo. Everything the product needs to answer
- * has to come from code analysis, instrumentation and telemetry of that project; the behavioural
- * half of AAP §0.5.4 holds only if the session still reaches `generated` with a real trace and a
- * real panel, and if nothing it produced mentions the demo.
+ * has to come from code analysis, instrumentation and telemetry of that project. This spec is the
+ * behavioural half of the no-hardcoding guarantee (`scripts/check-no-hardcoding.mjs` is the
+ * static half), and that half holds only if the session still reaches `generated` with a real
+ * trace and a real panel, and if nothing it produced mentions the demo.
  *
  * ## What is asserted, test by test (serial: a failure skips its dependents)
  *
@@ -43,7 +44,7 @@
  * ## What this spec never does
  *
  * - It never writes under `tests/fixtures/sample-next-app`: the product's installer patches and
- *   the product's cleanup restores (AAP §0.5.1); the helpers only read and hash.
+ *   the product's cleanup restores; the helpers only read and hash.
  * - It never starts `next dev` or sets `NODE_OPTIONS`: the launcher owns the preload and the
  *   server-agent credential.
  * - It never reads `.git/` or prints a credential; failure text names ids, kinds, paths and
@@ -201,7 +202,7 @@ const CHAIN_KINDS = [
   'route.handler',
 ] as const satisfies readonly TelemetryKind[];
 
-/** The committed forbidden-token list of AAP §0.5.4, repository-relative. */
+/** The no-hardcoding gate's committed forbidden-token list, repository-relative. */
 const POLICY_SEGMENTS = ['scripts', 'no-hardcoding.policy.json'] as const;
 
 /** A character that may continue an identifier: a policy identifier only matches as a whole word. */
@@ -693,8 +694,8 @@ function pressRunCheck(
 
 /**
  * Run the workflow, surfacing the product's own relaunch hint when the dev server behind the page
- * turned out to have no server agent (AAP §0.5.5): that is the actionable diagnosis, where a
- * later "no server spans" failure would name only the symptom.
+ * turned out to have no server agent: that is the actionable diagnosis, where a later "no server
+ * spans" failure would name only the symptom.
  */
 async function runWorkflow(
   run: () => Promise<DebugSessionOutcome>,

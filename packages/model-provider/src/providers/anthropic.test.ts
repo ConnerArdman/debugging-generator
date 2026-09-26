@@ -18,12 +18,23 @@
  *    module is spread back in underneath, so `APIUserAbortError` keeps its real
  *    identity, which is what the cancellation classification is recognised by.
  *
+ * One block constructs the vendor's *real* client, from the options the
+ * provider handed the recorded one, to prove what the client does with them.
+ * It is given a `fetch` stand-in that answers in-process, so no socket is
+ * opened there either.
+ *
  * ## What this file pins, in the order the blocks appear
  *
  * - **Construction.** The reported id, the structural provider guard, the two
  *   configuration refusals that carry AAP §0.5.5's sentence, the injected-client
  *   exemption from needing a credential, and the transport retry budget being
  *   handed to the transport and never conflated with the schema repair budget.
+ * - **The transport's destination and diagnostics.** A hostile inherited
+ *   `ANTHROPIC_BASE_URL` and `ANTHROPIC_LOG` neither redirect the client nor
+ *   make it print, proven against the real client with a private answer, and
+ *   an explicit base URL override is held to the endpoint policy. The only
+ *   block that mutates `process.env`: through `vi.stubEnv`, restored after
+ *   every case by `vi.unstubAllEnvs()`.
  * - **The schema-constrained route.** `zodOutputFormat`'s rendered schema is
  *   what is actually sent, `raw` carries the decoded output, and one call is one
  *   attempt.
@@ -41,7 +52,7 @@
  *   a denied pattern produces an `Err` and **zero** recorded transport calls,
  *   in three placements, through all three methods, and on a repair turn.
  * - **The factory.** Folded in here, driven through its injectable environment
- *   record; `process.env` is never mutated.
+ *   record; `process.env` is never mutated in that block.
  *
  * ## Conventions this file works under
  *
@@ -87,8 +98,9 @@ import { readFileSync } from 'node:fs';
 
 import { APIUserAbortError } from '@anthropic-ai/sdk';
 import type AnthropicClient from '@anthropic-ai/sdk';
+import type { ClientOptions } from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { DEBUGGEN_ERROR_CODES, DebuggenError, createConsoleLogger } from '@debuggen/shared';
@@ -109,6 +121,7 @@ import type {
   ToolDefinition,
 } from '../types.js';
 import {
+  ANTHROPIC_API_BASE_URL,
   ANTHROPIC_DEFAULT_MAX_RETRIES,
   ANTHROPIC_DEFAULT_TIMEOUT_MS,
   ANTHROPIC_SUPPORTED_TEMPERATURE,
@@ -937,7 +950,8 @@ describe('construction reports what it can and cannot do before any call is atte
     // A compile-time proof with no instance: if the seam narrowed to something
     // the vendor's client no longer satisfies, this stops compiling under
     // `pnpm typecheck` — which is where that regression should be caught, since
-    // constructing a real client in a suite is exactly what this file forbids.
+    // this file constructs a real client only over an in-process `fetch`
+    // stand-in, in the one block that exists to observe the client itself.
     const seamCheck = (client: AnthropicClient): AnthropicClientLike => client;
     const fake: AnthropicClientLike = createTransport().client;
 
@@ -950,6 +964,322 @@ describe('construction reports what it can and cannot do before any call is atte
     // lets a fake omit it to drive the tool route.
     expect('parse' in fake.messages).toBe(false);
   });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The transport's destination and diagnostics
+ *
+ * The vendor's client reads `ANTHROPIC_BASE_URL` for its destination and
+ * `ANTHROPIC_LOG` for its log level from `process.env` whenever its constructor
+ * is not told otherwise, and prints through `console` when it is given no
+ * logger. These cases stub both variables with `vi.stubEnv`, so the hostile
+ * values are live for the vendor's client exactly as an inherited variable
+ * would be, and `vi.unstubAllEnvs()` restores the environment after each case.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What a hostile inherited `ANTHROPIC_BASE_URL` names: a host no request may reach. */
+const HOSTILE_BASE_URL = 'http://attacker.test';
+
+/** The host of {@link HOSTILE_BASE_URL}, which no failure, record or request may name. */
+const HOSTILE_HOST = 'attacker.test';
+
+/** The most verbose level the vendor's client accepts from `ANTHROPIC_LOG`. */
+const HOSTILE_LOG_LEVEL = 'debug';
+
+/**
+ * Planted in the model's private answer. It must reach the caller and nothing
+ * else: not `console`, not the product's log records.
+ */
+const PRIVATE_ANSWER_SENTINEL = 'QZPRIVATE9043: the customer ledger excerpt the model echoed';
+
+/** The methods the vendor's client, or anything it calls, could print through. */
+const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const;
+
+/** Makes the hostile values live in `process.env` for the case that calls it. */
+function stubHostileEnvironment(): void {
+  vi.stubEnv('ANTHROPIC_BASE_URL', HOSTILE_BASE_URL);
+  vi.stubEnv('ANTHROPIC_LOG', HOSTILE_LOG_LEVEL);
+}
+
+/**
+ * The options the provider handed the recorded transport last, as the vendor's
+ * constructor options, so they can build a real client.
+ *
+ * The recorded value is whatever `./anthropic.ts` passed to the constructor,
+ * which the compiler already checked against `ClientOptions` there; narrowing
+ * it to a plain object is all that is left to do.
+ */
+function lastTransportOptions(): ClientOptions {
+  return asObject(transportConstruction.options.at(-1));
+}
+
+/** A logger capturing every record at every level, as {@link harness} builds one. */
+function capturingLogger(): {
+  readonly logger: ReturnType<typeof createConsoleLogger>;
+  readonly logs: LogRecord[];
+} {
+  const logs: LogRecord[] = [];
+  const logger = createConsoleLogger({
+    level: 'trace',
+    sink: (record: LogRecord): void => {
+      logs.push(record);
+    },
+  });
+  return { logger, logs };
+}
+
+/**
+ * A `fetch` stand-in that records every URL it is asked for and answers with
+ * one complete message carrying {@link PRIVATE_ANSWER_SENTINEL}. In-process:
+ * nothing it does opens a socket.
+ */
+function privateAnswerFetch(): {
+  readonly fetch: NonNullable<ClientOptions['fetch']>;
+  readonly requested: readonly string[];
+} {
+  const requested: string[] = [];
+  const recordingFetch: NonNullable<ClientOptions['fetch']> = (input) => {
+    requested.push(
+      typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
+    );
+    const message = {
+      id: assemble('msg_', cycle(HEX_CHARS, 12)),
+      type: 'message',
+      role: 'assistant',
+      model: MODEL_PLACEHOLDER,
+      content: [{ type: 'text', text: PRIVATE_ANSWER_SENTINEL }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+    return Promise.resolve(
+      new Response(JSON.stringify(message), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+  };
+  return { fetch: recordingFetch, requested };
+}
+
+/**
+ * Base URL overrides the endpoint policy accepts, each with the normalised URL
+ * the client is given: `https` to any host with a path prefix, and `http` to
+ * each loopback spelling — including a short IPv4 form the parser canonicalises.
+ */
+const ACCEPTED_OVERRIDES: readonly (readonly [string, string])[] = [
+  ['https://gateway.example.test/anthropic', 'https://gateway.example.test/anthropic'],
+  ['http://127.0.0.1:1/', 'http://127.0.0.1:1/'],
+  ['http://localhost:8080', 'http://localhost:8080/'],
+  ['http://[::1]:9000', 'http://[::1]:9000/'],
+  ['http://127.1:8080', 'http://127.0.0.1:8080/'],
+];
+
+/** One override the policy refuses, and every part of it no failure may name. */
+interface RefusedOverride {
+  readonly label: string;
+  readonly value: string;
+  readonly undisclosed: readonly string[];
+}
+
+/**
+ * Base URL overrides the endpoint policy refuses. The user information is
+ * assembled from fragments so no credentialed URI is a tracked literal.
+ */
+const REFUSED_OVERRIDES: readonly RefusedOverride[] = [
+  {
+    label: 'plain http to a remote host',
+    value: HOSTILE_BASE_URL,
+    undisclosed: [HOSTILE_BASE_URL, HOSTILE_HOST],
+  },
+  {
+    label: 'plain http to a host that only begins like a loopback address',
+    value: 'http://127.0.0.1.attacker.test',
+    undisclosed: ['127.0.0.1.attacker.test', HOSTILE_HOST],
+  },
+  {
+    label: 'plain http to a host that only begins like localhost',
+    value: 'http://localhost.attacker.test:8080',
+    undisclosed: ['localhost.attacker.test', HOSTILE_HOST],
+  },
+  {
+    label: 'a scheme other than http or https',
+    value: 'ftp://gateway.example.test',
+    undisclosed: ['ftp://gateway.example.test', 'gateway.example.test'],
+  },
+  {
+    label: 'user information',
+    value: assemble('https://', 'gateway-user', ':', 'gateway-pass', '@', 'gateway.example.test/'),
+    undisclosed: ['gateway-user', 'gateway-pass', 'gateway.example.test'],
+  },
+  {
+    label: 'a query',
+    value: 'https://gateway.example.test/anthropic?q=1',
+    undisclosed: ['https://gateway.example.test/anthropic?q=1', 'gateway.example.test', '?q=1'],
+  },
+  {
+    label: 'a fragment',
+    value: 'https://gateway.example.test/anthropic#frag',
+    undisclosed: ['https://gateway.example.test/anthropic#frag', 'gateway.example.test', '#frag'],
+  },
+  {
+    label: 'a value that is not a URL',
+    value: 'not a url',
+    undisclosed: ['not a url'],
+  },
+];
+
+describe("the transport's destination and diagnostics are never taken from the environment", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('pins the approved endpoint and silences the client under a hostile inherited environment', () => {
+    stubHostileEnvironment();
+
+    const created = createAnthropicProvider({
+      config: { ...BASE_CONFIG, apiKey: CREDENTIAL_FIXTURE },
+    });
+
+    expect(okValue(created).id).toBe('anthropic');
+    const options = asObject(transportConstruction.options.at(-1));
+    expect(options.baseURL).toBe(ANTHROPIC_API_BASE_URL);
+    expect(options.logLevel).toBe('off');
+    // Present and not `console`: a client given no logger falls back to it.
+    expect(options.logger).toBeDefined();
+    expect(options.logger).not.toBe(console);
+    const logger = asObject(options.logger);
+    for (const level of ['error', 'warn', 'info', 'debug']) {
+      expect(logger[level]).toBeTypeOf('function');
+    }
+    expect(Object.isFrozen(logger)).toBe(true);
+  });
+
+  it('proves against the real client that a private answer reaches the caller only, from the approved endpoint', async () => {
+    stubHostileEnvironment();
+    const { default: RealAnthropic } =
+      await vi.importActual<typeof import('@anthropic-ai/sdk')>('@anthropic-ai/sdk');
+    const transport = privateAnswerFetch();
+
+    // The control: a client built without this provider's options obeys the
+    // stubbed environment, so the hostile values are demonstrably live for the
+    // vendor's client and the cases below pass for the right reason.
+    const control = new RealAnthropic({ apiKey: CREDENTIAL_FIXTURE, fetch: transport.fetch });
+    expect(control.baseURL).toBe(HOSTILE_BASE_URL);
+    expect(control.logLevel).toBe(HOSTILE_LOG_LEVEL);
+
+    okValue(createAnthropicProvider({ config: { ...BASE_CONFIG, apiKey: CREDENTIAL_FIXTURE } }));
+    const client = new RealAnthropic({ ...lastTransportOptions(), fetch: transport.fetch });
+    expect(client.baseURL).toBe(ANTHROPIC_API_BASE_URL);
+    expect(client.logLevel).toBe('off');
+
+    const { logger, logs } = capturingLogger();
+    const provider = okValue(createAnthropicProvider({ config: BASE_CONFIG, client, logger }));
+    const consoleSpies = CONSOLE_METHODS.map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => undefined),
+    );
+
+    const answer = okValue(await provider.generateText(makeRequest()));
+
+    expect(answer.text).toBe(PRIVATE_ANSWER_SENTINEL);
+    expect(transport.requested.length).toBeGreaterThan(0);
+    for (const url of transport.requested) {
+      expect(new URL(url).origin).toBe(ANTHROPIC_API_BASE_URL);
+      expect(url).not.toContain(HOSTILE_HOST);
+    }
+    for (const spy of consoleSpies) {
+      expect(spy).not.toHaveBeenCalled();
+    }
+    // The product's own records are the diagnostics, and they carry
+    // provenance and outcome labels only — never the answer.
+    expect(logs.length).toBeGreaterThan(0);
+    expect(serialiseLogs(logs)).not.toContain(PRIVATE_ANSWER_SENTINEL);
+    expect(serialiseLogs(logs)).not.toContain('QZPRIVATE9043');
+    expectNoValueLeak(serialiseLogs(logs), CREDENTIAL_FIXTURE);
+  });
+
+  it('keeps the pin through the factory, whether the hostile values are ambient or in the injected record', () => {
+    stubHostileEnvironment();
+
+    const provider = okValue(
+      createModelProvider({
+        env: {
+          DEBUGGEN_PROVIDER: 'anthropic',
+          DEBUGGEN_MODEL: MODEL_PLACEHOLDER,
+          ANTHROPIC_API_KEY: CREDENTIAL_FIXTURE,
+          ANTHROPIC_BASE_URL: HOSTILE_BASE_URL,
+          ANTHROPIC_LOG: HOSTILE_LOG_LEVEL,
+        },
+      }),
+    );
+
+    expect(provider.id).toBe('anthropic');
+    const options = asObject(transportConstruction.options.at(-1));
+    expect(options.baseURL).toBe(ANTHROPIC_API_BASE_URL);
+    expect(options.logLevel).toBe('off');
+    expect(options.logger).not.toBe(console);
+  });
+
+  it.each(ACCEPTED_OVERRIDES)(
+    'accepts the explicit override %s and hands the client %s, over the hostile environment',
+    (value, expected) => {
+      stubHostileEnvironment();
+
+      const created = createAnthropicProvider({
+        config: { ...BASE_CONFIG, apiKey: CREDENTIAL_FIXTURE, baseUrl: value },
+      });
+
+      expect(okValue(created).id).toBe('anthropic');
+      const options = asObject(transportConstruction.options.at(-1));
+      expect(options.baseURL).toBe(expected);
+      expect(options.logLevel).toBe('off');
+    },
+  );
+
+  it.each(REFUSED_OVERRIDES)(
+    'refuses an override carrying $label, constructs nothing and names no part of it',
+    ({ value, undisclosed }) => {
+      stubHostileEnvironment();
+      const { logger, logs } = capturingLogger();
+      const constructedBefore = transportConstruction.options.length;
+
+      const direct = errorOf(
+        createAnthropicProvider({
+          config: { ...BASE_CONFIG, apiKey: CREDENTIAL_FIXTURE, baseUrl: value },
+          logger,
+        }),
+      );
+      // Refused with an injected client too: an unusable endpoint makes the
+      // configuration invalid whoever supplies the client.
+      const transport = createTransport();
+      const injected = errorOf(
+        createAnthropicProvider({
+          config: { ...BASE_CONFIG, baseUrl: value },
+          client: transport.client,
+          logger,
+        }),
+      );
+
+      expect(transportConstruction.options.length).toBe(constructedBefore);
+      expect(transport.callCount).toBe(0);
+      for (const failure of [direct, injected]) {
+        expectCodedFailure(failure);
+        expect(failure.code).toBe('CONFIG_INVALID');
+        expect(asObject(failure.details ?? {}).condition).toBe('base-url-invalid');
+        expect(failure.hint).toContain(ANTHROPIC_API_BASE_URL);
+        const surfaced = serialiseFailure(failure).toLowerCase();
+        for (const part of undisclosed) {
+          expect(surfaced).not.toContain(part.toLowerCase());
+        }
+        expectNoValueLeak(serialiseFailure(failure), CREDENTIAL_FIXTURE);
+      }
+      const logged = serialiseLogs(logs).toLowerCase();
+      for (const part of undisclosed) {
+        expect(logged).not.toContain(part.toLowerCase());
+      }
+    },
+  );
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -2124,7 +2454,9 @@ describe('a payload carrying a denied pattern never reaches the transport', () =
  * covered here, beside the provider it selects. Every case injects its own
  * environment record — `process.env` is never read for a decision and never
  * mutated — which is what keeps these cases independent of each other and of
- * the machine they run on.
+ * the machine they run on. The one factory case that stubs `process.env`, to
+ * show a hostile inherited base URL and log level are ignored, lives in the
+ * destination block above and is restored there by `vi.unstubAllEnvs()`.
  * ---------------------------------------------------------------------------------------------- */
 
 describe('the factory decides which boundary a host runs behind', () => {

@@ -28,6 +28,15 @@
  *   `TELEMETRY_LOSS_NOTICE_INTERVAL_MS`; loss inside an interval is
  *   accumulated and the burst's running total is shown when it ends, and an
  *   interval without loss ends the burst. Logs about loss carry counts only.
+ * - **The service's ledger learns of the loss the worker caused.** A notice is
+ *   not the service's producer-loss ledger: events the worker accepted and
+ *   could not deliver — the cold-start hold, a full lane, an unconfirmed
+ *   route, a frame the socket client discarded — and a loss-only report it
+ *   could not queue are held per capture context and reach the socket as
+ *   `droppedCount`, on the next batch of the same context or on a loss-only
+ *   frame once the service confirms the tab's route; never under another
+ *   capture or session, and for at most `MAX_PENDING_LOSS_CONTEXTS_PER_TAB`
+ *   contexts per tab.
  *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project (happy-dom). The real worker is built through
@@ -53,6 +62,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createEnvelope,
   decodeMessage,
+  DEFAULT_MAX_QUEUED_MESSAGES,
+  DEFAULT_WS_BACKOFF,
   encodeMessage,
   isMessageOfType,
   parseErrorPayload,
@@ -79,6 +90,7 @@ import type { TabBindingRecord } from '../src/background/messages';
 import {
   COLD_START_HELD_EVENTS_PER_TAB,
   createWorker,
+  MAX_PENDING_LOSS_CONTEXTS_PER_TAB,
   TELEMETRY_LOSS_NOTICE_INTERVAL_MS,
   telemetryLossNotice,
 } from '../src/background/service-worker';
@@ -150,6 +162,9 @@ const PRODUCER_ID_2 = 'prd_fedcba9876543210';
 /** The sessions the service binds {@link TAB_ID} and {@link OTHER_TAB_ID} to. */
 const SESSION_ID = 'ses_0123456789abcdef';
 const OTHER_SESSION_ID = 'ses_fedcba9876543210';
+
+/** The capture the page agent was armed for, of the exact shape the service mints. */
+const CAPTURE_ID = 'cap_0123456789abcdef';
 
 /**
  * The log line the worker writes when a batch it accepted could not be
@@ -478,6 +493,12 @@ interface FakeSocket extends WebSocketLike {
   receive(message: ProtocolMessage): void;
   /** The connection closed from the far side: `readyState` CLOSED, then `close`. */
   drop(code: number, reason?: string): void;
+  /**
+   * The connection died unnoticed: `readyState` stays OPEN and no event
+   * arrives, but every write throws — so the socket client queues each frame
+   * it is handed instead of writing it.
+   */
+  stall(): void;
 }
 
 /** A recording socket constructor and the list every socket it builds joins. */
@@ -491,6 +512,7 @@ function createSocketFactory(): {
     readyState: number = READY_STATE.connecting;
     readonly sent: string[] = [];
     readonly closeCalls: CloseCall[] = [];
+    private stalled = false;
     private readonly listeners: SocketListeners = {
       open: new Set(),
       message: new Set(),
@@ -517,10 +539,14 @@ function createSocketFactory(): {
     }
 
     send(data: string): void {
-      if (this.readyState !== READY_STATE.open) {
+      if (this.readyState !== READY_STATE.open || this.stalled) {
         throw new Error('the fake socket is not open');
       }
       this.sent.push(data);
+    }
+
+    stall(): void {
+      this.stalled = true;
     }
 
     close(code?: number, reason?: string): void {
@@ -583,6 +609,12 @@ interface WorkerHarnessOptions {
    * finds them. Defaults to none.
    */
   readonly boundTabs?: readonly number[];
+  /**
+   * The randomness the socket client's backoff jitter draws on. `() => 1`
+   * makes every reconnect delay exactly `DEFAULT_WS_BACKOFF`'s nominal one, so
+   * a case can fire it by its delay. Defaults to the platform's.
+   */
+  readonly random?: () => number;
 }
 
 /** The session the fake service binds a tab to. */
@@ -663,6 +695,7 @@ function createWorkerHarness(options: WorkerHarnessOptions): WorkerHarness {
       },
     },
     logger: createRecordingLogger(logs),
+    ...(options.random === undefined ? {} : { random: options.random }),
   };
 
   const worker = createWorker(env);
@@ -882,6 +915,8 @@ function batchFrame(
     readonly droppedCount?: number;
     readonly documentId?: string;
     readonly producerId?: string;
+    readonly captureId?: string;
+    readonly sessionId?: string;
   },
 ): BridgeUpstreamMessage<'telemetry.batch'> {
   const payload: PageTelemetryBatchPayload = {
@@ -890,6 +925,8 @@ function batchFrame(
     documentId: options.documentId ?? DOCUMENT_ID,
     batchSeq: options.batchSeq,
     droppedCount: options.droppedCount ?? 0,
+    ...(options.captureId === undefined ? {} : { captureId: options.captureId }),
+    ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
   };
   return {
     channel: EXTENSION_CHANNEL,
@@ -1670,5 +1707,572 @@ describe('the composed worker — events the page dropped before the batch', () 
 
     expect(lossIntervalsRunning(h)).toBe(0);
     expect(errorPushes(panel)).toEqual([telemetryLossNotice('dropped-in-page', 2)]);
+  });
+});
+
+/** The log line the worker writes once a loss-only report was forwarded. */
+const LOSS_REPORT_FORWARDED_LOG = "The page's telemetry loss report was forwarded.";
+
+/** The log line the worker writes when a loss-only report could not reach the service. */
+const LOSS_REPORT_UNDELIVERED_LOG =
+  'A telemetry loss report could not be delivered to the local service.';
+
+describe('the composed worker — loss-only reports reach the service', () => {
+  let h: WorkerHarness;
+
+  afterEach(() => {
+    h.worker.dispose();
+  });
+
+  /** The `loss` kind and count of every notice the worker pushed, in order. */
+  function noticeKinds(): (readonly [unknown, unknown])[] {
+    return logsOf(h, NOTICE_LOG).map((entry) => [entry.fields.loss, entry.fields.events]);
+  }
+
+  it('forwards an event-less batch as one telemetry.event { events: [], armedCaptureId, droppedCount } after session.bound, and shows its loss once', async () => {
+    h = createWorkerHarness({ paired: true, boundTabs: [TAB_ID] });
+    const panel = openPanel(h);
+    const bridge = connectReadyBridge(h);
+    await h.worker.ready;
+    const socket = onlySocket(h);
+    socket.accept();
+    await settle();
+
+    // The capture's last batch, then the loss no later batch will carry.
+    sendOnPort(bridge, batchFrame(makeEvents(0, 2), { batchSeq: 0, captureId: CAPTURE_ID }));
+    sendOnPort(bridge, batchFrame([], { batchSeq: 1, droppedCount: 9, captureId: CAPTURE_ID }));
+    await settle();
+    // Nothing leaves before the service confirms the re-announced binding.
+    expect(telemetryFramesOf(socket)).toEqual([]);
+
+    answerBinds(socket);
+    await settle();
+
+    // Decoded with the protocol's own validator, in arrival order.
+    const frames = telemetryFramesOf(socket);
+    expect(frames.map((frame) => frame.payload.events.map((event) => event.id))).toEqual([
+      eventIds(0, 2),
+      [],
+    ]);
+    expect(frames[0]?.payload).not.toHaveProperty('droppedCount');
+    expect(frames[1]?.payload).toEqual({
+      events: [],
+      armedCaptureId: CAPTURE_ID,
+      droppedCount: 9,
+    });
+    expect(frames[1]).toMatchObject({ tabId: TAB_ID, sessionId: SESSION_ID });
+    expect(logsOf(h, LOSS_REPORT_FORWARDED_LOG).map((entry) => entry.fields)).toEqual([
+      expect.objectContaining({ tabId: TAB_ID, dropped: 9 }),
+    ]);
+
+    // Shown once, as page-side loss; never as "undelivered", let alone of zero events.
+    expect(errorPushes(panel)).toEqual([telemetryLossNotice('dropped-in-page', 9)]);
+    await elapseLossInterval(h);
+    expect(errorPushes(panel)).toEqual([telemetryLossNotice('dropped-in-page', 9)]);
+    expect(noticeKinds()).toEqual([['dropped-in-page', 9]]);
+    expect(logsOf(h, LOSS_LOG)).toEqual([]);
+    expect(leaksSentinel(h.logs)).toBe(false);
+  });
+
+  it('still forwards the page’s loss when the cold-start hold refuses every event of its batch', async () => {
+    h = createWorkerHarness({ paired: true, boundTabs: [TAB_ID] });
+    const panel = openPanel(h);
+    const bridge = connectReadyBridge(h);
+    const refused = 3;
+
+    // Before start-up: the first batch fills the hold, and the second — which
+    // reports 4 events lost in the page — is refused whole.
+    sendOnPort(bridge, batchFrame(makeEvents(0, COLD_START_HELD_EVENTS_PER_TAB), { batchSeq: 0 }));
+    sendOnPort(
+      bridge,
+      batchFrame(makeEvents(COLD_START_HELD_EVENTS_PER_TAB, refused), {
+        batchSeq: 1,
+        droppedCount: 4,
+      }),
+    );
+    await settle();
+    expect(
+      logsOf(h, HOLD_OVERFLOW_LOG).map((entry) => [entry.fields.tabId, entry.fields.dropped]),
+    ).toEqual([[TAB_ID, refused]]);
+
+    const socket = await openAndBind(h);
+
+    // The held events, then the refused batch's loss on its own, in order.
+    // The events the hold refused are the worker's loss: the first job of the
+    // same context carries them to the service's ledger on its first frame.
+    const frames = telemetryFramesOf(socket);
+    expect(deliveredEventIds(socket)).toEqual(eventIds(0, COLD_START_HELD_EVENTS_PER_TAB));
+    expect(frames.at(-1)?.payload).toEqual({ events: [], droppedCount: 4 });
+    expect(frames.slice(0, -1).map((frame) => frame.payload.droppedCount)).toEqual(
+      frames.slice(0, -1).map((_, index) => (index === 0 ? refused : undefined)),
+    );
+    // Nothing is counted twice: the ledger receives the page's 4 and the 3.
+    expect(frames.reduce((sum, frame) => sum + (frame.payload.droppedCount ?? 0), 0)).toBe(
+      4 + refused,
+    );
+
+    // Each loss is shown once, with its own kind and count.
+    expect(noticeKinds()).toEqual([
+      ['dropped-in-page', 4],
+      ['undelivered', refused],
+    ]);
+    await elapseLossInterval(h);
+    expect(errorPushes(panel)).toHaveLength(2);
+    expect(errorPushes(panel)).toEqual(
+      expect.arrayContaining([
+        telemetryLossNotice('dropped-in-page', 4),
+        telemetryLossNotice('undelivered', refused),
+      ]),
+    );
+    expect(logsOf(h, LOSS_LOG)).toEqual([]);
+  });
+
+  it('reports a loss-only report that cannot reach the service by its count, with no undelivered notice', async () => {
+    // The tab's binding outlived the credential: nothing can confirm its route.
+    h = createWorkerHarness({ paired: false, boundTabs: [TAB_ID] });
+    const panel = openPanel(h);
+    const bridge = connectReadyBridge(h);
+    await h.worker.ready;
+    await settle();
+
+    sendOnPort(bridge, batchFrame([], { batchSeq: 0, droppedCount: 6 }));
+    await settle();
+    h.fireTimers(TELEMETRY_ROUTE_WAIT_MS);
+    await settle();
+
+    expect(h.sockets).toHaveLength(0);
+    expect(
+      logsOf(h, LOSS_REPORT_UNDELIVERED_LOG).map((entry) => [
+        entry.level,
+        entry.fields.tabId,
+        entry.fields.dropped,
+        entry.fields.errorCode,
+      ]),
+    ).toEqual([['warn', TAB_ID, 6, 'TRANSPORT_DISCONNECTED']]);
+    expect(logsOf(h, LOSS_LOG)).toEqual([]);
+    expect(errorPushes(panel)).toEqual([telemetryLossNotice('dropped-in-page', 6)]);
+    expect(noticeKinds()).toEqual([['dropped-in-page', 6]]);
+  });
+
+  it('ignores an empty batch that reports no loss: nothing is queued, waited for or shown', async () => {
+    h = createWorkerHarness({ paired: true, boundTabs: [TAB_ID] });
+    const panel = openPanel(h);
+    const bridge = connectReadyBridge(h);
+    await h.worker.ready;
+    const socket = await openAndBind(h);
+    const routeWaits = h.timersPending(TELEMETRY_ROUTE_WAIT_MS);
+
+    sendOnPort(bridge, batchFrame([], { batchSeq: 0 }));
+    await settle();
+
+    expect(h.timersPending(TELEMETRY_ROUTE_WAIT_MS)).toBe(routeWaits);
+    expect(telemetryFramesOf(socket)).toEqual([]);
+    expect(
+      logsOf(h, 'An empty telemetry batch that reports no loss was ignored.').map(
+        (entry) => entry.fields.tabId,
+      ),
+    ).toEqual([TAB_ID]);
+    expect(errorPushes(panel)).toEqual([]);
+    expect(noticeKinds()).toEqual([]);
+  });
+});
+
+/*
+ * ===========================================================================
+ * Loss the worker caused reaches the service's producer-loss ledger
+ * ===========================================================================
+ */
+
+/** The log line of a loss-only report that arrived at its tab's full lane. */
+const LANE_FULL_REPORT_LOG =
+  'A telemetry loss report found its tab’s lane full; its count is held.';
+
+/** The log line of every count the worker holds for the service's ledger. */
+const HELD_LOSS_LOG = 'Telemetry loss is held until the service can be told.';
+
+/** The log line of a held count the worker forwarded on a loss-only frame of its own. */
+const HELD_LOSS_FORWARDED_LOG = 'Telemetry loss the service was not told of was forwarded.';
+
+/** The log line of the oldest context's count abandoned beyond the context bound. */
+const CONTEXTS_ABANDONED_LOG =
+  'Telemetry loss the service was not told of was abandoned: its tab holds loss for too many capture contexts.';
+
+/** The log line of a batch produced for another session or capture than its tab's binding. */
+const STALE_BATCH_LOG = 'A telemetry batch produced for another session or capture was dropped.';
+
+/** The log line of a loss-only report produced for another session or capture. */
+const STALE_REPORT_LOG =
+  'A telemetry loss report produced for another session or capture was dropped.';
+
+/** A canonical capture id, distinct per `index` and from {@link CAPTURE_ID}. */
+function captureIdOf(index: number): string {
+  return `cap_${hexId(0x100 + index, 16)}`;
+}
+
+describe('the composed worker — loss the worker caused reaches the service ledger', () => {
+  let h: WorkerHarness;
+
+  afterEach(() => {
+    h.worker.dispose();
+  });
+
+  /**
+   * A paired worker whose tab is bound in session storage, started, with its
+   * panel and its announced content bridge — and a socket still connecting,
+   * so the tab's route is not confirmed and its batches wait on the lane.
+   */
+  async function startUnconfirmed(): Promise<{
+    readonly panel: FakePort;
+    readonly bridge: FakePort;
+  }> {
+    h = createWorkerHarness({ paired: true, boundTabs: [TAB_ID] });
+    const panel = openPanel(h);
+    const bridge = connectReadyBridge(h);
+    await h.worker.ready;
+    await settle();
+    return { panel, bridge };
+  }
+
+  /** Fill the tab's lane: {@link LANE_BOUND} one-event batches, stamped with `captureId` when given. */
+  function fillLane(bridge: FakePort, captureId?: string): void {
+    for (let batchSeq = 0; batchSeq < LANE_BOUND; batchSeq += 1) {
+      sendOnPort(
+        bridge,
+        batchFrame(makeEvents(batchSeq, 1), {
+          batchSeq,
+          ...(captureId === undefined ? {} : { captureId }),
+        }),
+      );
+    }
+  }
+
+  /** The service confirms TAB_ID's binding once more, as a re-announcement's answer. */
+  function confirmAgain(socket: FakeSocket): void {
+    socket.receive(
+      createEnvelope('session.bound', {
+        sessionId: SESSION_ID,
+        tabId: TAB_ID,
+        url: APP_URL,
+        reason: 'bound',
+      }),
+    );
+  }
+
+  it('holds a loss-only report that arrives at a full lane, and carries its count on the next batch of the same capture', async () => {
+    const { panel, bridge } = await startUnconfirmed();
+    fillLane(bridge, CAPTURE_ID);
+    sendOnPort(
+      bridge,
+      batchFrame([], { batchSeq: LANE_BOUND, droppedCount: 9, captureId: CAPTURE_ID }),
+    );
+    await settle();
+    expect(
+      logsOf(h, LANE_FULL_REPORT_LOG).map((entry) => [
+        entry.level,
+        entry.fields.tabId,
+        entry.fields.dropped,
+      ]),
+    ).toEqual([['warn', TAB_ID, 9]]);
+
+    const socket = await openAndBind(h);
+
+    // The first queued batch of the same capture carries the count: no
+    // event-less frame is needed, and the count is carried exactly once.
+    const frames = telemetryFramesOf(socket);
+    expect(deliveredEventIds(socket)).toEqual(eventIds(0, LANE_BOUND));
+    expect(frames.every((frame) => frame.payload.events.length > 0)).toBe(true);
+    expect(frames.map((frame) => frame.payload.droppedCount)).toEqual(
+      frames.map((_, index) => (index === 0 ? 9 : undefined)),
+    );
+    expect(new Set(frames.map((frame) => frame.payload.armedCaptureId))).toEqual(
+      new Set([CAPTURE_ID]),
+    );
+    // The panel's notice is unchanged: the page's loss, shown once on arrival.
+    expect(errorPushes(panel)).toEqual([telemetryLossNotice('dropped-in-page', 9)]);
+    expect(leaksSentinel(h.logs)).toBe(false);
+    expect(JSON.stringify(h.logs)).not.toContain(CAPTURE_ID);
+  });
+
+  it('sends a held count as one loss-only frame of its capture once session.bound confirms the route, behind a full lane and only once', async () => {
+    const { bridge } = await startUnconfirmed();
+    // The lane is full of batches that name no capture, so none carries it.
+    fillLane(bridge);
+    sendOnPort(
+      bridge,
+      batchFrame([], { batchSeq: LANE_BOUND, droppedCount: 9, captureId: CAPTURE_ID }),
+    );
+    await settle();
+    const socket = onlySocket(h);
+    socket.accept();
+    await settle();
+    // Nothing leaves before the service confirms the re-announced binding.
+    expect(telemetryFramesOf(socket)).toEqual([]);
+
+    // Two confirmations in a row schedule one report, not two.
+    answerBinds(socket);
+    confirmAgain(socket);
+    await settle();
+
+    const frames = telemetryFramesOf(socket);
+    expect(frames).toHaveLength(LANE_BOUND + 1);
+    expect(deliveredEventIds(socket)).toEqual(eventIds(0, LANE_BOUND));
+    expect(
+      frames
+        .slice(0, -1)
+        .every(
+          (frame) =>
+            frame.payload.droppedCount === undefined && frame.payload.armedCaptureId === undefined,
+        ),
+    ).toBe(true);
+    expect(frames.at(-1)).toMatchObject({ tabId: TAB_ID, sessionId: SESSION_ID });
+    expect(frames.at(-1)?.payload).toEqual({
+      events: [],
+      armedCaptureId: CAPTURE_ID,
+      droppedCount: 9,
+    });
+    expect(logsOf(h, HELD_LOSS_FORWARDED_LOG).map((entry) => entry.fields)).toEqual([
+      expect.objectContaining({ tabId: TAB_ID, dropped: 9, held: 9 }),
+    ]);
+
+    // A later confirmation finds nothing held and sends nothing.
+    confirmAgain(socket);
+    await settle();
+    expect(telemetryFramesOf(socket)).toHaveLength(LANE_BOUND + 1);
+  });
+
+  it('holds the events and loss of a batch whose route was not confirmed in time, and delivers them as one loss-only frame of the same capture once it is', async () => {
+    const { panel, bridge } = await startUnconfirmed();
+    sendOnPort(
+      bridge,
+      batchFrame(makeEvents(0, 3), { batchSeq: 0, droppedCount: 2, captureId: CAPTURE_ID }),
+    );
+    await settle();
+    h.fireTimers(TELEMETRY_ROUTE_WAIT_MS);
+    await settle();
+    expect(
+      logsOf(h, LOSS_LOG).map((entry) => [
+        entry.fields.tabId,
+        entry.fields.events,
+        entry.fields.stage,
+      ]),
+    ).toEqual([[TAB_ID, 3, 'route']]);
+    expect(
+      logsOf(h, HELD_LOSS_LOG).map((entry) => [entry.fields.dropped, entry.fields.source]),
+    ).toEqual([[3 + 2, 'route']]);
+
+    const socket = await openAndBind(h);
+
+    // The same capture, the tab's own session: never relabelled.
+    const frames = telemetryFramesOf(socket);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ tabId: TAB_ID, sessionId: SESSION_ID });
+    expect(frames[0]?.payload).toEqual({
+      events: [],
+      armedCaptureId: CAPTURE_ID,
+      droppedCount: 3 + 2,
+    });
+    // The panel's notices are unchanged: the page's loss, then the undelivered events.
+    expect(errorPushes(panel)).toEqual([
+      telemetryLossNotice('dropped-in-page', 2),
+      telemetryLossNotice('undelivered', 3),
+    ]);
+    expect(leaksSentinel(h.logs)).toBe(false);
+  });
+
+  it('holds nothing for a batch dropped for its binding: one stamped for another session never reaches the tab’s session', async () => {
+    const { bridge } = await startUnconfirmed();
+    sendOnPort(
+      bridge,
+      batchFrame(makeEvents(0, 2), { batchSeq: 0, droppedCount: 5, sessionId: OTHER_SESSION_ID }),
+    );
+    await settle();
+    expect(
+      logsOf(h, STALE_BATCH_LOG).map((entry) => [
+        entry.fields.tabId,
+        entry.fields.reason,
+        entry.fields.dropped,
+      ]),
+    ).toEqual([[TAB_ID, 'session-mismatch', 5]]);
+    expect(logsOf(h, HELD_LOSS_LOG)).toEqual([]);
+
+    const socket = await openAndBind(h);
+
+    expect(telemetryFramesOf(socket)).toEqual([]);
+  });
+
+  it('carries a held count only under its own capture, never on a later capture’s batch', async () => {
+    const { bridge } = await startUnconfirmed();
+    const laterCapture = captureIdOf(1);
+    // A batch of the first capture waits out its route …
+    sendOnPort(
+      bridge,
+      batchFrame(makeEvents(0, 2), { batchSeq: 0, droppedCount: 1, captureId: CAPTURE_ID }),
+    );
+    await settle();
+    h.fireTimers(TELEMETRY_ROUTE_WAIT_MS);
+    await settle();
+    // … and the page moves on to the next capture.
+    sendOnPort(bridge, batchFrame(makeEvents(2, 1), { batchSeq: 1, captureId: laterCapture }));
+    await settle();
+
+    const socket = await openAndBind(h);
+
+    expect(
+      telemetryFramesOf(socket).map((frame) => [
+        frame.payload.events.length,
+        frame.payload.armedCaptureId,
+        frame.payload.droppedCount,
+      ]),
+    ).toEqual([
+      [1, laterCapture, undefined],
+      [0, CAPTURE_ID, 2 + 1],
+    ]);
+  });
+
+  it('abandons a held count whose tab is bound to another session when the route is confirmed, rather than sending it as that session’s', async () => {
+    const { bridge } = await startUnconfirmed();
+    sendOnPort(
+      bridge,
+      batchFrame(makeEvents(0, 2), { batchSeq: 0, droppedCount: 1, captureId: CAPTURE_ID }),
+    );
+    await settle();
+    h.fireTimers(TELEMETRY_ROUTE_WAIT_MS);
+    await settle();
+    const socket = onlySocket(h);
+    socket.accept();
+    await settle();
+
+    // The service answers the re-announced bind with another session.
+    socket.receive(
+      createEnvelope('session.bound', {
+        sessionId: OTHER_SESSION_ID,
+        tabId: TAB_ID,
+        url: APP_URL,
+        reason: 'bound',
+      }),
+    );
+    await settle();
+
+    expect(telemetryFramesOf(socket)).toEqual([]);
+    expect(
+      logsOf(h, STALE_REPORT_LOG).map((entry) => [
+        entry.fields.tabId,
+        entry.fields.dropped,
+        entry.fields.reason,
+      ]),
+    ).toEqual([[TAB_ID, 2 + 1, 'session-mismatch']]);
+
+    // The new session's batches go without the abandoned count.
+    sendOnPort(bridge, batchFrame(makeEvents(2, 1), { batchSeq: 1 }));
+    await settle();
+    expect(
+      telemetryFramesOf(socket).map((frame) => [frame.sessionId, frame.payload.droppedCount]),
+    ).toEqual([[OTHER_SESSION_ID, undefined]]);
+  });
+
+  it('holds loss for at most MAX_PENDING_LOSS_CONTEXTS_PER_TAB contexts per tab, abandoning the oldest with a counts-only warning', async () => {
+    const { bridge } = await startUnconfirmed();
+    fillLane(bridge);
+    const contexts = MAX_PENDING_LOSS_CONTEXTS_PER_TAB + 1;
+    for (let index = 0; index < contexts; index += 1) {
+      sendOnPort(
+        bridge,
+        batchFrame([], {
+          batchSeq: LANE_BOUND + index,
+          droppedCount: index + 1,
+          captureId: captureIdOf(index),
+        }),
+      );
+    }
+    await settle();
+    expect(
+      logsOf(h, CONTEXTS_ABANDONED_LOG).map((entry) => [
+        entry.level,
+        entry.fields.tabId,
+        entry.fields.dropped,
+        entry.fields.limit,
+      ]),
+    ).toEqual([['warn', TAB_ID, 1, MAX_PENDING_LOSS_CONTEXTS_PER_TAB]]);
+
+    const socket = await openAndBind(h);
+
+    // Every other context's count reaches the socket under its own capture.
+    const reports = telemetryFramesOf(socket).filter((frame) => frame.payload.events.length === 0);
+    expect(
+      reports.map((frame) => [frame.payload.armedCaptureId, frame.payload.droppedCount]),
+    ).toEqual(
+      Array.from({ length: MAX_PENDING_LOSS_CONTEXTS_PER_TAB }, (_, offset) => [
+        captureIdOf(offset + 1),
+        offset + 2,
+      ]),
+    );
+    const logged = JSON.stringify(h.logs);
+    for (let index = 0; index < contexts; index += 1) {
+      expect(logged).not.toContain(captureIdOf(index));
+    }
+  });
+
+  it('holds the loss a frame the socket client queued and discarded carried, and sends it once the next connection confirms the route', async () => {
+    h = createWorkerHarness({ paired: true, boundTabs: [TAB_ID], random: () => 1 });
+    const bridge = connectReadyBridge(h);
+    await h.worker.ready;
+    const socket = await openAndBind(h);
+    // The connection dies unnoticed: each loss-only report's one frame is
+    // taken into the socket client's queue instead of being written.
+    socket.stall();
+    const reports = DEFAULT_MAX_QUEUED_MESSAGES + 1;
+    for (let batchSeq = 0; batchSeq < reports; batchSeq += 1) {
+      sendOnPort(
+        bridge,
+        batchFrame([], { batchSeq, droppedCount: batchSeq + 1, captureId: CAPTURE_ID }),
+      );
+      if (batchSeq % 50 === 49) {
+        // Let the lane drain, so no report meets a full lane.
+        await settle();
+      }
+    }
+    await settle();
+
+    // The full queue discarded the oldest report, and the worker holds its count.
+    expect(h.worker.wsBridge.getStatus()).toMatchObject({
+      droppedFrameCount: 1,
+      queuedFrameCount: DEFAULT_MAX_QUEUED_MESSAGES,
+    });
+    expect(
+      logsOf(h, HELD_LOSS_LOG).map((entry) => [
+        entry.fields.tabId,
+        entry.fields.dropped,
+        entry.fields.source,
+      ]),
+    ).toEqual([[TAB_ID, 1, 'socket-queue']]);
+
+    // The next connection flushes the queue, then confirms the route: the held
+    // count follows as a loss-only frame of the same capture.
+    socket.drop(1006);
+    await settle();
+    expect(h.fireTimers(DEFAULT_WS_BACKOFF.initialMs)).toBeGreaterThan(0);
+    await settle();
+    expect(h.sockets).toHaveLength(2);
+    const next = h.sockets[1];
+    if (next === undefined) {
+      expect.unreachable('the worker did not reconnect');
+    }
+    next.accept();
+    await settle();
+    answerBinds(next);
+    await settle();
+
+    const frames = telemetryFramesOf(next);
+    expect(frames).toHaveLength(DEFAULT_MAX_QUEUED_MESSAGES + 1);
+    expect(frames.at(-1)).toMatchObject({ tabId: TAB_ID, sessionId: SESSION_ID });
+    expect(frames.at(-1)?.payload).toEqual({
+      events: [],
+      armedCaptureId: CAPTURE_ID,
+      droppedCount: 1,
+    });
+    // Every report's count reached a socket exactly once.
+    expect(frames.map((frame) => frame.payload.droppedCount ?? 0).sort((a, b) => a - b)).toEqual(
+      Array.from({ length: reports }, (_, index) => index + 1),
+    );
   });
 });

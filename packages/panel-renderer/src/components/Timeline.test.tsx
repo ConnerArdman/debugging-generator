@@ -6,11 +6,11 @@
  *
  * The `timeline` node is the one view that shows the whole correlated shape of
  * an interaction at once: the click, the request it made, the server span that
- * answered it and the datastore call underneath, on one axis, in lanes by tier
- * (AAP 0.4.2, 0.6.2). `tests/e2e/demo-slow-interaction.spec.ts` proves that
- * chain end to end against a running application; this suite is the fast
- * feedback loop for the *rendering* half of the same story, and it is deliberately
- * more than a smoke test:
+ * answered it and the datastore call underneath, on one axis, in lanes by tier.
+ * `tests/e2e/demo-slow-interaction.spec.ts` proves that chain end to end
+ * against a running application; this suite is the fast feedback loop for the
+ * *rendering* half of the same story, and it is deliberately more than a smoke
+ * test:
  *
  *   - **Both payload shapes.** The catalog lets this node read either the
  *     correlated `trace` tree or a flat page of `spans`, and the component
@@ -23,11 +23,11 @@
  *     span ids; the orphan case asserts that a re-attached node is drawn, flagged,
  *     and counted — the rendered row count equals the tree's own `nodeCount`.
  *   - **Parent before child on a flat page.** A `spans` page is linked into a
- *     parent/child forest before it is drawn (AAP 0.2.3): a child whose clock
- *     reads earlier than its parent's still follows it, a subtree stays
- *     contiguous, siblings fall back to `ingestSeq` last, a parent cycle drops
- *     nothing and a row hanging beneath one still follows its parent, and a
- *     span whose parent is not loaded is marked "Parent not loaded" — never
+ *     parent/child forest before it is drawn: a child whose clock reads
+ *     earlier than its parent's still follows it, a subtree stays contiguous,
+ *     siblings fall back to `ingestSeq` last, a parent cycle drops nothing and
+ *     a row hanging beneath one still follows its parent, and a span whose
+ *     parent is not loaded is marked "Parent not loaded" — never
  *     "Re-attached" — until a later page brings the parent.
  *   - **Partial results say so.** A `spans` page states how much of the result it
  *     holds and offers to load more; a `trace` the correlator truncated says
@@ -54,14 +54,15 @@
  *   - **The canvas is not the only representation.** The SVG is `role="img"` with
  *     a text alternative, so its bars are deliberately outside the accessibility
  *     tree; the keyboard-reachable equivalent below it must therefore list every
- *     row and be operable (AAP 0.6.4).
+ *     row and be operable.
  *   - **Descriptions are not hover-only.** A row that holds keyboard focus
  *     shows its description in its Operation cell, dismissed by Escape, and no
  *     row's name is a tab stop, so the table body stays one roving stop; the
  *     focused row drives the detail strip, whose name is the pointer's trigger
  *     for the same description and no tab stop of its own.
  *   - **The three states of a query-backed view** and the **click-to-source
- *     payload** that AAP 0.8.3 asks of every component suite in this folder.
+ *     payload**, the contracts every query-backed component in this folder is
+ *     held to.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -75,12 +76,12 @@
  *     it drew.
  *   - **In-file synthetic builders, no fixture files.** {@link makeEvent},
  *     {@link makeTraceNode}, {@link makeTree} and {@link makeNode} take overrides.
- *     The correlated trees are **hand-constructed**: `@debuggen/telemetry` is a
- *     type-only dependency of this package (AAP 0.2.2), so neither the component
- *     nor this suite may reach for its builders, and a fixture assembled by the
- *     very code under discussion would prove less.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): span names, a file path and
- *     a symbol belonging to no application, demonstration or otherwise — in the
+ *     The correlated trees are **hand-constructed**: this package depends on
+ *     `@debuggen/telemetry` for types only, so neither the component nor this
+ *     suite may reach for its builders, and a fixture assembled by the very
+ *     code under discussion would prove less.
+ *   - **Generic fixture vocabulary only**: span names, a file path and a
+ *     symbol belonging to no application, demonstration or otherwise — in the
  *     fixtures and in the comments alike.
  *   - **Layout is not stubbed.** No `getBoundingClientRect` override, no
  *     `ResizeObserver` polyfill and no size getter anywhere: the component reads
@@ -166,9 +167,9 @@ import { Timeline } from './Timeline';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Every string below is application-neutral (AAP 0.5.4): no component, route,
- * service or symbol of any inspected project appears here. The identifiers are
- * shaped as a capture shapes them — a 32-hex trace id, 16-hex span ids, epoch
+ * Every string below is application-neutral: no component, route, service or
+ * symbol of any inspected project appears here. The identifiers are shaped as
+ * a capture shapes them — a 32-hex trace id, 16-hex span ids, epoch
  * millisecond start times and millisecond durations — because the component
  * reads exactly those fields and formats them.
  * ---------------------------------------------------------------------------
@@ -238,8 +239,8 @@ const FAILING_QUERY_NAME = 'Failing query';
 
 /*
  * The shared error-state contract, spelled out rather than imported: these are
- * the words every query-backed node shows a reader, so a change to any of them
- * is a change this suite should notice (B1-F16, B2-F14).
+ * the words every query-backed node shows a reader, so a drift in any of them
+ * is a change this suite notices rather than one it silently adopts.
  */
 
 /** The title of a view whose own data could not be loaded. */
@@ -823,7 +824,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -891,8 +892,8 @@ function renderComponent(
  * The canvas, once the query has settled.
  *
  * Obtained by its role: the SVG is `role="img"` with a text alternative, which
- * is the treatment AAP 0.6.4 permits only alongside the keyboard-reachable
- * equivalent every case below also asserts.
+ * keeps its bars out of the accessibility tree and is therefore sound only
+ * alongside the keyboard-reachable equivalent every case below also asserts.
  *
  * @returns The `svg` element.
  */
@@ -1095,7 +1096,7 @@ describe('Timeline states', () => {
     expect(busy.parentElement?.classList.contains('dg-timeline__loading')).toBe(true);
 
     // Nothing is drawn yet: no canvas, no equivalent table, and above all no
-    // empty state — an unsettled query is not an answer (AAP 0.5.5).
+    // empty state — an unsettled query is not an answer.
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
@@ -1110,7 +1111,7 @@ describe('Timeline states', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     // Queried by a generic substring of the product's own copy rather than by a
-    // restatement of the sentence (AAP 0.5.4).
+    // restatement of the sentence.
     const message = await screen.findByText(/no correlated spans were captured/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
     expect(message.closest('.dg-timeline__empty')).not.toBeNull();
@@ -1313,7 +1314,7 @@ describe('Timeline cross-tier chain', () => {
       const row = rowNamed(event.name);
 
       // The name is rendered exactly as the capture carried it: no shortening,
-      // no re-derivation from a url or a symbol (AAP 0.5.2).
+      // no re-derivation from a url or a symbol.
       expect(within(row).getByText(event.name).textContent).toBe(event.name);
 
       // A duration and an offset, both formatted; the wall-clock instant the
@@ -1361,7 +1362,7 @@ describe('Timeline cross-tier chain', () => {
 
     for (const event of CHAIN_EVENTS) {
       // A bar's colour reaches the stylesheet as the kind scale's token, which is
-      // the only inline value this view writes (AAP 0.6.3).
+      // the only inline value this view writes.
       expect(barTitled(canvas, event.name).getAttribute('style')).toContain(
         kindColorVar(event.kind),
       );
@@ -2808,7 +2809,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
  * with more than one possible parent, and a span whose parent never arrived. Both
  * are drawn and both are flagged — the first because a guess must not read as a
  * measurement, the second because dropping it would remove real captured work
- * from the picture (AAP 0.4.2).
+ * from the picture.
  * ---------------------------------------------------------------------------
  */
 
@@ -2988,12 +2989,13 @@ describe('Timeline correlation honesty', () => {
  * ---------------------------------------------------------------------------
  * Span order on a flat page
  *
- * AAP 0.2.3 fixes the order within a trace as parent-before-child, then
- * `startTime`, then `(producerId, seq)`, then `ingestSeq`. A `spans` page has no
- * tree to walk, so the component links the loaded rows into one before drawing
- * them. Every fixture below is built so that a pure time order would draw it
- * differently, and each is served out of order, so a case can only pass when
- * the structure — not the arrival order and not the clock — decided the rows.
+ * The canonical order within a trace is parent-before-child, then `startTime`,
+ * then `(producerId, seq)`, then `ingestSeq` (`docs/ARCHITECTURE.md`,
+ * "Ordering"). A `spans` page has no tree to walk, so the component links the
+ * loaded rows into one before drawing them. Every fixture below is built so
+ * that a pure time order would draw it differently, and each is served out of
+ * order, so a case can only pass when the structure — not the arrival order
+ * and not the clock — decided the rows.
  * ---------------------------------------------------------------------------
  */
 
@@ -3835,7 +3837,7 @@ describe('Timeline accessibility', () => {
 
     // The canvas is an image with a text alternative — the treatment that keeps
     // its bars out of the accessibility tree — and it is not hidden, so that
-    // alternative has to describe what was drawn (AAP 0.6.4).
+    // alternative has to describe what was drawn.
     expect(canvas.tagName.toLowerCase()).toBe('svg');
     expect(canvas.getAttribute('aria-hidden')).toBeNull();
 
@@ -3914,8 +3916,9 @@ describe('Timeline interactions', () => {
     const received = call[0];
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
-    // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2, hop 1 of five).
+    // `confidence` and an invented extra field both fail here. This is the
+    // first hop of the click-to-source chain (`docs/ARCHITECTURE.md`, "A click,
+    // end to end"), and every hop after it acts on the object it is handed.
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);

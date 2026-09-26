@@ -1,6 +1,6 @@
 /**
  * Tests for this package's message payload modules, in the directory
- * `packages/protocol/tsconfig.json` names for them (AAP 0.8.3).
+ * `packages/protocol/tsconfig.json` names for them.
  *
  * What is on trial here is the **wire contract**, not the schema library: every
  * assertion below is a statement about what one process may send and another
@@ -9,10 +9,9 @@
  *
  * ## The generic `error` frame, and why it is pinned this tightly
  *
- * AAP 0.4.2 specifies that payload exactly as `{ code, message, ref? }`, and
- * `../messages/error.ts` is the single definition of it (AAP 0.9.1). Two
- * properties make the shape easy to widen by accident, which is what these
- * tests stand against:
+ * Its payload is exactly `{ code, message, ref? }`, and `../messages/error.ts`
+ * is the single definition of it. Two properties make the shape easy to widen
+ * by accident, which is what these tests stand against:
  *
  * - `DebuggenError.toPayload()` — the class every process reports failures
  *   through — returns `{ code, message, hint? }`. It is *nearly* this payload,
@@ -23,7 +22,7 @@
  *   sanctioned projection, and the cases below assert both halves: what it
  *   produces parses, and what it exists to replace does not.
  * - a rejection must name the offending **key** and never echo the offending
- *   **value** (AAP 0.5.2), because a rejected frame is unvalidated data from
+ *   **value**, because a rejected frame is unvalidated data from
  *   another process and this product does not put such data into an error
  *   message, a log line or a persisted session row.
  *
@@ -31,13 +30,13 @@
  *
  * `../analysis.ts` is the single definition of the shape carried by the
  * `analysis.completed` payload, stored in the `analyses` table and handed to
- * `normalizePanel` (AAP 0.9.1). Its element schemas are **imported** from
+ * `normalizePanel`. Its element schemas are **imported** from
  * `@debuggen/panel-schema` rather than restated, and that is not a claim a
  * reader can check by inspection — a local copy of `Fact` would compile, would
  * type-check identically and would differ only in what it refuses. So the cases
  * below exercise the constraint only the imported schema has: a fact with an
- * empty `evidence` array is refused, which is what makes AAP 0.8.4's
- * "unevidenced observation" structurally impossible rather than merely
+ * empty `evidence` array is refused, which is what makes an observation with
+ * no evidence structurally impossible rather than merely
  * discouraged. The rest pin the fields deterministic code owns — the version
  * floor, the self-supersede rule, the closed metric vocabulary — and the
  * privacy rule, which applies to a rejected analysis exactly as it applies to a
@@ -56,11 +55,11 @@
  *
  * - `instrumentation.plan` carries the **normalised** plan, so the authoring
  *   shape a model produces — no `version`, no `planVersion`, actions with no
- *   `adapter` or `mode` — is refused (AAP §0.2.3);
+ *   `adapter` or `mode` — is refused;
  * - `telemetry.event` carries the strict **ingress** event, so an element
  *   carrying `sessionId`, `captureId` or `ingestSeq` is refused: attribution is
  *   the service's to assign, and a producer that could claim a session could
- *   write into another session's capture (AAP §0.4.2, §0.5.6);
+ *   write into another session's capture;
  * - `telemetry.tail` carries the **persisted** event, which is the mirror image
  *   — the same three fields are required;
  * - `instrumentation.ready` carries the journal's own record, so a digest that
@@ -71,7 +70,7 @@
  *   the imported schemas rather than written out a second time;
  * - `panel.generated` carries the panel specification, so a node type outside
  *   the catalogue is refused — while a specification marked `meta.fallback` is a
- *   **success**, never an error (AAP §0.5.5);
+ *   **success**, never an error;
  * - `source.open` and `cleanup.completed` carry the shared source-location and
  *   conflict shapes, so an absolute path, a `..` traversal and a zero line are
  *   refused by the same schema every located runtime item already answers to;
@@ -107,7 +106,7 @@
  * `sessionId` naming a different session than the payload does — its own
  * `sessionId`, or a session record's `id` — is refused at `sessionId` without
  * echoing either id, for every type whose fixture names a session, while the
- * six payloads that name none accept any routing key (AAP §0.5.6).
+ * six payloads that name none accept any routing key.
  *
  * ## The parse helpers, one table
  *
@@ -2907,7 +2906,7 @@ describe('telemetry.event — the strict ingress schema does the refusing', () =
     // The only payload in this folder with no `sessionId`, and deliberately so:
     // the service resolves a telemetry frame to a session from the *connection*
     // — the tab binding for a browser producer, the credential's scoped project
-    // root for a server one (AAP §0.4.2, §0.5.6). Beside the batch it carries
+    // root for a server one. Beside the batch it carries
     // only delivery context: the capture the producer was armed for, which can
     // refuse a late batch but never choose a capture, and its loss report.
     expect(Object.keys(telemetryEventPayloadSchema.shape)).toEqual([
@@ -2962,14 +2961,129 @@ describe('telemetry.event — the strict ingress schema does the refusing', () =
     );
   });
 
-  it('requires a non-empty batch', () => {
-    // An empty batch is a producer that flushed nothing, and a consumer that
-    // accepted it would record an ingest of zero events as a successful frame.
-    expect(telemetryEventPayloadSchema.safeParse({ events: [] }).success).toBe(false);
+  it('refuses an empty batch that reports no loss, under the events path', () => {
+    // An empty batch without a loss is a producer that flushed nothing, and a
+    // consumer that accepted it would record an ingest of zero events as a
+    // successful frame. Naming the capture adds nothing, and a zero count is no
+    // loss at all.
+    for (const payload of [
+      { events: [] },
+      { events: [], droppedCount: 0 },
+      { events: [], armedCaptureId: CAPTURE_ID },
+      { events: [], armedCaptureId: CAPTURE_ID, droppedCount: 0 },
+    ]) {
+      const refused = telemetryEventPayloadSchema.safeParse(payload);
+
+      expect(refused.success).toBe(false);
+      if (refused.success) {
+        return;
+      }
+      expect(issuePaths(refused.error)).toEqual(['events']);
+      expect(refused.error.issues[0]?.code).toBe('custom');
+    }
     expect(telemetryEventPayloadSchema.safeParse({}).success).toBe(false);
     expect(telemetryEventPayloadSchema.safeParse({ events: validIngressEvent() }).success).toBe(
       false,
     );
+  });
+
+  it('accepts an event-less batch as a loss-only report, and returns it unchanged', () => {
+    // What a producer sends when no later batch will carry its loss — at a
+    // capture's end, say — so the count still reaches the service's ledger and
+    // the capture does not look complete.
+    const lossOnly = { events: [], droppedCount: 3 };
+    const armedLossOnly = { events: [], droppedCount: 3, armedCaptureId: CAPTURE_ID };
+
+    expect(telemetryEventPayloadSchema.parse(lossOnly)).toStrictEqual(lossOnly);
+    expect(telemetryEventPayloadSchema.parse(armedLossOnly)).toStrictEqual(armedLossOnly);
+
+    const parsed = parseTelemetryEventPayload(armedLossOnly);
+
+    expect(parsed.ok ? parsed.value : renderedIssuePaths(parsed.error)).toStrictEqual(
+      armedLossOnly,
+    );
+  });
+
+  it('refuses a malformed loss count on an event-less batch by its own issue alone', () => {
+    // The loss-only rule runs on an otherwise valid payload, so a bad count is
+    // reported once, where it is, rather than as a second, derived issue.
+    for (const droppedCount of [-1, 1.5, '3']) {
+      const refused = telemetryEventPayloadSchema.safeParse({ events: [], droppedCount });
+
+      expect(refused.success).toBe(false);
+      if (refused.success) {
+        return;
+      }
+      expect(issuePaths(refused.error)).toEqual(['droppedCount']);
+    }
+  });
+
+  it('reports an empty batch by the rule it broke, never by a received value', () => {
+    // The sentinel is a well-formed capture id, so the loss-only rule is the one
+    // issue: the rejection must name it without echoing anything it was sent.
+    const parsed = parseTelemetryEventPayload({ events: [], armedCaptureId: SENTINEL });
+
+    expect(isErr(parsed)).toBe(true);
+    if (!isErr(parsed)) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(renderedIssuePaths(parsed.error)).toEqual(['events']);
+    expect(parsed.error.message).toContain('events (custom label=empty-batch-reports-loss)');
+    for (const surface of renderedSurfaces(parsed.error)) {
+      expect(surface).not.toContain(SENTINEL);
+    }
+  });
+
+  it('carries a loss-only report in a whole telemetry.event frame through parseMessage', () => {
+    const payload = { events: [], droppedCount: 3, armedCaptureId: CAPTURE_ID };
+    const frame = frameOf('telemetry.event', payload);
+    const parsed = parseMessage(frame);
+
+    expect(parsed.ok ? parsed.value : renderedIssuePaths(parsed.error)).toStrictEqual(frame);
+
+    // The rule is the payload schema's, so the envelope enforces it too.
+    const refused = parseMessage(frameOf('telemetry.event', { events: [] }));
+
+    expect(isErr(refused)).toBe(true);
+    if (!isErr(refused)) {
+      return;
+    }
+    expect(renderedIssuePaths(refused.error)).toEqual(['payload.events']);
+  });
+
+  it('keeps its shape and its batch bound readable where consumers read them', () => {
+    // The Chrome service worker and the service's ingest loop read the bound off
+    // `shape.events` structurally, so the loss-only rule must leave the object's
+    // `.shape` and the array's `max_length` check exactly where they were.
+    expect(Object.keys(telemetryEventPayloadSchema.shape)).toEqual([
+      'events',
+      'armedCaptureId',
+      'droppedCount',
+    ]);
+    const maxima = telemetryEventPayloadSchema.shape.events.def.checks?.flatMap((check) =>
+      check._zod.def.check === 'max_length' && 'maximum' in check._zod.def
+        ? [check._zod.def.maximum]
+        : [],
+    );
+
+    expect(maxima).toEqual([5000]);
+
+    const atBound = Array.from({ length: 5000 }, () => validIngressEvent());
+
+    expect(telemetryEventPayloadSchema.safeParse({ events: atBound }).success).toBe(true);
+    const oversized = telemetryEventPayloadSchema.safeParse({
+      events: [...atBound, validIngressEvent()],
+      droppedCount: 3,
+    });
+
+    expect(oversized.success).toBe(false);
+    if (oversized.success) {
+      return;
+    }
+    expect(oversized.error.issues.map((issue) => [issue.code, issue.path.join('.')])).toEqual([
+      ['too_big', 'events'],
+    ]);
   });
 
   it('runs the imported event schema element by element', () => {
@@ -3106,6 +3220,23 @@ describe('telemetry.tail — the persisted schema, which is the mirror image', (
     expect(telemetryTailPayloadSchema.safeParse({ ...payload, events: [] }).success).toBe(false);
     expect(
       telemetryTailPayloadSchema.safeParse({ ...payload, captureId: CAPTURE_ID }).success,
+    ).toBe(false);
+  });
+
+  it('never accepts an empty frame: the loss-only report is the inbound batch alone', () => {
+    const payload = VALID_PAYLOADS['telemetry.tail'];
+    const refused = telemetryTailPayloadSchema.safeParse({ ...payload, events: [] });
+
+    expect(refused.success).toBe(false);
+    if (refused.success) {
+      return;
+    }
+    expect(refused.error.issues.map((issue) => [issue.code, issue.path.join('.')])).toEqual([
+      ['too_small', 'events'],
+    ]);
+    // The tail has no loss field, so a count cannot make an empty frame valid.
+    expect(
+      telemetryTailPayloadSchema.safeParse({ ...payload, events: [], droppedCount: 3 }).success,
     ).toBe(false);
   });
 
@@ -5076,7 +5207,7 @@ const SUBJECT_TYPES = MESSAGE_TYPES.filter(
 
 // The envelope's `sessionId` is what the service routes and authorizes by; the
 // payload's subject is what a handler acts on. A devtools principal is
-// authorized only for its bound session (AAP §0.5.6), so every member of the
+// authorized only for its bound session, so every member of the
 // union must refuse a frame whose two answers differ — the rule lives in one
 // place in `../envelope.ts`, and this suite proves it reached all twenty-six.
 describe('parseMessage — every member refuses a routing key that contradicts its payload', () => {
@@ -5152,7 +5283,7 @@ describe('parseMessage — every member refuses a routing key that contradicts i
 // halves of the helper's contract directly: a valid input comes back as the
 // same value, and an input refused for one reason while the sentinel sits in
 // another value is answered with `PROTOCOL_INVALID_MESSAGE`, names the field it
-// was refused for, and echoes the sentinel in no rendering (AAP §0.5.2).
+// was refused for, and echoes the sentinel in no rendering.
 //
 // The table is keyed by the barrel's own export names, so it is exhaustive at
 // compile time, and a guard case compares it with the barrel at run time too.

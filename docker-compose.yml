@@ -18,11 +18,9 @@ services:
     image: postgres:18.6-alpine
     container_name: ${POSTGRES_CONTAINER_NAME:-debuggen-postgres}
     restart: unless-stopped
-    # Deliberately no `command:` override and no server tuning. The demo app is
-    # the instrumentation target, and one of its seeded performance problems is
-    # an unindexed aggregate over a large inventory-movement table: flags such as
-    # shared_buffers, work_mem, fsync=off or any planner setting would mask the
-    # very latency Debug Generator is meant to observe. Run the image's defaults.
+    # Stock image defaults: no `command:` override and no server tuning (such as
+    # shared_buffers, work_mem, fsync or planner settings), so the query timings
+    # Debug Generator captures come from PostgreSQL as it ships, untuned.
     #
     # The credentials below are local development placeholders, kept literal on
     # purpose: interpolating them (${POSTGRES_PASSWORD}) would break `pnpm

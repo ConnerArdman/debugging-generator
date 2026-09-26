@@ -5,9 +5,9 @@
  * Everything else in the monorepo observes. The page agent listens, the Node
  * preload registers a tracer provider, the code index parses, the pipeline
  * plans and the renderer draws; none of them writes a file the developer owns.
- * This module does, and the promise attached to that (AAP §0.5.1) is absolute:
- * whatever happens — the process dies mid-sequence, the machine loses power,
- * the developer edits the same file while it is patched — the file either comes
+ * This module does, and the promise attached to that is absolute: whatever
+ * happens — the process dies mid-sequence, the machine loses power, the
+ * developer edits the same file while it is patched — the file either comes
  * back byte-for-byte or is left untouched and reported.
  *
  * ## The sequence, which is the specification
@@ -202,10 +202,10 @@ import type { FunctionTimingPatch, FunctionTimingRequest } from './function-timi
  * Bounded rather than unbounded because the diff is not a local artifact: it
  * lands in a SQLite text column, travels inside `instrumentation.ready`, and is
  * rendered verbatim by the editor's modification list and the panel's session
- * summary (AAP §0.4.2). A patch past the bound is **truncated with a visible
- * notice** and {@link PatchOutcome.diffTruncated} says so, which is the honest
- * reading — the bytes that were hashed are unaffected, and the record's two
- * hashes remain the authority on what changed.
+ * summary. A patch past the bound is **truncated with a visible notice** and
+ * {@link PatchOutcome.diffTruncated} says so, which is the honest reading —
+ * the bytes that were hashed are unaffected, and the record's two hashes
+ * remain the authority on what changed.
  */
 export const PATCH_DIFF_CHARACTER_LIMIT = MAX_MODIFICATION_DIFF_LENGTH;
 
@@ -259,11 +259,11 @@ const BYTE_ORDER_MARK = '\uFEFF';
  *
  * `'function-timing'` and `'server-span'` only: a server span *is* a function
  * timing on a server-side entry point, and `./function-timing.js` emits the
- * same wrap for both (AAP §0.5.1's "named function timing on either tier →
- * patch"). Every other type in the plan vocabulary is satisfied by a runtime
- * hook and must never reach this module — an adapter that routed one here would
- * be asking for a file to be edited for a signal that needs no edit, so it is
- * refused rather than attempted.
+ * same wrap for both, because named function timing on either tier is the one
+ * signal a patch supplies. Every other type in the plan vocabulary is satisfied
+ * by a runtime hook and must never reach this module — an adapter that routed
+ * one here would be asking for a file to be edited for a signal that needs no
+ * edit, so it is refused rather than attempted.
  *
  * Typed as the widened action-type list so membership can be tested against an
  * arbitrary action without this tuple asserting anything about it.
@@ -276,10 +276,11 @@ const PATCHABLE_ACTION_TYPES: readonly InstrumentationActionType[] = Object.free
 /**
  * The named, individually observable steps of the sequence, in execution order.
  *
- * The order is the specification of AAP §0.5.1 and the tuple is what
- * {@link PatcherOptions.onStage} reports against, which makes every crash point
- * in the module addressable by name from a test: throwing from the observer for
- * a given stage is a failure injected *immediately after* that stage completed.
+ * The order is the specification — the sequence in this module's header — and
+ * the tuple is what {@link PatcherOptions.onStage} reports against, which makes
+ * every crash point in the module addressable by name from a test: throwing
+ * from the observer for a given stage is a failure injected *immediately
+ * after* that stage completed.
  *
  * - `'resolve-target'` — the action is a patch target, its path is inside the
  *   project as text, and it is still inside the project once every directory
@@ -322,9 +323,9 @@ export type PatchStage = (typeof PATCH_STAGES)[number];
  * What an observer is told when a stage completes.
  *
  * Identifiers, digests and a project-relative path — never a byte of file
- * content, per the privacy rule this package follows everywhere (AAP §0.5.2).
- * The two hashes are present from the stage that computes them onwards, so an
- * observer can assert the exact state the journal is about to record.
+ * content, which this package keeps out of every log, error and event. The two
+ * hashes are present from the stage that computes them onwards, so an observer
+ * can assert the exact state the journal is about to record.
  */
 export interface PatchStageEvent {
   /** The stage that just completed. */
@@ -354,8 +355,8 @@ export interface PatchStageEvent {
  * completed stage, awaited before the next one starts.
  *
  * **Throwing from it aborts the sequence at that boundary**, which is how
- * `./patcher.test.ts` drives AAP §0.5.1's crash points without monkey-patching
- * `node:fs` for the whole process: an observer that throws for
+ * `./patcher.test.ts` drives the sequence's crash points without
+ * monkey-patching `node:fs` for the whole process: an observer that throws for
  * `'store-backup'` produces "crashed after the backup, before the journal", one
  * that throws for `'journal-pending'` produces "crashed after the journal,
  * before the write", and one that throws for `'replace-file'` produces
@@ -558,7 +559,7 @@ export type FunctionTimingSource = FunctionTimingTransform | FunctionTimingTrans
  * of the same four fields. It is passed straight through to
  * {@link ConflictDetector}, which is why `message` — the developer-facing
  * sentence a conflict report carries — belongs here too: the wording of a
- * conflict is the service's to own (AAP §0.5.5), not this module's to invent.
+ * conflict is the service's to own, not this module's to invent.
  *
  * Importing the adapter's context type instead would point `patch/` at
  * `../adapter.js`, which sits above it and imports it; a structural superset
@@ -596,9 +597,9 @@ export interface PatcherOptions extends PatchContext {
    * The plan version these patches belong to, counting from 1.
    *
    * A follow-up question produces version *n + 1* as the previous plan plus
-   * additive actions (AAP §0.4.2), and a patcher is built per version: the
-   * value is recorded on every record this instance journals, and the
-   * duplicate-target guard is scoped to it.
+   * additive actions, and a patcher is built per version: the value is
+   * recorded on every record this instance journals, and the duplicate-target
+   * guard is scoped to it.
    *
    * Taken as given, never cross-checked against a plan document, because this
    * module sees actions and not plans. The value an adapter passes is the
@@ -694,7 +695,7 @@ export interface PatchTarget {
 export interface PatchAttemptOptions {
   /**
    * The record this patch is layered on top of, for a follow-up plan version
-   * whose delta touches an already-instrumented file (AAP §0.4.2).
+   * whose delta touches an already-instrumented file.
    *
    * Supply it when the caller already holds the chain's tip — the installer
    * does. When it is omitted the journal is consulted instead: the session's
@@ -727,8 +728,9 @@ export interface PatchOutcome {
    * 1-based line and column, the symbol's name and `resolvedBy: 'patch'`.
    *
    * This is the first and most precise of the four source-resolution routes
-   * (AAP §0.4.2): a function span carries the location captured when the patch
-   * was applied, so a click in a generated panel opens the exact declaration.
+   * (docs/ARCHITECTURE.md, "Resolution routes"): a function span carries the
+   * location captured when the patch was applied, so a click in a generated
+   * panel opens the exact declaration.
    */
   readonly location: SourceLocation;
 
@@ -774,7 +776,7 @@ export interface PatchOutcome {
    * the two texts are the same.
    *
    * Held in memory only — it carries the file's text, so it is never logged,
-   * journaled or sent anywhere (AAP §0.5.2).
+   * journaled or sent anywhere.
    */
   readonly patch: FunctionTimingPatch;
 
@@ -834,7 +836,7 @@ export interface PatchBatchFailure {
    *
    * Carried here rather than inside the error's details because a report holds
    * three-way diffs — file content — and an error's details may be logged and
-   * persisted (AAP §0.5.2).
+   * persisted, which file content never is.
    */
   readonly conflict: ModificationConflict | undefined;
 }
@@ -849,7 +851,8 @@ export interface PatchBatchFailure {
 export interface PatchBatchResult {
   /**
    * The successful patches, in application order. Reverse this list to unwind
-   * them — cleanup restores a chain strictly last-applied-first (AAP §0.4.2).
+   * them — cleanup restores a chain strictly last-applied-first
+   * (docs/ARCHITECTURE.md, "Follow-up plan versions and record chains").
    */
   readonly applied: readonly PatchOutcome[];
 
@@ -1157,7 +1160,8 @@ class SequencedPatcher implements Patcher {
   }
 
   /**
-   * The sequence of AAP §0.5.1 for one target, step by step.
+   * The crash-safe write sequence for one target, step by step: hash, backup,
+   * journal, atomic rename, mark applied.
    *
    * Linear on purpose: the order of these steps *is* the guarantee, so it is
    * written as one readable sequence rather than distributed across helpers
@@ -1719,8 +1723,8 @@ class SequencedPatcher implements Patcher {
         // The developer's version is on disk untouched, so this is a conflict
         // and not a failure to write: the record is moved to `failed` with both
         // hashes on it, and reconciliation — which finds a file matching
-        // neither digest — reports it and leaves the file alone. AAP §0.5.1:
-        // never overwritten.
+        // neither digest — reports it and leaves the file alone. A conflict is
+        // reported, never overwritten.
         return await failed(raceLostDuringWrite(replacement.reason, file, symbol, backup.path));
       }
 
@@ -1813,7 +1817,7 @@ class SequencedPatcher implements Patcher {
    * file, `applied` — because a mismatched one would give the new record an
    * `originalHash` for bytes the developer never had. Without one, the
    * session's records are listed in append order and the **last `applied`
-   * record for the same file** is the parent (AAP §0.4.2).
+   * record for the same file** is the parent.
    *
    * Any other open record for the file — `pending`, `failed` or `conflict` —
    * refuses the patch. The baseline of such a file is undecided until
@@ -1967,8 +1971,8 @@ class SequencedPatcher implements Patcher {
    * A chained patch is computed against layered bytes — the helper alias and
    * every earlier wrapper are already in them — so a position read from those
    * bytes points below where the developer's function actually is, by as many
-   * lines as the layers above it added (AAP §0.4.2 gives the patch route its
-   * authority precisely from recording the developer's position). The chain's
+   * lines as the layers above it added (a function span's click-to-source
+   * location is only as good as the position recorded here). The chain's
    * root record is the one patch whose `originalHash` describes bytes this
    * session never touched, and its backup holds exactly those bytes, so that is
    * the text the transform resolves the position in.
@@ -2165,7 +2169,7 @@ class SequencedPatcher implements Patcher {
  * goes back to the caller and may be logged and persisted, so it carries
  * identifiers and a reason only; the report holds three-way diffs of the
  * developer's file and therefore stays on {@link Patcher.detectedConflicts},
- * where a caller has to ask for it (AAP §0.5.2).
+ * where a caller has to ask for it.
  */
 interface BaselineRefusal {
   /** Why the patch was refused. */

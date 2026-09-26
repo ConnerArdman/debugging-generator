@@ -40,6 +40,8 @@
  *    `session.unbind`.
  * 4. Every `session.unbind` is owed until the service has it: the intent is
  *    written ahead as a tombstone and re-sent after a reconnect (below).
+ * 5. The registry is bounded, and nothing it forgets to stay bounded is left
+ *    bound at the service. See "Capacity" below.
  *
  * ## Unbind tombstones: an unbind outlives the worker that decided it
  *
@@ -53,11 +55,13 @@
  *
  * So every unbind — a cross-origin navigation, a navigation to a document the
  * service cannot be told about, DevTools closing, the tab closing, the session
- * ending — first writes a {@link TabUnbindTombstone} under
+ * ending, a binding ended to stay within {@link MAX_STORED_TAB_BINDINGS} —
+ * first writes a {@link TabUnbindTombstone} under
  * {@link UNBIND_TOMBSTONE_STORAGE_KEY}, *before* the frame is reported and
  * before the record is dropped, so a crash anywhere after the decision still
  * leaves the intent recorded. A tab holds at most one tombstone (a newer one
- * replaces it) and never a tombstone and a record at once.
+ * replaces it) and never a tombstone and a record at once, and the list holds
+ * at most {@link MAX_STORED_UNBIND_TOMBSTONES} (see "Capacity").
  *
  * ### Delivery
  *
@@ -126,6 +130,74 @@
  * has already been in use, so that removal is pushed and announced like any
  * other.
  *
+ * ## Capacity: bounded, and nothing owed is forgotten
+ *
+ * The service keeps a devtools binding across a dropped socket and a client
+ * that unregisters, and never tells the worker which bindings it holds; the
+ * worker's records and tombstones are therefore the only account of them. So
+ * the registry is bounded by the **obligations** it tracks, not by evicting
+ * them. A tab *holds a slot* while the service may hold a binding for it that
+ * this worker still has to account for:
+ *
+ * - it has a **record** (a binding the service confirmed);
+ * - it has an **undelivered tombstone** (`deliveries: 0` — an unbind that has
+ *   never reached an open socket); or
+ * - it has a **bind in flight**: a `session.bind` this worker generation
+ *   handed to the transport that no confirmation has recorded and no unbind
+ *   of the tab has ended (memory only — the socket that would answer it dies
+ *   with the generation).
+ *
+ * The registry's own writes never let more than
+ * {@link MAX_STORED_TAB_BINDINGS} tabs hold a slot, and
+ * {@link MAX_STORED_UNBIND_TOMBSTONES} is at least that, so every undelivered
+ * tombstone always fits in the list. The limit is kept where an obligation is
+ * **taken on**, never by dropping one:
+ *
+ * - {@link TabRegistry.requestBind} of a tab that holds no slot while every
+ *   slot is held is refused with `RATE_LIMITED` before anything is sent, so a
+ *   bind the service may apply always has a slot to land in;
+ * - a confirmation of a tab that holds no slot (its bind's slot was released —
+ *   DevTools closed on it, say) at the limit first makes room: owed unbinds are
+ *   delivered now, then the least recently bound binding is ended through the
+ *   ordinary unbind (tombstone written ahead with cause `binding-limit`,
+ *   `session.unbind` reported, `unbound` pushed, change announced). Only a
+ *   delivered unbind frees a slot, so when the socket takes no frame the
+ *   confirmation is declined rather than recorded past the limit; the
+ *   DevTools page's rebind on the next connect records it then;
+ * - an unbind of a tab holding no slot — DevTools closing on a tab with no
+ *   binding, no bind in flight and no owed unbind — while every slot is held
+ *   is still handed to the transport, but not written as a tombstone: nothing
+ *   this generation did can have left the service a binding of that tab.
+ *
+ * Every other change converts a slot rather than adding one (a record ending
+ * becomes its tombstone, a confirmation lands in its bind's slot) or frees one
+ * (a delivery, an acknowledgement, a superseding confirmation). The tombstone
+ * list outgrows its limit only through *delivered* tombstones, and those are
+ * what is evicted, oldest first: their unbind has reached the service's socket,
+ * and only the retransmission {@link MAX_UNBIND_TOMBSTONE_DELIVERIES} allows is
+ * given up. No sequence of the registry's own writes evicts an undelivered
+ * tombstone; only state it did not write can force that — stored data beyond
+ * its limits, or a merge after an unreadable tombstone key counted nothing
+ * stored — and such an eviction is logged as an error.
+ *
+ * Hydration applies the same rule to what it cannot keep. Stored bindings
+ * beyond {@link MAX_STORED_TAB_BINDINGS} were confirmed once and may still be
+ * bound at the service, so each is ended through an owed unbind (cause
+ * `binding-limit`, the frame sent at once unless a bind of the tab is in
+ * flight, whose confirmation supersedes it) and its removal pushed and
+ * announced — never forgotten silently. At most
+ * {@link MAX_STORED_UNBIND_TOMBSTONES} are ended that way, so corrupted storage
+ * cannot make the worker send an unbounded burst; the rest are dropped and
+ * logged as an error. A binding dropped because another stored entry names the
+ * same session is not unbound: the service holds that session on one tab only,
+ * and a `session.unbind { tabId }` for the stale duplicate could end an
+ * unrelated, newer binding of that tab.
+ *
+ * `chrome.storage.session` is cleared when the extension is disabled, reloaded
+ * or updated and when the browser restarts, so what hydration reads was always
+ * written by this code — within these limits — and stored data beyond them is
+ * corruption. It is still handled as above, never trusted to be impossible.
+ *
  * ## Why `chrome.storage.session`
  *
  * A Manifest V3 service worker is evicted after roughly thirty seconds idle and
@@ -146,8 +218,17 @@
  * through to storage — or, for the tombstones, held dirty and retried — before
  * it is announced to a panel or a listener. What is read back is
  * untrusted JSON from an earlier worker generation, and each entry is validated
- * field by field before it is relied on; a malformed entry is dropped, never
- * cast.
+ * field by field before it is relied on, with the protocol schemas that define
+ * those fields rather than limits restated here: a binding's session id, tab id
+ * and URL with the `session.bound` payload's schema, its capture id with the
+ * `capture.started` payload's, a tombstone's tab id with the `session.unbind`
+ * payload's (the frame it re-sends) and its session id with the binding's. So a
+ * URL longer than 2,048 characters, or an id longer than 64, is never hydrated.
+ * A malformed entry is dropped, never cast; of the valid ones, only the newest
+ * bindings within {@link MAX_STORED_TAB_BINDINGS} are kept (the rest are ended
+ * through owed unbinds, as "Capacity" describes) and the tombstones within
+ * {@link MAX_STORED_UNBIND_TOMBSTONES}, undelivered ones first; and whatever
+ * was dropped is rewritten out of storage.
  *
  * ## Invariants
  *
@@ -163,6 +244,17 @@
  *   outbound frames leave in the order the calls were made. Each queued
  *   operation first retries whatever tombstone storage I/O an earlier one
  *   left owed (a failed read, a dirty list), and does no I/O when nothing is.
+ * - **Bounded, and written as it is read.** In memory and in storage alike, the
+ *   binding map never holds more than {@link MAX_STORED_TAB_BINDINGS} records
+ *   and the tombstone list never more than {@link MAX_STORED_UNBIND_TOMBSTONES}
+ *   entries; no write of the registry's own makes more than
+ *   {@link MAX_STORED_TAB_BINDINGS} tabs hold a slot, and a bind request is
+ *   refused rather than let the in-flight binds do so. Every field held is
+ *   within the protocol schema that defines it: a confirmed binding is
+ *   validated by `session.bound`'s schema, a capture id by
+ *   `capture.started`'s, and a navigation URL outside `tab.navigated`'s bounds
+ *   is never recorded. What one generation writes is therefore exactly what
+ *   the next one hydrates.
  * - **No authored wording.** The "Tab left ‹origin›" notice is
  *   `formatTabLeftMessage` from `../shared/messages`; every binding reason is a
  *   member of the protocol's `BINDING_REASONS` vocabulary.
@@ -193,7 +285,15 @@ import type {
   SessionUpdatedPayload,
   TabNavigatedPayload,
 } from '@debuggen/protocol';
-import { parseSessionBindPayload, parseSessionBoundPayload } from '@debuggen/protocol';
+import {
+  captureStartedPayloadSchema,
+  MESSAGE_TYPE,
+  parseSessionBindPayload,
+  parseSessionBoundPayload,
+  parseSessionUnbindPayload,
+  parseTabNavigatedPayload,
+  sessionBoundPayloadSchema,
+} from '@debuggen/protocol';
 import type { CaptureId, LogFields, Logger, Result, SessionId } from '@debuggen/shared';
 import { assertNever, DebuggenError, err, noopLogger, nowEpochMs, ok } from '@debuggen/shared';
 
@@ -281,14 +381,25 @@ const CAUSE_DEVTOOLS_CLOSED = 'devtools-closed' satisfies TabUnbindCause;
 
 /**
  * Every reason an {@link TabUnbindTombstone} records: the three
- * {@link TAB_UNBIND_CAUSES}, plus `navigated-away` for a bound tab that
- * committed a document off its bound origin — a cross-origin navigation, or
- * one with no URL the service accepts (`chrome://`, `about:blank`, `file:`, an
- * extension page). Stored and logged, never sent.
+ * {@link TAB_UNBIND_CAUSES}, plus two the worker decides on its own:
+ *
+ * - `navigated-away` — a bound tab committed a document off its bound origin:
+ *   a cross-origin navigation, or one with no URL the service accepts
+ *   (`chrome://`, `about:blank`, `file:`, an extension page);
+ * - `binding-limit` — the binding was ended to keep the registry within
+ *   {@link MAX_STORED_TAB_BINDINGS}: it was the least recently bound when a
+ *   confirmation needed a slot none was free for, or a stored binding beyond
+ *   the limit that hydration could not keep (see "Capacity" in the module
+ *   overview).
+ *
+ * Stored and logged, never sent. Neither of the two is a
+ * {@link TabUnbindCause}, so a change announcing either carries no `cause`
+ * (see {@link TabBindingChange.cause}).
  */
 export const UNBIND_TOMBSTONE_CAUSES = Object.freeze([
   ...TAB_UNBIND_CAUSES,
   'navigated-away',
+  'binding-limit',
 ] as const);
 
 /** One of {@link UNBIND_TOMBSTONE_CAUSES}. */
@@ -296,6 +407,9 @@ export type UnbindTombstoneCause = (typeof UNBIND_TOMBSTONE_CAUSES)[number];
 
 /** The cause a navigation off the bound origin is tombstoned under. */
 const CAUSE_NAVIGATED_AWAY = 'navigated-away' satisfies UnbindTombstoneCause;
+
+/** The cause a binding ended to stay within {@link MAX_STORED_TAB_BINDINGS} is tombstoned under. */
+const CAUSE_BINDING_LIMIT = 'binding-limit' satisfies UnbindTombstoneCause;
 
 /**
  * The key under which the pending unbind tombstones are stored in
@@ -353,6 +467,57 @@ export const MAX_UNBIND_TOMBSTONE_DELIVERIES = 3;
  * `chrome.storage.session` when the browser session ends.
  */
 export const UNBIND_TOMBSTONE_TTL_MS = 24 * 60 * 60_000;
+
+/**
+ * The most tabs the registry tracks as possibly bound at the service — tabs
+ * holding a *slot*: a binding, an undelivered unbind or a bind in flight (see
+ * "Capacity" in the module overview) — and so the most bindings it holds in
+ * memory, under {@link BINDING_STORAGE_KEY}, and on hydration: 256.
+ *
+ * **Why a limit.** The stored snapshot is read back as untrusted data, and
+ * every binding it yields is held, validated, re-announced and routed to for
+ * the rest of the worker's life; a corrupted or oversized entry must not be
+ * able to make a restarted worker carry an unbounded map.
+ *
+ * **Why 256.** A binding is one DevTools-inspected tab per live session — one
+ * session accepts one bound tab at a time (AAP §0.2.3) — so the count in use is
+ * the number of sessions a developer runs at once with DevTools open on each:
+ * a handful. 256 is two orders of magnitude of headroom over that, and small
+ * enough that validating and sorting a full snapshot on every worker revival
+ * costs nothing noticeable.
+ *
+ * **At the limit.** A bind request of a tab holding no slot is refused
+ * (`RATE_LIMITED`, nothing sent); a confirmation that needs a slot first
+ * delivers owed unbinds and then ends the least recently bound binding through
+ * the ordinary unbind (a tombstone with cause `binding-limit`,
+ * `session.unbind`, the `unbound` push and a change), and is declined when the
+ * socket takes neither. Hydration keeps the most recently bound records (the
+ * higher `boundAt`, then the higher tab id — the rule a session named twice is
+ * resolved by) and ends the rest through owed unbinds. The service is always
+ * told, never left routing to a tab the worker no longer tracks.
+ */
+export const MAX_STORED_TAB_BINDINGS = 256;
+
+/**
+ * The most unbind tombstones the registry holds — in memory, under
+ * {@link UNBIND_TOMBSTONE_STORAGE_KEY}, and on hydration: 256.
+ *
+ * **Why 256.** A tab holds at most one tombstone. An *undelivered* one holds a
+ * slot, and at most {@link MAX_STORED_TAB_BINDINGS} tabs hold a slot, so a
+ * limit equal to it (never below it) always has room for every unbind still
+ * owed — an outage never retires one (see {@link UNBIND_TOMBSTONE_TTL_MS}) —
+ * while bounding what a corrupted entry can make every flush re-send.
+ *
+ * **At the limit.** What goes first is a *delivered* tombstone, oldest first
+ * (logged, counts only): its unbind has reached the service's socket, and only
+ * the retransmission is given up. An undelivered tombstone is never evicted by
+ * the registry's own writes; only state it did not write — stored data beyond
+ * its limits, or a merge after an unreadable tombstone key — can force that,
+ * and it is logged as an error. Hydration keeps undelivered tombstones before
+ * delivered ones and, within each, the newest (the higher `createdAt`, then the
+ * higher tab id), and rewrites storage without the rest.
+ */
+export const MAX_STORED_UNBIND_TOMBSTONES = 256;
 
 /** The transport outcome that means the frame was written to an open socket. */
 const OUTCOME_SENT = 'sent' satisfies SendOutcome;
@@ -562,14 +727,21 @@ export type NavigationDecisionKind = NavigationDecision['kind'];
  * - `recorded` — a binding was established (or replaced the tab's binding to
  *   another session). `previous` is the tab's earlier record, if it had one;
  *   `displaced` lists the records of *other* tabs removed because the session
- *   may hold only one tab, each of whose panels was told.
+ *   may hold only one tab, each of whose panels was told. A binding ended to
+ *   stay within {@link MAX_STORED_TAB_BINDINGS} is not listed there: it was
+ *   unbound (`session.unbind` sent, tombstone written), and its removal reaches
+ *   its panel and every listener as a change like any other unbind.
  * - `updated` — an existing binding of this tab to this session was refreshed:
  *   a re-announcement after a reconnect, or a kept same-origin navigation.
  * - `removed` — the announcement dropped this tab's binding (`replaced`,
  *   `origin-changed` or `unbound`); `removed` is the record that was dropped.
  * - `ignored` — the announcement was about a binding this worker does not hold
  *   (a late frame about an older binding, or a drop already applied). A late
- *   frame must never undo the current binding, so it changes nothing.
+ *   frame must never undo the current binding, so it changes nothing. Also the
+ *   answer to a confirmation declined at the limit (see "Capacity" in the
+ *   module overview): the tab is not recorded, though another tab the service
+ *   moved the session away from is still removed and announced, since the
+ *   service no longer holds it there.
  */
 export type ApplyBoundOutcome =
   | {
@@ -602,7 +774,7 @@ export type ApplyBoundOutcome =
  * panels. `state` is the {@link PanelBindingState} that was pushed; `reason` is
  * the protocol reason the change corresponds to (the service's own, when the
  * change came from `session.bound`); `cause` is set when the worker itself
- * unbound the tab.
+ * unbound the tab for one of the {@link TAB_UNBIND_CAUSES}.
  */
 export interface TabBindingChange {
   /** `recorded` (a new binding), `updated` (url or capture changed) or `removed`. */
@@ -617,7 +789,16 @@ export interface TabBindingChange {
   readonly state: PanelBindingState;
   /** The binding reason the change corresponds to. */
   readonly reason: BindingReason;
-  /** Why the worker unbound the tab, when it did. */
+  /**
+   * Why the worker unbound the tab, when it did so for one of the
+   * {@link TAB_UNBIND_CAUSES}. `undefined` for a change the service announced,
+   * and for the two unbinds the worker decides on its own: leaving the bound
+   * origin (announced with reason `origin-changed`) and ending a binding to
+   * stay within {@link MAX_STORED_TAB_BINDINGS} — the least recently bound one
+   * at a confirmation, or a stored one hydration could not keep — announced
+   * with reason `unbound`, which a consumer handles as it handles an unbind the
+   * service announced.
+   */
   readonly cause: TabUnbindCause | undefined;
 }
 
@@ -642,8 +823,13 @@ export interface TabRegistry {
    * or is held dirty for the next write — so replacing it with storage could
    * only lose intents. `service-worker.ts` calls it on a cold start; every
    * other read path hydrates on its own when the cache is cold, so calling it
-   * is never required for correctness. Malformed entries are dropped (and the
-   * cleaned map or list written back); a tab left holding both a record and a
+   * is never required for correctness. Malformed entries — any field outside
+   * the protocol schema that defines it — are dropped, and the cleaned map or
+   * list is written back. Valid bindings beyond {@link MAX_STORED_TAB_BINDINGS}
+   * are ended through owed unbinds — each `session.unbind` sent at once, its
+   * panel pushed `unbound` and the removal announced — and tombstones beyond
+   * {@link MAX_STORED_UNBIND_TOMBSTONES} are dropped delivered ones first (see
+   * "Capacity" in the module overview); a tab left holding both a record and a
    * tombstone is reconciled as the module overview describes.
    *
    * @returns Every valid binding, ordered by tab id.
@@ -667,11 +853,18 @@ export interface TabRegistry {
    * unbind. The same mark is set when the tombstone key has not hydrated yet,
    * because the tab may hold a stored tombstone.
    *
+   * A bind handed to the transport holds a slot for its tab until it is
+   * confirmed or the tab is unbound, so its confirmation always has room. A
+   * tab holding no slot is refused while all {@link MAX_STORED_TAB_BINDINGS}
+   * are held — before anything is sent — rather than making room by forgetting
+   * an obligation (see "Capacity" in the module overview).
+   *
    * @returns The transport's outcome for the `session.bind`: `ok('sent')`, or
    * `ok('queued')` while the socket reconnects (a success, AAP §0.5.5); an
    * `err` when the request is not a valid `session.bind` payload
-   * (`PROTOCOL_INVALID_MESSAGE`, nothing sent, no tombstone touched), or the
-   * transport refused the owed `session.unbind` or the `session.bind`.
+   * (`PROTOCOL_INVALID_MESSAGE`, nothing sent, no tombstone touched), when
+   * every slot is held (`RATE_LIMITED`, nothing sent), or when the transport
+   * refused the owed `session.unbind` or the `session.bind`.
    */
   readonly requestBind: (request: TabBindRequest) => Promise<Result<SendOutcome, DebuggenError>>;
 
@@ -688,6 +881,14 @@ export interface TabRegistry {
    * session or the announced one — even when this worker holds no record for
    * the tab, in which case the outcome is still `ignored`.
    *
+   * A binding of a tab that holds no slot (see {@link requestBind}), recorded
+   * while every slot is held, first makes room: owed unbinds are delivered,
+   * then the least recently bound binding is ended exactly as {@link unbind}
+   * would end it (cause `binding-limit` on its tombstone). When the socket
+   * takes neither frame, no room can be made without forgetting an
+   * obligation, so the confirmation is declined (`ignored`, logged) and the
+   * DevTools page's rebind on the next connect records it.
+   *
    * @returns What was done, or an `err` (`PROTOCOL_INVALID_MESSAGE`) when the
    * payload is not a valid `session.bound`, or names a document without an
    * HTTP(S) origin, in which case nothing changes.
@@ -700,6 +901,12 @@ export interface TabRegistry {
    * Handle one committed navigation: always report `tab.navigated`, then keep
    * the binding (same origin) or drop it (different origin) under a
    * write-ahead unbind tombstone. See {@link NavigationDecision}.
+   *
+   * A navigation that is not a valid `tab.navigated` payload — a URL longer
+   * than the protocol admits, or no absolute URL at all — has no form the
+   * service accepts, so it is handled exactly as
+   * {@link handleUnreportableNavigation} handles one: nothing is reported and
+   * the URL is never recorded.
    */
   readonly handleNavigated: (navigation: TabNavigation) => Promise<NavigationDecision>;
 
@@ -732,7 +939,11 @@ export interface TabRegistry {
    * still pending over its tombstone (see {@link requestBind}): that bind may
    * yet be applied, and the unbind, sent after it, ends it. Its tombstone
    * then names no session. For a tab this worker knows nothing about, closing
-   * it sends and stores nothing.
+   * it sends and stores nothing. A `'devtools-closed'` unbind of a tab holding
+   * no slot — no record, no bind in flight, no undelivered tombstone — while
+   * every slot is held is sent without a tombstone (see "Capacity" in the
+   * module overview). An unbind that is reported ends the tab's bind in
+   * flight, whose slot its tombstone takes over.
    *
    * @returns The record that was removed, or `undefined` when there was none.
    */
@@ -783,7 +994,9 @@ export interface TabRegistry {
    * continues the same capture.
    *
    * @returns `true` when the tab is bound and the id was stored; `false` when
-   * the tab is not bound or the id is empty.
+   * the tab is not bound or the id is not a capture id the protocol admits
+   * (empty, or longer than the `capture.started` schema allows) — a value
+   * hydration would refuse is never held.
    */
   readonly setCaptureId: (tabId: TabId, captureId: CaptureId) => Promise<boolean>;
 
@@ -846,8 +1059,9 @@ export interface TabRegistry {
  * Section D — pure helpers
  *
  * Total functions: each returns a value for every input and none throws. The
- * guards narrow through `typeof` and plain property reads, so nothing read
- * back from storage is ever cast into a record.
+ * guards narrow through `typeof`, plain property reads and the protocol's own
+ * schemas (whose `safeParse` and `parse…` helpers answer rather than throw),
+ * so nothing read back from storage is ever cast into a record.
  * ===========================================================================
  */
 
@@ -872,6 +1086,25 @@ function isTabId(value: unknown): value is TabId {
 /** A plausible epoch-millisecond stamp: a finite, non-negative number. */
 function isEpochMs(value: unknown): value is EpochMs {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * A session id the protocol admits — non-empty and at most 64 characters —
+ * checked with the `session.bound` payload's own field validator, the schema
+ * that confirmed every binding this module records, rather than with a limit
+ * restated here.
+ */
+function isSessionId(value: unknown): value is SessionId {
+  return sessionBoundPayloadSchema.shape.sessionId.safeParse(value).success;
+}
+
+/**
+ * A capture id the protocol admits — non-empty and at most 64 characters —
+ * checked with the field validator of the `capture.started` payload that
+ * announces every capture this module stores.
+ */
+function isCaptureId(value: unknown): value is CaptureId {
+  return captureStartedPayloadSchema.shape.captureId.safeParse(value).success;
 }
 
 /**
@@ -940,42 +1173,105 @@ function sortRecords(records: Iterable<TabBindingRecord>): readonly TabBindingRe
 }
 
 /**
+ * Order two records by how recently they were bound, least recent first: the
+ * earlier `boundAt`, then the lower tab id, so equal stamps still order
+ * deterministically. The one recency rule this module applies — to a session
+ * named twice in storage, to the records hydration keeps within
+ * {@link MAX_STORED_TAB_BINDINGS}, and to the record a bind at that limit
+ * ends.
+ */
+function compareBindingRecency(left: TabBindingRecord, right: TabBindingRecord): number {
+  return left.boundAt - right.boundAt || left.tabId - right.tabId;
+}
+
+/**
+ * The least recently bound of `records` under {@link compareBindingRecency},
+ * or `undefined` when there is none.
+ */
+function leastRecentlyBound(records: Iterable<TabBindingRecord>): TabBindingRecord | undefined {
+  let oldest: TabBindingRecord | undefined;
+  for (const record of records) {
+    if (oldest === undefined || compareBindingRecency(record, oldest) < 0) {
+      oldest = record;
+    }
+  }
+  return oldest;
+}
+
+/**
+ * The `limit` last of `entries` under `compare` — which orders the first to be
+ * left out first — and the ones left out, in that order. `entries` itself is
+ * answered, with nothing left out, when it is within the limit.
+ */
+function keepWithin<T>(
+  entries: readonly T[],
+  compare: (left: T, right: T) => number,
+  limit: number,
+): { readonly kept: readonly T[]; readonly excess: readonly T[] } {
+  if (entries.length <= limit) {
+    return { kept: entries, excess: [] };
+  }
+  const ordered = [...entries].sort(compare);
+  const cut = entries.length - limit;
+  return { kept: ordered.slice(cut), excess: ordered.slice(0, cut) };
+}
+
+/**
  * Validate one stored entry and rebuild it as a fresh record, or answer
  * `undefined` for anything malformed.
  *
- * An entry is valid when its key is its own tab id rendered in decimal, its
- * session id and URL are non-empty strings, its origin is exactly the URL's
- * HTTP(S) origin, its `boundAt` is a plausible stamp, and its `captureId` is
- * absent or a non-empty string. Unknown keys on the stored object are not
- * carried over — the record is rebuilt from the validated fields alone.
+ * An entry is valid when its session id, tab id and URL form a valid
+ * `session.bound` payload — the schema of the announcement that confirmed the
+ * binding, so the session id is non-empty and at most 64 characters, the tab
+ * id a real tab and the URL absolute and at most 2,048 characters — its key is
+ * that tab id rendered in decimal, its origin is exactly the URL's HTTP(S)
+ * origin, its `boundAt` is a plausible stamp, and its `captureId` is absent or
+ * a capture id the `capture.started` schema admits. Unknown keys on the stored
+ * object are not carried over — the record is rebuilt from the validated
+ * fields alone.
  */
 function readStoredRecord(key: string, value: unknown): TabBindingRecord | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
   const { tabId, sessionId, url, origin, boundAt, captureId } = value;
-  if (!isTabId(tabId) || String(tabId) !== key) {
+  const confirmed = parseSessionBoundPayload({ sessionId, tabId, url });
+  if (!confirmed.ok || String(confirmed.value.tabId) !== key || !isEpochMs(boundAt)) {
     return undefined;
   }
-  if (!isNonEmptyString(sessionId) || !isNonEmptyString(url) || !isEpochMs(boundAt)) {
-    return undefined;
-  }
-  const derivedOrigin = httpOriginOf(url);
+  const derivedOrigin = httpOriginOf(confirmed.value.url);
   if (derivedOrigin === undefined || origin !== derivedOrigin) {
     return undefined;
   }
-  if (captureId !== undefined && !isNonEmptyString(captureId)) {
+  if (captureId !== undefined && !isCaptureId(captureId)) {
     return undefined;
   }
-  return makeRecord({ tabId, sessionId, url, origin: derivedOrigin, boundAt, captureId });
+  return makeRecord({
+    tabId: confirmed.value.tabId,
+    sessionId: confirmed.value.sessionId,
+    url: confirmed.value.url,
+    origin: derivedOrigin,
+    boundAt,
+    captureId,
+  });
 }
 
 /** The outcome of reading a stored snapshot back. */
 interface ParsedSnapshot {
-  /** Every valid record, one per tab and one per session, ordered by tab id. */
+  /** Every record kept, one per tab and one per session, ordered by tab id. */
   readonly records: readonly TabBindingRecord[];
-  /** How many stored entries were refused (or `1` when the whole value was malformed). */
+  /**
+   * How many stored entries were refused — malformed, a session's older
+   * duplicate, or beyond {@link MAX_STORED_TAB_BINDINGS} — or `1` when the
+   * whole value was malformed.
+   */
   readonly dropped: number;
+  /**
+   * The valid records beyond {@link MAX_STORED_TAB_BINDINGS} (counted in
+   * `dropped`), least recently bound first: bindings the service confirmed
+   * once and may still hold, which the caller ends through owed unbinds.
+   */
+  readonly pruned: readonly TabBindingRecord[];
 }
 
 /**
@@ -986,14 +1282,19 @@ interface ParsedSnapshot {
  * valid entries name the same session — which the registry never writes, so it
  * can only be corruption — the one bound most recently is kept (ties broken by
  * the higher tab id, so the answer is deterministic) and the other dropped,
- * restoring the one-tab-per-session invariant.
+ * restoring the one-tab-per-session invariant. Of what remains, only the
+ * {@link MAX_STORED_TAB_BINDINGS} most recently bound are kept, by the same
+ * rule; the rest are counted in `dropped` and answered in `pruned`, so the
+ * caller rewrites storage without them and ends each through an owed unbind.
+ * A session's older duplicate is not in `pruned`: the service holds that
+ * session on one tab only, so it names no binding the service can still hold.
  */
 function parseSnapshot(raw: unknown): ParsedSnapshot {
   if (raw === undefined) {
-    return { records: Object.freeze([]), dropped: 0 };
+    return { records: Object.freeze([]), dropped: 0, pruned: Object.freeze([]) };
   }
   if (!isRecord(raw)) {
-    return { records: Object.freeze([]), dropped: 1 };
+    return { records: Object.freeze([]), dropped: 1, pruned: Object.freeze([]) };
   }
   const bySession = new Map<SessionId, TabBindingRecord>();
   let dropped = 0;
@@ -1009,14 +1310,20 @@ function parseSnapshot(raw: unknown): ParsedSnapshot {
       continue;
     }
     dropped += 1;
-    const newer =
-      record.boundAt > rival.boundAt ||
-      (record.boundAt === rival.boundAt && record.tabId > rival.tabId);
-    if (newer) {
+    if (compareBindingRecency(record, rival) > 0) {
       bySession.set(record.sessionId, record);
     }
   }
-  return { records: sortRecords(bySession.values()), dropped };
+  const { kept, excess } = keepWithin(
+    [...bySession.values()],
+    compareBindingRecency,
+    MAX_STORED_TAB_BINDINGS,
+  );
+  return {
+    records: sortRecords(kept),
+    dropped: dropped + excess.length,
+    pruned: Object.freeze([...excess]),
+  };
 }
 
 /** The JSON map form of a set of records, keyed by decimal tab id. */
@@ -1072,48 +1379,84 @@ function tombstoneFieldsOf(tombstone: TabUnbindTombstone): TombstoneFields {
 }
 
 /**
- * Tombstones oldest first (ties broken by tab id), as a frozen array — the
- * order they are stored and flushed in, so unbinds reach the service in the
- * order they were decided.
+ * Order two tombstones oldest first: the earlier `createdAt`, then the lower
+ * tab id. The order they are stored and flushed in, so unbinds reach the
+ * service in the order they were decided.
  */
-function sortTombstones(tombstones: Iterable<TabUnbindTombstone>): readonly TabUnbindTombstone[] {
-  return Object.freeze(
-    [...tombstones].sort(
-      (left, right) => left.createdAt - right.createdAt || left.tabId - right.tabId,
-    ),
+function compareTombstoneAge(left: TabUnbindTombstone, right: TabUnbindTombstone): number {
+  return left.createdAt - right.createdAt || left.tabId - right.tabId;
+}
+
+/**
+ * Whether a tombstone's unbind has never been handed to an open socket
+ * (`deliveries: 0`) — an unbind still owed, which holds its tab's slot (see
+ * "Capacity" in the module overview).
+ */
+function isUndelivered(tombstone: TabUnbindTombstone): boolean {
+  return tombstone.deliveries === 0;
+}
+
+/**
+ * Order two tombstones by which to give up first when the list would outgrow
+ * {@link MAX_STORED_UNBIND_TOMBSTONES}: every delivered tombstone before any
+ * undelivered one — a delivered unbind has reached the service's socket and
+ * gives up only its retransmission, an undelivered one is still owed — and,
+ * within each, the oldest first ({@link compareTombstoneAge}).
+ */
+function compareTombstoneRetention(left: TabUnbindTombstone, right: TabUnbindTombstone): number {
+  return (
+    Number(isUndelivered(left)) - Number(isUndelivered(right)) || compareTombstoneAge(left, right)
   );
+}
+
+/** Tombstones in {@link compareTombstoneAge} order, as a frozen array. */
+function sortTombstones(tombstones: Iterable<TabUnbindTombstone>): readonly TabUnbindTombstone[] {
+  return Object.freeze([...tombstones].sort(compareTombstoneAge));
 }
 
 /**
  * Validate one stored tombstone and rebuild it, or answer `undefined` for
- * anything malformed: the tab id must be a tab id, the session id absent or a
- * non-empty string, the cause a member of {@link UNBIND_TOMBSTONE_CAUSES},
- * `createdAt` a plausible stamp and `deliveries` a non-negative integer.
- * Unknown keys are not carried over.
+ * anything malformed: the tab id must form a valid `session.unbind` payload —
+ * the frame the tombstone re-sends — the session id be absent or a session id
+ * the protocol admits (the rule a binding's is held to), the cause a member of
+ * {@link UNBIND_TOMBSTONE_CAUSES}, `createdAt` a plausible stamp and
+ * `deliveries` a non-negative integer. Unknown keys are not carried over.
  */
 function readStoredTombstone(value: unknown): TabUnbindTombstone | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
   const { tabId, sessionId, cause, createdAt, deliveries } = value;
-  if (!isTabId(tabId) || !isUnbindTombstoneCause(cause)) {
+  const unbind = parseSessionUnbindPayload({ tabId });
+  if (!unbind.ok || !isUnbindTombstoneCause(cause)) {
     return undefined;
   }
   if (!isEpochMs(createdAt) || !isDeliveryCount(deliveries)) {
     return undefined;
   }
-  if (sessionId !== undefined && !isNonEmptyString(sessionId)) {
+  if (sessionId !== undefined && !isSessionId(sessionId)) {
     return undefined;
   }
-  return makeTombstone({ tabId, sessionId, cause, createdAt, deliveries });
+  return makeTombstone({ tabId: unbind.value.tabId, sessionId, cause, createdAt, deliveries });
 }
 
 /** The outcome of reading the stored tombstone list back. */
 interface ParsedTombstones {
-  /** Every valid tombstone, one per tab, oldest first. */
+  /** Every tombstone kept, one per tab, oldest first. */
   readonly tombstones: readonly TabUnbindTombstone[];
-  /** How many stored entries were refused (or `1` when the whole value was malformed). */
+  /**
+   * How many stored entries were refused — malformed, a tab's older duplicate,
+   * or beyond {@link MAX_STORED_UNBIND_TOMBSTONES} — or `1` when the whole
+   * value was malformed.
+   */
   readonly dropped: number;
+  /** How many of `dropped` were valid but beyond {@link MAX_STORED_UNBIND_TOMBSTONES}. */
+  readonly overLimit: number;
+  /**
+   * How many of `overLimit` were undelivered — owed unbinds, which only stored
+   * data the registry did not write can bring beyond the limit.
+   */
+  readonly owedOverLimit: number;
 }
 
 /**
@@ -1123,14 +1466,19 @@ interface ParsedTombstones {
  * dropped whole. Each entry is validated by {@link readStoredTombstone}; when
  * two valid entries name the same tab — which the registry never writes — the
  * later decision (the higher `createdAt`, the first entry on a tie) is kept
- * and the other dropped, restoring one tombstone per tab.
+ * and the other dropped, restoring one tombstone per tab. Of what remains,
+ * only {@link MAX_STORED_UNBIND_TOMBSTONES} are kept under
+ * {@link compareTombstoneRetention} — undelivered ones before delivered ones,
+ * and the newest within each — and the rest are counted in `dropped` (and
+ * `overLimit`, with `owedOverLimit` of them undelivered), so the caller
+ * rewrites storage without them.
  */
 function parseTombstones(raw: unknown): ParsedTombstones {
   if (raw === undefined) {
-    return { tombstones: Object.freeze([]), dropped: 0 };
+    return { tombstones: Object.freeze([]), dropped: 0, overLimit: 0, owedOverLimit: 0 };
   }
   if (!Array.isArray(raw)) {
-    return { tombstones: Object.freeze([]), dropped: 1 };
+    return { tombstones: Object.freeze([]), dropped: 1, overLimit: 0, owedOverLimit: 0 };
   }
   const entries: readonly unknown[] = raw;
   const byTab = new Map<TabId, TabUnbindTombstone>();
@@ -1151,7 +1499,17 @@ function parseTombstones(raw: unknown): ParsedTombstones {
       byTab.set(tombstone.tabId, tombstone);
     }
   }
-  return { tombstones: sortTombstones(byTab.values()), dropped };
+  const { kept, excess } = keepWithin(
+    [...byTab.values()],
+    compareTombstoneRetention,
+    MAX_STORED_UNBIND_TOMBSTONES,
+  );
+  return {
+    tombstones: sortTombstones(kept),
+    dropped: dropped + excess.length,
+    overLimit: excess.length,
+    owedOverLimit: excess.filter(isUndelivered).length,
+  };
 }
 
 /** The panel state for a recorded binding. */
@@ -1265,6 +1623,15 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    */
   const pendingBindTabs = new Set<TabId>();
   /**
+   * Tabs with a bind in flight: a `session.bind` of the tab was handed to the
+   * transport in this generation (outcome `sent` or `queued`), and no
+   * confirmation has recorded it and no unbind of the tab has ended it since.
+   * Each holds its tab's slot, so the confirmation always has room (see
+   * "Capacity" in the module overview). A superset of the tabs in
+   * `pendingBindTabs`; memory only, like the socket that would answer it.
+   */
+  const reservedBindTabs = new Set<TabId>();
+  /**
    * Tabs whose tombstone has had a delivery counted in the current delivery
    * epoch — since the latest flush, which `service-worker.ts` runs once per
    * connection — so re-sends within one connection count once.
@@ -1337,30 +1704,37 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * its session's traffic to it, and a stored record could contradict a
    * binding the service confirmed in between.
    *
-   * @returns Whether malformed entries were dropped, so the cleaned map must
-   * be written back.
+   * @returns `rewrite` — whether entries were dropped (malformed, or beyond
+   * {@link MAX_STORED_TAB_BINDINGS}), so the cleaned map must be written back —
+   * and `pruned`, the valid bindings beyond the limit, least recently bound
+   * first, for {@link endPrunedBindings} to end once the tombstones are merged.
    */
-  function loadBindings(stored: Result<unknown, DebuggenError>): boolean {
+  function loadBindings(stored: Result<unknown, DebuggenError>): {
+    readonly rewrite: boolean;
+    readonly pruned: readonly TabBindingRecord[];
+  } {
     cache.clear();
     bindingsHydrated = true;
     if (!stored.ok) {
       logger.error('Tab bindings could not be read from session storage; starting empty', {
         code: stored.error.code,
       });
-      return false;
+      return { rewrite: false, pruned: [] };
     }
     const parsed = parseSnapshot(stored.value);
     for (const record of parsed.records) {
       cache.set(record.tabId, record);
     }
     if (parsed.dropped === 0) {
-      return false;
+      return { rewrite: false, pruned: [] };
     }
-    logger.warn('Dropped malformed tab bindings read back from session storage', {
+    logger.warn('Dropped malformed or excess tab bindings read back from session storage', {
       dropped: parsed.dropped,
+      overLimit: parsed.pruned.length,
       kept: parsed.records.length,
+      limit: MAX_STORED_TAB_BINDINGS,
     });
-    return true;
+    return { rewrite: true, pruned: parsed.pruned };
   }
 
   /**
@@ -1371,10 +1745,14 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * that succeeded is merged *under* what this generation decided — a tab
    * holding an in-memory tombstone, or listed in `decidedBeforeHydration`,
    * keeps that newer decision — and the key becomes `hydrated`. The list is
-   * marked dirty when the stored copy must be rewritten: malformed entries
-   * were dropped, or this generation's decisions override stored ones. A
+   * marked dirty when the stored copy must be rewritten: malformed or excess
+   * entries were dropped, this generation's decisions override stored ones,
+   * or the merged list outgrew {@link MAX_STORED_UNBIND_TOMBSTONES} and was
+   * trimmed, delivered tombstones first ({@link enforceTombstoneLimit}). A
    * pending-bind mark on a tab the merge left without a tombstone is dropped,
-   * since there is nothing for it to hold back.
+   * since there is nothing for it to hold back; its bind is still in flight.
+   * Stored undelivered tombstones beyond the limit — which only data the
+   * registry did not write can hold — are logged as an error.
    */
   function mergeTombstones(stored: Result<unknown, DebuggenError>): void {
     if (!stored.ok) {
@@ -1399,16 +1777,27 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
     }
     tombstoneHydration = 'hydrated';
     decidedBeforeHydration.clear();
+    // This generation's tombstones and the stored ones are each within the
+    // limit, but together they need not be.
+    enforceTombstoneLimit();
     for (const tabId of [...pendingBindTabs]) {
       if (!tombstones.has(tabId)) {
         pendingBindTabs.delete(tabId);
       }
     }
     if (parsed.dropped > 0) {
-      logger.warn('Dropped malformed unbind tombstones read back from session storage', {
+      logger.warn('Dropped malformed or excess unbind tombstones read back from session storage', {
         dropped: parsed.dropped,
+        overLimit: parsed.overLimit,
         kept: parsed.tombstones.length,
+        limit: MAX_STORED_UNBIND_TOMBSTONES,
       });
+    }
+    if (parsed.owedOverLimit > 0) {
+      logger.error(
+        'Dropped undelivered unbind tombstones read back from session storage: it held more owed unbinds than the registry writes',
+        { owed: parsed.owedOverLimit, limit: MAX_STORED_UNBIND_TOMBSTONES },
+      );
     }
     if (parsed.dropped > 0 || overridden > 0) {
       tombstonesDirty = true;
@@ -1470,7 +1859,9 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * ended. The record had been in use in this generation, so its panel may be
    * showing it bound: a tab that navigated off its origin is shown as having
    * left it, as {@link leaveOrigin} shows it, and any other cause as unbound,
-   * as {@link unbindLocked} does. The tombstone itself stays to be flushed.
+   * as {@link unbindLocked} does — a `binding-limit` one without a change
+   * cause, as {@link endLeastRecentlyBound} announces it. The tombstone itself
+   * stays to be flushed.
    */
   function announceEndedByTombstone({ record, tombstone }: EndedByTombstone): void {
     const { cause } = tombstone;
@@ -1501,8 +1892,108 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       current: undefined,
       state: UNBOUND_STATE,
       reason: REASON_UNBOUND,
-      cause,
+      cause: cause === CAUSE_BINDING_LIMIT ? undefined : cause,
     });
+  }
+
+  /**
+   * End the stored bindings hydration could not keep — the valid ones beyond
+   * {@link MAX_STORED_TAB_BINDINGS}, least recently bound first — through owed
+   * unbinds, so none is forgotten while the service may still hold it: the
+   * service keeps a binding across a dropped socket, and a reconnect
+   * re-announces only the records that remain.
+   *
+   * Each gets a write-ahead tombstone (cause `binding-limit`, naming its
+   * session) unless a decision about the tab made at or after its `boundAt`
+   * already stands, which carries the unbind itself; the list is written, then
+   * each `session.unbind { tabId }` is handed to the transport and its delivery
+   * counted. A tab with a bind in flight in this generation is held back
+   * instead, as {@link TabRegistry.requestBind} holds one back: sent now, the
+   * unbind would follow that bind and end it, and the bind's confirmation
+   * supersedes the tombstone.
+   *
+   * At most {@link MAX_STORED_UNBIND_TOMBSTONES} — the most recently bound —
+   * are ended, so corrupted storage cannot make the worker send more unbinds
+   * than the list can hold; any beyond that are dropped and logged as an
+   * error. Runs inside the queue, from {@link hydrate}, which writes the
+   * bindings through and announces the removals.
+   *
+   * @returns The records ended, least recently bound first.
+   */
+  async function endPrunedBindings(
+    pruned: readonly TabBindingRecord[],
+  ): Promise<readonly TabBindingRecord[]> {
+    if (pruned.length === 0) {
+      return [];
+    }
+    const ending = pruned.slice(-MAX_STORED_UNBIND_TOMBSTONES);
+    const abandoned = pruned.length - ending.length;
+    const createdAt = now();
+    const written: TabUnbindTombstone[] = [];
+    for (const record of ending) {
+      departures.delete(record.tabId);
+      const standing = tombstones.get(record.tabId);
+      if (standing !== undefined && standing.createdAt >= record.boundAt) {
+        continue;
+      }
+      forgetTombstone(record.tabId);
+      const tombstone = makeTombstone({
+        tabId: record.tabId,
+        sessionId: record.sessionId,
+        cause: CAUSE_BINDING_LIMIT,
+        createdAt,
+        deliveries: 0,
+      });
+      tombstones.set(record.tabId, tombstone);
+      noteDecidedBeforeHydration(record.tabId);
+      written.push(tombstone);
+    }
+    enforceTombstoneLimit();
+    if (written.length > 0) {
+      await writeTombstones();
+    }
+    let handed = 0;
+    let heldBack = 0;
+    let counted = false;
+    for (const tombstone of written) {
+      if (tombstones.get(tombstone.tabId) !== tombstone) {
+        continue;
+      }
+      if (reservedBindTabs.has(tombstone.tabId)) {
+        pendingBindTabs.add(tombstone.tabId);
+        heldBack += 1;
+        continue;
+      }
+      const payload: SessionUnbindPayload = { tabId: tombstone.tabId };
+      const outcome = report(MESSAGE_TYPE.SESSION_UNBIND, payload, {
+        tabId: tombstone.tabId,
+        sessionId: tombstone.sessionId,
+        cause: tombstone.cause,
+      });
+      if (outcome.ok) {
+        handed += 1;
+      }
+      if (countDelivery(tombstone, outcome) !== 'unchanged') {
+        counted = true;
+      }
+    }
+    if (counted) {
+      await writeTombstones();
+    }
+    logger.warn('Ended stored tab bindings beyond the binding limit through owed unbinds', {
+      ended: ending.length,
+      tombstoned: written.length,
+      handed,
+      heldBack,
+      limit: MAX_STORED_TAB_BINDINGS,
+    });
+    if (abandoned > 0) {
+      logger.error(
+        'Dropped stored tab bindings beyond what one hydration ends: storage held more than the registry writes',
+        { dropped: abandoned, limit: MAX_STORED_UNBIND_TOMBSTONES },
+      );
+    }
+    return ending;
   }
 
   /**
@@ -1520,6 +2011,12 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * A record ended by a tombstone read back *late* — after the binding cache
    * was already in use — is then announced; at a generation's first
    * hydration, before anything was announced, ending one is silent.
+   *
+   * Stored bindings beyond {@link MAX_STORED_TAB_BINDINGS} are ended through
+   * owed unbinds ({@link endPrunedBindings}) once the tombstones are merged —
+   * their tombstones written ahead of the binding map that no longer names
+   * them — and every one of them is announced, whichever hydration read it:
+   * its panel may still show the binding an earlier generation pushed.
    */
   async function hydrate(rereadBindings: boolean): Promise<void> {
     const readBindings = rereadBindings || !bindingsHydrated;
@@ -1528,7 +2025,8 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       readBindings ? readStorageKey(BINDING_STORAGE_KEY) : undefined,
       readTombstones ? readStorageKey(UNBIND_TOMBSTONE_STORAGE_KEY) : undefined,
     ]);
-    let bindingsChanged = storedBindings !== undefined && loadBindings(storedBindings);
+    const loaded = storedBindings === undefined ? undefined : loadBindings(storedBindings);
+    let bindingsChanged = loaded?.rewrite ?? false;
     if (storedTombstones !== undefined) {
       mergeTombstones(storedTombstones);
     }
@@ -1538,6 +2036,7 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
     if (ended.length > 0) {
       bindingsChanged = true;
     }
+    const endedPruned = await endPrunedBindings(loaded?.pruned ?? []);
     if (bindingsChanged) {
       await persist();
     }
@@ -1548,6 +2047,17 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       for (const endedRecord of ended) {
         announceEndedByTombstone(endedRecord);
       }
+    }
+    for (const record of endedPruned) {
+      announce({
+        kind: 'removed',
+        tabId: record.tabId,
+        previous: record,
+        current: undefined,
+        state: UNBOUND_STATE,
+        reason: REASON_UNBOUND,
+        cause: undefined,
+      });
     }
     logger.debug('Tab registry hydrated from session storage', {
       bindings: cache.size,
@@ -1652,6 +2162,86 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
     tombstones.delete(tabId);
     pendingBindTabs.delete(tabId);
     countedThisEpoch.delete(tabId);
+  }
+
+  /**
+   * Keep the tombstone cache within {@link MAX_STORED_UNBIND_TOMBSTONES} by
+   * evicting in {@link compareTombstoneRetention} order — delivered tombstones
+   * first, oldest first — each with its per-generation state, and mark the
+   * list dirty so the bounded list is what the next write stores. `keep` — the
+   * tab whose tombstone was just written ahead of its unbind — is never
+   * evicted: it is the decision being made, whatever the clock says of its age.
+   *
+   * The registry's own writes keep every undelivered tombstone within the slot
+   * budget ({@link MAX_STORED_TAB_BINDINGS}, never above this limit), so they
+   * always leave a delivered one to evict. Evicting an undelivered one — an
+   * unbind still owed — takes state the registry did not write, and is logged
+   * as an error rather than the warning an eviction of delivered ones gets. In
+   * memory only; logged with counts alone.
+   */
+  function enforceTombstoneLimit(keep?: TabId): void {
+    const excess = tombstones.size - MAX_STORED_UNBIND_TOMBSTONES;
+    if (excess <= 0) {
+      return;
+    }
+    const evicted = [...tombstones.values()]
+      .filter((tombstone) => tombstone.tabId !== keep)
+      .sort(compareTombstoneRetention)
+      .slice(0, excess);
+    for (const tombstone of evicted) {
+      forgetTombstone(tombstone.tabId);
+    }
+    tombstonesDirty = true;
+    const owed = evicted.filter(isUndelivered).length;
+    const fields = {
+      evicted: evicted.length,
+      owed,
+      pending: tombstones.size,
+      limit: MAX_STORED_UNBIND_TOMBSTONES,
+    };
+    if (owed === 0) {
+      logger.warn(
+        'Evicted the oldest delivered unbind tombstones to stay within the stored limit',
+        fields,
+      );
+    } else {
+      logger.error(
+        'Evicted undelivered unbind tombstones: the registry held more owed unbinds than it stores',
+        fields,
+      );
+    }
+  }
+
+  /**
+   * Whether a tab holds a slot (see "Capacity" in the module overview): it has
+   * a record, a bind in flight, or an undelivered tombstone.
+   */
+  function holdsSlot(tabId: TabId): boolean {
+    const tombstone = tombstones.get(tabId);
+    return (
+      cache.has(tabId) ||
+      reservedBindTabs.has(tabId) ||
+      (tombstone !== undefined && isUndelivered(tombstone))
+    );
+  }
+
+  /** How many tabs hold a slot — each counted once, whatever holds it. */
+  function slotsInUse(): number {
+    const holders = new Set<TabId>(cache.keys());
+    for (const tabId of reservedBindTabs) {
+      holders.add(tabId);
+    }
+    for (const tombstone of tombstones.values()) {
+      if (isUndelivered(tombstone)) {
+        holders.add(tombstone.tabId);
+      }
+    }
+    return holders.size;
+  }
+
+  /** Whether a tab that holds no slot can take one now. */
+  function hasFreeSlot(): boolean {
+    return slotsInUse() < MAX_STORED_TAB_BINDINGS;
   }
 
   /**
@@ -1777,7 +2367,10 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * and epoch count), then hand `session.unbind { tabId }` to the transport,
    * then write the delivery count through when a `sent` outcome changed it.
    * Runs inside the queue, and before the caller drops the record, so the
-   * intent is durable before anything else of the unbind happens.
+   * intent is durable before anything else of the unbind happens. A tombstone
+   * that takes the list past {@link MAX_STORED_UNBIND_TOMBSTONES} evicts
+   * another one before the write — a delivered one ({@link enforceTombstoneLimit})
+   * — so storage never holds more than hydration keeps.
    *
    * When a write cannot be made — the key is unreadable, or storage refuses
    * it — the tombstone stays in memory, dirty, and the frame is still
@@ -1792,10 +2385,11 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
     const tombstone = makeTombstone({ tabId, sessionId, cause, createdAt: now(), deliveries: 0 });
     forgetTombstone(tabId);
     tombstones.set(tabId, tombstone);
+    enforceTombstoneLimit(tabId);
     noteDecidedBeforeHydration(tabId);
     await writeTombstones();
     const payload: SessionUnbindPayload = { tabId };
-    const outcome = report('session.unbind', payload, { tabId, sessionId, cause });
+    const outcome = report(MESSAGE_TYPE.SESSION_UNBIND, payload, { tabId, sessionId, cause });
     if (countDelivery(tombstone, outcome) !== 'unchanged') {
       await writeTombstones();
     }
@@ -1890,7 +2484,7 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
         continue;
       }
       const payload: SessionUnbindPayload = { tabId: tombstone.tabId };
-      const outcome = report('session.unbind', payload, {
+      const outcome = report(MESSAGE_TYPE.SESSION_UNBIND, payload, {
         tabId: tombstone.tabId,
         sessionId: tombstone.sessionId,
         cause: tombstone.cause,
@@ -1928,13 +2522,159 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    */
 
   /**
+   * End the least recently bound binding ({@link compareBindingRecency}) to
+   * make room for a confirmation at {@link MAX_STORED_TAB_BINDINGS}, through
+   * the ordinary unbind: its tombstone is written ahead (cause
+   * `binding-limit`), its `session.unbind { tabId }` handed to the transport,
+   * and its record dropped from the cache. Never a silent drop — a record
+   * forgotten here but still bound at the service would keep the session's
+   * `agent.config`, `telemetry.tail` and `panel.generated` routed to a tab
+   * this worker no longer tracks. Runs inside the queue, from
+   * {@link makeRoom}; {@link establish} writes the bindings through and
+   * announces the removal.
+   *
+   * @returns The record that was ended, or `undefined` when none is held.
+   */
+  async function endLeastRecentlyBound(): Promise<TabBindingRecord | undefined> {
+    const oldest = leastRecentlyBound(cache.values());
+    if (oldest === undefined) {
+      return undefined;
+    }
+    await reportUnbind(oldest.tabId, oldest.sessionId, CAUSE_BINDING_LIMIT);
+    cache.delete(oldest.tabId);
+    departures.delete(oldest.tabId);
+    logger.warn('Ended the least recently bound tab binding to stay within the binding limit', {
+      tabId: oldest.tabId,
+      sessionId: oldest.sessionId,
+      cause: CAUSE_BINDING_LIMIT,
+      limit: MAX_STORED_TAB_BINDINGS,
+    });
+    return oldest;
+  }
+
+  /**
+   * Make room to record a confirmed binding of a new tab `tabId`, without
+   * forgetting any obligation (see "Capacity" in the module overview). Room is
+   * needed when the binding map is full, or when the tab holds no slot and
+   * every slot is held.
+   *
+   * A slot is freed first by delivering owed unbinds — the oldest undelivered
+   * tombstones of other tabs with no bind in flight, which the next flush would
+   * send anyway — and then by ending the least recently bound bindings through
+   * the ordinary unbind ({@link endLeastRecentlyBound}), which also makes room
+   * in the map. Only a delivery frees a slot, so once the socket takes no frame
+   * no more bindings are ended for a slot: a binding ended whose unbind was not
+   * sent still holds its slot, as an owed unbind. The tab's own tombstone is
+   * never delivered here: sent after the bind the service just applied, it
+   * would end it. Runs inside the queue, from {@link establish}.
+   *
+   * @param ended Receives every binding ended here, for the caller to announce.
+   * @returns Whether the binding can now be recorded.
+   */
+  async function makeRoom(tabId: TabId, ended: TabBindingRecord[]): Promise<boolean> {
+    const mapFull = (): boolean => cache.size >= MAX_STORED_TAB_BINDINGS;
+    const slotsFull = (): boolean => !holdsSlot(tabId) && !hasFreeSlot();
+    if (!mapFull() && !slotsFull()) {
+      return true;
+    }
+    let socketTakesFrames = true;
+    let delivered = 0;
+    while (slotsFull()) {
+      const owed = sortTombstones(tombstones.values()).find(
+        (tombstone) =>
+          tombstone.tabId !== tabId &&
+          isUndelivered(tombstone) &&
+          !reservedBindTabs.has(tombstone.tabId),
+      );
+      if (owed === undefined) {
+        break;
+      }
+      const payload: SessionUnbindPayload = { tabId: owed.tabId };
+      const outcome = report(MESSAGE_TYPE.SESSION_UNBIND, payload, {
+        tabId: owed.tabId,
+        sessionId: owed.sessionId,
+        cause: owed.cause,
+        deliveries: owed.deliveries,
+      });
+      if (countDelivery(owed, outcome) === 'unchanged') {
+        socketTakesFrames = false;
+        break;
+      }
+      delivered += 1;
+    }
+    if (delivered > 0) {
+      await writeTombstones();
+    }
+    while (mapFull() || (socketTakesFrames && slotsFull())) {
+      const endedRecord = await endLeastRecentlyBound();
+      if (endedRecord === undefined) {
+        break;
+      }
+      ended.push(endedRecord);
+      const tombstone = tombstones.get(endedRecord.tabId);
+      if (tombstone !== undefined && isUndelivered(tombstone)) {
+        socketTakesFrames = false;
+      }
+    }
+    const room = !mapFull() && !slotsFull();
+    logger.info('Made room for a confirmed binding at the binding limit', {
+      tabId,
+      delivered,
+      ended: ended.length,
+      room,
+      limit: MAX_STORED_TAB_BINDINGS,
+    });
+    return room;
+  }
+
+  /**
+   * Announce the removals one confirmation caused, after they were written
+   * through: the tabs the session was moved off (`replaced`), then the
+   * bindings ended to make room for it — announced as `unbound` with no
+   * worker cause, since the binding limit is not one of
+   * {@link TAB_UNBIND_CAUSES} (see {@link TabBindingChange.cause}).
+   */
+  function announceRemovedForConfirmation(
+    displaced: readonly TabBindingRecord[],
+    endedAtLimit: readonly TabBindingRecord[],
+  ): void {
+    for (const other of displaced) {
+      announce({
+        kind: 'removed',
+        tabId: other.tabId,
+        previous: other,
+        current: undefined,
+        state: UNBOUND_STATE,
+        reason: REASON_REPLACED,
+        cause: undefined,
+      });
+    }
+    for (const ended of endedAtLimit) {
+      announce({
+        kind: 'removed',
+        tabId: ended.tabId,
+        previous: ended,
+        current: undefined,
+        state: UNBOUND_STATE,
+        reason: REASON_UNBOUND,
+        cause: undefined,
+      });
+    }
+  }
+
+  /**
    * Record an established binding (`reason` absent or `bound`).
    *
    * The tab's previous record, if it named another session, is replaced; any
    * other tab holding the same session is displaced and its panel told it is
    * unbound, so a panel whose binding was taken never keeps claiming
    * "Connected". A re-announcement of the binding the tab already holds (after
-   * a socket reconnect) keeps its `boundAt` and its running capture.
+   * a socket reconnect) keeps its `boundAt` and its running capture. A tab
+   * that holds no slot, confirmed while every slot is held, first makes room
+   * ({@link makeRoom}); a binding ended for it is announced after this one's.
+   * When no room can be made, the confirmation is declined — not recorded,
+   * answered `ignored` — and only the displacement is written and announced:
+   * the service moved the session off those tabs either way.
    */
   async function establish(
     bound: SessionBoundPayload,
@@ -1972,7 +2712,30 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       cache.delete(other.tabId);
       departures.delete(other.tabId);
     }
+    // A new tab at the limit: room is made first, so the map written below —
+    // and hydrated by the next generation — stays within
+    // MAX_STORED_TAB_BINDINGS, and so do the slots. A binding ended for it has
+    // its tombstone written ahead inside, before the bindings are.
+    const endedAtLimit: TabBindingRecord[] = [];
+    const hasRoom = cache.has(record.tabId) || (await makeRoom(record.tabId, endedAtLimit));
+    if (!hasRoom) {
+      await persist();
+      announceRemovedForConfirmation(displaced, endedAtLimit);
+      logger.error(
+        'Declined to record a confirmed binding: every slot is held and the socket took no frame to free one',
+        {
+          tabId: record.tabId,
+          sessionId: record.sessionId,
+          slots: slotsInUse(),
+          limit: MAX_STORED_TAB_BINDINGS,
+          displacedTabs: displaced.map((other) => other.tabId),
+          limitEndedTabs: endedAtLimit.map((ended) => ended.tabId),
+        },
+      );
+      return ok({ kind: 'ignored', reason });
+    }
     cache.set(record.tabId, record);
+    reservedBindTabs.delete(record.tabId);
     departures.delete(record.tabId);
     await persist();
     // The service accepted a bind of this tab, replacing whatever it held, so
@@ -2001,17 +2764,7 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       reason,
       cause: undefined,
     });
-    for (const other of displaced) {
-      announce({
-        kind: 'removed',
-        tabId: other.tabId,
-        previous: other,
-        current: undefined,
-        state: UNBOUND_STATE,
-        reason: REASON_REPLACED,
-        cause: undefined,
-      });
-    }
+    announceRemovedForConfirmation(displaced, endedAtLimit);
 
     logger.info(sameBinding ? 'Tab binding re-confirmed' : 'Tab bound to session', {
       tabId: record.tabId,
@@ -2019,6 +2772,7 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       origin,
       replacedSession: previous !== undefined && !sameBinding ? previous.sessionId : undefined,
       displacedTabs: displaced.map((other) => other.tabId),
+      limitEndedTabs: endedAtLimit.map((ended) => ended.tabId),
     });
 
     if (sameBinding) {
@@ -2167,6 +2921,11 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * binding was recorded for, both serialized by the platform `URL` parser. A
    * URL that does not parse, or has no HTTP(S) origin, can never equal a bound
    * origin, so it is a cross-origin navigation: the tab has left the app.
+   *
+   * A navigation that is not a valid `tab.navigated` payload — its URL longer
+   * than the protocol admits, or not absolute — can be neither reported nor
+   * recorded (a record holding it would be refused by the next hydration), so
+   * it takes {@link navigateUnreportable}'s path.
    */
   async function navigate(navigation: TabNavigation): Promise<NavigationDecision> {
     const { tabId, url } = navigation;
@@ -2174,9 +2933,13 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       logger.warn('Ignored a navigation report for an invalid tab id');
       return { kind: 'not-bound', tabId, reported: false };
     }
+    if (!parseTabNavigatedPayload({ tabId, url }).ok) {
+      logger.warn('Navigation not reportable as tab.navigated; handled as unreportable', { tabId });
+      return navigateUnreportable(tabId);
+    }
 
     const navigated: TabNavigatedPayload = { tabId, url };
-    const reported = report('tab.navigated', navigated, { tabId }).ok;
+    const reported = report(MESSAGE_TYPE.TAB_NAVIGATED, navigated, { tabId }).ok;
 
     await ensureHydrated();
     const current = cache.get(tabId);
@@ -2312,7 +3075,10 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * `'devtools-closed'` report and for a tab a `session.bind` is still pending
    * over (the new tombstone replaces the one that bind held back, so it is
    * flushable, and the unbind leaves after the bind and ends it if the service
-   * applies it); such a tombstone names no session.
+   * applies it); such a tombstone names no session. A reported unbind ends the
+   * tab's bind in flight, whose slot its tombstone takes over; one of a tab
+   * holding no slot while every slot is held is sent without a tombstone (see
+   * "Capacity" in the module overview).
    */
   async function unbindLocked(
     tabId: TabId,
@@ -2323,11 +3089,33 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
     departures.delete(tabId);
 
     if (current === undefined && cause !== CAUSE_DEVTOOLS_CLOSED && !pendingBindTabs.has(tabId)) {
+      // A bind still in flight keeps its slot: the DevTools page closing with
+      // the tab reports that unbind itself, as `devtools-closed`, and writes
+      // its tombstone into that slot.
       logger.debug('Unbind for a tab with no binding; nothing to report', { tabId, cause });
       return undefined;
     }
 
+    if (current === undefined && !holdsSlot(tabId) && !hasFreeSlot()) {
+      // DevTools closed on a tab with no binding, no bind in flight and no owed
+      // unbind, while every slot is held: nothing this generation did can have
+      // left the service a binding of it, so the unbind is sent as the race
+      // closer it is, without a tombstone that would need a slot.
+      const payload: SessionUnbindPayload = { tabId };
+      report(MESSAGE_TYPE.SESSION_UNBIND, payload, { tabId, cause });
+      logger.warn('Unbind sent without a tombstone: every slot is held and the tab holds none', {
+        tabId,
+        cause,
+        slots: slotsInUse(),
+        limit: MAX_STORED_TAB_BINDINGS,
+      });
+      return undefined;
+    }
+
     await reportUnbind(tabId, current?.sessionId, cause);
+    // The tombstone now carries whatever the bind in flight could leave bound:
+    // it is flushable, and sent after that bind it ends it.
+    reservedBindTabs.delete(tabId);
     if (current === undefined) {
       return undefined;
     }
@@ -2370,9 +3158,16 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
    * ---- capture bookkeeping ----
    */
 
-  /** Store a capture id on a bound tab. Runs inside the queue. */
+  /**
+   * Store a capture id on a bound tab. Runs inside the queue. The id is held
+   * to the `capture.started` schema hydration applies, so the record written
+   * here is one the next generation accepts.
+   */
   async function setCaptureLocked(tabId: TabId, captureId: CaptureId): Promise<boolean> {
-    if (!isTabId(tabId) || !isNonEmptyString(captureId)) {
+    if (!isTabId(tabId) || !isCaptureId(captureId)) {
+      logger.debug('Capture id not stored: not a valid tab id and capture id', {
+        tabId: isTabId(tabId) ? tabId : undefined,
+      });
       return false;
     }
     await ensureHydrated();
@@ -2469,18 +3264,34 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       }
       await ensureHydrated();
       const bindTabId = parsed.value.tabId;
+      if (!holdsSlot(bindTabId) && !hasFreeSlot()) {
+        // Refused before anything is sent: a bind the service may apply needs
+        // a slot to land in, and making one here would mean forgetting an
+        // obligation some other tab holds.
+        logger.warn('Refused to request a binding: every slot is held', {
+          tabId: bindTabId,
+          slots: slotsInUse(),
+          limit: MAX_STORED_TAB_BINDINGS,
+        });
+        return err(
+          workerError(
+            'RATE_LIMITED',
+            `The worker already tracks ${String(MAX_STORED_TAB_BINDINGS)} tabs that are bound, or being bound or unbound, so no binding was requested for this one. Close DevTools on tabs no longer being debugged, then try again.`,
+          ),
+        );
+      }
       const owed = tombstones.get(bindTabId);
       if (owed !== undefined) {
         // The owed unbind leaves first, so on the FIFO transport the service
         // ends the stale binding before it considers this bind. The tombstone
         // stays: only a confirmed bind (`establish`) supersedes it.
         const unbindPayload: SessionUnbindPayload = { tabId: bindTabId };
-        const unbound = report('session.unbind', unbindPayload, {
+        const unbound = report(MESSAGE_TYPE.SESSION_UNBIND, unbindPayload, {
           tabId: bindTabId,
           sessionId: owed.sessionId,
           cause: owed.cause,
           deliveries: owed.deliveries,
-          aheadOf: 'session.bind',
+          aheadOf: MESSAGE_TYPE.SESSION_BIND,
         });
         if (!unbound.ok) {
           // Sent alone, the bind would not be ordered behind the unbind. The
@@ -2495,11 +3306,16 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
           await writeTombstones();
         }
       }
-      const outcome = report('session.bind', parsed.value, {
+      const outcome = report(MESSAGE_TYPE.SESSION_BIND, parsed.value, {
         tabId: bindTabId,
         origin: parsed.value.origin,
         sessionId: parsed.value.sessionId,
       });
+      if (outcome.ok) {
+        // The bind is in flight: its tab holds a slot until the confirmation
+        // lands in it or an unbind of the tab ends it.
+        reservedBindTabs.add(bindTabId);
+      }
       // A bind now pending holds back this generation's flushes of the tab's
       // tombstone — known, or possibly stored while the key is unreadable. A
       // refused bind is not pending, so nothing is held back.

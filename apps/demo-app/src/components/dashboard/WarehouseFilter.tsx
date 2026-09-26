@@ -534,12 +534,12 @@ export function WarehouseFilter({
   // comparison to make before this row has navigated at all, so arriving at the dashboard and
   // immediately blurring an untouched field asks for nothing.
   //
-  // Built from the parameters rather than from anything resolved against the location list, and
-  // that is what makes it correct in the one state where it used to be wrong: when the URL asks
-  // for a location the payload does not list, a comparator built from resolved values reads as
-  // "nothing is filtered", so the Clear that would have recovered compared equal to the URL it was
-  // leaving and was dropped. This string is the query string, so a navigation is asked for exactly
-  // when it would change the address bar.
+  // Built from the raw URL parameters rather than from anything resolved against the location
+  // list, so it stays correct when the URL names a location the payload does not list. A
+  // comparator built from resolved values would read that state as "nothing is filtered", and the
+  // Clear that recovers from it would compare equal to the URL it leaves and be dropped. Because
+  // this string is the query string, a navigation is asked for exactly when it would change the
+  // address bar.
   const appliedInventoryQuery = buildInventoryQuery(seed);
 
   // What the controls are asking for, in the same form: the query string the address bar would
@@ -811,9 +811,10 @@ export function WarehouseFilter({
   const unlisted =
     draft.warehouseId.length > 0 && findWarehouse(warehouses, draft.warehouseId) === undefined;
 
-  // How the status line names the location the figures beside it were produced under. Three cases,
-  // and the third is the one that used to be dishonest: a parameter this row cannot resolve is
-  // reported as exactly that, rather than as "every location", which is a different dashboard.
+  // How the status line names the location the figures beside it were produced under. Three cases:
+  // a listed location by its code and name, no location parameter as "every location", and a
+  // parameter this row cannot resolve as a location this dashboard does not list - never as
+  // "every location", which would describe a different dashboard.
   const location =
     applied !== undefined
       ? `${applied.code} - ${applied.name}`

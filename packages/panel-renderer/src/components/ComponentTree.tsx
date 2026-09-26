@@ -1,11 +1,11 @@
 /**
  * `components/ComponentTree` — the renderer for the `componentTree` panel node.
  *
- * AAP 0.6.2 states this node in one line: the `componentTree` data source
- * resolves to a component-tree snapshot — "owner/parent tree with per-node
- * render counts" — drawn as an "expandable tree; highlight components above a
- * render threshold". Everything below follows from that sentence plus three
- * properties of the datum it draws.
+ * The node's contract fits in one line: the `componentTree` data source
+ * resolves to a component-tree snapshot — an owner/parent tree with per-node
+ * render counts — drawn as an expandable tree that highlights the components
+ * above a render threshold. Everything below follows from that sentence plus
+ * three properties of the datum it draws.
  *
  * ## What the datum actually is, and what that forbids
  *
@@ -16,7 +16,7 @@
  * commit of the capture", and the counts are labelled as cumulative.
  *
  * The snapshot also **states its own limits**, and they are part of the answer
- * rather than diagnostics (AAP 0.6.6):
+ * rather than diagnostics:
  *
  *   - `origin` records how the structure was obtained — serialized by the
  *     runtime, rebuilt from the owner chains of the individual renders, or not
@@ -48,10 +48,10 @@
  * actually recorded it.
  *
  * The panel has one selected event, owned by the panel host and read here
- * through `useViewSelection` (AAP 0.7.3). The commit control is drawn pressed
- * while the commit is that event. A node the reader activated is marked as the
- * tree's selected row (`aria-selected`, or `aria-current` in a flat listing,
- * with `dg-is-selected`) for as long as the panel's selection is the one that
+ * through `useViewSelection`. The commit control is drawn pressed while the
+ * commit is that event. A node the reader activated is marked as the tree's
+ * selected row (`aria-selected`, or `aria-current` in a flat listing, with
+ * `dg-is-selected`) for as long as the panel's selection is the one that
  * activation left it with: the node's representative render once the host has
  * recorded the report, or — for a node that names none — the selection it was
  * activated beside. Any other selection takes the mark away — and a node whose
@@ -59,7 +59,7 @@
  * selection it was activated under — so the tree never shows a selection that
  * contradicts the event every other view and the details drawer show.
  *
- * ## Privacy (AAP 0.5.2)
+ * ## Privacy
  *
  * A node carries a display name, an optional instance key, counts, a duration,
  * the trigger of its most recent render and that render's ids, and an optional
@@ -69,8 +69,10 @@
  * The render ids are coordinates handed to the host, never text on screen.
  * Names and keys are length-bounded through `../utils/format` before they
  * reach the DOM, because they arrive from a page this product does not control.
+ * `docs/SECURITY.md` ("Browser tier — the page agent" and "Never captured")
+ * states what the capture records for this snapshot and what it never records.
  *
- * ## Accessibility (AAP 0.6.4)
+ * ## Accessibility
  *
  * The tree is a single composite widget with **one tab stop**: a roving
  * `tabIndex` over the visible rows, and nothing inside a row in the Tab order.
@@ -129,15 +131,15 @@
  *
  * Indentation is therefore the `--dgc-depth` custom property and nothing else.
  * This file writes no other inline style, no colour and no dimension: every
- * value it produces is a token reference resolved by the stylesheet
- * (AAP 0.6.4).
+ * value it produces is a token reference resolved by the stylesheet.
  *
- * ## Transport blindness (AAP 0.1.2, 0.6.2)
+ * ## Transport blindness
  *
  * Data arrives only through `useQuery(node.query)`, resolved by whatever
  * `DataProvider` the surrounding host mounted; interactions leave only through
  * `PanelActions`. No socket, no `fetch`, no message name, no knowledge of which
- * of the two host surfaces is rendering.
+ * of the two host surfaces is rendering — the rule `docs/ARCHITECTURE.md`
+ * ("The renderer contract") sets for every component.
  */
 
 import clsx from 'clsx';
@@ -199,8 +201,8 @@ import { SourceLink } from './SourceLink';
  *
  * Every string a developer can read lives here, and every one of them is
  * generic: no component name, no route, no framework-specific noun and nothing
- * drawn from any particular project (AAP 0.5.4). The names on screen come from
- * the data, never from this file.
+ * drawn from any particular project. The names on screen come from the data,
+ * never from this file.
  * ------------------------------------------------------------------------- */
 
 /** The node type this component draws, as the panel schema spells it. */
@@ -212,12 +214,12 @@ const COMPONENT_TREE_SOURCE: DataQuerySource = 'componentTree';
 /**
  * This node type's entry in the single registry of node types.
  *
- * Imported rather than restated (AAP 0.6.2): the catalog owns the node's label,
- * the data sources it may read — which the query guard below checks against —
- * and the `reads` list naming the captured fields this view draws, which is the
- * same list the schema's semantic validation checks a capture can satisfy. A
- * second copy of any of the three in this file is how a renderer and its schema
- * drift apart.
+ * Imported rather than restated: the catalog owns the node's label, the data
+ * sources it may read — which the query guard below checks against — and the
+ * `reads` list naming the captured fields this view draws, which is the same
+ * list the schema's semantic validation checks a capture can satisfy. A second
+ * copy of any of the three in this file is how a renderer and its schema drift
+ * apart.
  */
 const CATALOG_ENTRY = PANEL_NODE_CATALOG[COMPONENT_TREE_NODE_TYPE];
 
@@ -306,11 +308,11 @@ const EMPTY_TITLE = 'Nothing to show';
  * title, a generic lead followed by the cause, the error's code, the query as
  * `formatDataQuery` prints it and, where asking again can change the answer, a
  * retry — so a failed component tree reads exactly like every other failed node
- * of a panel (B1-F16, B2-F14). The host's response check
- * (`../host/DataProvider`) already refuses a snapshot missing any member this
- * view reads, so that refusal arrives here as an ordinary failed query; the
- * shape guard below stays as defence in depth for a member present with the
- * wrong type, and words its refusal with the host's own sentence and hint.
+ * of a panel. The host's response check (`../host/DataProvider`) already
+ * refuses a snapshot missing any member this view reads, so that refusal
+ * arrives here as an ordinary failed query; the shape guard below stays as
+ * defence in depth for a member present with the wrong type, and words its
+ * refusal with the host's own sentence and hint.
  */
 
 /** The shape the guard requires, for the closed "Technical details" disclosure. */
@@ -674,8 +676,9 @@ function isComponentTreeSnapshot(value: unknown): value is ComponentTreeSnapshot
  * Each one bounds a value that arrives from a page this product does not
  * control, and each one has an answer for the absent case — `n/a` from the one
  * module that owns that spelling, never an empty cell and never the strings
- * "undefined" or "null" (AAP 0.6.2 three-states rule, and the defensive
- * patterns of the UI guidelines).
+ * "undefined" or "null": no part of a view is ever a blank area, and an absent
+ * value is stated as absent rather than left for the reader to mistake for
+ * data.
  * ------------------------------------------------------------------------- */
 
 /** The tree's own reading of a node's display name, length-bounded. */
@@ -1065,8 +1068,8 @@ function prepareTree(
  * structure: the roots open so the first level is visible, and every ancestor
  * of a marked node opens so the finding is on screen. Nothing else does, so a
  * structure of thousands of nodes puts a bounded number of rows in the DOM on
- * first paint (AAP 0.4.2 — this source answers with one object and no paging,
- * so expansion is the only bound available).
+ * first paint. This source answers with one object and no paging, so expansion
+ * is the only bound available.
  *
  * The result is a *default*, not the state: a developer's own toggles are held
  * separately and win, so re-deriving this set after a threshold change never
@@ -1189,10 +1192,10 @@ function projectRows(
 /* ---------------------------------------------------------------------------
  * The threshold
  *
- * "Highlight components above a render threshold" (AAP 0.6.2) needs a number,
- * and a constant would be a claim this product cannot support: what counts as
- * too many renders depends on the interaction that was captured. So the default
- * is derived from the capture itself and the derivation is explained on screen,
+ * Highlighting the components above a render threshold needs a number, and a
+ * constant would be a claim this product cannot support: what counts as too
+ * many renders depends on the interaction that was captured. So the default is
+ * derived from the capture itself and the derivation is explained on screen,
  * where a developer can disagree with it and type their own.
  * ------------------------------------------------------------------------- */
 
@@ -2133,8 +2136,7 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
         <div className="dg-component-tree__error">
           {/* The shared contract: the generic lead followed by the cause the
               provider stated, its hint and code, the query as asked and a
-              retry. It reports what failed and never reads like an analysis
-              (AAP 0.5.5). */}
+              retry. It reports what failed and never reads like an analysis. */}
           <ErrorState {...queryFailureProps(result, query)} />
         </div>
       );

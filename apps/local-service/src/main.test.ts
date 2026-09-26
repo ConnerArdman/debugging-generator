@@ -24,6 +24,20 @@
  *    folds the write-ahead log back into the database.
  * 6. The composition adapters this file owns — the agent-readiness ledger and
  *    the entry guard — directly.
+ * 7. **The state root stays outside every project** (AAP 0.4.2). A start whose
+ *    stored sessions' projects contain `$DEBUGGEN_HOME` or lie inside it is
+ *    refused after crash recovery restored their files, so is one whose stored
+ *    project cannot be resolved on disk (fail-closed), and the served session
+ *    and dev-server routes refuse such a project.
+ * 8. **Every connection is bounded** (CWE-400): the header deadline closes a
+ *    stalled or silent connection with a raw `408`, a malformed or oversized
+ *    request is answered and closed, an upgraded WebSocket outlives the request
+ *    deadline, and a connection past the cap is refused and reported. The
+ *    pre-auth admission budget holds too: a flood of stalled connections is
+ *    evicted oldest first so an authenticated request, a slow handler and a
+ *    WebSocket are all still served, connections past the admission rate are
+ *    closed unanswered until the bucket refills, and a newcomer is refused at
+ *    the soft cap only when every connection held is serving a request.
  *
  * Every start passes `env: {}` and explicit overrides, so nothing here reads the
  * developer's environment or `.env`: a fresh `mkdtemp` state root, `port: 0` and
@@ -66,7 +80,7 @@ import {
   ok,
   unwrap,
 } from '@debuggen/shared';
-import type { LogRecord, Result } from '@debuggen/shared';
+import type { LogRecord, Logger, Result } from '@debuggen/shared';
 import { MIN_EPOCH_MS } from '@debuggen/telemetry';
 import type { SessionRecord } from '@debuggen/protocol';
 import { sha256Hex } from '@debuggen/shared/node';
@@ -84,12 +98,22 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import type { Server } from 'node:http';
+import { connect as connectTcp, type AddressInfo, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
-import { AUTH_FILE_NAME, SESSIONS_DATABASE_FILE_NAME, loadServiceConfig } from './config.js';
+import {
+  AUTH_FILE_NAME,
+  PROJECT_ROOT_UNRESOLVABLE_REASON,
+  SESSIONS_DATABASE_FILE_NAME,
+  STATE_HOME_OVERLAP_HINT,
+  STATE_HOME_OVERLAP_MESSAGE,
+  STATE_HOME_OVERLAP_REASON,
+  loadServiceConfig,
+} from './config.js';
 import { createDevServerLauncher } from './dev-server/launcher.js';
 import type { DevServerLauncher, DevServerTerminationReport } from './dev-server/launcher.js';
 import { fingerprintDocumentId } from './instrumentation/document-fingerprint.js';
@@ -97,19 +121,25 @@ import type { ArmingSnapshot } from './instrumentation/service.js';
 import { createServiceLogger } from './logging.js';
 import {
   DEV_SERVER_STOP_GRACE_MS,
+  DROPPED_CONNECTIONS_REPORT_INTERVAL_MS,
   EXIT_BACKSTOP_MS,
+  HTTP_SERVER_LIMITS,
   LAUNCHER_KILL_CONFIRM_MS,
   LAUNCHER_REVOCATION_SLACK_MS,
   SERVICE_VERSION,
   SHUTDOWN_BUDGET,
+  STORED_PROJECT_UNRESOLVABLE_STARTUP_HINT,
+  STORED_PROJECT_UNRESOLVABLE_STARTUP_MESSAGE,
   createAgentReadyLedger,
   createIngestSourceLocator,
+  createLimitedServer,
   endLiveSessions,
   isProcessEntry,
   regatingBindingRoutes,
   regatingReadinessPort,
   releaseParts,
   startService,
+  type HttpServerLimits,
   type ServiceHandle,
   type ServiceLoggers,
   type ServiceParts,
@@ -119,7 +149,8 @@ import {
 import type { PipelineCodeHandles } from './pipeline/context-builder.js';
 import type { RegateRequest } from './pipeline/orchestrator.js';
 import { createAuthService } from './server/auth.js';
-import { WS_CLOSE_GOING_AWAY } from './server/clients.js';
+import { DEFAULT_MAX_CLIENTS, WS_CLOSE_GOING_AWAY } from './server/clients.js';
+import { DEFAULT_REQUEST_BODY_TIMEOUT_MS } from './server/http.js';
 import type {
   BindingConnection,
   BindingRoutes,
@@ -148,6 +179,12 @@ const POLL_TIMEOUT_MS = 5_000;
 
 /** The constant `msg` of the record a refused start writes (`STARTUP_REFUSED_MESSAGE`). */
 const STARTUP_REFUSED_MSG = 'the Debug Generator service could not start';
+
+/**
+ * Whether a mode of `0o000` denies this process a directory search: never for
+ * uid 0, which bypasses permission bits, nor where POSIX ids are unavailable.
+ */
+const CAN_DENY_SEARCH = typeof process.getuid === 'function' && process.getuid() !== 0;
 
 /** Temporary roots and open handles this suite cleans up after itself. */
 const roots: string[] = [];
@@ -660,6 +697,275 @@ describe('startService — crash recovery before serving', () => {
   });
 });
 
+/**
+ * The JSON records a capturing destination received, parsed.
+ *
+ * @param records The raw records.
+ * @returns One object per record.
+ */
+function parsedRecords(records: readonly string[]): Record<string, unknown>[] {
+  return records
+    .join('')
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+/**
+ * Stores a session of `projectRoot` through the manager, bypassing the routes'
+ * checks, the way a previous process's session is found by the next start.
+ */
+async function storeSessionOf(handle: ServiceHandle, projectRoot: string): Promise<SessionRecord> {
+  return unwrap(
+    await handle.manager.create({
+      projectRoot,
+      question: 'Why is it slow?',
+      devServerUrl: 'http://127.0.0.1:3000',
+    }),
+  );
+}
+
+describe('startService — the state root stays outside every project (AAP 0.4.2)', () => {
+  it("restores an overlapping project's instrumented file first, then refuses to start and releases the store", async () => {
+    const { container, stateRoot } = makeStateRoot();
+    // The project is the directory that holds the state root.
+    const first = await started(stateRoot);
+    const { file, originalBytes, instrumentedBytes } = await instrumentFileOf(
+      first,
+      stateRoot,
+      container,
+    );
+    for (const handle of handles.splice(0)) {
+      await handle.close({ liveSessions: 'retain' });
+    }
+    expect(readFileSync(join(container, file), 'utf8')).toBe(instrumentedBytes);
+    const destination = capturingDestination();
+
+    const refused = await start(stateRoot, {
+      overrides: { logLevel: 'info' },
+      loggerOptions: { destination },
+    });
+
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(refused.error.code).toBe('FS_UNSAFE_PATH');
+      expect(refused.error.hint).toBe(STATE_HOME_OVERLAP_HINT);
+      expect(refused.error.details).toMatchObject({
+        reason: STATE_HOME_OVERLAP_REASON,
+        relation: 'home-inside-project',
+        overlappingProjects: 1,
+      });
+      expect(
+        JSON.stringify([refused.error.message, refused.error.hint, refused.error.details]),
+      ).not.toContain(container);
+    }
+    // The reconciliation ran before the refusal: the file is the developer's again.
+    expect(readFileSync(join(container, file), 'utf8')).toBe(originalBytes);
+    const refusal = parsedRecords(destination.records).find(
+      (record) => record['msg'] === STARTUP_REFUSED_MSG,
+    );
+    expect(refusal).toMatchObject({
+      level: 50,
+      step: 'state-home-overlap',
+      code: 'FS_UNSAFE_PATH',
+    });
+    expect(JSON.stringify(refusal)).not.toContain(container);
+    // Everything the refused start acquired was released.
+    expect(() => lstatSync(join(stateRoot, `${SESSIONS_DATABASE_FILE_NAME}-wal`))).toThrow();
+  });
+
+  it('refuses stored projects inside the state root: one not created yet, one reached through a link', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const first = await started(stateRoot);
+    const inside = join(stateRoot, 'projects', 'shop');
+    mkdirSync(inside, { recursive: true });
+    const link = join(container, 'linked-shop');
+    symlinkSync(inside, link);
+    await storeSessionOf(first, join(stateRoot, 'not-yet', 'created'));
+    await storeSessionOf(first, link);
+    for (const handle of handles.splice(0)) {
+      await handle.close();
+    }
+
+    const refused = await start(stateRoot);
+
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(refused.error.code).toBe('FS_UNSAFE_PATH');
+      expect(refused.error.details).toMatchObject({
+        reason: STATE_HOME_OVERLAP_REASON,
+        relation: 'project-inside-home',
+        overlappingProjects: 2,
+      });
+    }
+  });
+
+  it("starts when every stored project lies apart, including a sibling whose name extends the state root's", async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const first = await started(stateRoot);
+    const sibling = `${stateRoot}-shop`;
+    mkdirSync(sibling, { recursive: true });
+    await storeSessionOf(first, sibling);
+    await storeSessionOf(first, join(container, 'project'));
+    for (const handle of handles.splice(0)) {
+      await handle.close();
+    }
+
+    expect(isOk(await start(stateRoot))).toBe(true);
+  });
+
+  it('refuses to start, fail-closed, when a stored project cannot be resolved on disk, then starts once it can', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const first = await started(stateRoot);
+    // Two links naming each other: `realpath` answers ELOOP, whoever runs it.
+    const loopA = join(container, 'loop-a');
+    const loopB = join(container, 'loop-b');
+    symlinkSync(loopB, loopA);
+    symlinkSync(loopA, loopB);
+    await storeSessionOf(first, join(loopA, 'shop'));
+    await storeSessionOf(first, join(container, 'project'));
+    for (const handle of handles.splice(0)) {
+      await handle.close();
+    }
+    const destination = capturingDestination();
+
+    const refused = await start(stateRoot, {
+      overrides: { logLevel: 'info' },
+      loggerOptions: { destination },
+    });
+
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(refused.error.code).toBe('FS_UNSAFE_PATH');
+      expect(refused.error.message).toBe(STORED_PROJECT_UNRESOLVABLE_STARTUP_MESSAGE);
+      expect(refused.error.hint).toBe(STORED_PROJECT_UNRESOLVABLE_STARTUP_HINT);
+      expect(refused.error.details).toMatchObject({
+        reason: PROJECT_ROOT_UNRESOLVABLE_REASON,
+        unresolvedProjects: 1,
+        storedProjects: 2,
+      });
+      expect(
+        JSON.stringify([refused.error.message, refused.error.hint, refused.error.details]),
+      ).not.toContain(container);
+    }
+    const refusal = parsedRecords(destination.records).find(
+      (record) => record['msg'] === STARTUP_REFUSED_MSG,
+    );
+    expect(refusal).toMatchObject({
+      level: 50,
+      step: 'state-home-overlap',
+      code: 'FS_UNSAFE_PATH',
+    });
+    expect(JSON.stringify(refusal)).not.toContain(container);
+    // Everything the refused start acquired was released.
+    expect(() => lstatSync(join(stateRoot, `${SESSIONS_DATABASE_FILE_NAME}-wal`))).toThrow();
+
+    // Breaking the loop is the recovery: the missing root resolves through its
+    // nearest existing ancestor, apart from the state root.
+    rmSync(loopA);
+    rmSync(loopB);
+    expect(isOk(await start(stateRoot))).toBe(true);
+  });
+
+  it('reports a proven overlap in preference to a stored project it could not resolve', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const first = await started(stateRoot);
+    const loop = join(container, 'loop');
+    symlinkSync(loop, loop);
+    await storeSessionOf(first, join(loop, 'shop'));
+    await storeSessionOf(first, container);
+    for (const handle of handles.splice(0)) {
+      await handle.close();
+    }
+
+    const refused = await start(stateRoot);
+
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(refused.error.hint).toBe(STATE_HOME_OVERLAP_HINT);
+      expect(refused.error.details).toMatchObject({
+        reason: STATE_HOME_OVERLAP_REASON,
+        relation: 'home-inside-project',
+        overlappingProjects: 1,
+      });
+    }
+  });
+
+  it.skipIf(!CAN_DENY_SEARCH)(
+    'refuses to start when a folder above a stored project is no longer searchable',
+    async () => {
+      const { container, stateRoot } = makeStateRoot();
+      const first = await started(stateRoot);
+      const locked = join(container, 'locked');
+      mkdirSync(join(locked, 'shop'), { recursive: true });
+      await storeSessionOf(first, join(locked, 'shop'));
+      for (const handle of handles.splice(0)) {
+        await handle.close();
+      }
+
+      chmodSync(locked, 0o000);
+      let refused: Awaited<ReturnType<typeof start>>;
+      try {
+        refused = await start(stateRoot);
+      } finally {
+        chmodSync(locked, OWNER_ONLY_DIR);
+      }
+
+      expect(isErr(refused)).toBe(true);
+      if (isErr(refused)) {
+        expect(refused.error.message).toBe(STORED_PROJECT_UNRESOLVABLE_STARTUP_MESSAGE);
+        expect(refused.error.details).toMatchObject({
+          reason: PROJECT_ROOT_UNRESOLVABLE_REASON,
+          unresolvedProjects: 1,
+          storedProjects: 1,
+        });
+      }
+      // Access restored, the same state root starts.
+      expect(isOk(await start(stateRoot))).toBe(true);
+    },
+  );
+
+  it('refuses a session, a follow-up, a launch and a credential for an overlapping project, and still stops', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const handle = await started(stateRoot);
+    // The editor announces the folder that holds the state root.
+    await connectEditor(handle, stateRoot, container);
+    const headers = {
+      [AUTHORIZATION_HEADER]: formatBearer(editorToken(stateRoot)),
+      'content-type': 'application/json',
+    };
+    const post = (path: string, body: unknown): Promise<Response> =>
+      fetch(`${handle.url}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
+    const sessionRefusal = { code: 'FS_UNSAFE_PATH', message: STATE_HOME_OVERLAP_MESSAGE };
+
+    const created = await post('/sessions', {
+      projectRoot: container,
+      question: 'Why is it slow?',
+    });
+    expect(created.status).toBe(400);
+    expect(await created.json()).toEqual(sessionRefusal);
+
+    const stored = await storeSessionOf(handle, container);
+    const asked = await post(`/sessions/${stored.id}/question`, {
+      question: 'And the second render?',
+    });
+    expect(asked.status).toBe(400);
+    expect(await asked.json()).toEqual(sessionRefusal);
+
+    for (const path of ['/dev-server/launch', '/dev-server/credential']) {
+      const refused = await post(path, { projectRoot: container });
+      expect(refused.status).toBe(400);
+      expect(await refused.json()).toEqual({
+        code: 'FS_UNSAFE_PATH',
+        message: `${STATE_HOME_OVERLAP_MESSAGE} ${STATE_HOME_OVERLAP_HINT}`,
+      });
+    }
+
+    const stopped = await post('/dev-server/stop', { projectRoot: container });
+    expect(stopped.status).toBe(200);
+  });
+});
+
 /** A three-line source file whose one function returns `expression`. */
 function totalReturning(expression: string): string {
   return `export function total(): number {\n  return ${expression};\n}\n`;
@@ -1018,6 +1324,583 @@ describe('startService — one server, two protocols', () => {
     const databasePath = join(stateRoot, SESSIONS_DATABASE_FILE_NAME);
     expect(lstatSync(databasePath).isFile()).toBe(true);
     expect(() => lstatSync(`${databasePath}-wal`)).toThrow();
+  });
+});
+
+/** One raw TCP connection to the service, and what it received until it closed. */
+interface RawConnection {
+  readonly socket: Socket;
+  /** Everything received so far, as Latin-1 text (an HTTP response head is ASCII). */
+  received(): string;
+  /** Resolves, once the connection has closed, with its lifetime in milliseconds. */
+  readonly closed: Promise<number>;
+}
+
+/** Raw connections the running test opened; destroyed after it. */
+const rawConnections: Socket[] = [];
+
+/**
+ * Opens a raw TCP connection to the service and resolves once it is
+ * established, so a test can send an incomplete or malformed request — or
+ * nothing at all.
+ */
+function rawConnection(handle: Pick<ServiceHandle, 'host' | 'port'>): Promise<RawConnection> {
+  return new Promise((resolve, reject) => {
+    const socket = connectTcp({ host: handle.host, port: handle.port });
+    rawConnections.push(socket);
+    const chunks: Buffer[] = [];
+    let openedAt = performance.now();
+    const closed = new Promise<number>((resolveClosed) => {
+      socket.once('close', () => {
+        resolveClosed(performance.now() - openedAt);
+      });
+    });
+    socket.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+    socket.once('connect', () => {
+      openedAt = performance.now();
+      // A reset by the server is an outcome here, observed through `closed`.
+      socket.off('error', reject);
+      socket.on('error', () => undefined);
+      resolve({ socket, received: () => Buffer.concat(chunks).toString('latin1'), closed });
+    });
+    socket.once('error', reject);
+  });
+}
+
+/**
+ * Asserts that `head` is exactly one raw refusal of the server's
+ * `clientError` answer: `status` with no body, not cached, not sniffed, and
+ * the connection closed.
+ */
+function expectRawRefusal(head: string, status: string): void {
+  expect(head.startsWith(`HTTP/1.1 ${status}\r\n`)).toBe(true);
+  expect(head.endsWith('\r\n\r\n')).toBe(true);
+  const fields = head.slice(0, -4).split('\r\n').slice(1);
+  expect(fields.sort()).toEqual([
+    'Cache-Control: no-store',
+    'Connection: close',
+    'Content-Length: 0',
+    'X-Content-Type-Options: nosniff',
+  ]);
+}
+
+describe('startService — the HTTP server bounds every connection (CWE-400)', () => {
+  afterEach(() => {
+    for (const socket of rawConnections.splice(0)) {
+      socket.destroy();
+    }
+  });
+
+  /** Short limits a suite can observe; the check interval keeps the close prompt. */
+  const SHORT_LIMITS = {
+    headersTimeoutMs: 400,
+    requestTimeoutMs: 800,
+    connectionsCheckingIntervalMs: 50,
+  } as const;
+
+  /** How far past a deadline a close may come on a loaded host, in milliseconds. */
+  const DEADLINE_SLACK_MS = 1_500;
+
+  /** Starts the service with `httpLimits`, failing the test when it does not start. */
+  async function startedWith(
+    stateRoot: string,
+    extra: Omit<StartServiceOptions, 'env'>,
+  ): Promise<ServiceHandle> {
+    const result = await start(stateRoot, extra);
+    if (isErr(result)) {
+      expect.unreachable(`startService failed: ${result.error.code}: ${result.error.message}`);
+    }
+    return result.value;
+  }
+
+  it('keeps the request deadline above the header deadline plus the body guard, and the cap above the WebSocket surface', () => {
+    expect(Object.isFrozen(HTTP_SERVER_LIMITS)).toBe(true);
+    expect(HTTP_SERVER_LIMITS.headersTimeoutMs).toBeLessThanOrEqual(10_000);
+    // A trickling body meets `./server/http.ts`'s own `408` before the server's.
+    expect(HTTP_SERVER_LIMITS.requestTimeoutMs).toBeGreaterThan(
+      HTTP_SERVER_LIMITS.headersTimeoutMs + DEFAULT_REQUEST_BODY_TIMEOUT_MS,
+    );
+    expect(HTTP_SERVER_LIMITS.connectionsCheckingIntervalMs).toBeLessThanOrEqual(
+      HTTP_SERVER_LIMITS.headersTimeoutMs / 10,
+    );
+    expect(HTTP_SERVER_LIMITS.keepAliveTimeoutMs).toBeGreaterThan(0);
+    // Every registered WebSocket client, as many again awaiting `client.hello`,
+    // and HTTP connections beyond both.
+    expect(HTTP_SERVER_LIMITS.maxConnections).toBeGreaterThanOrEqual(2 * DEFAULT_MAX_CLIENTS + 512);
+    expect(DROPPED_CONNECTIONS_REPORT_INTERVAL_MS).toBeGreaterThan(0);
+  });
+
+  it('listens with the documented limits in force, as read back from the server', async () => {
+    const { stateRoot } = makeStateRoot();
+    const destination = capturingDestination();
+    await startedWith(stateRoot, {
+      overrides: { logLevel: 'info' },
+      loggerOptions: { destination },
+    });
+
+    const record = parsedRecords(destination.records).find(
+      (entry) => entry['msg'] === 'the HTTP server enforces its connection limits',
+    );
+    expect(record).toMatchObject({ ...HTTP_SERVER_LIMITS });
+  });
+
+  it('closes a connection that stalls in its header block, or sends nothing, at the header deadline', async () => {
+    const { stateRoot } = makeStateRoot();
+    const handle = await startedWith(stateRoot, { httpLimits: SHORT_LIMITS });
+    const stalled = await rawConnection(handle);
+    stalled.socket.write('GET /sessions HTTP/1.1\r\nHost: 127.0.0.1\r\n');
+    const silent = await rawConnection(handle);
+
+    // While both hold their connections, an authenticated request is answered.
+    const authorized = await fetch(`${handle.url}/sessions`, {
+      headers: { [AUTHORIZATION_HEADER]: formatBearer(editorToken(stateRoot)) },
+    });
+    expect(authorized.status).toBe(200);
+
+    for (const connection of [stalled, silent]) {
+      const lifetime = await connection.closed;
+      expect(lifetime).toBeGreaterThanOrEqual(SHORT_LIMITS.headersTimeoutMs * 0.75);
+      expect(lifetime).toBeLessThan(
+        SHORT_LIMITS.headersTimeoutMs +
+          SHORT_LIMITS.connectionsCheckingIntervalMs +
+          DEADLINE_SLACK_MS,
+      );
+      expectRawRefusal(connection.received(), '408 Request Timeout');
+    }
+  });
+
+  it('answers a malformed request 400 and an oversized header block 431, then closes them', async () => {
+    const { stateRoot } = makeStateRoot();
+    const handle = await startedWith(stateRoot, { httpLimits: SHORT_LIMITS });
+
+    const malformed = await rawConnection(handle);
+    malformed.socket.write('NOT A REQUEST\r\n\r\n');
+    const oversized = await rawConnection(handle);
+    oversized.socket.write(
+      `GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Padding: ${'a'.repeat(32 * 1024)}\r\n\r\n`,
+    );
+
+    await Promise.all([malformed.closed, oversized.closed]);
+    expectRawRefusal(malformed.received(), '400 Bad Request');
+    expectRawRefusal(oversized.received(), '431 Request Header Fields Too Large');
+    expect((await fetch(`${handle.url}/health`)).status).toBe(200);
+  });
+
+  it('keeps an upgraded WebSocket open well past the request deadline', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const handle = await startedWith(stateRoot, { httpLimits: SHORT_LIMITS });
+    const { closed } = await connectEditor(handle, stateRoot, join(container, 'workspace'));
+    let closedEarly = false;
+    void closed.then(() => {
+      closedEarly = true;
+    });
+
+    // Three request deadlines and many deadline checks.
+    await sleep(SHORT_LIMITS.requestTimeoutMs * 3);
+
+    expect(closedEarly).toBe(false);
+    expect(sockets.at(-1)?.readyState).toBe(WebSocket.OPEN);
+    expect(await health(handle.url)).toMatchObject({ pairingAvailable: true });
+  });
+
+  it('refuses a connection past maxConnections, reports it, and serves again once one closes', async () => {
+    const { stateRoot } = makeStateRoot();
+    const destination = capturingDestination();
+    const handle = await startedWith(stateRoot, {
+      httpLimits: { maxConnections: 2 },
+      overrides: { logLevel: 'info' },
+      loggerOptions: { destination },
+    });
+    // Two keep-alive connections, each proven accepted by its answer.
+    const held: RawConnection[] = [];
+    for (let index = 0; index < 2; index += 1) {
+      const connection = await rawConnection(handle);
+      connection.socket.write('GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+      expect(
+        await eventually(() => Promise.resolve(connection.received().includes('\r\n\r\n'))),
+      ).toBe(true);
+      held.push(connection);
+    }
+
+    const refused = await rawConnection(handle);
+    await refused.closed;
+    expect(refused.received()).toBe('');
+    const reported = await eventually(() =>
+      Promise.resolve(
+        parsedRecords(destination.records).some(
+          (entry) =>
+            entry['msg'] ===
+              'refused connections: the HTTP server holds its maximum number of connections' &&
+            entry['maxConnections'] === 2 &&
+            entry['droppedConnections'] === 1,
+        ),
+      ),
+    );
+    expect(reported).toBe(true);
+
+    held[0]?.socket.destroy();
+    const served = await eventually(async () => {
+      try {
+        return (await fetch(`${handle.url}/health`)).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    expect(served).toBe(true);
+  });
+
+  it('refuses limits that are not positive whole numbers, or a header deadline above the request deadline, before touching the filesystem', async () => {
+    const { stateRoot } = makeStateRoot();
+
+    for (const httpLimits of [
+      { headersTimeoutMs: 0 },
+      { maxConnections: 1.5 },
+      { keepAliveTimeoutMs: Number.POSITIVE_INFINITY },
+      { headersTimeoutMs: 2_000, requestTimeoutMs: 1_000 },
+    ]) {
+      const refused = await start(stateRoot, { httpLimits });
+      expect(isErr(refused)).toBe(true);
+      if (isErr(refused)) {
+        expect(refused.error.code).toBe('CONFIG_INVALID');
+      }
+    }
+    expect(() => lstatSync(stateRoot)).toThrow();
+  });
+});
+
+describe('startService — the HTTP server budgets pre-auth connections (CWE-400)', () => {
+  /** Servers `createLimitedServer` built for the running test; closed after it. */
+  const limitedServers: Server[] = [];
+
+  afterEach(async () => {
+    for (const socket of rawConnections.splice(0)) {
+      socket.destroy();
+    }
+    for (const server of limitedServers.splice(0)) {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      });
+    }
+  });
+
+  /** The request line and host of a request whose header block never ends. */
+  const PARTIAL_HEAD = 'GET /sessions HTTP/1.1\r\nHost: 127.0.0.1\r\n';
+
+  /** Starts the service with `extra`, failing the test when it does not start. */
+  async function startedWith(
+    stateRoot: string,
+    extra: Omit<StartServiceOptions, 'env'>,
+  ): Promise<ServiceHandle> {
+    const result = await start(stateRoot, extra);
+    if (isErr(result)) {
+      expect.unreachable(`startService failed: ${result.error.code}: ${result.error.message}`);
+    }
+    return result.value;
+  }
+
+  /** Opens `count` connections that each send a header block they never finish, in order. */
+  async function stalledFlood(
+    target: Pick<ServiceHandle, 'host' | 'port'>,
+    count: number,
+  ): Promise<RawConnection[]> {
+    const flood: RawConnection[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const connection = await rawConnection(target);
+      connection.socket.write(PARTIAL_HEAD);
+      flood.push(connection);
+    }
+    return flood;
+  }
+
+  /** Whether each connection has closed, read without waiting. */
+  function closedFlags(connections: readonly RawConnection[]): { closed: boolean }[] {
+    return connections.map((connection) => {
+      const flag = { closed: false };
+      void connection.closed.then(() => {
+        flag.closed = true;
+      });
+      return flag;
+    });
+  }
+
+  /** A logger that keeps every JSON record, and those records. */
+  function capturingLogger(): { readonly logger: Logger; readonly records: string[] } {
+    const destination = capturingDestination();
+    const logger = createServiceLogger(
+      unwrap(loadServiceConfig({}, { debuggenHome: makeStateRoot().stateRoot, logLevel: 'info' })),
+      { destination },
+    );
+    return { logger, records: destination.records };
+  }
+
+  /**
+   * A server built by `createLimitedServer` whose handler holds every
+   * `/slow` request until `release()` is called and answers anything else at
+   * once, listening on an ephemeral loopback port.
+   */
+  async function slowServer(
+    limits: HttpServerLimits,
+    logger: Logger,
+  ): Promise<{
+    readonly target: Pick<ServiceHandle, 'host' | 'port'>;
+    readonly entered: () => number;
+    release(): void;
+  }> {
+    let entered = 0;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const server = createLimitedServer(
+      (request, response) => {
+        const answer = (): void => {
+          response.writeHead(200, { 'content-length': '0' });
+          response.end();
+        };
+        if (request.url === '/slow') {
+          entered += 1;
+          void released.then(answer);
+          return;
+        }
+        answer();
+      },
+      limits,
+      logger,
+    );
+    limitedServers.push(server);
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = server.address() as AddressInfo;
+    return { target: { host: '127.0.0.1', port }, entered: () => entered, release };
+  }
+
+  /** The fields of `record` beside the logger's own. */
+  function ownFields(record: Record<string, unknown> | undefined): string[] {
+    return Object.keys(record ?? {})
+      .filter((key) => !['level', 'time', 'subsystem', 'msg'].includes(key))
+      .sort();
+  }
+
+  it('admits a reconnect storm of a full registry at once and keeps the unengaged share below the soft cap', () => {
+    expect(HTTP_SERVER_LIMITS.connectionBurst).toBeGreaterThanOrEqual(2 * DEFAULT_MAX_CLIENTS);
+    expect(HTTP_SERVER_LIMITS.connectionsPerSecond).toBeGreaterThan(0);
+    expect(HTTP_SERVER_LIMITS.reservedConnections).toBeLessThan(HTTP_SERVER_LIMITS.maxConnections);
+    expect(HTTP_SERVER_LIMITS.maxUnengagedConnections).toBeLessThan(
+      HTTP_SERVER_LIMITS.maxConnections - HTTP_SERVER_LIMITS.reservedConnections,
+    );
+  });
+
+  it('evicts the oldest stalled connection, so an authenticated request is served through a flood of partial headers', async () => {
+    const { stateRoot } = makeStateRoot();
+    const destination = capturingDestination();
+    const handle = await startedWith(stateRoot, {
+      httpLimits: { maxUnengagedConnections: 4 },
+      overrides: { logLevel: 'info' },
+      loggerOptions: { destination },
+    });
+    const flood = await stalledFlood(handle, 4);
+    const closed = closedFlags(flood);
+
+    const authorized = await fetch(`${handle.url}/sessions`, {
+      headers: { [AUTHORIZATION_HEADER]: formatBearer(editorToken(stateRoot)) },
+    });
+
+    expect(authorized.status).toBe(200);
+    await flood[0]?.closed;
+    // Evicted without an answer: nothing of it was ever parsed as a request.
+    expect(flood[0]?.received()).toBe('');
+    expect(closed.slice(1).map((flag) => flag.closed)).toEqual([false, false, false]);
+    const evicted = await eventually(() =>
+      Promise.resolve(
+        parsedRecords(destination.records).some(
+          (entry) =>
+            entry['msg'] === 'closed stalled or idle connections to admit new ones' &&
+            entry['evictedConnections'] === 1 &&
+            entry['maxUnengagedConnections'] === 4,
+        ),
+      ),
+    );
+    expect(evicted).toBe(true);
+    const record = parsedRecords(destination.records).find(
+      (entry) => entry['msg'] === 'closed stalled or idle connections to admit new ones',
+    );
+    // Counts and limits only: never an address or a port.
+    expect(ownFields(record)).toEqual(
+      [
+        'evictedConnections',
+        'maxConnections',
+        'maxUnengagedConnections',
+        'openConnections',
+        'reservedConnections',
+        'unengagedConnections',
+      ].sort(),
+    );
+  });
+
+  it('closes connections past the admission rate before answering a byte, and admits again once the bucket refills', async () => {
+    const { stateRoot } = makeStateRoot();
+    const destination = capturingDestination();
+    const handle = await startedWith(stateRoot, {
+      httpLimits: { connectionBurst: 2, connectionsPerSecond: 2 },
+      overrides: { logLevel: 'info' },
+      loggerOptions: { destination },
+    });
+    const admitted = [await rawConnection(handle), await rawConnection(handle)];
+
+    const refused = await rawConnection(handle);
+    await refused.closed;
+
+    expect(refused.received()).toBe('');
+    for (const connection of admitted) {
+      connection.socket.write('GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    }
+    expect(
+      await eventually(() =>
+        Promise.resolve(
+          admitted.every((connection) => connection.received().startsWith('HTTP/1.1 200')),
+        ),
+      ),
+    ).toBe(true);
+    const record = parsedRecords(destination.records).find(
+      (entry) =>
+        entry['msg'] ===
+        'refused connections: new connections arrived faster than the HTTP server admits them',
+    );
+    expect(record).toMatchObject({
+      level: 40,
+      connectionBurst: 2,
+      connectionsPerSecond: 2,
+      refusedConnections: 1,
+    });
+    expect(ownFields(record)).toEqual(
+      ['connectionBurst', 'connectionsPerSecond', 'refusedConnections'].sort(),
+    );
+
+    // Half a second regains one admission; until then every attempt is refused.
+    const served = await eventually(async () => {
+      try {
+        return (await fetch(`${handle.url}/health`)).status === 200;
+      } catch {
+        return false;
+      }
+    });
+    expect(served).toBe(true);
+  });
+
+  it('never evicts a connection whose handler is still answering, however many stalled connections follow it', async () => {
+    const { logger } = capturingLogger();
+    const server = await slowServer({ ...HTTP_SERVER_LIMITS, maxUnengagedConnections: 2 }, logger);
+    const slow = await rawConnection(server.target);
+    slow.socket.write('GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    expect(await eventually(() => Promise.resolve(server.entered() === 1))).toBe(true);
+    const [slowClosed] = closedFlags([slow]);
+
+    const flood = await stalledFlood(server.target, 6);
+
+    // Each newcomer past the budget of two displaced the oldest stalled one.
+    await Promise.all(flood.slice(0, 4).map((connection) => connection.closed));
+    const survivors = closedFlags(flood.slice(4));
+    server.release();
+    expect(
+      await eventually(() => Promise.resolve(slow.received().startsWith('HTTP/1.1 200'))),
+    ).toBe(true);
+    expect(slowClosed?.closed).toBe(false);
+    expect(survivors.map((flag) => flag.closed)).toEqual([false, false]);
+  });
+
+  it('evicts at the soft cap, and refuses a newcomer only when every connection held is serving a request', async () => {
+    const { logger, records } = capturingLogger();
+    // A soft cap of three connections of any kind.
+    const server = await slowServer(
+      { ...HTTP_SERVER_LIMITS, maxConnections: 8, reservedConnections: 5 },
+      logger,
+    );
+    const engaged: RawConnection[] = [];
+    for (let index = 0; index < 2; index += 1) {
+      const connection = await rawConnection(server.target);
+      connection.socket.write('GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+      engaged.push(connection);
+    }
+    expect(await eventually(() => Promise.resolve(server.entered() === 2))).toBe(true);
+    const [stalled] = await stalledFlood(server.target, 1);
+
+    // The third slot is taken: a newcomer evicts the one unengaged connection.
+    const newcomer = await rawConnection(server.target);
+    await stalled?.closed;
+    expect(stalled?.received()).toBe('');
+    newcomer.socket.write('GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    engaged.push(newcomer);
+    expect(await eventually(() => Promise.resolve(server.entered() === 3))).toBe(true);
+
+    // Every connection held is serving a request: nothing can be evicted.
+    const refused = await rawConnection(server.target);
+    await refused.closed;
+    expect(refused.received()).toBe('');
+    const record = parsedRecords(records).find(
+      (entry) =>
+        entry['msg'] ===
+        'refused connections: every connection the HTTP server holds is serving a request',
+    );
+    expect(record).toMatchObject({
+      level: 40,
+      refusedConnections: 1,
+      openConnections: 3,
+      unengagedConnections: 0,
+      maxConnections: 8,
+      reservedConnections: 5,
+    });
+
+    server.release();
+    expect(
+      await eventually(() =>
+        Promise.resolve(
+          engaged.every((connection) => connection.received().startsWith('HTTP/1.1 200')),
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps an authenticated WebSocket open through a flood of stalled connections', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const handle = await startedWith(stateRoot, { httpLimits: { maxUnengagedConnections: 2 } });
+    const { closed } = await connectEditor(handle, stateRoot, join(container, 'workspace'));
+    let closedEarly = false;
+    void closed.then(() => {
+      closedEarly = true;
+    });
+
+    const flood = await stalledFlood(handle, 6);
+    await Promise.all(flood.slice(0, 4).map((connection) => connection.closed));
+
+    expect(closedEarly).toBe(false);
+    expect(sockets.at(-1)?.readyState).toBe(WebSocket.OPEN);
+    expect(await health(handle.url)).toMatchObject({ pairingAvailable: true });
+  });
+
+  it('refuses an admission budget that is not a positive whole number, before touching the filesystem', async () => {
+    const { stateRoot } = makeStateRoot();
+
+    for (const [limit, value] of [
+      ['connectionBurst', 0],
+      ['connectionsPerSecond', 2.5],
+      ['maxUnengagedConnections', -1],
+      ['reservedConnections', Number.NaN],
+      ['connectionBurst', Number.POSITIVE_INFINITY],
+    ] as const) {
+      const refused = await start(stateRoot, { httpLimits: { [limit]: value } });
+      expect(isErr(refused)).toBe(true);
+      if (isErr(refused)) {
+        expect(refused.error.code).toBe('CONFIG_INVALID');
+        expect(refused.error.details).toMatchObject({ invalid: [limit] });
+      }
+    }
+    expect(() => lstatSync(stateRoot)).toThrow();
   });
 });
 

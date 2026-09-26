@@ -530,7 +530,7 @@ export {
  * `ref` to the `source.open` it settles, from the editor to the service and
  * from the service to the panel. Containment is decided by the service and
  * again, independently, by the editor's URI handler — never here, because this
- * package has no project root and no filesystem (AAP §0.2.3, §0.5.6).
+ * package has no project root and no filesystem.
  */
 export {
   SOURCE_MESSAGE_PAYLOADS,
@@ -706,17 +706,16 @@ export const MESSAGE_PAYLOAD_SCHEMAS = Object.freeze({
  * build envelopes with and switch on, instead of repeating the wire string at
  * every boundary.
  *
- * This object is where each name is spelled, once. Twenty-five names are
- * verbatim from AAP §0.4.2 — the dot spellings, and the hyphen in
- * `'server-agent.config'` — and ten of them are the user's own names for these
- * messages. The twenty-sixth, `'source.result'`, is the answer to
- * `'source.open'`, named in that message's domain so a click on a source link
- * is acknowledged end to end instead of being reported done when a frame was
- * merely queued. A single character of drift is a frame one process sends and
- * another refuses, so every other statement of the vocabulary is derived from
- * here: {@link MESSAGE_TYPES} lists these constants in discriminant order,
- * {@link MessageType} is derived from that tuple, and the envelope's union from
- * both.
+ * This object is where each name is spelled, once. Twenty-five names are the
+ * specified WebSocket message names, character for character — the dot
+ * spellings, and the hyphen in `'server-agent.config'`. The twenty-sixth,
+ * `'source.result'`, is the answer to `'source.open'`, named in that message's
+ * domain so a click on a source link is acknowledged end to end instead of
+ * being reported done when a frame was merely queued. A single character of
+ * drift is a frame one process sends and another refuses, so every other
+ * statement of the vocabulary is derived from here: {@link MESSAGE_TYPES} lists
+ * these constants in discriminant order, {@link MessageType} is derived from
+ * that tuple, and the envelope's union from both.
  *
  * A key is its wire name in upper snake case — `.` and `-` become `_` — so the
  * identifier is predictable from the name (`'server-agent.config'` is
@@ -1009,7 +1008,7 @@ export type MessageRegistryIsComplete = AssertTrue<
  * message about the union rather than about the tuple. A dropped name that
  * happened to be a duplicate would hide the same way.
  *
- * So the count is asserted here: the twenty-five messages AAP §0.4.2 specifies,
+ * So the count is asserted here: the twenty-five specified WebSocket messages,
  * plus `source.result`, the answer to `source.open`. It is the one figure in
  * this file not derived from something else, which makes it the one that has to
  * be maintained: adding a twenty-seventh message means updating this literal in

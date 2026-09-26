@@ -88,39 +88,59 @@
  * Tokens are spent only by a batch that was accepted **and** posted on the
  * port; a refused frame, or one left in the agent's custody, spends none.
  *
- * The loss is reported, never hidden: the refused batch's events — and the
- * agent's own `droppedCount` it carried, which the agent clears on that
- * acknowledgement — are held as an unreported count, added to the
- * `droppedCount` of the next batch actually posted, and cleared only once that
- * post succeeded. When no later batch comes to carry it — the burst ended, or
- * the document is going away — the bridge reports it on its own, as a
- * loss-only `telemetry.batch`: no events, the held count as its
- * `droppedCount`, the pinned document and producer, and the last relayed
- * batch's position repeated rather than advanced, so it spends no budget and
- * never puts the agent's next batch out of sequence. That report is posted
- * {@link BRIDGE_LOSS_REPORT_DELAY_MS} after the first unreported refusal
- * unless a batch carried the loss first; at once on a trusted `pagehide`
- * (`isTrusted` cannot be forged by a page script's synthetic event); and at
- * once for every refusal after that `pagehide`, until a trusted `pageshow`.
- * With no usable port the loss stays held, and a new port re-arms the report
- * once it has sent `bridge.ready`. The worker re-validates `droppedCount` as a
- * safe non-negative integer, so the sum is clamped to
- * `Number.MAX_SAFE_INTEGER`.
+ * The loss is reported, never hidden, and only ever under its own capture: a
+ * count relabelled to another capture is counted against the wrong one, and
+ * the service drops a count naming a capture it has closed. The refused
+ * batch's events, and the agent's own `droppedCount` it carried (which the
+ * agent clears on that acknowledgement), are held in the bucket of the refused
+ * batch's capture: one bucket per capture, oldest first, at most
+ * {@link BRIDGE_MAX_HELD_LOSS_CAPTURES}. A bucket is added to the
+ * `droppedCount` of the next batch of its capture actually posted, and cleared
+ * only once that post succeeded. Otherwise the bridge reports it on its own,
+ * as a loss-only `telemetry.batch`: no events, the bucket's count as its
+ * `droppedCount`, the pinned document and producer, the bucket's capture, and
+ * that capture's last relayed `batchSeq` repeated rather than advanced (0 when
+ * none was relayed), so it spends no budget and never puts the agent's next
+ * batch out of sequence. Buckets are reported oldest first, one frame each; a
+ * bucket is cleared only by its own successful post, and the first failed post
+ * leaves it and every later bucket held for the next attempt. Reports go out
+ * at once: for every other capture's bucket when a batch or a refusal of a
+ * capture arrives; and for every bucket after a worker `agent.config` is
+ * dispatched (the agent flushes the capture's tail inside it, and the service
+ * closes the capture's window soon after), on every new port once
+ * `bridge.ready` has let the agent drain (nothing else is left to carry the
+ * loss, and the capture's window may be closing), and on a trusted `pagehide`
+ * (`isTrusted` cannot be forged by a page script's synthetic event) and for
+ * every refusal after it until a trusted `pageshow`. Otherwise they go out
+ * {@link BRIDGE_LOSS_REPORT_DELAY_MS} after the first unreported refusal,
+ * unless a batch carried the loss first.
+ * The worker re-validates `droppedCount` as a safe non-negative integer, so
+ * every sum is clamped to `Number.MAX_SAFE_INTEGER`.
  *
  * ## Custody, without a buffer
  *
  * The page agent owns the only buffer (5 000 events, drop-oldest). The bridge
  * tells it, per frame, whether custody passed: it calls `preventDefault()` on
- * an agent frame — making the agent's `dispatchEvent` return `false` — when
- * it posted the frame on the port, or when it refused the frame for good
- * (retrying a frame that fails validation can only fail again). With no open
- * port, or when `port.postMessage` throws, it does **not** acknowledge: the
- * frame stays with the agent, which sends it again after the next
- * `bridge.ready`. A throwing post also marks the port lost exactly as a
- * disconnect would — except that `bridge.gone` is only ever sent from the
- * port's `onDisconnect`, `stop()` and termination, never re-entrantly from
- * inside the agent's own dispatch; the unacknowledged frame is the agent's
- * signal there.
+ * an agent frame — making the agent's `dispatchEvent` return `false` — in
+ * three cases:
+ *
+ * 1. it posted the frame on the port;
+ * 2. it refused the frame for good (retrying a frame that fails validation can
+ *    only fail again);
+ * 3. the frame is the agent's own loss-only batch (no events, a positive
+ *    `droppedCount`) and no port could take it. The agent posts one only at a
+ *    terminal flush, and the capture change that follows a disarm zeroes an
+ *    unclaimed count, so the bridge takes the count instead: it holds it in
+ *    the bucket of the batch's capture and reports it like its own held loss,
+ *    at once on the next port.
+ *
+ * With no open port, or when `port.postMessage` throws, it does **not**
+ * acknowledge any other frame: the frame stays with the agent, which sends it
+ * again after the next `bridge.ready`. A throwing post also marks the port
+ * lost exactly as a disconnect would — except that `bridge.gone` is only ever
+ * sent from the port's `onDisconnect`, `stop()` and termination, never
+ * re-entrantly from inside the agent's own dispatch; the unacknowledged frame
+ * is the agent's signal there.
  *
  * ## Recovery
  *
@@ -133,9 +153,10 @@
  * connection state is complete before that dispatch, because the agent drains
  * its buffer and re-announces itself synchronously inside it and every frame
  * it sends re-enters this bridge. No heartbeat is ever sent over a live port:
- * keeping the worker alive is `background/ws-bridge.ts`'s job
- * (`chrome.alarms`, AAP §0.5.5), and a content-script heartbeat would defeat
- * worker suspension on every localhost tab. When the extension is reloaded or
+ * the worker's lifetime is `background/ws-bridge.ts`'s concern (its
+ * open-socket heartbeat, and the `chrome.alarms` tick that revives a suspended
+ * worker, AAP §0.5.5), and a content-script heartbeat would defeat worker
+ * suspension on every localhost tab. When the extension is reloaded or
  * updated, `chrome.runtime.id` disappears; the bridge then stops for good
  * rather than retrying into "Extension context invalidated" errors on every
  * tab.
@@ -342,10 +363,30 @@ export const BRIDGE_EVENT_BUDGET_REFILL_PER_SECOND = 2_000;
  * timer bounds how long its loss can stay unreported. It starts at the first
  * unreported refusal and later refusals do not push it back, so while a port
  * is open no refused event waits longer than this for its report, even in a
- * sustained over-budget stream. The document's end does not wait for it: a
- * trusted `pagehide` reports at once.
+ * sustained over-budget stream. Neither the document's end, nor a capture's,
+ * nor a worker outage waits for it: a trusted `pagehide`, a dispatched
+ * `agent.config`, a new port (once the agent has drained) and a batch or
+ * refusal of another capture each report at once. It reports every held
+ * capture's bucket, each under its own capture.
  */
 export const BRIDGE_LOSS_REPORT_DELAY_MS = 1_000;
+
+/**
+ * The most captures whose loss the bridge holds at once: the bound on its
+ * per-capture held-loss buckets (the "no capture" bucket included).
+ *
+ * With a usable port a document holds at most two buckets — the ending
+ * capture's and the next one's — and only until the next report. Buckets
+ * accumulate only while no report can be posted, one per capture the agent
+ * produced for in that time: a handful across one worker outage, since
+ * captures are started by the developer. Eight leaves that ample room while a
+ * subverted agent naming a fresh capture on every batch still holds a bounded
+ * map. When a capture without a bucket would exceed the bound, the oldest
+ * bucket's count is abandoned — counted in
+ * {@link BridgeStats.abandonedLossEvents} — and never moved to another
+ * capture, which would misattribute it.
+ */
+export const BRIDGE_MAX_HELD_LOSS_CAPTURES = 8;
 
 /** The bucket's level at one instant. */
 export interface EventBudget {
@@ -510,6 +551,12 @@ export interface RateLimitedDecision {
    * when the refusal is acknowledged, so the bridge must report it instead.
    */
   readonly droppedCount: number;
+  /**
+   * The capture the refused batch was labelled with, or `undefined` for none:
+   * the capture its loss belongs to, and so the one the bridge's report of it
+   * names.
+   */
+  readonly captureId: PageTelemetryBatchPayload['captureId'];
 }
 
 /** The filter's verdict: the parsed agent frame, or why it was refused. */
@@ -620,6 +667,7 @@ function budgetRefusal(
     reason: 'rate-limited',
     events,
     droppedCount: message.payload.droppedCount,
+    captureId: message.payload.captureId,
   };
 }
 
@@ -650,7 +698,8 @@ function budgetRefusal(
  *    `sequence-regression`; see the context's fields);
  * 10. a `telemetry.batch` carries no more events than the context's budget
  *    holds (`rate-limited`, whose verdict also carries the batch's event
- *    count and `droppedCount` — the loss the refusal causes).
+ *    count and `droppedCount` — the loss the refusal causes — and the capture
+ *    that loss belongs to).
  *
  * @param detail The frame event's `detail`, exactly as dispatched.
  * @param context The pinned provenance, the last batch position, the
@@ -844,17 +893,34 @@ export interface BridgeStats {
    */
   readonly rateLimitedEvents: number;
   /**
-   * Loss not yet reported upward: the events of `rate-limited` batches plus
-   * the agent's own `droppedCount` they carried. Added to the `droppedCount`
-   * of the next batch posted on the port — or, when none comes in time or the
-   * document is hiding, posted as a loss-only batch — then zero.
+   * Loss not yet reported upward, summed across every capture's bucket: the
+   * events of `rate-limited` batches plus the agent's own `droppedCount` they
+   * carried, and the count of every agent loss-only batch the bridge took
+   * without a port. Each bucket is added to the `droppedCount` of the next
+   * batch of its capture posted on the port — or posted as a loss-only batch
+   * of that capture (see {@link BRIDGE_LOSS_REPORT_DELAY_MS} for when) — and
+   * then leaves this sum.
    */
   readonly pendingDroppedCount: number;
   /**
    * Loss-only `telemetry.batch` frames the bridge itself posted to report held
-   * loss that no agent batch carried (see {@link BRIDGE_LOSS_REPORT_DELAY_MS}).
+   * loss that no agent batch carried: one per capture's bucket per report
+   * (see {@link BRIDGE_LOSS_REPORT_DELAY_MS}).
    */
   readonly lossReports: number;
+  /**
+   * The agent's own loss-only batches that no port could take, acknowledged
+   * so the agent's capture reset cannot zero them, whose counts the bridge
+   * holds in their captures' buckets (custody case 3 in the module notes).
+   */
+  readonly agentLossReportsHeld: number;
+  /**
+   * Held loss given up because a new capture's bucket would have exceeded
+   * {@link BRIDGE_MAX_HELD_LOSS_CAPTURES}: the oldest bucket's count, which is
+   * never relabelled to another capture. Zero unless more captures than that
+   * held loss while no report could be posted.
+   */
+  readonly abandonedLossEvents: number;
   /** Whole events the event-rate budget held when it was last measured or spent. */
   readonly budgetAvailableEvents: number;
 }
@@ -870,8 +936,8 @@ export interface ContentBridge {
    * Remove every listener, cancel any pending reconnect and loss report,
    * disconnect the port and tell the agent `bridge.gone`. Idempotent. The
    * channel node is kept, because the agent answers only one handshake
-   * request per document; so is any held loss, which the next port's
-   * `bridge.ready` re-arms the report for after a restart.
+   * request per document; so is any held loss, which the next port reports
+   * at once, after its `bridge.ready`, on a restart.
    */
   stop(): void;
   /** Whether a port to the worker is currently open. */
@@ -929,6 +995,8 @@ function emptyStats(): MutableStats {
     rateLimitedEvents: 0,
     pendingDroppedCount: 0,
     lossReports: 0,
+    agentLossReportsHeld: 0,
+    abandonedLossEvents: 0,
     budgetAvailableEvents: BRIDGE_EVENT_BUDGET_CAPACITY,
   };
 }
@@ -1137,6 +1205,18 @@ interface PendingLossReport {
   handle: unknown;
 }
 
+/** The capture a held count belongs to; `undefined` is the "no capture" bucket. */
+type HeldLossCapture = PageTelemetryBatchPayload['captureId'];
+
+/**
+ * Held loss, one bucket per capture: the capture → its positive unreported
+ * count. A `Map`, so iteration is insertion order — oldest bucket first — and
+ * `undefined` is a key distinct from every capture id. A bucket is created
+ * when its capture first holds loss, deleted once reported, never merged with
+ * another, and bounded in number by {@link BRIDGE_MAX_HELD_LOSS_CAPTURES}.
+ */
+type HeldLoss = Map<HeldLossCapture, number>;
+
 /** What the page agent was last told about the port. */
 type PageSignal = 'none' | 'ready' | 'gone';
 
@@ -1170,28 +1250,34 @@ interface LossOptions {
  *   — offer listener removed), attaches the agent-frame listener to the node
  *   it received, opens the port, re-announces the last accepted `agent.ready`
  *   upstream if there is one, dispatches `bridge.ready` to the agent and, if
- *   loss is still held once the agent has drained, arms its report.
+ *   loss is still held once the agent has drained, reports it at once.
  * - An agent frame on the node is judged by {@link shouldAcceptAgentFrame},
  *   against the document's provenance and its event-rate budget refilled to
  *   the present. A refused frame is counted and acknowledged; a
- *   `rate-limited` batch's loss is also held for the next batch posted, and a
- *   loss-only report of it is armed for {@link BRIDGE_LOSS_REPORT_DELAY_MS}
- *   later (or posted at once while the document is hiding). An accepted frame
- *   is posted on the port as the matching upstream frame — a batch with any
- *   held loss added to its `droppedCount` — and acknowledged, and only then
- *   does a batch spend budget and clear the held loss, which also disarms the
- *   report; with no port open, or when the post throws, it is left
- *   unacknowledged in the agent's custody, spending nothing, a throwing port
- *   is treated as lost, and a reconnect is scheduled — never opened inline,
+ *   `rate-limited` batch's loss is also held in its capture's bucket, after
+ *   every other capture's bucket was reported at once, and a loss-only report
+ *   is armed for {@link BRIDGE_LOSS_REPORT_DELAY_MS} later (or posted at once
+ *   while the document is hiding). An accepted batch first has every other
+ *   capture's bucket reported on its own; then it, like any accepted frame, is
+ *   posted on the port as the matching upstream frame — a batch with its own
+ *   capture's bucket added to its `droppedCount` — and acknowledged, and only
+ *   then does a batch spend budget and clear that bucket, which disarms the
+ *   report once nothing is held. With no port open, or when the post throws,
+ *   the frame is left unacknowledged in the agent's custody, spending nothing
+ *   (the agent's own loss-only batch is acknowledged instead, and its count
+ *   joins its capture's bucket: custody case 3); a throwing port is treated
+ *   as lost, and a reconnect is scheduled — never opened inline,
  *   because opening dispatches `bridge.ready` and this runs inside the
  *   agent's own dispatch.
- * - The armed report, when it fires, posts the held loss as an event-less
- *   `telemetry.batch` of the pinned document at the last relayed position,
- *   leaving that position, the budget and the agent's custody untouched. With
- *   no usable port the loss stays held; the next port's `bridge.ready` re-arms
- *   the report.
+ * - The armed report, when it fires, posts every held bucket, oldest first, as
+ *   an event-less `telemetry.batch` of the pinned document under the bucket's
+ *   capture, leaving the relayed position, the budget and the agent's custody
+ *   untouched. The first post that finds no usable port leaves that bucket
+ *   and every later one held; the next port reports them at once.
  * - A well-formed worker frame is dispatched to the agent on the node with
  *   the bridge's tag, {@link PAGE_CHANNEL_VERSION} and the worker's payload.
+ *   After an `agent.config`, whose dispatch runs the agent's terminal flush,
+ *   held loss is reported at once.
  * - When the port closes (the worker suspended, crashed or refused the
  *   connection), `chrome.runtime.lastError` is read and discarded, the agent
  *   is told `bridge.gone`, and a reconnect is scheduled with
@@ -1235,12 +1321,12 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
 
   const stats = emptyStats();
 
-  // The document's event-rate budget and the loss it caused that no posted
-  // batch has reported yet. Per bridge, so per document; kept across
-  // stop()/start() like the provenance pin.
+  // The document's event-rate budget and the loss that no posted batch has
+  // reported yet, one bucket per capture (see HeldLoss). Per bridge, so per
+  // document; kept across stop()/start() like the provenance pin.
   let budget: EventBudget = fullEventBudget();
-  let pendingDroppedCount = 0;
-  // The one armed loss-only report of that held loss, if any.
+  const heldLoss: HeldLoss = new Map();
+  // The one armed loss-only report of the held buckets, if any.
   let pendingLossReport: PendingLossReport | undefined;
   // Set by a trusted `pagehide`, cleared by a trusted `pageshow`: while the
   // document is hiding no timer can be relied on, so held loss is reported at
@@ -1286,10 +1372,19 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
 
   /* ----------------------------- rate budget ----------------------------- */
 
+  /** The held loss summed across every capture's bucket, clamped like any count. */
+  function heldLossTotal(): number {
+    let total = 0;
+    for (const count of heldLoss.values()) {
+      total = addEventCounts(total, count);
+    }
+    return total;
+  }
+
   /** Mirror the budget's level and the held loss into the counters. */
   function syncBudgetStats(): void {
     stats.budgetAvailableEvents = Math.floor(budget.availableEvents);
-    stats.pendingDroppedCount = pendingDroppedCount;
+    stats.pendingDroppedCount = heldLossTotal();
   }
 
   /**
@@ -1311,68 +1406,159 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     syncBudgetStats();
   }
 
-  /** Hold a `rate-limited` batch's loss until a batch is posted to report it. */
+  /**
+   * Add `count` events to the bucket of `captureId`, creating the bucket last
+   * in the order when that capture holds nothing yet. A new bucket that would
+   * exceed {@link BRIDGE_MAX_HELD_LOSS_CAPTURES} first abandons the oldest
+   * buckets until it fits: their counts leave the held loss for
+   * {@link BridgeStats.abandonedLossEvents}, and no other capture receives
+   * them. A count that is not positive holds nothing.
+   */
+  function holdLoss(captureId: HeldLossCapture, count: number): void {
+    if (!(count > 0)) {
+      return;
+    }
+    const held = heldLoss.get(captureId);
+    if (held === undefined) {
+      // Oldest first; deleting the entry being visited is safe for a `Map`.
+      for (const [oldest, abandoned] of heldLoss) {
+        if (heldLoss.size < BRIDGE_MAX_HELD_LOSS_CAPTURES) {
+          break;
+        }
+        heldLoss.delete(oldest);
+        stats.abandonedLossEvents = addEventCounts(stats.abandonedLossEvents, abandoned);
+      }
+      heldLoss.set(captureId, count);
+    } else {
+      heldLoss.set(captureId, addEventCounts(held, count));
+    }
+    syncBudgetStats();
+  }
+
+  /**
+   * Take `reported` events off the bucket of `captureId` once a post carried
+   * them, deleting the bucket when nothing is left; once nothing is held at
+   * all, the armed report is disarmed — no separate report is due.
+   */
+  function releaseHeldLoss(captureId: HeldLossCapture, reported: number): void {
+    const held = heldLoss.get(captureId);
+    if (held === undefined || reported <= 0) {
+      return;
+    }
+    if (held > reported) {
+      heldLoss.set(captureId, held - reported);
+    } else {
+      heldLoss.delete(captureId);
+    }
+    syncBudgetStats();
+    if (heldLoss.size === 0) {
+      cancelLossReport();
+    }
+  }
+
+  /**
+   * Hold a `rate-limited` batch's loss — its events plus the agent's own
+   * `droppedCount` it carried — in the bucket of the batch's capture, until a
+   * batch of that capture carries it or a loss-only report posts it.
+   *
+   * A refusal of one capture means the agent has moved past every other
+   * capture, so their buckets are reported at once first
+   * ({@link reportOtherCapturesLoss}). A report that finds no usable port
+   * leaves its bucket held under its own capture: buckets are never merged,
+   * and a count never takes another capture's label.
+   */
   function holdRateLimitedLoss(decision: RateLimitedDecision): void {
     stats.rateLimitedEvents = addEventCounts(stats.rateLimitedEvents, decision.events);
-    pendingDroppedCount = addEventCounts(
-      pendingDroppedCount,
-      addEventCounts(decision.events, decision.droppedCount),
-    );
-    syncBudgetStats();
+    reportOtherCapturesLoss(decision.captureId);
+    holdLoss(decision.captureId, addEventCounts(decision.events, decision.droppedCount));
   }
 
   /**
-   * Post the held loss on its own, as a loss-only upstream `telemetry.batch`:
-   * no events, the held count as its `droppedCount`, the pinned `producerId`
-   * and `documentId`, and the last relayed batch's `batchSeq` (0 before any)
-   * and `captureId` (omitted when it had none). No `sessionId`: the worker
-   * attributes by the tab's binding, and the bridge invents no page context.
+   * Post every held bucket on its own, oldest first, each as one loss-only
+   * upstream `telemetry.batch`: no events, the bucket's count as its
+   * `droppedCount`, the pinned `producerId` and `documentId`, the bucket's
+   * capture (`captureId`, omitted for the "no capture" bucket), and that
+   * capture's last relayed `batchSeq` — 0 unless the last relayed batch was of
+   * that capture. No `sessionId`: the worker attributes by the tab's binding,
+   * and the bridge invents no page context.
    *
-   * It is the bridge's own report, not an agent batch: it leaves `sequence`
-   * where it is, so the agent's next batch (`batchSeq` n + 1) is still in
-   * order, and carries no events, so it spends no budget. Nothing is
+   * These are the bridge's own reports, not agent batches: they leave
+   * `sequence` where it is, so the agent's next batch (`batchSeq` n + 1) is
+   * still in order, and carry no events, so they spend no budget. Nothing is
    * acknowledged or taken from the agent's custody.
    *
-   * Does nothing with no loss held, or with no document pinned — which cannot
-   * hold loss, because a batch is refused for provenance before it is ever
-   * metered. On success the loss is cleared, counted in
-   * {@link BridgeStats.lossReports} and the armed report disarmed. With no
-   * port, or a post that throws, the loss stays held: `postUp` has already
-   * arranged the reconnect, and the next port's `bridge.ready` re-arms the
-   * report.
+   * Posted by the armed report ({@link BRIDGE_LOSS_REPORT_DELAY_MS}), and at
+   * once while the document is hiding, after a worker `agent.config` was
+   * dispatched to the agent (whose terminal flush of the capture's tail runs
+   * inside that dispatch), and on every new port once the agent has drained —
+   * so each report reaches the service while its capture's window is still
+   * open. {@link reportOtherCapturesLoss} is the same round for every bucket
+   * but one capture's.
+   *
+   * Does nothing with no document pinned — which cannot hold loss, because a
+   * batch is refused for provenance before it is ever metered or taken. Each
+   * bucket is cleared only by its own successful post, counted in
+   * {@link BridgeStats.lossReports}, and once nothing is held the armed report
+   * is disarmed. The first post that finds no usable port, or throws, ends the
+   * round: that bucket and every later one stay held under their own
+   * captures, `postUp` has already arranged the reconnect, and the next port
+   * reports them at once.
    */
   function reportHeldLoss(): void {
-    const pinned = provenance;
-    const loss = pendingDroppedCount;
-    if (loss <= 0 || pinned === undefined) {
-      return;
-    }
-    const position = sequence;
-    const payload: PageTelemetryBatchPayload = {
-      events: [],
-      producerId: pinned.producerId,
-      documentId: pinned.documentId,
-      batchSeq: position?.batchSeq ?? 0,
-      droppedCount: loss,
-      ...(position?.captureId === undefined ? {} : { captureId: position.captureId }),
-    };
-    if (!postUp({ ...UPSTREAM_FRAMING, type: 'telemetry.batch', payload })) {
-      return;
-    }
-    pendingDroppedCount -= loss;
-    stats.lossReports += 1;
-    syncBudgetStats();
-    cancelLossReport();
+    postHeldLoss(() => true);
   }
 
   /**
-   * Arm the one loss-only report of the held loss, to fire
+   * {@link reportHeldLoss} for every bucket except that of `captureId`: what
+   * a batch or a refusal of `captureId` reports first, because the agent has
+   * moved past the other captures and a batch carries only its own capture's
+   * bucket.
+   */
+  function reportOtherCapturesLoss(captureId: HeldLossCapture): void {
+    postHeldLoss((held) => held !== captureId);
+  }
+
+  /**
+   * The round behind {@link reportHeldLoss}: one loss-only report per held
+   * bucket that `include` selects, oldest first, stopping at the first post
+   * the port did not take.
+   */
+  function postHeldLoss(include: (captureId: HeldLossCapture) => boolean): void {
+    const pinned = provenance;
+    if (pinned === undefined || heldLoss.size === 0) {
+      return;
+    }
+    // A snapshot of the order, because each successful post deletes its bucket.
+    for (const [captureId, loss] of [...heldLoss]) {
+      if (!include(captureId)) {
+        continue;
+      }
+      const position = sequence;
+      const payload: PageTelemetryBatchPayload = {
+        events: [],
+        producerId: pinned.producerId,
+        documentId: pinned.documentId,
+        batchSeq:
+          position !== undefined && position.captureId === captureId ? position.batchSeq : 0,
+        droppedCount: loss,
+        ...(captureId === undefined ? {} : { captureId }),
+      };
+      if (!postUp({ ...UPSTREAM_FRAMING, type: 'telemetry.batch', payload })) {
+        return;
+      }
+      stats.lossReports += 1;
+      releaseHeldLoss(captureId, loss);
+    }
+  }
+
+  /**
+   * Arm the one loss-only report of the held buckets, to fire
    * {@link BRIDGE_LOSS_REPORT_DELAY_MS} from now — unless one is already
    * armed (a later refusal never postpones the report), nothing is held, or
    * the bridge is not running.
    */
   function scheduleLossReport(): void {
-    if (!started || terminated || pendingLossReport !== undefined || pendingDroppedCount <= 0) {
+    if (!started || terminated || pendingLossReport !== undefined || heldLoss.size === 0) {
       return;
     }
     const pending: PendingLossReport = { handle: undefined };
@@ -1422,6 +1608,15 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     if (pageHiding) {
       reportHeldLoss();
     }
+    scheduleLossReport();
+  }
+
+  /**
+   * Report held loss now, whatever the document's state; should that post
+   * find no usable port, the armed report stays responsible for it.
+   */
+  function reportHeldLossAtOnce(): void {
+    reportHeldLoss();
     scheduleLossReport();
   }
 
@@ -1518,8 +1713,32 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
   }
 
   /**
+   * Custody case 3 (see the module notes): the agent's own loss-only batch
+   * found no usable port, so its count joins the bucket of its capture and
+   * is reported like the bridge's own held loss — at once on the next port,
+   * or by the armed report. The caller acknowledges the frame, which clears
+   * the count on the agent's side; the agent's position (`batchSeq`) moves on
+   * there, while `sequence` here stays at the last relayed batch.
+   */
+  function holdAgentLossReport(batch: PageTelemetryBatchPayload): void {
+    stats.agentLossReportsHeld += 1;
+    holdLoss(batch.captureId, batch.droppedCount);
+    arrangeLossReport();
+  }
+
+  /**
+   * Whether the bridge can still report what it holds: started and not
+   * terminated. Read through a call because `postUp` may terminate the bridge
+   * (an invalidated context) in the middle of {@link onAgentFrame}.
+   */
+  function isRunning(): boolean {
+    return started && !terminated;
+  }
+
+  /**
    * The agent-frame listener on the channel node: judge, then relay and
-   * acknowledge, refuse and acknowledge, or leave in the agent's custody.
+   * acknowledge, refuse and acknowledge, take an unpostable loss-only
+   * report's count and acknowledge, or leave in the agent's custody.
    * Re-entrant by design — it runs inside `bridge.ready` and every other
    * frame the bridge dispatches — so it reads the connection afresh each time
    * and commits provenance state only for frames it accepted, and budget
@@ -1559,22 +1778,40 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
         lastReady = message.payload;
       }
 
-      // Held loss rides on the next batch, and is cleared only once the port
-      // took it: a batch left with the agent reports nothing and loses nothing.
-      const reportedLoss = message.type === 'telemetry.batch' ? pendingDroppedCount : 0;
-      if (!postUp(toUpstreamFrame(withReportedLoss(message, reportedLoss)))) {
+      // A batch carries only its own capture's bucket, cleared only once the
+      // port took it: a batch left with the agent reports nothing and loses
+      // nothing. Every other capture's bucket is reported on its own first,
+      // under its own capture, and never added to this batch.
+      const batch = message.type === 'telemetry.batch' ? message.payload : undefined;
+      if (batch !== undefined) {
+        reportOtherCapturesLoss(batch.captureId);
+      }
+      const carriedLoss = batch === undefined ? 0 : (heldLoss.get(batch.captureId) ?? 0);
+      if (!postUp(toUpstreamFrame(withReportedLoss(message, carriedLoss)))) {
+        if (
+          batch !== undefined &&
+          batch.events.length === 0 &&
+          batch.droppedCount > 0 &&
+          isRunning()
+        ) {
+          // The agent posts a loss-only batch only at a terminal flush, and
+          // the capture change right after a disarm zeroes an unclaimed count:
+          // left with the agent it would be lost, so the bridge takes it.
+          holdAgentLossReport(batch);
+          acknowledge(event);
+          return;
+        }
+        // Any other frame — every event batch, and a loss-only batch once the
+        // bridge can no longer report — stays with the agent, which re-sends
+        // it after the next `bridge.ready`.
         stats.unclaimed += 1;
         return;
       }
-      if (message.type === 'telemetry.batch') {
-        sequence = { captureId: message.payload.captureId, batchSeq: message.payload.batchSeq };
-        budget = consumeEventBudget(budget, message.payload.events.length);
-        pendingDroppedCount -= reportedLoss;
+      if (batch !== undefined) {
+        sequence = { captureId: batch.captureId, batchSeq: batch.batchSeq };
+        budget = consumeEventBudget(budget, batch.events.length);
         syncBudgetStats();
-        if (pendingDroppedCount === 0) {
-          // This batch carried everything held: no separate report is due.
-          cancelLossReport();
-        }
+        releaseHeldLoss(batch.captureId, carriedLoss);
       }
       stats.relayed += 1;
       acknowledge(event);
@@ -1703,6 +1940,14 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
       // The worker answered, so it is reachable: the backoff starts over.
       attempt = 0;
       const outcome = sendToAgent(toPageFrame(message));
+      if (message.type === 'agent.config') {
+        // A configuration can end or change the capture, and the agent's
+        // terminal flush of its tail runs inside that dispatch, so whatever
+        // the budget refused of it is held now. The service closes the
+        // capture's window shortly after, so the loss is reported at once
+        // rather than when the armed report fires.
+        reportHeldLossAtOnce();
+      }
       switch (outcome) {
         case 'claimed':
           stats.forwardedDown += 1;
@@ -1852,9 +2097,11 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
       stats.reannounced += 1;
     }
     signalReady();
-    // The agent has drained inside `bridge.ready`; loss that no batch of its
-    // carried — held while no port was usable — is not stranded.
-    arrangeLossReport();
+    // The agent has drained inside `bridge.ready`, so every batch left to
+    // carry a bucket has done so. What is still held — kept while no port was
+    // usable — is reported at once: after an outage the capture's window may
+    // be closing, and nothing more is going to carry it.
+    reportHeldLossAtOnce();
   }
 
   /** Schedule one reconnect with backoff, unless one is pending or pointless. */

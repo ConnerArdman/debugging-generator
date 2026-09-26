@@ -4,13 +4,11 @@
 // `pnpm lint` is `eslint . --max-warnings 0` (AAP 0.8.5): a blocking step of
 // `pnpm verify` where a WARNING fails the run exactly like an error. Every rule
 // enabled below therefore has to be satisfiable by the code in this repository;
-// nothing here is advisory. The script is that plain command - no runtime flag
-// and no path into node_modules. Its 8 GiB heap ceiling comes from the
-// `nodeOptions` key of pnpm-workspace.yaml, which pnpm applies to every script
-// it runs: type-aware linting holds every project's TypeScript program in one
-// process and peaks near 5.6 GB, above Node's default ~4 GB heap, which
-// otherwise aborts the run with a heap OOM. Run it through pnpm (`pnpm lint`,
-// `pnpm exec eslint`); a bare `node_modules/.bin/eslint .` gets no ceiling.
+// nothing here is advisory.
+//
+// Type-aware linting needs more heap than Node's default. The `nodeOptions` key
+// of pnpm-workspace.yaml raises the heap ceiling for every script pnpm runs, so
+// lint through pnpm (`pnpm lint`, `pnpm exec eslint`).
 //
 // Three layers, in order of importance:
 //
@@ -254,32 +252,30 @@ const TOOLING_CONFIG_FILES = [
 ];
 
 /**
- * The React surfaces of `apps/demo-app`, the product's instrumentation target.
- * They are linted like every other React surface, with the one workspace-level
- * exception that the 'debuggen/react-hooks-instrumentation-target' block below
- * states and justifies.
- */
-const INSTRUMENTATION_TARGET_REACT_SURFACES = [
-  'apps/demo-app/app/**/*.tsx',
-  'apps/demo-app/src/**/*.tsx',
-];
-
-/**
  * The React surfaces. Everything else in the repository is Node or plain DOM
  * code, and the React Compiler rule set has nothing to say about it.
  *
- * `.tsx` only, deliberately. A hook module written as plain `.ts`
- * (`src/host/useQuery.ts`, a workspace's `src/hooks/*.ts`) is therefore checked
- * by the type-aware rules but not by the hook rules. Widening this list to
- * `.ts` means widening INSTRUMENTATION_TARGET_REACT_SURFACES in step, so the
- * instrumentation target's workspace exception keeps covering every file of
- * that workspace the hook rules reach.
+ * Every file under these trees gets the hook rules, `.ts` as well as `.tsx`, so
+ * a hook module written as plain `.ts` is held to them exactly like a
+ * component. The compiler-backed rules analyse only components and hooks, which
+ * leaves the other `.ts` modules here unaffected.
+ *
+ * No workspace, file or rule is exempted in this config. A statement that
+ * genuinely needs a rule relaxed carries a line-scoped `eslint-disable-next-line`
+ * in its own source, and `reportUnusedDisableDirectives` retires that directive
+ * as soon as it stops suppressing anything.
  */
 const REACT_SURFACES = [
+  'packages/panel-renderer/src/**/*.ts',
   'packages/panel-renderer/src/**/*.tsx',
+  'apps/chrome-extension/src/panel/**/*.ts',
   'apps/chrome-extension/src/panel/**/*.tsx',
+  'apps/vscode-extension/src/webview/**/*.ts',
   'apps/vscode-extension/src/webview/**/*.tsx',
-  ...INSTRUMENTATION_TARGET_REACT_SURFACES,
+  'apps/demo-app/app/**/*.ts',
+  'apps/demo-app/app/**/*.tsx',
+  'apps/demo-app/src/**/*.ts',
+  'apps/demo-app/src/**/*.tsx',
 ];
 
 /** Every test and spec file, whichever workspace owns it. */
@@ -517,28 +513,6 @@ export default tseslint.config(
     },
   },
 
-  {
-    // The instrumentation target, as a workspace. `apps/demo-app` is not
-    // product code: it is the ordinary application the product instruments and
-    // explains (AAP 0.4.2, 0.5.4), and its effect dependency lists and the state
-    // its effects publish are runtime behaviour the product exists to capture,
-    // which a lint gate must never demand be rewritten (AAP 0.8.2). Exactly the
-    // two rules that judge that behaviour are off for the whole workspace, and
-    // every other rule - rules-of-hooks and the rest of the React Compiler set
-    // included - stays on there, so a genuine hook bug still fails the gate.
-    //
-    // The exception is expressed by workspace and rule only, never by file or
-    // symbol: repository tooling records nothing about where anything in the
-    // demo lives, and `scripts/check-no-hardcoding.mjs` scans this file to keep
-    // it that way.
-    name: 'debuggen/react-hooks-instrumentation-target',
-    files: INSTRUMENTATION_TARGET_REACT_SURFACES,
-    rules: {
-      'react-hooks/exhaustive-deps': 'off',
-      'react-hooks/set-state-in-effect': 'off',
-    },
-  },
-
   // -------------------------------------------------------------------------
   // Package layering (AAP 0.2.2) - the mechanical guardian of the dependency
   // edge list. Order is load-bearing: ESLint replaces a rule's options when a
@@ -668,9 +642,9 @@ export default tseslint.config(
   {
     // The one exception to the block above, scoped to a directory rather than
     // to the workspace: the integration suite's live-response render oracle
-    // mounts every catalog component against a real panel-data answer (AAP
-    // 0.4.2, 0.8.3), so its helpers may import @debuggen/panel-renderer. The
-    // package is a devDependency of the service, and src/** stays renderer-free.
+    // mounts every catalog component against a real panel-data answer, so its
+    // helpers may import @debuggen/panel-renderer. The package is a
+    // devDependency of the service, and src/** stays renderer-free.
     name: 'debuggen/layering-apps-local-service-test-integration-render',
     files: ['apps/local-service/test/integration/render/**/*.ts'],
     rules: {

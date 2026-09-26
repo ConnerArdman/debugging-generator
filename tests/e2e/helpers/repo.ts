@@ -31,8 +31,8 @@
  *
  * ## Three prohibitions
  *
- * 1. **Nothing under the checkout's `.git/` is ever read, copied, archived or logged** (AAP
- *    0.2.1): the repository's `origin` URL embeds a live access token. Running git as a
+ * 1. **Nothing under the checkout's `.git/` is ever read, copied, archived or logged**: the
+ *    repository's `origin` URL embeds a live access token. Running git as a
  *    *command* whose output is paths or object ids only (`git ls-files -z`, `git status
  *    --porcelain`, `git rev-parse`) is the sanctioned mechanism; {@link runGit} additionally
  *    refuses the subcommands that print remotes or configuration or that reach the network
@@ -43,17 +43,17 @@
  *    that local path — is removed before it resolves, and none of its git output is echoed. It
  *    inspects the clone's metadata by `lstat` only (`.git` is a directory, no
  *    `objects/info/alternates`); no file under any `.git/` is opened.
- * 2. **Nothing is written into either project tree** (AAP 0.5.1 — helpers read, the product
- *    writes): this module never creates, modifies, truncates or deletes a path under
+ * 2. **Nothing is written into either project tree** (helpers read, the product writes): this
+ *    module never creates, modifies, truncates or deletes a path under
  *    `apps/demo-app` or `tests/fixtures/sample-next-app`, or anywhere else in the checkout.
  *    {@link cloneRepository} and {@link copyTrackedTree} write only into a caller-supplied
  *    destination that they prove (by real path) lies outside {@link repoRoot}. The caller owns
  *    that destination and its cleanup; it belongs under `os.tmpdir()` (for example
  *    `fs.mkdtemp(path.join(os.tmpdir(), 'debuggen-clean-clone-'))`).
- * 3. **No credential reaches output** (AAP 0.3.4, `pnpm check:secrets`): no environment
- *    *value* is ever logged, attached or returned by a diagnostic path — sanitisation and its
- *    reports work on variable *names* and on value *shapes* only — and this file contains no
- *    token, key or credential-bearing connection string.
+ * 3. **No credential reaches output** (`pnpm check:secrets` guards the tracked tree): no
+ *    environment *value* is ever logged, attached or returned by a diagnostic path —
+ *    sanitisation and its reports work on variable *names* and on value *shapes* only — and
+ *    this file contains no token, key or credential-bearing connection string.
  *
  * ## Relationship to `tests/browser/fixtures.ts`
  *
@@ -137,7 +137,7 @@ export const MIGRATE_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * `pnpm demo:seed`: ≈400 products, six warehouses and ≈200 000 inventory movements in batched
- * inserts (AAP 0.8.2) — about twenty seconds on an idle host, minutes on a contended one.
+ * inserts — about twenty seconds on an idle host, minutes on a contended one.
  */
 export const SEED_TIMEOUT_MS = 15 * 60_000;
 
@@ -384,7 +384,7 @@ const BLOCKED_ENV_NAMES: ReadonlySet<string> = new Set([
   'ANTHROPIC_API_KEY',
 ]);
 
-/** Name prefixes never passed to a child: the product's own configuration (AAP 0.3.4). */
+/** Name prefixes never passed to a child: the product's own configuration (see `.env.example`). */
 const BLOCKED_ENV_PREFIXES: readonly string[] = Object.freeze(['DEBUGGEN_']);
 
 /** A variable whose NAME says it carries a credential, whatever its value looks like. */
@@ -452,9 +452,10 @@ export function sanitizedEnv(extra?: Readonly<Record<string, string>>): Record<s
  * One asymmetry is deliberate: an *inherited* value that is a URL with `user:password@` is
  * withheld, while a *requested* one is kept. `extra` is where a caller states intent, and the
  * demo's migrate and seed can only be told where PostgreSQL is through such a URL — the
- * development placeholder of AAP 0.3.4, which `demo-app.ts` reads from its own environment and
- * forwards here rather than writing it down. Blocked names, sensitive names and every other
- * credential shape are refused on both paths.
+ * development placeholder `.env.example` documents and `scripts/check-secrets.allowlist.json`
+ * allowlists, which `demo-app.ts` reads from its own environment and forwards here rather than
+ * writing it down. Blocked names, sensitive names and every other credential shape are refused
+ * on both paths.
  *
  * Pure: nothing is logged here. {@link runCommand} prints the withheld NAMES when it echoes.
  */
@@ -947,7 +948,7 @@ export function runGit(args: readonly string[], options?: RunGitOptions): Promis
   if (subcommand !== undefined && REFUSED_GIT_SUBCOMMANDS.has(subcommand)) {
     return Promise.reject(
       new Error(
-        `runGit(): \`git ${subcommand}\` is refused — its output can carry the origin URL, which embeds an access token (AAP 0.2.1). Enumerate the tree with \`git ls-files -z\` instead.`,
+        `runGit(): \`git ${subcommand}\` is refused — its output can carry the origin URL, which embeds an access token. Enumerate the tree with \`git ls-files -z\` instead.`,
       ),
     );
   }
@@ -1159,7 +1160,7 @@ type CloneStep = (
  *    source is always the checkout's absolute PATH — never a URL and never the checkout's
  *    remote — so nothing reaches the network and no credential is consulted, and a clone never
  *    copies its source's `.git/config`, so the token in the checkout's `origin` URL cannot
- *    travel (AAP 0.2.1). `--no-local` transfers objects through `upload-pack` instead of
+ *    travel. `--no-local` transfers objects through `upload-pack` instead of
  *    hardlinking or borrowing the checkout's object store; `--template=` installs no hooks;
  *    `--no-checkout` leaves the working tree to step 2.
  * 2. `git checkout --detach --quiet <commit>`: the working tree of exactly that commit.
@@ -1380,7 +1381,7 @@ export interface CopyTrackedTreeResult {
  *
  * **No `.git` is ever created in `dest` and nothing under `.git/` is ever copied.** That is the
  * whole point of enumerating with `git ls-files` instead of copying the directory: the
- * repository's `origin` URL in `.git/config` embeds a live access token (AAP 0.2.1), and a copy
+ * repository's `origin` URL in `.git/config` embeds a live access token, and a copy
  * that carried it could leak it into build logs, caches or artifacts. The copy is verified
  * `.git`-free before this resolves.
  *

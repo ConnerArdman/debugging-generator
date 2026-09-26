@@ -47,6 +47,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { DENIED_HEADER_NAMES } from './headers.js';
 import type { RedactionRuleId } from './rules.js';
 import {
   ENTROPY_MIN_BITS_PER_CHAR,
@@ -213,6 +214,21 @@ const BEARER_CREDENTIAL = cycle(BEARER_CHARS, 48);
 const BEARER_HEADER_VALUE = BEARER_SCHEME + ' ' + BEARER_CREDENTIAL;
 
 /**
+ * A credential shorter than the bearer rule's eight-character threshold, so
+ * that only the header line rule can remove it.
+ */
+const SHORT_CREDENTIAL = assemble('S3', 'CRET');
+
+/** A cookie header's value: an ordinary `name=value` list with no credential shape. */
+const COOKIE_VALUE = 'session=' + cycle(LOWER_LETTERS, 12) + '; theme=dark';
+
+/** A sensitive header written out as a line of free text. */
+const COOKIE_LINE = 'Cookie: ' + COOKIE_VALUE;
+
+/** An authorization header line carrying the short credential. */
+const SHORT_AUTHORIZATION_LINE = 'Authorization: ' + BEARER_SCHEME + ' ' + SHORT_CREDENTIAL;
+
+/**
  * Base64url prefix of a JOSE header object, split across fragments so the
  * three characters that identify a token never appear contiguously here.
  */
@@ -309,6 +325,8 @@ const SECRET_FIXTURES: readonly Fixture[] = [
   ...PROVIDER_CREDENTIALS,
   { label: 'a bare bearer credential', value: BEARER_CREDENTIAL },
   { label: 'a bearer header value', value: BEARER_HEADER_VALUE },
+  { label: 'a header line carrying a short bearer credential', value: SHORT_AUTHORIZATION_LINE },
+  { label: 'a cookie header line', value: 'note: ' + COOKIE_LINE },
   { label: 'a signed JOSE token', value: JWT_SIGNED },
   { label: 'an unsigned JOSE token', value: JWT_UNSIGNED },
   { label: 'a two-segment JOSE token', value: JWT_TWO_SEGMENT },
@@ -329,8 +347,9 @@ const SECRET_FIXTURES: readonly Fixture[] = [
  * Over-redaction costs the analysis pipeline its evidence: a trace id, a
  * digest, a source location and an already-masked URL or statement are what
  * the panel is built from, so each one is asserted to survive rather than
- * merely "probably" surviving. The last three are the idempotence traps — the
- * marker, the form the bearer rule produces, and the empty string.
+ * merely "probably" surviving. The last four are the idempotence traps — the
+ * marker, the forms the bearer and header line rules produce, and the empty
+ * string.
  */
 const CLEAN_FIXTURES: readonly Fixture[] = [
   { label: 'ordinary prose', value: 'The panel rendered 4 rows in 22 ms' },
@@ -350,6 +369,7 @@ const CLEAN_FIXTURES: readonly Fixture[] = [
     label: 'an already-redacted bearer header value',
     value: BEARER_SCHEME + ' ' + REDACTION_MARKER,
   },
+  { label: 'an already-redacted header line', value: 'Cookie: ' + REDACTION_MARKER },
   { label: 'an empty string', value: '' },
 ];
 
@@ -491,8 +511,17 @@ describe('scrub', () => {
 
   describe('bearer credentials', () => {
     it('keeps the scheme word and replaces only the credential', () => {
-      expect(scrub('authorization: ' + BEARER_HEADER_VALUE)).toBe(
-        'authorization: ' + BEARER_SCHEME + ' ' + REDACTION_MARKER,
+      expect(scrub('the request carried ' + BEARER_HEADER_VALUE)).toBe(
+        'the request carried ' + BEARER_SCHEME + ' ' + REDACTION_MARKER,
+      );
+    });
+
+    it('leaves a short word after the scheme alone outside a header line', () => {
+      // The eight-character threshold is what keeps English prose intact; a
+      // short credential inside a header line is the line rule's to remove.
+      expect(scrub('a bearer token was sent')).toBe('a bearer token was sent');
+      expect(scrub(BEARER_SCHEME + ' ' + SHORT_CREDENTIAL)).toBe(
+        BEARER_SCHEME + ' ' + SHORT_CREDENTIAL,
       );
     });
 
@@ -511,11 +540,195 @@ describe('scrub', () => {
     });
   });
 
+  describe('sensitive header lines', () => {
+    it('replaces the whole value of an authorization line, however short the credential', () => {
+      expect(scrub(SHORT_AUTHORIZATION_LINE)).toBe('Authorization: ' + REDACTION_MARKER);
+      expect(scrub('authorization: ' + BEARER_HEADER_VALUE)).toBe(
+        'authorization: ' + REDACTION_MARKER,
+      );
+      expect(scrub(SHORT_AUTHORIZATION_LINE)).not.toContain(SHORT_CREDENTIAL);
+    });
+
+    it('replaces a cookie line inside other text and keeps the text before it', () => {
+      expect(scrub('note: ' + COOKIE_LINE)).toBe('note: Cookie: ' + REDACTION_MARKER);
+      expect(scrub('(' + COOKIE_LINE)).toBe('(Cookie: ' + REDACTION_MARKER);
+      expect(scrub('note: ' + COOKIE_LINE)).not.toContain('session=');
+    });
+
+    it('replaces every header the header handler denies, and no other', () => {
+      // `./headers.ts` holds the deny list and this rule holds its own copy,
+      // by convention rather than by an import; this is the tie between them.
+      for (const name of DENIED_HEADER_NAMES) {
+        expect(scrub(name + ': ' + SHORT_CREDENTIAL), name).toBe(name + ': ' + REDACTION_MARKER);
+        expect(findDeniedRules(name + ': ' + SHORT_CREDENTIAL), name).toEqual(['sensitive-header']);
+      }
+      for (const line of ['Accept: text/html', 'Content-Type: application/json', 'Host: a.test']) {
+        expect(scrub(line), line).toBe(line);
+      }
+    });
+
+    it('covers set-cookie, x-api-key, x-auth-token and proxy-authorization lines', () => {
+      expect(scrub('Set-Cookie: sid=' + SHORT_CREDENTIAL + '; Path=/; HttpOnly')).toBe(
+        'Set-Cookie: ' + REDACTION_MARKER,
+      );
+      expect(scrub('X-Api-Key: ' + SHORT_CREDENTIAL)).toBe('X-Api-Key: ' + REDACTION_MARKER);
+      expect(scrub('x-auth-token:' + SHORT_CREDENTIAL)).toBe('x-auth-token:' + REDACTION_MARKER);
+      expect(scrub('Proxy-Authorization: Basic ' + SHORT_CREDENTIAL)).toBe(
+        'Proxy-Authorization: ' + REDACTION_MARKER,
+      );
+    });
+
+    it('matches the name in any letter case and keeps the spacing as written', () => {
+      expect(scrub('AUTHORIZATION: ' + SHORT_CREDENTIAL)).toBe(
+        'AUTHORIZATION: ' + REDACTION_MARKER,
+      );
+      expect(scrub('cOoKiE:\t' + COOKIE_VALUE)).toBe('cOoKiE:\t' + REDACTION_MARKER);
+      expect(scrub('Cookie :  ' + COOKIE_VALUE)).toBe('Cookie :  ' + REDACTION_MARKER);
+    });
+
+    it('masks only the header line of a multi-line value', () => {
+      const request = ['GET /v1/items', COOKIE_LINE, 'Accept: text/html'];
+
+      expect(scrub(request.join('\n'))).toBe(
+        ['GET /v1/items', 'Cookie: ' + REDACTION_MARKER, 'Accept: text/html'].join('\n'),
+      );
+      expect(scrub(request.join('\r\n'))).toBe(
+        ['GET /v1/items', 'Cookie: ' + REDACTION_MARKER, 'Accept: text/html'].join('\r\n'),
+      );
+    });
+
+    it('masks a header line after a written whitespace escape, as the outbound guard reads one', () => {
+      // A JSON-rendered section or a string literal writes the line break as
+      // `\n`, so the line after it is a header line to the guard.
+      for (const escape of ['\\n', '\\r', '\\t', '\\f', '\\u000b']) {
+        const text = 'first' + escape + 'Authorization: Bearer ' + SHORT_CREDENTIAL;
+
+        expect(scrub(text), escape).toBe('first' + escape + 'Authorization: ' + REDACTION_MARKER);
+        expect(findDeniedRules(text), escape).toEqual(['sensitive-header']);
+        expect(scrub(scrub(text)), escape).toBe(scrub(text));
+      }
+      // A backslash before any other letter continues a name.
+      expect(scrub('a\\xcookie: ' + SHORT_CREDENTIAL)).toBe('a\\xcookie: ' + SHORT_CREDENTIAL);
+    });
+
+    it('does not read a longer name that merely ends in a denied one', () => {
+      for (const text of [
+        'mycookie: ' + SHORT_CREDENTIAL,
+        'x-cookie: ' + SHORT_CREDENTIAL,
+        'authorization_code: ' + SHORT_CREDENTIAL,
+        'cookies: ' + SHORT_CREDENTIAL,
+        'Cookie banner dismissed',
+      ]) {
+        expect(scrub(text), text).toBe(text);
+        expect(findDeniedRules(text), text).toEqual([]);
+      }
+    });
+
+    it('leaves a header line with nothing after its separator alone', () => {
+      for (const text of ['Cookie:', 'Cookie:   ', 'Cookie:\nnext line', 'Cookie: \r\n']) {
+        expect(scrub(text), JSON.stringify(text)).toBe(text);
+        expect(findDeniedRules(text), JSON.stringify(text)).toEqual([]);
+      }
+    });
+
+    it('treats a value that is exactly the marker as already redacted, and nothing else', () => {
+      for (const text of [
+        'Cookie: ' + REDACTION_MARKER,
+        'Cookie: ' + REDACTION_MARKER + '\nnext line',
+        'Authorization:' + REDACTION_MARKER + '\r\n',
+      ]) {
+        expect(scrub(text), JSON.stringify(text)).toBe(text);
+        expect(findDeniedRules(text), JSON.stringify(text)).toEqual([]);
+        expect(containsDenied(text), JSON.stringify(text)).toBe(false);
+      }
+      // The marker's bytes, exactly: anything else in the value is data.
+      for (const value of [REDACTION_MARKER.toUpperCase(), REDACTION_MARKER + ' extra']) {
+        expect(scrub('Cookie: ' + value), value).toBe('Cookie: ' + REDACTION_MARKER);
+        expect(findDeniedRules('Cookie: ' + value), value).toEqual(['sensitive-header']);
+      }
+    });
+
+    it('treats what a preview cut leaves of the marker as already redacted, at the end only', () => {
+      // `truncate` ends a cut with its suffix. A cut inside a redacted header
+      // line leaves a prefix of the marker (possibly empty) and the suffix,
+      // which is fixed text hiding nothing; a second pass must leave it.
+      for (const text of [
+        'Cookie: [red' + TRUNCATION_SUFFIX,
+        'Cookie: ' + TRUNCATION_SUFFIX,
+        'Cookie:' + TRUNCATION_SUFFIX,
+        'note\nAuthorization: [' + TRUNCATION_SUFFIX,
+        'Cookie: [redacted' + TRUNCATION_SUFFIX,
+        'Cookie: ' + REDACTION_MARKER + TRUNCATION_SUFFIX,
+      ]) {
+        expect(scrub(text), JSON.stringify(text)).toBe(text);
+        expect(findDeniedRules(text), JSON.stringify(text)).toEqual([]);
+      }
+      // Anything else before the suffix, or the suffix anywhere but the end,
+      // is a value like any other.
+      for (const text of [
+        'Cookie: [x' + TRUNCATION_SUFFIX,
+        'Cookie: [RED' + TRUNCATION_SUFFIX,
+        'Cookie: [red' + TRUNCATION_SUFFIX + ' more',
+        'Cookie: [red' + TRUNCATION_SUFFIX + '\n',
+        'Cookie: ' + SHORT_CREDENTIAL + TRUNCATION_SUFFIX,
+      ]) {
+        expect(scrub(text), JSON.stringify(text)).toMatch(/^Cookie: \[redacted\]\n?$/);
+        expect(findDeniedRules(text), JSON.stringify(text)).toEqual(['sensitive-header']);
+      }
+    });
+
+    it('keeps a preview bound of scrubbed header lines a fixed point, wherever it cuts', () => {
+      const text =
+        'note: see ' + COOKIE_LINE + '\n' + SHORT_AUTHORIZATION_LINE + '\nx-api-key: k tail';
+      const scrubbed = scrub(text);
+
+      for (let bound = 1; bound <= Array.from(scrubbed).length + 1; bound += 1) {
+        const preview = truncate(scrubbed, bound);
+
+        expect(scrub(preview), `bound ${String(bound)}`).toBe(preview);
+        expect(findDeniedRules(preview), `bound ${String(bound)}`).toEqual([]);
+      }
+    });
+
+    it('masks a header line a replaced credential exposes, in the same pass', () => {
+      // A name only counts after a character that cannot continue one. An
+      // upper-case access identifier or a key block's closing dashes directly
+      // in front of a lower-case name hide it until they are replaced by the
+      // marker, whose `]` qualifies; the line must go in that same call.
+      const behindIdentifier = ACCESS_KEY_ID + 'cookie: ' + SHORT_CREDENTIAL;
+      const behindBlock = PEM_BLOCK + 'cookie: ' + SHORT_CREDENTIAL;
+
+      expect(scrub(behindIdentifier)).toBe(REDACTION_MARKER + 'cookie: ' + REDACTION_MARKER);
+      expect(scrub(behindBlock)).toBe(REDACTION_MARKER + 'cookie: ' + REDACTION_MARKER);
+      for (const value of [behindIdentifier, behindBlock]) {
+        const once = scrub(value);
+        expect(scrub(once)).toBe(once);
+      }
+    });
+
+    it('is idempotent', () => {
+      for (const text of [
+        SHORT_AUTHORIZATION_LINE,
+        'note: ' + COOKIE_LINE,
+        'Cookie:Cookie: ' + SHORT_CREDENTIAL,
+        'x Cookie: a\nCookie: b\r\nCookie:c',
+        'Cookie: ' + REDACTION_MARKER.toUpperCase(),
+        'bearer authorization: ' + SHORT_CREDENTIAL,
+      ]) {
+        const once = scrub(text);
+
+        expect(scrub(once), JSON.stringify(text)).toBe(once);
+        expect(findDeniedRules(once), JSON.stringify(text)).toEqual([]);
+      }
+    });
+  });
+
   describe('JOSE tokens', () => {
     it('replaces a signed three-segment token', () => {
-      expect(scrub('cookie: session=' + JWT_SIGNED + ';')).toBe(
-        'cookie: session=' + REDACTION_MARKER + ';',
-      );
+      expect(scrub('session=' + JWT_SIGNED + ';')).toBe('session=' + REDACTION_MARKER + ';');
+      // Written out as a cookie header line, the header line rule runs first
+      // and takes the whole value, the token with it.
+      expect(scrub('cookie: session=' + JWT_SIGNED + ';')).toBe('cookie: ' + REDACTION_MARKER);
     });
 
     it('replaces an unsigned token whose third segment is empty', () => {
@@ -1047,9 +1260,11 @@ describe('findDeniedRules', () => {
     expect(findDeniedRules(JWT_SIGNED + ' ' + ACCESS_KEY_ID)).toEqual(['provider-key', 'jwt']);
     expect(findDeniedRules(ACCESS_KEY_ID + ' ' + JWT_SIGNED)).toEqual(['provider-key', 'jwt']);
     expect(findDeniedRules('authorization: ' + BEARER_SCHEME + ' ' + JWT_SIGNED)).toEqual([
+      'sensitive-header',
       'bearer-token',
       'jwt',
     ]);
+    expect(findDeniedRules(BEARER_SCHEME + ' ' + JWT_SIGNED)).toEqual(['bearer-token', 'jwt']);
   });
 
   it('reports every id at most once however many times its class matches', () => {
@@ -1085,17 +1300,24 @@ describe('findDeniedRules', () => {
     expect(findDeniedRules('', 'password')).toEqual([]);
   });
 
-  it('never reports the positional classes the handlers own', () => {
-    // `sensitive-header` and `url-query-value` classify a value by where it
-    // appears, which only headers.ts and url.ts can see. They belong to the
-    // vocabulary so those handlers report in the same terms, never to this
-    // function.
+  it('never reports url-query-value, which only the URL handler can see', () => {
+    // A query value is classified by where it appears, which only url.ts can
+    // see. The id belongs to the vocabulary so that handler reports in the
+    // same terms, never to this function.
     for (const { value } of SECRET_FIXTURES) {
-      const reported = findDeniedRules(value, 'authorization');
-
-      expect(reported).not.toContain('sensitive-header');
-      expect(reported).not.toContain('url-query-value');
+      expect(findDeniedRules(value, 'authorization')).not.toContain('url-query-value');
     }
+  });
+
+  it('reports sensitive-header for a header line in the text, never for the name it is given', () => {
+    // A value under a denied header *name* is the positional case, which
+    // headers.ts and redactor.ts report themselves; the name passed here is a
+    // key, not text. A header line written out inside the value is content,
+    // and this function reports it like any other content rule.
+    expect(findDeniedRules(BEARER_HEADER_VALUE, 'authorization')).not.toContain('sensitive-header');
+    expect(findDeniedRules(COOKIE_VALUE, 'cookie')).toEqual([]);
+    expect(findDeniedRules(COOKIE_LINE)).toEqual(['sensitive-header']);
+    expect(findDeniedRules(SHORT_AUTHORIZATION_LINE)).toEqual(['sensitive-header']);
   });
 
   it('reports a credential whose terminator sits past the scan bound', () => {
@@ -1424,6 +1646,15 @@ const CROSSING_CASES: readonly CrossingCase[] = [
     keeps: CONNECTION_SCHEME,
     secret: CONNECTION_USERINFO,
   },
+  {
+    label: 'a sensitive header line',
+    credential: COOKIE_LINE,
+    inHead: 'Cookie: '.length + 3,
+    // The header's name and separator survive a cut exactly as they survive a
+    // replacement, so a cut line reads `Cookie: [redacted]`.
+    keeps: 'Cookie: ',
+    secret: COOKIE_VALUE,
+  },
 ];
 
 describe('properties', () => {
@@ -1571,6 +1802,23 @@ describe('properties', () => {
     expect(scrub(scrubbed)).toBe(scrubbed);
   });
 
+  it('cuts an already-redacted header line back to its name, so the result stays a fixed point', () => {
+    // The line rule does not match its own output, but a cut inside that
+    // output would leave `Cookie: [red` in front of the appended marker — a
+    // value it no longer recognises as redacted, masked again by the next
+    // call. The cut therefore moves back to the header's kept prefix whatever
+    // its value, and produces the same line the replacement produces.
+    const line = 'Cookie: ' + REDACTION_MARKER;
+    const padding = 'x'.repeat(SCAN_CUT - 'Cookie: '.length - 4 - 1) + ' ';
+    const value = padding + line + '\n' + 'tail '.repeat(4_000);
+    const scrubbed = scrub(value);
+
+    expect(value.indexOf(line)).toBeLessThan(SCAN_CUT);
+    expect(value.indexOf(line) + line.length).toBeGreaterThan(SCAN_CUT);
+    expect(scrubbed).toBe(padding + line);
+    expect(scrub(scrubbed)).toBe(scrubbed);
+  });
+
   it('does not cut a long run whose end it actually reached', () => {
     // The conservative cut is for text that was never examined, not for text
     // that was: a value whose credential-shaped tail ends within the examined
@@ -1633,11 +1881,19 @@ describe('properties', () => {
     const openedPem = PEM_HEADER.slice(0, PEM_HEADER.length - 8) + 'A'.repeat(50_000);
     const repeatedHeader = (PEM_DASHES + 'BEGIN ').repeat(2_000);
     const longBearer = BEARER_SCHEME + ' ' + cycle(BEARER_CHARS, 10_000);
+    // Many header lines on one line that ends inside the examined window, with
+    // input left beyond it: the case in which every header name on that line
+    // is a candidate start for the cut probes.
+    const crowdedHeaderLine = 'x Cookie:a '.repeat(1_400) + '\n' + 'y'.repeat(20_000);
+    // A header name whose separator is out of reach of every bounded run.
+    const farSeparator = 'Cookie' + ' '.repeat(MAX_SCAN_LENGTH + 4_000) + ':' + SHORT_CREDENTIAL;
     const hostile: readonly Fixture[] = [
       { label: '200 KB of dense punctuated text', value: noise },
       { label: 'a truncated key header before a long single-character run', value: openedPem },
       { label: 'a repeated key header that never closes', value: repeatedHeader },
       { label: 'a bearer scheme before 10 000 credential characters', value: longBearer },
+      { label: '1 400 header lines crowded onto one line', value: crowdedHeaderLine },
+      { label: 'a header name separated from its colon by 20 000 spaces', value: farSeparator },
     ];
 
     for (const { label, value } of hostile) {
@@ -1662,6 +1918,9 @@ describe('properties', () => {
     const longBearer = BEARER_SCHEME + ' ' + cycle(BEARER_CHARS, 10_000);
 
     expect(scrub(longBearer)).toBe(BEARER_SCHEME + ' ' + REDACTION_MARKER);
+    expect(scrub('x Cookie:a '.repeat(1_400) + '\nend')).toBe(
+      'x Cookie:' + REDACTION_MARKER + '\nend',
+    );
   });
 
   it('is pure: repeated calls agree and no module state drifts', () => {

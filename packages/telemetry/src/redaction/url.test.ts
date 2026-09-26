@@ -56,7 +56,9 @@ import {
   isUrlAttributeKey,
   parseQueryPairs,
   parseUrlParts,
+  redactEmbeddedUrls,
   redactQueryString,
+  redactStackText,
   redactStackUrls,
   redactTextUrls,
   redactUrl,
@@ -265,6 +267,16 @@ function expectOnlyMaskedValues(redacted: string): void {
 }
 
 /**
+ * The characters that end a URL run in text — whitespace, quotes, angle
+ * brackets and the backtick, the delimiters `./url.ts`'s text patterns stop at.
+ *
+ * Splitting redacted text on them yields the runs {@link expectOnlyMaskedValues}
+ * can judge one at a time, without a selector's closing quote being read as
+ * part of the last value.
+ */
+const URL_RUN_DELIMITERS = /[\s"'<>`]+/;
+
+/**
  * Width of the sliding window the crossing-bound cases compare against.
  *
  * A `toContain` on the whole credential proves nothing about a cut, because
@@ -306,9 +318,9 @@ function expectStraddles(value: string, credential: string, bound: number): void
  * credential that straddled the cut nor the prefix that would reveal it, every
  * query value is still masked, and it is a fixed point.
  *
- * @param redacted - Output of {@link redactUrl} for a crossing-bound fixture.
- * @param credential - The secret text the cut ran through.
- * @param prefix - The shorter fragment that identifies the credential's class
+ * @param redacted Output of {@link redactUrl} for a crossing-bound fixture.
+ * @param credential The secret text the cut ran through.
+ * @param prefix The shorter fragment that identifies the credential's class
  * and is therefore the leak a window comparison alone can miss.
  */
 function expectCutClear(redacted: string, credential: string, prefix: string): void {
@@ -1312,12 +1324,56 @@ describe('redactStackUrls', () => {
     expect(masked.split('\n')).toHaveLength(3);
   });
 
-  it('masks a quoted or bracketed URL without swallowing the punctuation', () => {
+  it('masks a quoted URL up to its closing quote, which ends the run', () => {
     expect(redactStackUrls(`loaded "${CHUNK_URL}?email=${IDENTIFIER}".`)).toBe(
       `loaded "${CHUNK_URL}?email=${REDACTION_MASK}".`,
     );
+  });
+
+  it('masks punctuation after a query with the value it may belong to', () => {
+    // `)`, `]`, `;` and `.` are legal query-value characters, so outside a
+    // frame's position nothing tells them apart from the last value: they go
+    // with it rather than being handed back as sentence punctuation.
     expect(redactStackUrls(`[${CHUNK_URL}?email=${IDENTIFIER}]`)).toBe(
-      `[${CHUNK_URL}?email=${REDACTION_MASK}]`,
+      `[${CHUNK_URL}?email=${REDACTION_MASK}`,
+    );
+    expect(redactStackUrls('https://x.test/reset?code=);')).toBe(
+      `https://x.test/reset?code=${REDACTION_MASK}`,
+    );
+    expect(redactStackUrls('see https://x.test/a?b=1).')).toBe(
+      `see https://x.test/a?b=${REDACTION_MASK}`,
+    );
+    expect(redactStackUrls(`(${CHUNK_URL}#${IDENTIFIER})`)).toBe(`(${CHUNK_URL}#${REDACTION_MASK}`);
+    // A frame with no position gives nothing to separate its bracket from the
+    // value either, so the bracket goes too.
+    expect(redactStackUrls(`    at d (${CHUNK_URL}?v=abc)`)).toBe(
+      `    at d (${CHUNK_URL}?v=${REDACTION_MASK}`,
+    );
+  });
+
+  it('keeps the position and the closing bracket of a frame whose URL carries a query', () => {
+    expect(redactStackUrls(`    at fn (${CHUNK_URL}?v=${IDENTIFIER}:10:5)`)).toBe(
+      `    at fn (${CHUNK_URL}?v=${REDACTION_MASK}:10:5)`,
+    );
+    expect(redactStackUrls(`fn@${CHUNK_URL}?v=${IDENTIFIER}:10:5),`)).toBe(
+      `fn@${CHUNK_URL}?v=${REDACTION_MASK}:10:5),`,
+    );
+  });
+
+  it('keeps punctuation after a URL that carries no query and no fragment', () => {
+    // Only the query and the fragment are ever masked, so peeling costs no
+    // value here and the text comes back as it was.
+    for (const text of [`see ${CHUNK_URL}.`, `(${CHUNK_URL})`, `[${CHUNK_URL}:4:2],`]) {
+      expect(redactStackUrls(text), text).toBe(text);
+    }
+  });
+
+  it('matches the scheme in any letter case', () => {
+    expect(redactStackUrls(`HTTP://127.0.0.1:20450/a?email=${IDENTIFIER}`)).toBe(
+      `HTTP://127.0.0.1:20450/a?email=${REDACTION_MASK}`,
+    );
+    expect(redactStackUrls(`    at fn (Https://h.test/a.js?v=${IDENTIFIER}:1:2)`)).toBe(
+      `    at fn (Https://h.test/a.js?v=${REDACTION_MASK}:1:2)`,
     );
   });
 
@@ -1331,6 +1387,13 @@ describe('redactStackUrls', () => {
       `send@${CHUNK_URL}?email=${IDENTIFIER}:8:1`,
       'at e (webpack-internal:///./src/x.ts:1:1)',
       `at f (${CHUNK_URL}?email=${IDENTIFIER.slice(0, 4)}${REDACTION_MARKER}`,
+      `[${CHUNK_URL}?email=${IDENTIFIER}]`,
+      'https://x.test/reset?code=);',
+      'see https://x.test/a?b=1).',
+      `    at fn (${CHUNK_URL}?v=${IDENTIFIER}:10:5)`,
+      `    at d (${CHUNK_URL}?v=abc)`,
+      `see ${CHUNK_URL}.`,
+      `HTTP://127.0.0.1:20450/a?email=${IDENTIFIER}`,
       '',
     ]) {
       const once = redactStackUrls(input);
@@ -1387,7 +1450,9 @@ describe('redactTextUrls', () => {
   it('masks an origin-relative query inside prose and keeps the sentence around it', () => {
     const text = 'Visit /reset?coupon=QQZZ7 now, or /orders?id=WWXX9.';
 
-    expect(redactTextUrls(text)).toBe('Visit /reset?coupon=? now, or /orders?id=?.');
+    // The full stop ends the last run, and a run is masked whole: `.` is a
+    // legal value character, so it goes with the value it may belong to.
+    expect(redactTextUrls(text)).toBe('Visit /reset?coupon=? now, or /orders?id=?');
   });
 
   it('masks a query inside an attribute selector and keeps the selector shape', () => {
@@ -1403,10 +1468,63 @@ describe('redactTextUrls', () => {
     expect(redactTextUrls('/a?b=QQZZ7#')).toBe('/a?b=?#');
   });
 
-  it('keeps sentence punctuation that closes a query rather than belonging to it', () => {
-    expect(redactTextUrls('(open /p?id=QQZZ7)')).toBe('(open /p?id=?)');
-    expect(redactTextUrls('Try /p?id=QQZZ7!')).toBe('Try /p?id=?!');
-    expect(redactTextUrls('/p?a=QQZZ7; /q?b=WWXX9,')).toBe('/p?a=?; /q?b=?,');
+  it('masks punctuation at the end of a query with the value it may belong to', () => {
+    // Every one of these characters is legal inside a query value, so a run
+    // that ends in them may end in data: `/reset?code=!!!!` carries `!!!!`.
+    // The run is masked whole rather than guessed apart.
+    const cases: readonly (readonly [string, string])[] = [
+      ['/reset?code=!!!!', '/reset?code=?'],
+      ['/reset?code=....', '/reset?code=?'],
+      ['/reset?code=ZIP42!', '/reset?code=?'],
+      ['See /p?id=7.', 'See /p?id=?'],
+      ['(open /p?id=QQZZ7)', '(open /p?id=?'],
+      ['Try /p?id=QQZZ7!', 'Try /p?id=?'],
+      ['/p?a=QQZZ7; /q?b=WWXX9,', '/p?a=? /q?b=?'],
+      ['https://x.test/reset?code=);', 'https://x.test/reset?code=?'],
+      ['https://x.test/a?b=1).', 'https://x.test/a?b=?'],
+      ['[https://x.test/p?email=QQZZ7]', '[https://x.test/p?email=?'],
+      ['a[href="/reset?code=!!!!"]', 'a[href="/reset?code=?"]'],
+    ];
+
+    for (const [text, expected] of cases) {
+      const redacted = redactTextUrls(text);
+
+      expect(redacted, text).toBe(expected);
+      expect(redactTextUrls(redacted), text).toBe(redacted);
+      for (const token of redacted.split(URL_RUN_DELIMITERS)) {
+        expectOnlyMaskedValues(token);
+      }
+    }
+  });
+
+  it('masks a fragment after an origin-relative query that holds no pair', () => {
+    // Everything `redactEmbeddedUrls` masks, this masks too.
+    expect(redactTextUrls('see /p?flag#sectionVVBB')).toBe('see /p?flag#?');
+    expect(redactTextUrls('see /p?flag#sectionVVBB')).toBe(
+      redactEmbeddedUrls('see /p?flag#sectionVVBB'),
+    );
+  });
+
+  it('masks everything redactEmbeddedUrls masks, and bare and quoted references besides', () => {
+    for (const text of [
+      'GET /reset?code=ZIP42 then https://x.test/a?b=1#top',
+      '(see /reset?code=ZIP42).',
+      'line\n/p?a=1&b=&c#frag',
+      'p?id=QQZZ7 and ?id=WWXX9',
+      "fetch('/api/x?a=QQZZ7')",
+    ]) {
+      const embedded = redactEmbeddedUrls(text);
+      const masked = redactTextUrls(text);
+
+      // Applying the wider pass to the narrower one's output changes nothing
+      // the narrower one already decided, and reaches the same text.
+      expect(redactTextUrls(embedded), text).toBe(masked);
+      for (const token of masked.split(URL_RUN_DELIMITERS)) {
+        expectOnlyMaskedValues(token);
+      }
+    }
+    expect(redactTextUrls("fetch('/api/x?a=QQZZ7')")).toBe("fetch('/api/x?a=?')");
+    expect(redactTextUrls('p?id=QQZZ7 and ?id=WWXX9')).toBe('p?id=? and ?id=?');
   });
 
   it('leaves text with no name=value pair after a ? unchanged', () => {
@@ -1438,6 +1556,15 @@ describe('redactTextUrls', () => {
       'Visit /reset?coupon=QQZZ7 and https://x.test/a?b=1#top.',
       'a[href="/p?id=QQZZ7"]',
       '?token=QQZZ7&flag',
+      '/reset?code=!!!!',
+      '/reset?code=....',
+      '/reset?code=ZIP42!',
+      'https://x.test/reset?code=);',
+      'https://x.test/a?b=1).',
+      '[https://x.test/p?email=QQZZ7]',
+      '(open /p?id=QQZZ7)',
+      'see /p?flag#sectionVVBB',
+      `    at fn (https://x.test/a.js?v=QQZZ7:10:5)`,
     ]) {
       const once = redactTextUrls(text);
       expect(redactTextUrls(once), text).toBe(once);
@@ -1452,10 +1579,249 @@ describe('redactTextUrls', () => {
     expect(redacted).toBe(`see http://${REDACTION_MARKER}@host.example.test/p`);
   });
 
+  it('bounds its output and reports the loss on a line of its own', () => {
+    const long = '/p?id=QQZZ7 '.repeat(Math.ceil((MAX_SCAN_LENGTH * 2) / 12));
+    const redacted = redactTextUrls(long);
+
+    expect(redacted.length).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+    expect(redacted.endsWith(`\n${REDACTION_MARKER}`)).toBe(true);
+    expect(redacted).not.toContain('QQZZ7');
+    expect(redactTextUrls(redacted)).toBe(redacted);
+  });
+
   it('never throws, whatever it is given', () => {
     for (const value of [undefined, null, 42, true, { href: '/p?id=1' }, ['?a=1']]) {
       expect(() => redactTextUrls(value)).not.toThrow();
       expect(typeof redactTextUrls(value)).toBe('string');
+    }
+  });
+});
+
+describe('redactEmbeddedUrls', () => {
+  it('masks an origin-relative query in prose, and an absolute URL beside it', () => {
+    expect(redactEmbeddedUrls('GET /reset?code=ZIP42 then https://x.test/a?b=1#top')).toBe(
+      'GET /reset?code=? then https://x.test/a?b=?#?',
+    );
+  });
+
+  it('anchors a run at the start of the text, after whitespace and after an opening parenthesis', () => {
+    const cases: readonly (readonly [string, string])[] = [
+      ['/reset?code=ZIP42', '/reset?code=?'],
+      ['Why is /reset?code=ZIP42 slow', 'Why is /reset?code=? slow'],
+      ['first line\n/p?id=QQZZ7', 'first line\n/p?id=?'],
+      ['tab\t/p?id=QQZZ7', 'tab\t/p?id=?'],
+      ['(see /reset?code=ZIP42).', '(see /reset?code=?'],
+      ['fn(/a?b=QQZZ7)', 'fn(/a?b=?'],
+      ['// see /api/x?id=QQZZ7', '// see /api/x?id=?'],
+    ];
+
+    for (const [text, expected] of cases) {
+      const redacted = redactEmbeddedUrls(text);
+
+      expect(redacted, text).toBe(expected);
+      for (const token of redacted.split(URL_RUN_DELIMITERS)) {
+        expectOnlyMaskedValues(token);
+      }
+    }
+  });
+
+  it('masks every value and a non-empty fragment, keeping keys, flags and empty values', () => {
+    expect(redactEmbeddedUrls('/p?a=QQZZ7&b=&c&a=WWXX9#frag')).toBe('/p?a=?&b=&c&a=?#?');
+    expect(redactEmbeddedUrls('/p?flag#frag')).toBe('/p?flag#?');
+    expect(redactEmbeddedUrls('/p?a=QQZZ7#')).toBe('/p?a=?#');
+    expect(redactEmbeddedUrls('/p?')).toBe('/p?');
+  });
+
+  it('masks the whole run, punctuation at its end included', () => {
+    for (const [text, expected] of [
+      ['/reset?code=!!!!', '/reset?code=?'],
+      ['/reset?code=ZIP42!', '/reset?code=?'],
+      ['see /p?id=7.', 'see /p?id=?'],
+      ['see https://x.test/a?b=1).', 'see https://x.test/a?b=?'],
+    ] as const) {
+      expect(redactEmbeddedUrls(text), text).toBe(expected);
+    }
+  });
+
+  it('anchors a run after a written whitespace escape, as the outbound guard reads one', () => {
+    // A JSON-rendered prompt section or a string literal writes a line break
+    // as `\n`; the run after it starts a line there.
+    for (const [text, expected] of [
+      ['const s = "a\\n/api/x?id=QQZZ7";', 'const s = "a\\n/api/x?id=?";'],
+      ['first\\t/p?id=QQZZ7 then', 'first\\t/p?id=? then'],
+      ['x\\u000b/p?id=QQZZ7', 'x\\u000b/p?id=?'],
+    ] as const) {
+      expect(redactEmbeddedUrls(text), text).toBe(expected);
+      expect(redactEmbeddedUrls(expected), expected).toBe(expected);
+    }
+    // A backslash before any other letter is not whitespace, and does not
+    // anchor.
+    expect(redactEmbeddedUrls('a\\x/p?id=1')).toBe('a\\x/p?id=1');
+  });
+
+  it('matches an absolute scheme in any letter case and keeps a frame position', () => {
+    expect(redactEmbeddedUrls('HTTP://X.test/a?b=QQZZ7')).toBe('HTTP://X.test/a?b=?');
+    expect(redactEmbeddedUrls('    at fn (https://x.test/a.js?v=QQZZ7:10:5)')).toBe(
+      '    at fn (https://x.test/a.js?v=?:10:5)',
+    );
+  });
+
+  it('leaves code and relative shapes that are not an anchored URL unchanged', () => {
+    // The context builder runs this over source excerpts, where each of these
+    // is an expression rather than a URL.
+    for (const text of [
+      'p?id=1',
+      '?id=1',
+      'const re = /^(?=\\S+$)(?:\\S*[0-9]\\S*|[^a-z]+)$/;',
+      '/^(?=\\S+$)(?:\\S*[0-9]\\S*|[^a-z]+)$/',
+      'const x = a ? b : c;',
+      'const n = total /count ? 1 : 0;',
+      'if (a?.b) { return c?.d; }',
+      "const url = '/api/x?a=1';",
+      'const url = "/api/x?a=1";',
+      'fetch(`/x?a=${v}`)',
+      '//cdn.example.test/p?a=1',
+      'x/p?a=1',
+      'Why? Because.',
+      '',
+    ]) {
+      expect(redactEmbeddedUrls(text), text).toBe(text);
+    }
+  });
+
+  it('is idempotent', () => {
+    for (const text of [
+      'GET /reset?code=ZIP42 then https://x.test/a?b=1#top',
+      '(see /reset?code=ZIP42).',
+      '/p?a=QQZZ7&b=&c&a=WWXX9#frag',
+      '/reset?code=!!!!',
+      '    at fn (https://x.test/a.js?v=QQZZ7:10:5)',
+      `/p?${'a=1&'.repeat(MAX_QUERY_PAIRS + 4)}`,
+      "const url = '/api/x?a=1'; if (a?.b) {}",
+    ]) {
+      const once = redactEmbeddedUrls(text);
+
+      expect(redactEmbeddedUrls(once), text.slice(0, 40)).toBe(once);
+    }
+  });
+
+  it('bounds its output and reports the loss on a line of its own', () => {
+    const long = 'see /p?id=QQZZ7 '.repeat(Math.ceil((MAX_SCAN_LENGTH * 2) / 16));
+    const redacted = redactEmbeddedUrls(long);
+
+    expect(redacted.length).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+    expect(redacted.endsWith(`\n${REDACTION_MARKER}`)).toBe(true);
+    expect(redacted).not.toContain('QQZZ7');
+    expect(redactEmbeddedUrls(redacted)).toBe(redacted);
+  });
+
+  it('never throws, whatever it is given', () => {
+    for (const value of [undefined, null, 42, true, { href: '/p?id=1' }, ['/p?a=1']]) {
+      expect(() => redactEmbeddedUrls(value)).not.toThrow();
+      expect(typeof redactEmbeddedUrls(value)).toBe('string');
+    }
+    expect(redactEmbeddedUrls(null)).toBe(REDACTION_MARKER);
+  });
+});
+
+describe('redactStackText', () => {
+  it("masks every reference in a stack's message lines as free text", () => {
+    // The first line is the thrown error's message, which quotes URLs the
+    // way page text does; `redactTextUrls` masks the same text under
+    // `error.message`.
+    const stack =
+      "Error: failed '/reset?code=QQZZ7' and reset?code=WWXX9 and ?code=ZZYY3\n" +
+      'caused by a[href="/p?id=QQZZ7"]\n' +
+      '    at fn (http://127.0.0.1:3000/app.js?v=QQZZ7:10:5)';
+
+    expect(redactStackText(stack)).toBe(
+      "Error: failed '/reset?code=?' and reset?code=? and ?code=?\n" +
+        'caused by a[href="/p?id=?"]\n' +
+        '    at fn (http://127.0.0.1:3000/app.js?v=?:10:5)',
+    );
+  });
+
+  it('keeps the position of every V8 and SpiderMonkey frame', () => {
+    const stack =
+      'Error: boom\n' +
+      '    at fn (http://127.0.0.1:3000/app.js?v=QQZZ7:10:5)\n' +
+      '    at http://127.0.0.1:3000/b.js?v=WWXX9:2:1\n' +
+      'load@http://127.0.0.1:3000/c.js?v=ZZYY3:7:3\n' +
+      '@http://127.0.0.1:3000/d.js?v=QQZZ7:1:9';
+
+    expect(redactStackText(stack)).toBe(
+      'Error: boom\n' +
+        '    at fn (http://127.0.0.1:3000/app.js?v=?:10:5)\n' +
+        '    at http://127.0.0.1:3000/b.js?v=?:2:1\n' +
+        'load@http://127.0.0.1:3000/c.js?v=?:7:3\n' +
+        '@http://127.0.0.1:3000/d.js?v=?:1:9',
+    );
+  });
+
+  it('classifies a frame by its whole line, so a message quoting a frame is still masked', () => {
+    // A message line that merely contains `@https://…` is page text: every
+    // query on it is masked, and the position after the URL goes with it.
+    const stack = 'Error: failed reset?code=QQZZ7; fn@https://h.test/app.js?v=WWXX9:10:5';
+    const redacted = redactStackText(stack);
+
+    expect(redacted).toBe('Error: failed reset?code=? fn@https://h.test/app.js?v=?');
+    expect(redacted).not.toContain('QQZZ7');
+    expect(redacted).not.toContain('WWXX9');
+  });
+
+  it('masks a bare-relative query on a frame line and keeps the frame position', () => {
+    const stack =
+      'Error: boom\n' +
+      '    at handler (src/a.ts?code=QQZZ7:3:4)\n' +
+      'load@http://h.test/b.js?v=WWXX9:7:3\n' +
+      '    at run (src/c.ts?page=ZZYY3)';
+
+    const redacted = redactStackText(stack);
+    expect(redacted).toBe(
+      'Error: boom\n' +
+        '    at handler (src/a.ts?code=?:3:4)\n' +
+        'load@http://h.test/b.js?v=?:7:3\n' +
+        '    at run (src/c.ts?page=?',
+    );
+    expect(redactStackText(redacted)).toBe(redacted);
+  });
+
+  it('masks everything redactEmbeddedUrls masks, and leaves a stack without a query alone', () => {
+    const cases = [
+      'GET /reset?code=ZIP42 then https://x.test/a?b=1#top',
+      '(see /reset?code=ZIP42).',
+      "Error: '/p?id=QQZZ7' and p?id=WWXX9",
+    ];
+    for (const text of cases) {
+      const redacted = redactStackText(text);
+
+      expect(redactEmbeddedUrls(redacted), text).toBe(redacted);
+      for (const token of redacted.split(URL_RUN_DELIMITERS)) {
+        expectOnlyMaskedValues(token);
+      }
+    }
+    const plain = 'Error: boom\n    at send (src/a.ts:18:3)\n    at flush (src/a.ts:31:9)';
+    expect(redactStackText(plain)).toBe(plain);
+  });
+
+  it('is idempotent, bounded and total', () => {
+    for (const text of [
+      "Error: failed '/reset?code=QQZZ7'\n    at fn (http://x.test/a.js?v=1:10:5)",
+      'Error: see p?id=7.\nload@http://x.test/c.js?v=2:7:3',
+      "Error: '/reset?code=!!!!'",
+    ]) {
+      const once = redactStackText(text);
+
+      expect(redactStackText(once), text).toBe(once);
+    }
+    const long = "Error: '/p?id=QQZZ7' ".repeat(Math.ceil((MAX_SCAN_LENGTH * 2) / 21));
+    const redacted = redactStackText(long);
+    expect(redacted.length).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+    expect(redacted).not.toContain('QQZZ7');
+    expect(redactStackText(redacted)).toBe(redacted);
+    for (const value of [undefined, null, 42, { stack: '/p?id=1' }]) {
+      expect(() => redactStackText(value)).not.toThrow();
+      expect(typeof redactStackText(value)).toBe('string');
     }
   });
 });

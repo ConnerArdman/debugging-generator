@@ -31,6 +31,16 @@
  *
  * The sentinels are assembled from fragments, so this tracked file carries no
  * contiguous credential shape for `pnpm check:secrets` to report.
+ *
+ * ## The journal walk
+ *
+ * The last block drives {@link readModificationJournal} against a scripted
+ * `getModifications`: one request for a one-page journal, every page gathered
+ * in order and de-duplicated by id, a later page's failure or throw kept as an
+ * incomplete read with the records already gathered, a first page's failure
+ * returned as it is, the defensive stops (a page that does not advance, the
+ * page cap), the overall deadline bounding each page's `timeoutMs`, the abort
+ * signal, and the endpoint and signal forwarded to every page.
  */
 
 import { inspect } from 'node:util';
@@ -41,20 +51,30 @@ import { createEnvelope, encodeMessage } from '@debuggen/protocol';
 import type {
   FetchLike,
   HttpResponseLike,
+  ListPageRequest,
+  ModificationRecord,
+  ModificationsResponse,
   TimerApi,
   WebSocketConstructorLike,
   WebSocketLike,
   WsEventMapLike,
 } from '@debuggen/protocol';
-import { DebuggenError, createConsoleLogger, isErr, ok } from '@debuggen/shared';
-import type { LogRecord } from '@debuggen/shared';
+import { DebuggenError, createConsoleLogger, err, isErr, isOk, ok } from '@debuggen/shared';
+import type { LogRecord, Result } from '@debuggen/shared';
 
-import { createServiceClient, errorClassOf } from './client';
+import {
+  MODIFICATION_JOURNAL_PAGE_CAP,
+  createServiceClient,
+  errorClassOf,
+  readModificationJournal,
+} from './client';
 import type {
+  ModificationJournalRead,
   ServiceClient,
   ServiceClientConfiguration,
   ServiceClientOptions,
   ServiceCredential,
+  SessionEndpointCallOptions,
 } from './client';
 
 vi.mock('vscode', () => ({
@@ -881,4 +901,323 @@ describe('a code property that is not a known system or Node error code', () => 
       expectNoLeak(harness.records);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// readModificationJournal
+// ---------------------------------------------------------------------------
+
+/** The session every journal case reads. */
+const JOURNAL_SESSION = 'ses_journal_fixture';
+
+/** The owning endpoint every journal case names. */
+const JOURNAL_ENDPOINT = 'http://127.0.0.1:43118';
+
+/** Record `n` of the fixture journal: a distinct id and file, an empty diff. */
+function journalRecord(n: number): ModificationRecord {
+  return {
+    id: `mod_${String(n).padStart(16, '0')}`,
+    sessionId: JOURNAL_SESSION,
+    planVersion: 1,
+    file: `src/lib/module-${String(n)}.ts`,
+    originalHash: 'a'.repeat(64),
+    backupPath: `/tmp/debuggen-home/backups/${JOURNAL_SESSION}/${'a'.repeat(64)}`,
+    instrumentedHash: 'b'.repeat(64),
+    appliedAt: 1_700_000_000_000 + n,
+    status: 'applied',
+    diff: '',
+  };
+}
+
+/** A page of the journal carrying `records`, as the service answers one. */
+function journalPage(
+  records: readonly ModificationRecord[],
+  window: { readonly offset: number; readonly total: number; readonly nextOffset: number | null },
+): ModificationsResponse {
+  return { modifications: [...records], limit: 256, ...window };
+}
+
+/** One `getModifications` call the scripted client received. */
+interface PageCall {
+  readonly sessionId: string;
+  readonly window: ListPageRequest | undefined;
+  readonly options: SessionEndpointCallOptions | undefined;
+}
+
+/** What one scripted page answers: a result, or a throw. */
+type PageAnswer =
+  | Result<ModificationsResponse, DebuggenError>
+  | { readonly throws: Error }
+  | ((call: PageCall) => Result<ModificationsResponse, DebuggenError>);
+
+/**
+ * A `getModifications` that answers the scripted pages in order and records
+ * every call; a call past the script fails the case.
+ */
+function scriptedJournal(...answers: readonly PageAnswer[]): {
+  readonly client: Pick<ServiceClient, 'getModifications'>;
+  readonly calls: PageCall[];
+} {
+  const calls: PageCall[] = [];
+  const client: Pick<ServiceClient, 'getModifications'> = {
+    getModifications: (sessionId, window, options) => {
+      const call = { sessionId, window, options };
+      calls.push(call);
+      const answer = answers[calls.length - 1];
+      if (answer === undefined) {
+        throw new Error(`unscripted page request ${String(calls.length)}`);
+      }
+      if (typeof answer === 'function') {
+        return Promise.resolve(answer(call));
+      }
+      if ('throws' in answer) {
+        return Promise.reject(answer.throws);
+      }
+      return Promise.resolve(answer);
+    },
+  };
+  return { client, calls };
+}
+
+/** The walk's value, failing the case when it answered an `Err`. */
+function journalOf(read: Result<ModificationJournalRead, DebuggenError>): ModificationJournalRead {
+  if (!isOk(read)) {
+    throw new Error(`expected a journal, got ${read.error.code}`);
+  }
+  return read.value;
+}
+
+/** The ids of the gathered records, in order. */
+function idsOf(read: ModificationJournalRead): string[] {
+  return read.modifications.map((record) => record.id);
+}
+
+describe('readModificationJournal', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('reads a one-page journal with exactly one request for the service default window', async () => {
+    const records = [journalRecord(1), journalRecord(2)];
+    const { client, calls } = scriptedJournal(
+      ok(journalPage(records, { offset: 0, total: 2, nextOffset: null })),
+    );
+
+    const read = journalOf(
+      await readModificationJournal(client, JOURNAL_SESSION, { endpoint: JOURNAL_ENDPOINT }),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.sessionId).toBe(JOURNAL_SESSION);
+    expect(calls[0]?.window).toBeUndefined();
+    expect(calls[0]?.options?.endpoint).toBe(JOURNAL_ENDPOINT);
+    expect(read).toEqual({ modifications: records, total: 2, complete: true, pages: 1 });
+    expect(Object.hasOwn(read, 'failure')).toBe(false);
+  });
+
+  it('walks every page along nextOffset, in order, forwarding the endpoint and the signal to each', async () => {
+    const controller = new AbortController();
+    const { client, calls } = scriptedJournal(
+      ok(journalPage([journalRecord(1), journalRecord(2)], { offset: 0, total: 4, nextOffset: 2 })),
+      ok(journalPage([journalRecord(3)], { offset: 2, total: 4, nextOffset: 3 })),
+      ok(journalPage([journalRecord(4)], { offset: 3, total: 4, nextOffset: null })),
+    );
+
+    const read = journalOf(
+      await readModificationJournal(client, JOURNAL_SESSION, {
+        endpoint: JOURNAL_ENDPOINT,
+        signal: controller.signal,
+      }),
+    );
+
+    expect(calls.map((call) => call.window)).toEqual([undefined, { offset: 2 }, { offset: 3 }]);
+    for (const call of calls) {
+      expect(call.sessionId).toBe(JOURNAL_SESSION);
+      expect(call.options?.endpoint).toBe(JOURNAL_ENDPOINT);
+      expect(call.options?.signal).toBe(controller.signal);
+    }
+    expect(idsOf(read)).toEqual([1, 2, 3, 4].map((n) => journalRecord(n).id));
+    expect(read.total).toBe(4);
+    expect(read.complete).toBe(true);
+    expect(read.pages).toBe(3);
+  });
+
+  it('keeps a record repeated on a later page once, as its first occurrence', async () => {
+    const first = journalRecord(2);
+    const repeated = { ...journalRecord(2), status: 'reverted' as const };
+    const { client } = scriptedJournal(
+      ok(journalPage([journalRecord(1), first], { offset: 0, total: 3, nextOffset: 1 })),
+      ok(journalPage([repeated, journalRecord(3)], { offset: 1, total: 3, nextOffset: null })),
+    );
+
+    const read = journalOf(await readModificationJournal(client, JOURNAL_SESSION));
+
+    expect(idsOf(read)).toEqual([1, 2, 3].map((n) => journalRecord(n).id));
+    expect(read.modifications[1]).toBe(first);
+    expect(read.complete).toBe(true);
+  });
+
+  it('keeps the gathered records and the failure when a later page fails', async () => {
+    const failure = new DebuggenError('TRANSPORT_DISCONNECTED', 'The service went away', {
+      hint: 'Start the local service.',
+    });
+    const { client, calls } = scriptedJournal(
+      ok(journalPage([journalRecord(1)], { offset: 0, total: 3, nextOffset: 1 })),
+      err(failure),
+    );
+
+    const read = journalOf(await readModificationJournal(client, JOURNAL_SESSION));
+
+    expect(calls).toHaveLength(2);
+    expect(idsOf(read)).toEqual([journalRecord(1).id]);
+    expect(read.total).toBe(3);
+    expect(read.complete).toBe(false);
+    expect(read.pages).toBe(1);
+    expect(read.failure).toBe(failure);
+  });
+
+  it('keeps the gathered records when a later page request throws', async () => {
+    const { client } = scriptedJournal(
+      ok(journalPage([journalRecord(1)], { offset: 0, total: 2, nextOffset: 1 })),
+      { throws: new TypeError('a double that rejected') },
+    );
+
+    const read = journalOf(await readModificationJournal(client, JOURNAL_SESSION));
+
+    expect(idsOf(read)).toEqual([journalRecord(1).id]);
+    expect(read.complete).toBe(false);
+    expect(read.failure).toBeInstanceOf(DebuggenError);
+  });
+
+  it('answers the first page’s failure as it is, without a second request', async () => {
+    const failure = new DebuggenError('SESSION_NOT_FOUND', 'No such session');
+    const { client, calls } = scriptedJournal(err(failure));
+
+    const read = await readModificationJournal(client, JOURNAL_SESSION);
+
+    expect(calls).toHaveLength(1);
+    expect(isErr(read) ? read.error : undefined).toBe(failure);
+  });
+
+  it('stops, incomplete and without a failure, at a page whose nextOffset does not advance', async () => {
+    const { client, calls } = scriptedJournal(
+      ok(journalPage([journalRecord(1)], { offset: 0, total: 3, nextOffset: 1 })),
+      ok(journalPage([journalRecord(2)], { offset: 1, total: 3, nextOffset: 1 })),
+    );
+
+    const read = journalOf(await readModificationJournal(client, JOURNAL_SESSION));
+
+    expect(calls).toHaveLength(2);
+    expect(idsOf(read)).toEqual([1, 2].map((n) => journalRecord(n).id));
+    expect(read.complete).toBe(false);
+    expect(read.failure).toBeUndefined();
+  });
+
+  it(`requests at most MODIFICATION_JOURNAL_PAGE_CAP (${String(MODIFICATION_JOURNAL_PAGE_CAP)}) pages`, async () => {
+    const endless = (call: PageCall): Result<ModificationsResponse, DebuggenError> => {
+      const offset = call.window?.offset ?? 0;
+      return ok(
+        journalPage([journalRecord(offset + 1)], {
+          offset,
+          total: Number.MAX_SAFE_INTEGER,
+          nextOffset: offset + 1,
+        }),
+      );
+    };
+    const { client, calls } = scriptedJournal(
+      ...Array.from({ length: MODIFICATION_JOURNAL_PAGE_CAP + 1 }, () => endless),
+    );
+
+    const read = journalOf(await readModificationJournal(client, JOURNAL_SESSION));
+
+    expect(calls).toHaveLength(MODIFICATION_JOURNAL_PAGE_CAP);
+    expect(read.pages).toBe(MODIFICATION_JOURNAL_PAGE_CAP);
+    expect(read.modifications).toHaveLength(MODIFICATION_JOURNAL_PAGE_CAP);
+    expect(read.complete).toBe(false);
+    expect(read.failure).toBeUndefined();
+  });
+
+  it('bounds every page by what is left of the deadline and stops once it has elapsed', async () => {
+    vi.useFakeTimers({ now: 1_700_000_000_000 });
+    const elapse = (ms: number): void => {
+      vi.setSystemTime(Date.now() + ms);
+    };
+    const { client, calls } = scriptedJournal(
+      () => {
+        elapse(2_000);
+        return ok(journalPage([journalRecord(1)], { offset: 0, total: 3, nextOffset: 1 }));
+      },
+      () => {
+        elapse(1_500);
+        return ok(journalPage([journalRecord(2)], { offset: 1, total: 3, nextOffset: 2 }));
+      },
+    );
+
+    const read = journalOf(
+      await readModificationJournal(client, JOURNAL_SESSION, {
+        endpoint: JOURNAL_ENDPOINT,
+        deadlineMs: 3_000,
+      }),
+    );
+
+    expect(calls.map((call) => call.options?.timeoutMs)).toEqual([3_000, 1_000]);
+    expect(idsOf(read)).toEqual([1, 2].map((n) => journalRecord(n).id));
+    expect(read.complete).toBe(false);
+    expect(read.failure?.code).toBe('TRANSPORT_DISCONNECTED');
+    expect(read.failure?.details).toEqual({
+      operation: 'modifications.list',
+      cancelled: 'timeout',
+      timeoutMs: 3_000,
+    });
+    expect(read.failure?.hint).toBeDefined();
+  });
+
+  it('keeps a tighter per-page timeout under the deadline, and forwards it unchanged without one', async () => {
+    const onePage = ok(journalPage([journalRecord(1)], { offset: 0, total: 1, nextOffset: null }));
+
+    const bounded = scriptedJournal(onePage);
+    await readModificationJournal(bounded.client, JOURNAL_SESSION, {
+      timeoutMs: 500,
+      deadlineMs: 3_000,
+    });
+    expect(bounded.calls[0]?.options?.timeoutMs).toBe(500);
+
+    const unbounded = scriptedJournal(onePage);
+    await readModificationJournal(unbounded.client, JOURNAL_SESSION, { timeoutMs: 700 });
+    expect(unbounded.calls[0]?.options?.timeoutMs).toBe(700);
+
+    const defaulted = scriptedJournal(onePage);
+    await readModificationJournal(defaulted.client, JOURNAL_SESSION, { deadlineMs: Number.NaN });
+    expect(defaulted.calls[0]?.options?.timeoutMs).toBeUndefined();
+  });
+
+  it('requests nothing for an aborted signal, and no further page once it aborts', async () => {
+    const aborted = new AbortController();
+    aborted.abort();
+    const idle = scriptedJournal();
+    const refused = await readModificationJournal(idle.client, JOURNAL_SESSION, {
+      signal: aborted.signal,
+    });
+    expect(idle.calls).toHaveLength(0);
+    expect(isErr(refused) ? refused.error.details : undefined).toEqual({
+      operation: 'modifications.list',
+      cancelled: 'aborted',
+    });
+
+    const controller = new AbortController();
+    const { client, calls } = scriptedJournal(() => {
+      controller.abort();
+      return ok(journalPage([journalRecord(1)], { offset: 0, total: 2, nextOffset: 1 }));
+    });
+    const read = journalOf(
+      await readModificationJournal(client, JOURNAL_SESSION, { signal: controller.signal }),
+    );
+    expect(calls).toHaveLength(1);
+    expect(idsOf(read)).toEqual([journalRecord(1).id]);
+    expect(read.complete).toBe(false);
+    expect(read.failure?.details).toEqual({
+      operation: 'modifications.list',
+      cancelled: 'aborted',
+    });
+  });
 });

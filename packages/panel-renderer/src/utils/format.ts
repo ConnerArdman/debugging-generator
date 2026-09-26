@@ -27,19 +27,19 @@
  * table cannot drift apart).
  *
  * It owns no visual decision. There is no colour, no token, no length and no
- * style value here — AAP 0.6.4 permits no hardcoded CSS value anywhere in this
- * package, and a formatter that emitted one would be taking a decision that
+ * style value here: every CSS value in this package resolves to a `--dg-*`
+ * token, and a formatter that emitted one would be taking a decision that
  * belongs to `./color` (colour and severity) or `./scale` (geometry).
  *
  * ## Absence is a value, not a failure
  *
  * {@link NOT_AVAILABLE_LABEL} is a first-class result. A capture legitimately
  * cannot measure everything it reports on — a transfer size is exposed for
- * same-origin responses only, and a server span reports none at all (AAP
- * 0.6.6) — so every formatter here answers an unmeasurable input with that one
- * label instead of a zero, a dash, an empty cell or the text `NaN`. A zero
- * would turn an absence into an observation, which the product forbids
- * structurally (AAP 0.8.4).
+ * same-origin responses only, and a server span reports none at all — so every
+ * formatter here answers an unmeasurable input with that one label instead of
+ * a zero, a dash, an empty cell or the text `NaN`. A zero would turn an absence
+ * into an observation, and the product presents as observed only what captured
+ * evidence supports.
  *
  * ## Layering
  *
@@ -53,10 +53,10 @@
  *   `basenamePosix` and `formatSourceLocation` (the canonical
  *   `file:line:column` label). A second implementation of any of them would be
  *   a second answer to a question the product answers once.
- * - `@debuggen/telemetry` is a **type-only** dependency (AAP 0.2.2): every
- *   telemetry import below is `import type`, and exhaustiveness over a closed
- *   vocabulary comes from typing a table as a `Record` over the union rather
- *   than from importing a runtime tuple.
+ * - `@debuggen/telemetry` is a **type-only** dependency: every telemetry
+ *   import below is `import type`, and exhaustiveness over a closed vocabulary
+ *   comes from typing a table as a `Record` over the union rather than from
+ *   importing a runtime tuple.
  * - No platform builtin, no React, no transport. `src/index.ts` does not
  *   re-export `./utils`, so this surface is package-internal.
  *
@@ -117,7 +117,7 @@ import type {
  * a test cannot each invent their own spelling — `N/A`, `—` and an empty cell
  * are three different claims, and only this one says "not measured". A caller
  * comparing a formatted string against this constant is the sanctioned way to
- * detect the absent case after the fact (AAP 0.6.6).
+ * detect the absent case after the fact.
  */
 export const NOT_AVAILABLE_LABEL = 'n/a';
 
@@ -139,9 +139,9 @@ const ELLIPSIS_COST = Array.from(ELLIPSIS).length;
  *
  * `typeof import(...)` is a type-level import: it is erased, so it adds no
  * runtime edge to `@debuggen/telemetry`, which this package depends on for
- * types only (AAP 0.2.2). Because the upstream constant is declared as a
- * literal, this alias is the literal, and the mirrored value below fails to
- * compile the moment the two disagree.
+ * types only. Because the upstream constant is declared as a literal, this
+ * alias is the literal, and the mirrored value below fails to compile the
+ * moment the two disagree.
  */
 type TelemetryPreviewBound = typeof import('@debuggen/telemetry').MAX_PREVIEW_LENGTH;
 
@@ -154,10 +154,11 @@ type TelemetryPreviewBound = typeof import('@debuggen/telemetry').MAX_PREVIEW_LE
  * mirrored rather than imported because telemetry is a type-only dependency
  * here.
  *
- * The number is a privacy guarantee, not a layout preference: AAP 0.5.2 bounds
- * a captured prop, state or attribute preview at 120 characters, so the
- * renderer must never present more than the producer was allowed to capture.
- * It is the default budget of {@link truncate} and {@link oneLinePreview}.
+ * The number is a privacy guarantee, not a layout preference: the capture
+ * bounds a prop, state or attribute preview at 120 characters (the bound
+ * `docs/SECURITY.md` documents), so the renderer must never present more than
+ * the producer was allowed to capture. It is the default budget of
+ * {@link truncate} and {@link oneLinePreview}.
  */
 export const MAX_PREVIEW_LENGTH: TelemetryPreviewBound = 120;
 
@@ -245,8 +246,7 @@ function groupDigits(digits: string): string {
  *
  * The fraction is left untouched, so the decimal point stays the ASCII `.` and
  * the digit count after it stays exactly `decimals` — which is what lets a
- * column of these strings align under the monospace token's tabular numerals
- * (AAP 0.6.3).
+ * column of these strings align under the monospace token's tabular numerals.
  */
 function groupedFixed(value: number, decimals: number): string | undefined {
   const text = fixedText(value, decimals);
@@ -268,8 +268,8 @@ function groupedFixed(value: number, decimals: number): string | undefined {
  *
  * The most-used formatter in the package: every bar, tick, cell, tooltip and
  * observed-fact sentence that mentions time goes through it. Milliseconds are
- * the canonical unit of every telemetry event (AAP 0.2.3), so milliseconds are
- * what every entry point takes.
+ * the canonical unit of every telemetry event, so milliseconds are what every
+ * entry point takes.
  * ---------------------------------------------------------------------------
  */
 
@@ -491,11 +491,11 @@ export function formatDurationCompact(ms: number): string {
  * Formats an event's offset from the start of its capture.
  *
  * Event log rows and timeline tooltips show an offset, never a wall-clock
- * time: the canonical time base is epoch milliseconds as a double (AAP 0.2.3),
- * and epoch text would be noise beside the interaction it belongs to. The
- * offset is a subtraction, rounded through the shared `roundMs` before it is
- * formatted so that two events one floating-point artefact apart cannot print
- * different offsets for the same instant.
+ * time: the canonical time base is epoch milliseconds as a double, and epoch
+ * text would be noise beside the interaction it belongs to. The offset is a
+ * subtraction, rounded through the shared `roundMs` before it is formatted so
+ * that two events one floating-point artefact apart cannot print different
+ * offsets for the same instant.
  *
  * An offset that comes out negative — a producer whose first event predates the
  * origin the caller passed — clamps to `0 ms` rather than rendering a negative
@@ -612,8 +612,7 @@ const UNAVAILABLE_BYTES: ByteParts = Object.freeze<ByteParts>({
  * shared `clampNonNegative`; `NaN` and `Infinity` → the unavailable arm, whose
  * `text` is {@link NOT_AVAILABLE_LABEL}, as does a magnitude fixed notation
  * cannot express. An *unmeasured* transfer size must not be passed here as `0`:
- * it is an absent metric value and renders through {@link formatMetric} as
- * `n/a` (AAP 0.6.6).
+ * it is an absent metric value and renders through {@link formatMetric} as `n/a`.
  *
  * @example
  * ```ts
@@ -701,9 +700,9 @@ export function formatCount(value: number): string {
  * they decide it from the count *as {@link formatCount} prints it*, so the
  * word can never disagree with the digits beside it.
  *
- * English only, deliberately: the product's copy is English and generic (AAP
- * 0.5.4), and a locale-aware plural rule would be an `Intl` dependency this
- * module forbids itself (see the header).
+ * English only, deliberately: the product's copy is English and generic, never
+ * specific to the application under debug, and a locale-aware plural rule
+ * would be an `Intl` dependency this module forbids itself (see the header).
  * ---------------------------------------------------------------------------
  */
 
@@ -884,9 +883,9 @@ export function collapseWhitespace(text: string): string {
  * the budget.
  *
  * The budget defaults to {@link MAX_PREVIEW_LENGTH}, the 120-code-point privacy
- * bound AAP 0.5.2 fixes on a captured preview: the renderer never displays more
- * than the producer was allowed to capture, so the default is the guarantee and
- * a caller passing a *smaller* budget is the only sanctioned deviation.
+ * bound the capture places on a preview: the renderer never displays more than
+ * the producer was allowed to capture, so the default is the guarantee and a
+ * caller passing a *smaller* budget is the only sanctioned deviation.
  *
  * Counting is by code point, not by UTF-16 unit, so an astral character — an
  * emoji in a state value, a character outside the basic plane in a label — is
@@ -1228,8 +1227,9 @@ function metricNumber(metric: MetricValue): number | undefined {
  * and never a dash. That is a correctness requirement rather than a cosmetic
  * one. `transferred_bytes` is unmeasurable in an ordinary capture (a transfer
  * size is exposed for same-origin responses only, and a server span reports
- * none), AAP 0.6.6 records it as a known gap, and substituting a zero would
- * present an absence as an observation.
+ * none), so the aggregate reports it unavailable, never `0`, when no response
+ * exposed a size, and substituting a zero here would present an absence as an
+ * observation.
  *
  * A measured metric is dispatched on its unit: milliseconds through
  * {@link formatDuration}, counts through {@link formatCount}, bytes through
@@ -1489,8 +1489,8 @@ export function formatKindLabel(kind: TelemetryKind): string {
  * **Mirrors `TIER_LANE_LABELS` in `packages/telemetry/src/aggregate/timeline.ts`,
  * which is the authority for these three words.** It is mirrored rather than
  * imported for the same reason {@link MAX_PREVIEW_LENGTH} is: that table is a
- * runtime value and telemetry is a type-only dependency of this package (AAP
- * 0.2.2), so importing it would add a runtime edge the layering forbids.
+ * runtime value and telemetry is a type-only dependency of this package, so
+ * importing it would add a runtime edge the layering forbids.
  *
  * Mirrored, and therefore narrowly scoped: a timeline, waterfall or flame lane
  * must render the label carried on its own lane data — the aggregate already

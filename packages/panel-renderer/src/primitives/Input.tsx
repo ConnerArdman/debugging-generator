@@ -1,30 +1,29 @@
 /**
  * Input - the text-entry primitive of `@debuggen/panel-renderer`.
  *
- * Every place a developer types inside this product lands here. AAP 0.6.4 forbids a raw `<input>`
- * anywhere in the product - "library primitives over raw `<button>`, `<input>`, `<select>`,
- * `<table>` and heading elements" - so this component is the only text field in existence: the
- * filter and search boxes of the panel toolbar above the event log and the sortable tables, the
- * numeric threshold filters beside them, and, through `multiline`, the two prose fields of the
- * editor view.
+ * Every place a developer types inside this product lands here. No raw `<input>` is written
+ * anywhere in the product - library primitives replace raw `<button>`, `<input>`, `<select>`,
+ * `<table>` and heading elements wherever a primitive exists - so this component is the only text
+ * field in existence: the filter and search boxes of the panel toolbar above the event log and the
+ * sortable tables, the numeric threshold filters beside them, and, through `multiline`, the two
+ * prose fields of the editor view.
  *
  * WHY THE MULTI-LINE CASE LIVES IN THIS FILE
- * AAP 0.6.2 fixes this folder at fourteen UI primitives and names no separate text-area primitive,
- * while AAP 0.7.3 requires a multi-line question box and a multi-line follow-up field in the
- * editor surface, and AAP 0.6.4 forbids hand-rolling either from raw elements. The multi-line case
- * is therefore an option of this component (`multiline`), rendering a `<textarea>` through exactly
- * the same wrapper, label, hint and error wiring as the single-line case. Adding a fifteenth
- * primitive file to "separate concerns" would break the fixed primitive list; this is the
- * sanctioned shape.
+ * This folder holds a fixed set of fourteen UI primitives with no separate text-area primitive,
+ * while the editor surface needs a multi-line question box and a multi-line follow-up field, and
+ * neither may be hand-rolled from raw elements. The multi-line case is therefore an option of this
+ * component (`multiline`), rendering a `<textarea>` through exactly the same wrapper, label, hint
+ * and error wiring as the single-line case. Adding a fifteenth primitive file to "separate
+ * concerns" would break the fixed primitive list; this is the sanctioned shape.
  *
  * WHY THE WRAPPER MARKUP IS DUPLICATED IN `Select.tsx`
  * The `dg-field*` wrapper structure below - wrapper, label, control row, hint, error - is declared
  * identically by this file and by the select primitive so that a toolbar row of a text field and a
  * dropdown aligns on one grid. That duplication is DELIBERATE and must not be "fixed" by
- * extracting a shared field helper: the primitive list of AAP 0.6.2 is fixed at fourteen files, so
- * no fifteenth helper module may be created, and AAP 0.6.4 ranks design-system compliance above
- * code quality when the two disagree. The stylesheet is the shared artefact instead: one
- * `dg-field*` rule set in `../styles/components.css` serves both components.
+ * extracting a shared field helper: the primitive list is fixed at fourteen files, so no fifteenth
+ * helper module may be created, and design-system compliance ranks above code quality when the two
+ * disagree. The stylesheet is the shared artefact instead: one `dg-field*` rule set in
+ * `../styles/components.css` serves both components.
  *
  * ALWAYS CONTROLLED
  * `value` plus `onValueChange` is the only data path. The component keeps no text state of its own,
@@ -45,12 +44,12 @@
  *
  * STYLING
  * Class names only. This file chooses no colour, spacing, radius or type size and sets no inline
- * style; `../styles/components.css` implements the classes declared here against the token set of
- * AAP 0.6.3, and the `::placeholder` colour comes from `../styles/base.css`. Keyboard focus is
- * always indicated by `--dg-focus-ring`: for this field the stylesheet draws the ring on the
- * `dg-field__control` box - the field's visible edge - instead of on the borderless native control
- * inside it, which is why the control must stay inside that box. The ring is relocated, never
- * removed.
+ * style; `../styles/components.css` implements the classes declared here, resolving every visual
+ * value to a `--dg-*` token, and the `::placeholder` colour comes from `../styles/base.css`.
+ * Keyboard focus is always indicated by `--dg-focus-ring`: for this field the stylesheet draws the
+ * ring on the `dg-field__control` box - the field's visible edge - instead of on the borderless
+ * native control inside it, which is why the control must stay inside that box. The ring is
+ * relocated, never removed.
  *
  * @see ../styles/base.css for the global `dg-visually-hidden` and `dg-icon` utilities reused here.
  * @see ../tokens/tokens.ts for the token source the classes below resolve against.
@@ -108,9 +107,9 @@ export interface InputProps extends Omit<HTMLAttributes<HTMLElement>, 'children'
   /**
    * The field's accessible name, always rendered as a real `<label htmlFor>` bound to the control.
    *
-   * Required, because a field without a programmatic label is a defect (AAP 0.6.4 ranks
-   * accessibility above visual fidelity). Use `labelHidden` when the design has no room for it; the
-   * label stays in the DOM and in the accessibility tree either way.
+   * Required, because a field without a programmatic label is a defect: accessibility ranks above
+   * visual fidelity. Use `labelHidden` when the design has no room for it; the label stays in the
+   * DOM and in the accessibility tree either way.
    */
   label: string;
 
@@ -155,9 +154,9 @@ export interface InputProps extends Omit<HTMLAttributes<HTMLElement>, 'children'
    * Placeholder text, forwarded unchanged and rendered in `--dg-text-muted` by the global
    * `::placeholder` rule of `../styles/base.css`.
    *
-   * There is no default: a placeholder is content, and this component ships none (AAP 0.5.4 - no
-   * application vocabulary anywhere in the design system). A placeholder is never a substitute for
-   * `label`, which is why it cannot be set without one.
+   * There is no default: a placeholder is content, and this component ships none, because the
+   * design system carries no application vocabulary anywhere. A placeholder is never a substitute
+   * for `label`, which is why it cannot be set without one.
    */
   placeholder?: string;
 
@@ -252,8 +251,8 @@ export interface InputProps extends Omit<HTMLAttributes<HTMLElement>, 'children'
    * global `dg-icon` utility of `../styles/base.css`, which is the design system's only icon
    * metric: it makes the element a square of the surrounding type role, takes `currentColor` and
    * turns off pointer events. Pass it as `<SomeIcon className="dg-icon" />` and never with numeric
-   * size or colour props - sizing or colouring a glyph from TSX is the hardcoded-CSS violation
-   * AAP 0.6.4 forbids.
+   * size or colour props - sizing or colouring a glyph from TSX is a hardcoded CSS value, and every
+   * visual value resolves to a `--dg-*` token.
    *
    * The wrapper is rendered BEFORE the control inside the control row, which is the order
    * `../styles/components.css` relies on to inset the control's leading padding when a glyph is
@@ -311,7 +310,7 @@ export function Input(props: InputProps): ReactElement {
    * Called unconditionally, before any branch or early return, because it is a hook. The value is
    * used as a DOM id and in `htmlFor`/`aria-describedby` only: React's generated ids contain
    * characters that would have to be escaped in a selector, so no CSS selector is ever built from
-   * it (AAP 0.6.4's class-names-only rule says the same thing from the styling side).
+   * it (the package's class-names-only rule says the same thing from the styling side).
    */
   const generatedId = useId();
 

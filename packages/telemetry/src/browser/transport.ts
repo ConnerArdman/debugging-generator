@@ -14,343 +14,263 @@
  *
  * ## The page↔bridge channel (this module defines it)
  *
- * The agent runs in the **MAIN world** of the inspected page and has no
- * extension APIs at all: no `chrome.runtime`, no socket, no storage. Its only
- * neighbour is the isolated-world content script
+ * The agent runs in the page's **MAIN world** with no extension APIs. Its only
+ * neighbour is the isolated-world bridge
  * (`apps/chrome-extension/src/content/bridge.ts`), which shares the page's DOM
- * — but not its JavaScript realm — and which does hold a `chrome.runtime` port
- * to the service worker. Both sides of the channel are defined here, in one
- * frame shape and two closed type vocabularies, because the bridge
- * (`apps/chrome-extension/src/shared/messages.ts` mirrors every literal below)
- * and the service worker are written against this file.
+ * but not its JavaScript realm and holds the `chrome.runtime` port to the
+ * service worker. Both sides of the channel are defined here: the bridge and
+ * `apps/chrome-extension/src/shared/messages.ts` mirror every literal below.
+ * `docs/ARCHITECTURE.md` §4.7 has the sequence diagram, the reason each
+ * platform primitive is captured and the no-shared-secret decision.
  *
- * ### Version 3: a detached node, never the window
- *
- * The channel is **one DOM element** this module creates per document — with
- * the `Document.prototype.createElement` it captured when it was evaluated —
- * and never inserts into the document, never stores on a global and never
- * publishes on `__DEBUGGEN__`. Every frame is a `CustomEvent` dispatched **on
- * that node**. A node with no parent has no propagation path: an event
- * dispatched on it reaches the listeners registered on that very node and
- * nothing else — not `window`, not `document`, not a capture-phase listener a
- * page installed anywhere. So a script can observe a frame, or inject one,
- * only by holding a reference to the node, and exactly one reference is ever
- * handed out.
- *
- * ```text
- * document_start, MAIN world                    document_start, ISOLATED world
- * ──────────────────────────                    ──────────────────────────────
- * agent.iife.js evaluated: Reflect.apply, the
- *   EventTarget methods, CustomEvent,
- *   MouseEvent, the detail getter,
- *   preventDefault, JSON and createElement
- *   are captured
- * subscribe(): node = createElement('div')
- *   (detached; never inserted)
- *   node   listens for 'debuggen-bridge-frame'
- *   window listens for 'debuggen-bridge-handshake'
- *                                               bridge.ts evaluated
- *                                                 window listens for
- *                                                   'debuggen-agent-handshake'
- *                                        <────    window.dispatchEvent(new CustomEvent(
- *                                                   'debuggen-bridge-handshake'))
- * the FIRST request, and only that one:
- *   latch set, request listener removed,
- *   then window.dispatchEvent(new MouseEvent(
- *     'debuggen-agent-handshake',
- *     { relatedTarget: node }))          ────>    node = event.relatedTarget
- *                                                 node listens for 'debuggen-agent-frame'
- *
- * node.dispatchEvent(new CustomEvent('debuggen-agent-frame',
- *   { detail: '{"source":"debuggen-agent","version":3,…}', cancelable: true }))  ──> bridge
- * agent  <──  node.dispatchEvent(new CustomEvent('debuggen-bridge-frame',
- *   { detail: '{"source":"debuggen-bridge","version":3,…}', cancelable: true }))
- * ```
- *
- * **The wire, in full** — the bridge is written against exactly this:
- *
+ * - **Node.** The channel is one `div` per document, created with the
+ *   `Document.prototype.createElement` captured at evaluation and never
+ *   inserted into the document, stored on a global or published on
+ *   `__DEBUGGEN__`. A node with no parent has no propagation path: an event
+ *   dispatched on it reaches that node's own listeners and nothing else, so
+ *   observing or injecting a frame requires holding the node.
  * - **Handshake.** The bridge dispatches one {@link HANDSHAKE_REQUEST_EVENT}
  *   (a `CustomEvent` with no `detail`) on `window`, with its
- *   {@link HANDSHAKE_OFFER_EVENT} listener already registered, because the
- *   answer is dispatched synchronously inside the request. The answer is a
- *   `MouseEvent` on `window` whose `relatedTarget` is the node: `relatedTarget`
- *   is the one standard event field that carries a node, and a DOM node is the
- *   one kind of value both worlds see as the same object (each world wraps the
- *   one underlying node). **Only the first request is ever answered**, and
- *   there is no unsolicited offer: the manifest declares this agent before the
- *   bridge, both at `document_start`, so the agent's listener always exists
- *   when the bridge asks.
- * - **Frames.** Agent → bridge frames are {@link AGENT_FRAME_EVENT}, bridge →
- *   agent frames are {@link BRIDGE_FRAME_EVENT}; each is a `CustomEvent` with
- *   `bubbles: false` and `cancelable: true` whose `detail` is the **string**
- *   JSON text of `{ source, version, type, payload }`. A string, because a
- *   primitive is the one `detail` shape that crosses the world boundary
- *   unchanged, and because JSON is the measure the size cap is written in.
- *   This module renders that text with {@link serializeFrameJson}: exactly
- *   what `JSON.stringify` returns for the JSON-shaped data a frame is made
- *   of, produced without consulting any `toJSON` or running any getter (see
- *   "Frame serialization").
- * - **Size.** `detail.length` — code units of that one string, the string
- *   actually dispatched — is at most {@link MAX_MESSAGE_BYTES}, in both
- *   directions.
+ *   {@link HANDSHAKE_OFFER_EVENT} listener already registered. The first
+ *   request, and only that one, is answered synchronously inside its dispatch
+ *   by a `MouseEvent` on `window` whose `relatedTarget` is the node — the
+ *   standard event field that carries a node, and a node is the one value both
+ *   worlds see as the same object. The request listener is removed before the
+ *   answer is dispatched. No offer is ever unsolicited: the manifest declares
+ *   this agent and then the bridge, both at `document_start`, so the listener
+ *   exists when the bridge asks.
+ * - **Frames.** {@link AGENT_FRAME_EVENT} (agent → bridge) and
+ *   {@link BRIDGE_FRAME_EVENT} (bridge → agent) are `CustomEvent`s dispatched
+ *   on the node with `bubbles: false` and `cancelable: true`, whose `detail`
+ *   is the **string** JSON of `{ source, version, type, payload }`, because a
+ *   primitive crosses the world boundary unchanged. This module renders it
+ *   with {@link serializeFrameJson}: the text `JSON.stringify` would produce,
+ *   without consulting any `toJSON` or running any getter (see "Frame
+ *   serialization").
+ * - **Size.** `detail.length`, in code units of the string dispatched, is at
+ *   most {@link MAX_MESSAGE_BYTES} in both directions.
  * - **Acknowledgement.** A receiver that accepts a frame calls
- *   `preventDefault()` on it; the sender reads `dispatchEvent`'s return value,
- *   and `false` means "claimed". Dispatch is synchronous, so the answer exists
- *   before `dispatchEvent` returns, which is what lets a batch stay in this
- *   module's custody until the bridge has actually taken it (see **Custody**).
+ *   `preventDefault()` on it, so the sender's `dispatchEvent` returns `false`:
+ *   "claimed". Dispatch is synchronous, so the answer exists before
+ *   `dispatchEvent` returns (see **Custody**).
  *
- * The four outbound types ({@link AgentOutboundType}):
+ * Outbound types ({@link AgentOutboundType}):
  *
- * - `agent.ready` — the agent initialised. Payload:
- *   `{ documentId, producerId, url, installedBeforeReact, reactDetected }`.
- *   The bridge adds nothing; the service worker adds `tabId` and relays it, so
- *   the service can tell a fresh document from a reconnecting one (AAP 0.4.2).
- * - `telemetry.batch` — a batch of completed events. Payload:
- *   `{ events, producerId, documentId, captureId?, sessionId?, batchSeq,
- *   droppedCount }`, where `events` is a raw `TelemetryEventIngress[]`. The
- *   service worker is what turns that array into the protocol's
- *   `telemetry.event` message (AAP 0.4.2: "agent → SW (raw
- *   `{ events: TelemetryEventIngress[] }` over the bridge) → service (wrapped
- *   in the envelope by the SW)"), which is why no protocol type is named
- *   anywhere in this bundle.
+ * - `agent.ready` — `{ documentId, producerId, url, installedBeforeReact,
+ *   reactDetected }`, sent when the agent initialises. The service worker adds
+ *   `tabId` and relays it, so the service can tell a fresh document from a
+ *   reconnecting one.
+ * - `telemetry.batch` — `{ events, producerId, documentId, captureId?,
+ *   sessionId?, batchSeq, droppedCount }`, where `events` is a raw
+ *   `TelemetryEventIngress[]`. The service worker wraps the events into the
+ *   protocol's `telemetry.event` envelope, which is why this bundle names no
+ *   protocol type.
  * - `target.described` — a descriptor for an element the panel asked about.
- * - `agent.error` — the agent could not do something, stated without any
- *   captured data in it.
+ * - `agent.error` — something the agent could not do, stated without any
+ *   captured data.
  *
- * The five inbound types ({@link BridgeInboundType}):
+ * Inbound types ({@link BridgeInboundType}):
  *
- * - `bridge.ready` — the bridge holds the node, its listener is installed and
- *   its runtime port is live. The bridge sends this once it has the node
- *   **and again after every service-worker reconnect**: a Manifest V3 worker
- *   suspends after roughly 30 seconds of idleness, and until the bridge says it
- *   is back this module buffers rather than dispatches. It is also the cue for
- *   `./agent.ts` to re-send `agent.ready`, because a control frame is a
- *   statement about a moment and this module deliberately does not queue one,
- *   so that a dormant agent holds nothing.
- * - `bridge.gone` — the bridge's runtime port disconnected. Buffering resumes.
- * - `agent.config` — the service's hook configuration for this tab, relayed.
- *   `./agent.ts` reads it and calls {@link configureTransport}.
- * - `agent.snapshot` — a request for an on-demand snapshot (the component
- *   tree).
+ * - `bridge.ready` — the bridge holds the node, listens on it and has a live
+ *   runtime port. Sent when the bridge first has both and again after every
+ *   service-worker reconnect; until it arrives this module buffers. It is also
+ *   `./agent.ts`'s cue to re-send `agent.ready`: control frames are never
+ *   queued, so a dormant agent holds nothing.
+ * - `bridge.gone` — the runtime port disconnected; buffering resumes.
+ * - `agent.config` — the service's hook configuration for this tab, which
+ *   `./agent.ts` reads and applies through {@link configureTransport}.
+ * - `agent.snapshot` — a request for an on-demand component-tree snapshot.
  * - `target.request` — the panel entered element-picker mode.
  *
- * ### Inbound acceptance
- *
- * The node's listener accepts a frame only when its `detail` — read through
- * the captured `CustomEvent.prototype.detail` getter, so a page that redefined
- * the accessor reads nothing into it — is a string no longer than
- * {@link MAX_MESSAGE_BYTES} that the captured `JSON.parse` turns into a plain
- * object carrying exactly {@link BRIDGE_SOURCE_TAG}, exactly
- * {@link CHANNEL_VERSION} and a member of the closed inbound vocabulary. An
- * accepted frame is acknowledged with the captured `preventDefault`; anything
- * else is dropped in silence and left unacknowledged — no logging, which would
- * itself be a channel. The parsed tree is revived into **null-prototype**
- * objects, so a field the bridge did not send reads as absent even on a page
- * that has since added that name to `Object.prototype`, and no field of an
- * accepted frame is ever called, evaluated or trusted as a function.
+ * **Inbound acceptance.** The node's listener accepts a frame only when its
+ * `detail`, read through the captured `CustomEvent.prototype.detail` getter,
+ * is a string no longer than {@link MAX_MESSAGE_BYTES} that the captured
+ * `JSON.parse` turns into a plain object carrying exactly
+ * {@link BRIDGE_SOURCE_TAG}, exactly {@link CHANNEL_VERSION} and a member of
+ * the inbound vocabulary. An accepted frame is acknowledged with the captured
+ * `preventDefault`; anything else is dropped silently and left
+ * unacknowledged, because a log would itself be a channel. The parse revives
+ * into null-prototype objects, so a field the bridge did not send reads as
+ * absent even where the page has added that name to `Object.prototype`, and
+ * no field of an accepted frame is ever called, evaluated or trusted as a
+ * function.
  *
  * ### What the channel protects against, and what it does not
  *
- * It is built against **page scripts that run after `document_start`** —
- * which is every script the document loads, because
- * `apps/chrome-extension/manifest.config.ts` declares both content scripts at
- * `document_start` and Chrome injects them, in declaration order (this agent,
- * then the bridge), before the page's first statement. Such a script:
+ * Chrome injects both `document_start` content scripts declared in
+ * `apps/chrome-extension/manifest.config.ts` before the page's first
+ * statement, so every script the document loads runs after both. Such a
+ * script:
  *
- * - **observes no frame.** None is dispatched anywhere it can listen; the only
- *   events this module ever dispatches on `window` are the one handshake
- *   answer, dispatched before that script existed, and nothing after it.
- * - **injects no frame.** It holds no reference to the node, and an event
+ * - **observes no frame.** None is dispatched where it can listen; the one
+ *   event this module dispatches on `window`, the handshake answer, precedes
+ *   it.
+ * - **injects no frame.** It holds no reference to the node, and nothing
  *   dispatched on `window` — a `message`, a forged {@link BRIDGE_FRAME_EVENT},
- *   anything — never reaches the node's listener.
- * - **cannot obtain the node.** The bridge's request was the first and is the
- *   only one ever answered; the listener is removed before the answer is
- *   dispatched, and neither a transport reset nor a re-subscribe re-opens it.
- * - **cannot subvert the machinery.** `EventTarget.prototype.addEventListener`,
- *   `removeEventListener` and `dispatchEvent` (and the same three as `window`
- *   resolves them), the event constructors, the `detail` getter,
- *   `preventDefault`, `JSON.parse`, `createElement` and the object helpers the
- *   reviver uses were captured before it ran and are called through the
- *   captured `Reflect.apply`, so replacing any of them afterwards changes
- *   nothing here. The event init dictionaries are null-prototype records, so
- *   a getter the page defines on `Object.prototype` for a dictionary member
- *   (`composed`, say) is never consulted and never sees a frame's `detail`.
- * - **cannot obtain a handler that applies a configuration, nor change what a
+ *   anything — reaches the node's listener.
+ * - **cannot obtain the node.** The one request ever answered is the bridge's,
+ *   and neither a transport reset nor a re-subscribe re-opens the handshake.
+ * - **cannot subvert the machinery.** The event methods (on
+ *   `EventTarget.prototype` and as `window` resolves them), the event
+ *   constructors, the `detail` getter, `preventDefault`, `JSON.parse`,
+ *   `createElement` and the reviver's object helpers are captured before it
+ *   runs and called through the captured `Reflect.apply`. Event init
+ *   dictionaries are null-prototype records, so a getter on `Object.prototype`
+ *   for a dictionary member is never consulted and never sees a frame.
+ * - **cannot reach a handler that applies a configuration, nor change what a
  *   delivered one asks for.** The control path — frame receipt, subscriber
  *   delivery, configuration parsing and the arm/disarm decisions in
  *   `./agent.ts` — runs only on language intrinsics captured at evaluation,
  *   null-prototype storage and operators (see "Core intrinsics and page-proof
- *   primitives"). No built-in the page can replace — `Array.from`, a `Set` or
- *   `Map` method, an iterator, `Array.prototype.some`, `Array.isArray`,
- *   `Function.prototype.call`, `JSON.parse` — is ever handed the subscriber
- *   registry, a handler, the parsed frame or its payload, or asked a question
- *   whose answer decides whether the agent arms, which capture it stamps or
- *   which hooks it attaches. The payload is revived null-prototype all the
- *   way down, so a key the bridge did not send reads as absent. Nothing
- *   published on `globalThis.__DEBUGGEN__` (`span`, `version`,
- *   `describeTarget` and a diagnostic copy of the configuration that nothing
- *   reads back) leads to a handler, and the bundle is an IIFE that exposes no
- *   module export on any global.
+ *   primitives"). No built-in the page can replace is handed the subscriber
+ *   registry, a handler, the parsed frame or its payload, or decides whether
+ *   the agent arms, which capture it stamps or which hooks it attaches.
+ *   Nothing on `globalThis.__DEBUGGEN__` (`span`, `version`, `describeTarget`
+ *   and a diagnostic copy of the configuration that nothing reads back) leads
+ *   to a handler, and the IIFE bundle exposes no module export on any global.
  * - **cannot read or rewrite an outbound frame as the agent builds it.**
  *   Frames and events are composed by defining own properties
- *   ({@link defineOwnValue}, {@link appendValue}) rather than assigning them,
- *   so a setter or index accessor on `Object.prototype` or `Array.prototype`
- *   is never handed a value, and they are rendered by
- *   {@link serializeFrameJson}, which never consults an own or inherited
- *   `toJSON`. The bytes the bridge receives are the bytes this module
- *   composed.
+ *   ({@link defineOwnValue}, {@link appendValue}), so no setter or index
+ *   accessor on `Object.prototype` or `Array.prototype` is handed a value, and
+ *   rendered by {@link serializeFrameJson}: the bytes the bridge receives are
+ *   the bytes this module composed.
  *
  * It does **not** protect against, and no in-page design can:
  *
  * - **code that ran before this agent** — another extension's MAIN-world
- *   `document_start` script, an automation tool's init script (Playwright's
- *   `addInitScript`), a modified browser. Such code can replace the primitives
- *   before they are captured, or listen on `window` for the handshake answer
- *   and take the node. It is as privileged in the page as this agent is.
+ *   `document_start` script, an automation tool's init script, a modified
+ *   browser. Such code is as privileged in the page as this agent: it can
+ *   replace the primitives before they are captured, or listen on `window`
+ *   for the handshake answer and take the node.
  * - **a page with no bridge.** If the bridge never asks, a page script can ask
- *   first and hold the node. What it then drives is an agent with no bridge
- *   behind it: no session, no capture, no service, and no network egress of
- *   the agent's own in any configuration.
- * - **the page's own behaviour.** A page script can still call
- *   `__DEBUGGEN__.span` and can cause real clicks, renders, requests and
- *   errors, and every one of them is recorded faithfully. Telemetry from the
- *   MAIN world is therefore **evidence about what the page did, never a
- *   tamper-proof measurement**, and the service treats every field of it as
- *   untrusted input (ingest validation, bounds and redaction). An object a
- *   page hands `__DEBUGGEN__.span` as attributes is read once, own getters
+ *   first and hold the node. It then drives an agent with no bridge behind
+ *   it: no session, no capture, no service and no network egress of the
+ *   agent's own in any configuration.
+ * - **the page's own behaviour.** A page script can call `__DEBUGGEN__.span`
+ *   and cause real clicks, renders, requests and errors, each recorded
+ *   faithfully. MAIN-world telemetry is **evidence about what the page did,
+ *   never a tamper-proof measurement**, and the service treats every field of
+ *   it as untrusted input (ingest validation, bounds and redaction). An object
+ *   a page hands `__DEBUGGEN__.span` as attributes is read once, own getters
  *   included, as the page's own data.
- * - **the signal producers' in-page hooks.** The producers
- *   (`./interaction.ts`, `./react.ts`, `./fetch.ts`, `./perf.ts`,
- *   `./errors.ts`, `./state.ts` and the helpers they arm, `./continuation.ts`
- *   and `./dom-target.ts`) install their listeners, observers and patches
- *   through the page's own built-ins when they are armed, reset their
- *   counters through them, and build their drafts with them. A page that
- *   rewrites those built-ins can keep a signal from attaching, or stop or
- *   distort what it records. That costs the signal, never the decision: a
- *   producer failure is contained and reported as that producer's failure
- *   (its type name reduced to a closed vocabulary), and the capture stays
- *   armed or disarmed as the extension asked.
+ * - **the signal producers' in-page hooks.** `./interaction.ts`, `./react.ts`,
+ *   `./fetch.ts`, `./perf.ts`, `./errors.ts`, `./state.ts` and the helpers
+ *   they arm (`./continuation.ts`, `./dom-target.ts`) attach, reset and build
+ *   their drafts through the page's own built-ins, so a page that rewrites
+ *   those can keep a signal from attaching, or stop or distort what it
+ *   records. That costs the signal, never the decision: a producer failure is
+ *   contained and reported with its type name reduced to a closed
+ *   vocabulary, and the capture stays armed or disarmed as the extension
+ *   asked.
  * - **the page's clock and scheduler.** Timestamps come from the page's
  *   `performance.now()` and `performance.timeOrigin` (`Date.now()` as the
- *   fallback) through `Math.round`, so a page can skew the times its events
- *   carry. The coalescing timer, the drain task and the drain microtask use
- *   the page's `setTimeout`, `clearTimeout`, `MessageChannel` and
- *   `queueMicrotask`, so a page can delay, hasten or suppress a scheduled
- *   delivery, and the callback it is handed does one thing: drain the queue
- *   onto the private node. The terminal drains — `pagehide`, capture stop
- *   and capture change — are synchronous and scheduled by nothing.
+ *   fallback) through `Math.round`, so a page can skew them. The coalescing
+ *   timer, the drain task and the drain microtask use the page's
+ *   `setTimeout`, `clearTimeout`, `MessageChannel` and `queueMicrotask`, so a
+ *   page can delay, hasten or suppress a scheduled delivery; the callback it
+ *   is handed only drains the queue onto the node. The terminal drains —
+ *   `pagehide`, capture stop and capture change — are synchronous and
+ *   scheduled by nothing.
  *
- * **Why there is no token any more.** Version 2 authenticated inbound frames
- * with a per-document secret handed to the bridge over a `CustomEvent` and
- * then carried on *every* bridge frame posted to `window` — so every frame
- * disclosed the secret to any page listener, and a replayed `agent.config`
- * (an all-false one disarms a live capture) was indistinguishable from the
- * bridge's. Version 3 carries no secret at all: authority is possession of a
- * node that never leaves the two content scripts.
+ * **The channel carries no secret.** Authority is possession of the node,
+ * which only the agent and the bridge hold. A secret carried on
+ * `window`-dispatched frames would reach every page listener, and a replayed
+ * all-false `agent.config` — which disarms a live capture — would be
+ * indistinguishable from the bridge's.
  *
  * ### Custody
  *
- * A telemetry batch is taken out of the queue to be dispatched and is
- * **returned to the front of the queue, in order, unless the bridge claims
- * it**. The bridge claims a batch only once its runtime port has accepted it,
- * so a port that died between `bridge.ready` and the batch costs a retry, not
- * the events: the batch is requeued, the bridge is marked away, and the next
- * `bridge.ready` delivers it with the `batchSeq` it would have carried and no
- * duplicate. See {@link postFrame} for the five outcomes and {@link deliver}
- * for what each one does. Before the handshake has been answered no bridge
- * can exist, so nothing is dispatched and nothing is counted as lost: the
- * `agent.ready` that `./agent.ts` announces at `document_start` is simply
+ * A telemetry batch taken out of the queue for dispatch is **returned to the
+ * front of the queue, in order, unless the bridge claims it**. The bridge
+ * claims a batch once its runtime port has taken it, or once it refuses the
+ * batch for good, so a port that died between `bridge.ready` and the batch
+ * costs a retry, not the events: the batch is requeued, the bridge is marked
+ * away, and the next `bridge.ready` delivers it with the `batchSeq` it would
+ * have carried and no duplicate. {@link postFrame} defines the five outcomes
+ * and {@link deliver} what each one does. Before the handshake is answered no
+ * bridge can exist, so nothing is dispatched and nothing is counted as lost:
+ * the `agent.ready` that `./agent.ts` announces at `document_start` is
  * re-announced on the bridge's `bridge.ready`.
  *
- * Every step is re-entrant. The bridge's listener runs synchronously inside
- * this module's dispatch, and this module's `bridge.ready` handling — a drain,
+ * Every step is re-entrant: the bridge's listener runs synchronously inside
+ * this module's dispatch, and this module's `bridge.ready` handling — a drain
  * and `./agent.ts`'s re-announcement — runs synchronously inside the bridge's.
- * One drain is ever in progress (a nested request is left to the drain that
- * is already running, which reschedules what is left), and a batch whose
- * capture ended or whose transport was reset while it was in the bridge's
- * hands is never requeued into the next one: a capture change settles it into
- * the cumulative totals, and a reset — which has just zeroed them — into
- * nothing.
+ * One drain runs at a time (a nested request is left to the running drain,
+ * which reschedules what remains), and a batch whose capture ended or whose
+ * transport was reset while the bridge held it is never requeued into the
+ * next capture: a capture change settles it into the cumulative totals, and a
+ * reset, which has just zeroed them, into nothing.
  *
  * ## Invariants
  *
- * **1. No side effects at import time.** No listener, no timer, no node and no
- * `dispatchEvent` at module scope; what module evaluation does is *read* the
- * platform intrinsics the channel and the control path use (see
- * {@link CHANNEL_INTRINSICS}, {@link CORE_INTRINSICS} and {@link NODE_TEST})
- * and build a few frozen lookup tables and pre-made errors from them, which
- * observes nothing and changes nothing. The node is created, and its listener
- * and the handshake request listener installed, by the first
- * {@link subscribe}; the last unsubscribe removes both listeners. The flush
- * timer starts on the first enqueue, the queue allocates its first slots with
- * the first event and the drain channel is created with the first scheduled
- * drain. `./agent.ts` is the one module in this folder allowed to act when it
- * is evaluated.
+ * **1. No side effects at import time.** Module evaluation only *reads* the
+ * platform intrinsics the channel and the control path use
+ * ({@link CHANNEL_INTRINSICS}, {@link CORE_INTRINSICS}, {@link NODE_TEST}) and
+ * builds frozen lookup tables and pre-made errors from them: no listener, no
+ * timer, no node and no `dispatchEvent`. The first {@link subscribe} creates
+ * the node and installs its listener and the handshake request listener; the
+ * last unsubscribe removes both listeners. The flush timer starts on the
+ * first enqueue, the queue allocates with the first event and the drain
+ * channel is created by the first scheduled drain. `./agent.ts` is the one
+ * module in this folder allowed to act when it is evaluated.
  *
- * **2. Nothing throws into the page.** Every exported function wraps its body:
- * the agent runs inside the developer's own click handlers and React commits,
- * where an exception escaping would break the application it is observing. A
+ * **2. Nothing throws into the page.** The agent runs inside the developer's
+ * click handlers and React commits, where an escaping exception would break
+ * the application it observes, so every exported function wraps its body; a
  * failure is counted in {@link TransportStats} and swallowed.
  *
- * **3. Nothing leaves that JSON cannot render faithfully.** A frame's `detail`
- * is its JSON rendering, so one function, symbol, bigint, DOM node, `Proxy` or
- * cyclic object in an attribute bag would either throw (and cost the whole
- * batch) or silently change shape. Attributes are therefore rebuilt through a
- * bounded sanitizer before an event is buffered (see {@link emit}), into
- * plain data the renderer, {@link serializeFrameJson}, reproduces exactly as
- * `JSON.stringify` would — except that it never calls a `toJSON` or a getter,
- * and refuses a cycle, a bigint or excessive nesting with a throw that
- * {@link postFrame} counts as an unserializable frame.
+ * **3. Nothing leaves that JSON cannot render faithfully.** A function,
+ * symbol, bigint, DOM node, `Proxy` or cycle in an attribute bag would either
+ * throw (costing the whole batch) or silently change shape, so attributes are
+ * rebuilt through a bounded sanitizer before an event is buffered (see
+ * {@link emit}). {@link serializeFrameJson} renders the result exactly as
+ * `JSON.stringify` would, never calls a `toJSON` or a getter, and refuses a
+ * cycle, a bigint or excessive nesting with a throw that {@link postFrame}
+ * counts as an unserializable frame.
  *
  * **4. Only the producer fields are stamped.** `sessionId`, `captureId` and
- * `ingestSeq` are assigned by the service and rejected by the strict ingress
- * schema if a producer sends them; `redacted` is set by the service's redactor
- * at ingest. This module builds an event field by field rather than by
- * spreading a draft, so none of the four can reach the wire even from a
- * mistaken caller.
+ * `ingestSeq` are assigned by the service, and the strict ingress schema
+ * rejects them from a producer; `redacted` is set by the service's redactor
+ * at ingest. Events are built field by field, never by spreading a draft, so
+ * none of the four reaches the wire even from a mistaken caller.
  *
  * **5. Nothing costs the page more than a bounded amount of work per turn.**
- * The agent observes latency, so it must not create any. Three bounds together
- * make that structural rather than aspirational:
+ * The agent observes latency, so it must not create any:
  *
- * - **The queue is a ring** ({@link enqueue}), so an event costs one slot
- *   write whether the queue holds one event or the full
- *   {@link MAX_BUFFERED_EVENTS}. Evicting the oldest event at the cap advances
- *   a head index; nothing is copied or shifted.
+ * - **The queue is a ring** ({@link enqueue}): an event costs one slot write
+ *   at any depth up to {@link MAX_BUFFERED_EVENTS}, and evicting the oldest
+ *   event at the cap advances a head index rather than copying.
  * - **Delivery never runs on a producer's stack.** Reaching
- *   {@link MAX_EVENTS_PER_BATCH} schedules one drain on its own task (a
- *   `MessageChannel` message, the cheapest true task source a page has)
- *   instead of serialising a frame inside the click handler or React commit
- *   that produced the last event.
- * - **Every drain dispatches at most {@link MAX_BATCHES_PER_DRAIN} batches**
- *   and reschedules the remainder, so emptying a full queue is several short
- *   tasks rather than one long one. That applies to all three non-terminal
- *   routes — the batch threshold, the {@link FLUSH_INTERVAL_MS} timer and the
- *   bridge announcing itself after an absence — because each of them can find
- *   a queue of any depth, and a full one is twenty-five batches.
- * - **Unbounded, synchronous draining is kept for the terminal moments only**,
- *   the ones with no later turn to rely on: {@link flush} (`pagehide` and
- *   capture stop) and the capture change in {@link configureTransport}, where
- *   the alternative is not a slower delivery but no delivery at all — the
- *   document is going away, or the queued events are about to stop being
- *   attributable to the capture they were recorded under.
+ *   {@link MAX_EVENTS_PER_BATCH} schedules one drain on its own
+ *   `MessageChannel` task instead of serialising a frame inside the click
+ *   handler or React commit that produced the last event.
+ * - **Every scheduled drain dispatches at most {@link MAX_BATCHES_PER_DRAIN}
+ *   batches** and reschedules the remainder. That holds for all three
+ *   non-terminal routes — the batch threshold, the {@link FLUSH_INTERVAL_MS}
+ *   timer and the bridge returning after an absence — because each can find
+ *   a full queue.
+ * - **Unbounded, synchronous draining is reserved for the terminal moments**
+ *   with no later turn to rely on: {@link flush} (`pagehide` and capture stop)
+ *   and the capture change in {@link configureTransport}, where the
+ *   alternative is no delivery at all: the document is going away, or the
+ *   queued events are about to stop being attributable to their capture.
  *
- * **6. Every frame is measured before it is dispatched.**
- * {@link MAX_MESSAGE_BYTES} is enforced in {@link postFrame}, the only function
- * that dispatches a frame, on the very string it dispatches — so it bounds
- * control frames (an `agent.ready` carrying a page-controlled URL, a
- * `target.described` descriptor) exactly as it bounds a telemetry batch. A
- * batch over the cap is split; a control frame over it is refused and replaced
- * by one fixed-size diagnostic that cannot itself be oversize and cannot
- * trigger another.
+ * **6. Every frame is measured before it is dispatched.** {@link postFrame},
+ * the only function that dispatches a frame, enforces
+ * {@link MAX_MESSAGE_BYTES} on the very string it dispatches, so control
+ * frames (an `agent.ready` carrying a page-controlled URL, a
+ * `target.described` descriptor) are bounded exactly as batches are. A batch
+ * over the cap is split; a control frame over it is refused and replaced by
+ * one fixed-size diagnostic that cannot itself be oversize or trigger
+ * another.
  *
- * ## The clock offset (AAP 0.2.3)
+ * ## The clock offset
  *
- * AAP 0.2.3 applies no clock alignment to event times "beyond a recorded
- * per-producer `clockOffsetMs` (server `Date` header versus local clock,
- * informational)". This document is the producer, so this module holds its one
- * estimator ({@link clockOffset}) and is the only place the value is written
- * onto an event:
+ * No clock alignment is applied to event times beyond a recorded per-producer
+ * `clockOffsetMs` (server `Date` header versus local clock, informational; see
+ * `docs/ARCHITECTURE.md` §5.2). This document is the producer, so this module
+ * holds its one estimator ({@link clockOffset}) and is the only place the
+ * value is written onto an event:
  *
  * - **Measured** by `./fetch.ts`, which hands {@link observeServerClock} the
  *   `Date` header of each same-origin response its hook observes — the dev
@@ -358,38 +278,28 @@
  *   {@link nowEpochMs}, the clock every `startTime` in this folder comes from.
  * - **Stamped once**, in {@link completeDraft}, when the event is created and
  *   only once an estimate exists. A queued or re-delivered event is never
- *   restamped: the store compares a replay against the event it already holds,
+ *   restamped: the store compares a replay with the event it already holds,
  *   so a replay whose offset had moved would read as an id conflict.
  * - **Never applied.** `startTime` and `duration` are exactly what they would
  *   be with no sample at all; the offset is a statement *about* them.
  * - **Document-scoped**, like the producer id and the channel node: it
- *   describes this document's clock, not a capture, so neither a capture change
- *   nor {@link resetTransport} discards it. {@link getClockOffsetStats} reports
- *   it for diagnostics without widening {@link TransportStats}.
+ *   describes this document's clock, not a capture, so neither a capture
+ *   change nor {@link resetTransport} discards it. {@link getClockOffsetStats}
+ *   reports it for diagnostics without widening {@link TransportStats}.
  *
- * ## Imports: five modules, and why not a sixth
+ * ## Imports
  *
- * `packages/telemetry/esbuild.agent.mjs` bundles this folder into the static
- * content script the Chrome extension copies verbatim, and it hard-fails on
- * any input resolving to a Node builtin, `@debuggen/protocol`,
- * `@debuggen/shared/node` or `zod`. So: `./ids.js` (import-free by
- * construction), `../schema/attributes.js` (imports only `../schema/kinds.js`,
- * both vocabulary-only), `../redaction/rules.js` (import-free by contract, for
- * the {@link TRUNCATION_SUFFIX} its code-point-safe `truncate` marks a cut
- * with — {@link boundControlText} reproduces that function's output exactly,
- * on this module's page-proof primitives rather than on the `Array.from`,
- * `slice` and `join` it calls, so a value bounded here still reads the same
- * as one `./fiber-diff.ts` bounded there),
- * `../schema/clock-offset.js` (import-free by contract, for the
- * `ClockOffsetEstimator` the Node preload runs too, so both tiers measure the
- * offset by one definition and one bound), and
- * `../schema/event.js` **for a type alone** — that
- * module value-imports `zod` and `@debuggen/shared`, and `import type` is
- * erased before esbuild ever sees the file, which is what lets the one
- * definition of {@link TelemetryEventIngress} be reused here instead of
- * restated. `@debuggen/shared`'s barrel is not imported in any form, not even
- * for a type, because its value imports would come with it if the `type`
- * keyword were ever dropped in a refactor.
+ * `packages/telemetry/esbuild.agent.mjs` bundles this folder into a static
+ * content script and fails on any input resolving to a Node builtin,
+ * `@debuggen/protocol`, `@debuggen/shared/node` or `zod`. This module
+ * therefore value-imports only modules that import nothing (`./ids.js`,
+ * `../redaction/rules.js` for {@link TRUNCATION_SUFFIX},
+ * `../schema/clock-offset.js`, whose estimator the Node preload shares) or
+ * nothing but `../schema/kinds.js` (`../schema/attributes.js`), and takes
+ * {@link TelemetryEventIngress} from `../schema/event.js` by `import type`
+ * alone, which is erased before esbuild sees it. `@debuggen/shared`'s barrel
+ * is not imported even for a type, so a dropped `type` keyword cannot pull
+ * its value imports into the bundle.
  *
  * @module packages/telemetry/src/browser/transport
  */
@@ -495,13 +405,9 @@ export const BRIDGE_FRAME_EVENT = 'debuggen-bridge-frame';
  * or to the transport itself is a version bump, and both sides then simply
  * ignore each other until the page reloads.
  *
- * **Version 3 is that rule being applied.** The transport moved off `window`
- * and onto the private channel node, the handshake now hands over the node
- * rather than a token, frames travel as JSON strings, and a frame is
- * acknowledged by `preventDefault()`. A version-2 bridge dispatches nothing
- * this module listens for and a version-3 frame reaching a stale listener
- * fails its version check, so a mismatched pair sits quiet until the page
- * reloads.
+ * Version 3 is the channel the module overview describes: the private
+ * channel node handed over by the handshake, frames as JSON strings, and
+ * acknowledgement by `preventDefault()`.
  */
 export const CHANNEL_VERSION = 3;
 
@@ -822,7 +728,11 @@ export interface TransportStats {
   dropped: number;
   /** Events the bridge claimed, cumulative: only a claimed batch counts. */
   sent: number;
-  /** `telemetry.batch` frames the bridge claimed, cumulative. */
+  /**
+   * `telemetry.batch` frames the bridge claimed, cumulative — including the
+   * event-less loss reports a terminal flush posts (see
+   * {@link deliverLossReport}), which are `telemetry.batch` frames too.
+   */
   batches: number;
   /**
    * The sequence number the next stamped event will carry — equivalently, how
@@ -1113,7 +1023,8 @@ let drainChannel: MessageChannel | undefined;
 let reportingControlLoss = false;
 
 /**
- * Whether a drain is dispatching batches right now.
+ * Whether a drain — or a terminal loss report ({@link deliverLossReport}) — is
+ * dispatching batches right now.
  *
  * The one-drain-at-a-time latch, and the reason this module is re-entrant.
  * The bridge's listener runs synchronously inside every dispatch, and anything
@@ -2029,7 +1940,7 @@ function renderJsonRecord(
 /**
  * This document's clock-offset estimate: the dev server's clock minus this
  * document's event clock, from the `Date` headers `./fetch.ts` feeds through
- * {@link observeServerClock} (AAP 0.2.3; the estimator is defined in
+ * {@link observeServerClock} (the estimator is defined in
  * `../schema/clock-offset.ts`).
  *
  * **Document-scoped, and deliberately untouched by {@link configureTransport}
@@ -2961,7 +2872,14 @@ function acceptDraft(draft: EventDraft): void {
  * ---------------------------------------------------------------------------
  */
 
-/** Count events that were dropped before or instead of delivery. */
+/**
+ * Count events that were dropped before or instead of delivery.
+ *
+ * The count is reported on the next claimed batch's `droppedCount` — and, when
+ * no batch follows, by the event-less loss report a terminal flush posts (see
+ * {@link deliverLossReport}), so a loss on a capture's last batch still reaches
+ * the service.
+ */
 function recordDropped(count: number): void {
   droppedTotal += count;
   pendingDropped += count;
@@ -3024,9 +2942,11 @@ function growBuffer(): boolean {
  * moved on from; the ones arriving now describe what they are looking at. A
  * newest-first policy would answer the question "what just happened?" with the
  * beginning of a render storm and nothing else. The loss is reported rather
- * than hidden: the count rides out on the next batch's `droppedCount` and
- * shows up in {@link TransportStats}, so the panel can say events were lost
- * instead of presenting a truncated capture as a whole one.
+ * than hidden: the count rides out on the next batch's `droppedCount` (or, when
+ * no batch follows, on the terminal flush's loss-only report — see
+ * {@link deliverLossReport}) and shows up in {@link TransportStats}, so the
+ * panel can say events were lost instead of presenting a truncated capture as
+ * a whole one.
  *
  * Both operations are constant time. An eviction advances {@link ringHead} and
  * releases one slot; it never moves a neighbour, which is what keeps a capture
@@ -3098,7 +3018,8 @@ function takeBatch(limit: number): TelemetryEventIngress[] {
  * while they were out are subject to the same oldest-first eviction as
  * {@link pushBuffered}: the oldest of them — the oldest events there are — are
  * the ones dropped, counted in {@link recordDropped} and reported on the next
- * batch's `droppedCount`, and the rest keep their place.
+ * batch's `droppedCount` (or the terminal flush's loss-only report), and the
+ * rest keep their place.
  *
  * @param events The unclaimed events, oldest first.
  */
@@ -3426,9 +3347,21 @@ function drainBatches(maxBatches: number): void {
  * return — goes through {@link drainBatches} with
  * {@link MAX_BATCHES_PER_DRAIN}, because each of those has a next turn and
  * none of them is worth a long task on someone else's page.
+ *
+ * **Terminal means the loss travels too.** Loss otherwise rides out on the
+ * next batch's `droppedCount`, and at a terminal moment there may be no next
+ * batch: the capture's last event was too large to post, or a loss was
+ * recorded while the bridge held the last frame. So once the queue is empty
+ * the pending count is posted on its own, as one event-less batch (see
+ * {@link deliverLossReport}); a capture with nothing lost posts nothing extra.
+ * `./agent.ts` also calls {@link flush} when the document is hidden and on
+ * every `bridge.ready`, which is where a report the bridge did not claim is
+ * retried. The bounded routes never post one — each has a next turn, and a
+ * later batch or this flush will carry the count.
  */
 function flushNow(): void {
   drainBatches(Number.POSITIVE_INFINITY);
+  deliverLossReport();
 }
 
 /**
@@ -3443,7 +3376,9 @@ function flushNow(): void {
  * `droppedCount` carries the loss accumulated since the last batch reported
  * one; {@link deliver} clears what a batch reported only once the bridge has
  * claimed that batch, so the count is reported exactly once and never lost to
- * a frame nobody took.
+ * a frame nobody took. With an empty `events` list the payload is a loss-only
+ * report ({@link deliverLossReport}), which is built only while that count is
+ * positive: an empty batch with nothing lost is never posted.
  */
 function buildBatchPayload(events: readonly TelemetryEventIngress[]): Record<string, unknown> {
   const payload: Record<string, unknown> = {
@@ -3479,10 +3414,11 @@ function buildBatchPayload(events: readonly TelemetryEventIngress[]): Record<str
  *   because its listener called `preventDefault()`. The only outcome after
  *   which a batch's events are counted as delivered and leave custody.
  * - `unclaimed` — the frame was dispatched and nobody claimed it:
- *   `dispatchEvent` returned `true`. The bridge's runtime port was gone, its
- *   listener was not installed, or it refused the frame. A batch is requeued in
- *   order and delivered after the next `bridge.ready`; a control frame, which
- *   is never retried, is counted as lost.
+ *   `dispatchEvent` returned `true`. The bridge's runtime port was gone or
+ *   its listener was not installed; the bridge claims every frame it refuses
+ *   for good, so a refusal never lands here. A batch is requeued in order and
+ *   delivered after the next `bridge.ready`; a control frame, which is never
+ *   retried, is counted as lost.
  * - `oversize` — the rendered frame is longer than {@link MAX_MESSAGE_BYTES}.
  *   A batch is split into halves that fit.
  * - `unserializable` — {@link serializeFrameJson} threw: the frame held a
@@ -3875,6 +3811,112 @@ function deliver(events: readonly TelemetryEventIngress[]): readonly TelemetryEv
     return later;
   }
   return deliver(later);
+}
+
+/**
+ * Post the pending loss on its own, as one `telemetry.batch` with no events.
+ *
+ * The terminal half of loss reporting. {@link recordDropped}'s count normally
+ * rides out on the next batch's `droppedCount`, and at a terminal moment —
+ * `pagehide`, a hidden document, a capture that stops or changes — there may be
+ * no next batch: the capture's last event was too large to post or could not
+ * be stamped, the platform refused the last frame, or a loss was recorded while
+ * the bridge held it. Without this report that loss would be zeroed with the
+ * capture, and the service would record the capture as complete.
+ *
+ * Called by {@link flushNow} only, after its unbounded drain. It posts only
+ * when all of these hold, and otherwise does nothing:
+ *
+ * - the queue is empty, so no batch is left that could carry the count;
+ * - the count is positive, so an empty batch never says "nothing lost" — the
+ *   protocol accepts an empty `events` list only beside a positive
+ *   `droppedCount`;
+ * - the bridge is present and no dispatch is running — a report posted from
+ *   inside the bridge's listener would overtake the frame still in its hands;
+ * - a capture is set, since the count describes one.
+ *
+ * **Custody is {@link deliver}'s.** The payload is {@link buildBatchPayload}'s
+ * with `events: []`: the capture's next `batchSeq`, the pending count, and the
+ * capture and session ids. Then, by outcome:
+ *
+ * - `sent`, capture unchanged — `batchSeq` advances (the bridge requires it to
+ *   increase strictly within a capture, so a claimed report takes a position)
+ *   and the reported part of the count is cleared, so a loss recorded while
+ *   the bridge held the frame stays pending. The frame counts in
+ *   {@link TransportStats}'s `batches` — it is a claimed `telemetry.batch` —
+ *   and adds nothing to `sent`, which counts events.
+ * - `unclaimed` — the bridge is marked away ({@link noteUnclaimedBatch}) and
+ *   the count kept, so the flush `./agent.ts` runs on the next `bridge.ready`
+ *   re-sends it under the same `batchSeq`, once.
+ * - `oversize`, `unserializable`, `refused` — the count is kept for the next
+ *   batch or terminal flush. There are no events to split or drop, and the
+ *   loss is already in the cumulative `dropped`.
+ * - The capture changed, or the transport was reset, during the dispatch —
+ *   none of the new capture's counters move. A claimed report still counts in
+ *   `batches` unless a reset zeroed it, and an unclaimed one still marks the
+ *   bridge away, because that fact is about the channel.
+ *
+ * Holds {@link delivering} for the dispatch, as a drain does: a `bridge.ready`
+ * and flush handed back from inside the bridge's listener would otherwise post
+ * a second report under the same `batchSeq` with the same count. Anything
+ * queued in that window is rescheduled afterwards, as {@link drainBatches}
+ * reschedules its remainder.
+ *
+ * Page-proof like every dispatch: the payload is composed by
+ * {@link buildBatchPayload} from own properties and rendered and dispatched by
+ * {@link postFrame}, which never throws.
+ *
+ * @example
+ * // The capture's last event is too large to post: `flush()` drops it, then
+ * // posts `{ events: [], batchSeq: n, droppedCount: 1, captureId, ... }`.
+ */
+function deliverLossReport(): void {
+  if (
+    ringCount !== 0 ||
+    pendingDropped <= 0 ||
+    !bridgeAvailable ||
+    delivering ||
+    currentCaptureId === undefined
+  ) {
+    return;
+  }
+
+  const epoch = captureEpoch;
+  const resets = resetGeneration;
+  const generation = bridgeReadyGeneration;
+  const reportedDropped = pendingDropped;
+
+  let outcome: FrameOutcome;
+  delivering = true;
+  try {
+    // A fresh literal rather than a shared constant, so the payload owns the
+    // array it carries; an empty literal calls nothing a page can replace.
+    outcome = postFrame('telemetry.batch', buildBatchPayload([]));
+  } finally {
+    delivering = false;
+  }
+
+  if (captureEpoch !== epoch) {
+    // The report belongs to the capture that ended while the bridge held it.
+    if (outcome === 'sent' && resetGeneration === resets) {
+      batchesTotal += 1;
+    }
+    if (outcome === 'unclaimed') {
+      noteUnclaimedBatch(generation);
+    }
+  } else if (outcome === 'sent') {
+    batchSeqCounter += 1;
+    batchesTotal += 1;
+    pendingDropped = pendingDropped > reportedDropped ? pendingDropped - reportedDropped : 0;
+  } else if (outcome === 'unclaimed') {
+    noteUnclaimedBatch(generation);
+  }
+
+  if (ringCount > 0) {
+    // Events queued from inside the dispatch, while the latch turned their
+    // drain away: they travel on the next turn, as a drain's remainder does.
+    scheduleDrain();
+  }
 }
 
 /*
@@ -5040,7 +5082,9 @@ export function configureTransport(config: TransportConfig): void {
  *
  * `./agent.ts` calls this on `pagehide` — the last moment a document can hand
  * anything to the bridge — and when a capture stops, so the analysis runs on
- * the whole capture and not on the whole capture minus its final 250 ms.
+ * the whole capture and not on the whole capture minus its final 250 ms. Loss
+ * that no batch is left to carry is posted after the queue, as one event-less
+ * loss report (see {@link flushNow}).
  *
  * A no-op while the bridge is away: the queue is kept and the arrival of
  * `bridge.ready` starts draining it. A flush that meets a batch the bridge
@@ -5163,7 +5207,7 @@ export function resetTransport(): void {
 
 /**
  * Fold one server response's `Date` header into this document's clock-offset
- * estimate (AAP 0.2.3: "server `Date` header versus local clock").
+ * estimate: the server's `Date` header versus this document's local clock.
  *
  * `./fetch.ts` calls it where a same-origin request settles with a response the
  * dev server produced just then — a response carrying `Age` came from a cache

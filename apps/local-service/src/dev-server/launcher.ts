@@ -31,8 +31,15 @@
  *    database variables the product's `.env.example` documents and the `pg`
  *    driver reads (`DATABASE_URL`, `PG*`), and `DEBUGGEN_LOG_LEVEL`, which the
  *    preload reads;
- * 2. the launch command's explicit `NAME=value` assignments, whatever their
- *    names — the target-app environment the developer approved in the editor;
+ * 2. the launch command's explicit `NAME=value` assignments that
+ *    {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST} admits — the dev server's own
+ *    settings (`NODE_ENV`, `PORT`, `NEXT_TELEMETRY_DISABLED`,
+ *    `NEXT_PUBLIC_*`, the database variables…) and a checked `NODE_OPTIONS`
+ *    or `NODE_PATH` (whose directories {@link checkLaunchCommand} must also
+ *    trust). Any other assignment refuses the launch before anything is
+ *    minted or spawned ({@link parseLaunchCommand}): an `LD_PRELOAD`, a
+ *    `NODE_OPTIONS=--require …`, a `PATH` or a `NEXT_PRIVATE_DEV_DIR` would
+ *    run or serve code of the requester's choosing inside the child (CWE-78);
  * 3. the four keys below, set last, so nothing earlier can override them.
  *
  * Everything else is dropped: `ANTHROPIC_API_KEY`, every other `DEBUGGEN_*`
@@ -41,12 +48,12 @@
  * credentials, and any variable not recognised. Service-only credentials
  * must never reach a target application and the dependencies it loads. A
  * developer gives the target app more variables the way the app expects them:
- * its own `.env` files (which Next.js loads itself) or `NAME=value` at the
- * start of the launch command. On Windows names compare case-insensitively.
+ * its own `.env` files, which Next.js loads itself. On Windows names compare
+ * case-insensitively.
  *
  * | Variable | Value |
  * | --- | --- |
- * | `NODE_OPTIONS` | the launch command's assigned value, else the service's, **with** `--import <preload file URL>` appended — never replaced |
+ * | `NODE_OPTIONS` | the launch command's assigned (checked) value, else the service's, **with** `--import <preload file URL>` appended — never replaced |
  * | `DEBUGGEN_INGEST_URL` | the **full** ingest endpoint, `http://<host>:<port>/telemetry/ingest` |
  * | `DEBUGGEN_TOKEN` | a `server-agent` credential scoped to this one project root |
  * | `DEBUGGEN_PROJECT_ROOT` | the absolute project root the credential is scoped to |
@@ -93,8 +100,15 @@
  * ## The credential route, and the CLI mirror
  *
  * `POST /dev-server/credential` ({@link DEV_SERVER_CREDENTIAL_PATH}) mints a
- * time-bounded `server-agent` credential for a dev server the caller starts
- * itself. It is the `devServer.credential` operation of `@debuggen/protocol`'s
+ * `server-agent` credential for a dev server the caller starts itself. This
+ * service never observes that process's exit, so the credential is a
+ * supervised lease instead ({@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}): the
+ * launcher renews it while the dev server's preload holds its `server-agent`
+ * control connection, and revokes it
+ * {@link CLI_CREDENTIAL_DISCONNECT_GRACE_MS} after that connection is gone,
+ * at the end of its first lease when no preload ever connected with it, and
+ * when the service shuts down; one nothing renews lapses within one lease.
+ * It is the `devServer.credential` operation of `@debuggen/protocol`'s
  * route table, which owns its path, method and both body schemas: this module
  * reads the path and method off that row and re-exports the response schema,
  * and adds only the absolute-path check the Node-neutral protocol cannot make
@@ -118,7 +132,17 @@
  * ({@link DevServerLauncher.preloadServesAt}), and an address another process
  * holds — an answer detection could not identify as this project's server — is
  * refused before anything is minted or spawned — resolves the command (the
- * request's, or the package manager plus dev script detection selected),
+ * request's, or the package manager plus dev script detection selected) and
+ * checks it before anything is minted: its `NAME=value` assignments against
+ * {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST}, and what it runs against
+ * {@link checkLaunchCommand} — a package-manager run of one of the project's
+ * dev-server scripts (a `package.json` script that runs `next dev`), `next
+ * dev`, or the service's own Node running the project's
+ * `node_modules/next/dist/bin/next dev`, each with only the Next.js dev
+ * options {@link DEV_SERVER_ARGUMENT_ALLOWLIST} lists and no positional
+ * argument, from `NODE_PATH` directories the service's user alone can write,
+ * because `shell: false` decides how a program is spawned, never which one
+ * (`sh -c '…'` would otherwise simply run `sh`). It then
  * mints the credential, spawns the child **without a shell option on any
  * platform** — on Windows `cmd.exe` is itself the executable, with a `/c` line
  * that refuses expansion and operator syntax instead of quoting around it
@@ -166,8 +190,23 @@
  * `stop` sends `SIGTERM` to the child's process group (a real POSIX spawn
  * leads its own group, so a framework's server worker is reached too) and
  * escalates to `SIGKILL` after a grace period; a child whose leader exits on
- * its own has its group reaped the same way. `stopAll`/`dispose` are the first
- * step of `../main.ts`'s graceful shutdown.
+ * its own has its group reaped the same way. A group id is signalled directly
+ * only while the leader is unreaped — its pid, hence the group id, cannot be
+ * reused before then. After the leader exits, the id may already name an
+ * unrelated process's group, so the launcher signals it only when a listing
+ * taken immediately before ({@link ProcessGroupInspector}) still holds a
+ * process it pinned in the group earlier — at spawn, at readiness and when a
+ * stop begins — by pid and start time; a group that is gone, recycled or
+ * cannot be listed is left alone for good (and logged, unless it is gone).
+ * Where the inspector can answer synchronously (`/proc` on Linux,
+ * {@link ProcessGroupInspector.confirm}), a pinned member of that listing is
+ * confirmed again in the same synchronous step that sends the signal, and a
+ * group none of whose pins still confirms is released as gone. What remains
+ * is the width of that step — the confirming read and the `kill` system call
+ * — because Node exposes no pidfd, so no pid-based signal is free of a final
+ * syscall-width window; without `confirm` (a `ps`-based inspector) the window
+ * runs from the listing to the signal.
+ * `stopAll`/`dispose` are the first step of `../main.ts`'s graceful shutdown.
  *
  * ## Who owns a launched child
  *
@@ -243,10 +282,10 @@
  */
 
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
-import { statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { readFile, readdir, readlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, isAbsolute as isNativeAbsolute, join } from 'node:path';
+import { dirname, isAbsolute as isNativeAbsolute, join, posix, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -287,6 +326,7 @@ import {
   type ExceptionDescription,
 } from '../logging.js';
 import {
+  FRAMEWORK_DEV_CLIS,
   PRELOAD_DEPENDENT_SIGNALS,
   buildRelaunchHint,
   detectDevServer,
@@ -297,6 +337,7 @@ import {
   type ServerAgentPresence,
   type DevServerFramework,
   type DevServerProbeResult,
+  type FrameworkDevCli,
 } from './detect.js';
 
 // ---------------------------------------------------------------------------
@@ -373,15 +414,68 @@ const KILL_CONFIRM_MS = 2_000;
 export const DEFAULT_TERMINATION_BOUND_MS = DEFAULT_STOP_GRACE_MS + KILL_CONFIRM_MS;
 
 /**
- * Lifetime of a credential minted through {@link DEV_SERVER_CREDENTIAL_PATH},
- * in milliseconds.
+ * One lease of a credential minted through {@link DEV_SERVER_CREDENTIAL_PATH},
+ * in milliseconds: five minutes.
  *
- * A launched child's credential is revoked when the child exits; a credential
- * for a process the caller starts itself cannot be tied to an exit this
- * service observes, so it carries an explicit expiry instead. Twelve hours
- * outlasts a working day of one dev server and bounds a forgotten one.
+ * The caller starts that dev server itself, so this service never observes
+ * its exit. What it observes is the preload's `server-agent` control
+ * connection, which the preload holds for as long as the dev server runs. The
+ * credential is therefore a supervised lease (AAP §0.5.6: a server-agent
+ * credential expires when the launched process exits):
+ *
+ * - it is minted to expire one lease from now, and the launcher renews it to
+ *   one lease from now at most every third of a lease — and only while a
+ *   control connection authenticated with it is online;
+ * - it is revoked {@link CLI_CREDENTIAL_DISCONNECT_GRACE_MS} after that
+ *   connection is gone, and at the end of its first lease when no preload
+ *   connected with it at all (without its control connection the preload
+ *   receives no capture and ingests nothing);
+ * - it is revoked when the service shuts down.
+ *
+ * A credential nothing renews any more — the service crashed, or its store
+ * refused every renewal — stops authenticating within one lease. Without a
+ * connection view ({@link DevServerLauncherDeps.serverAgentConnections})
+ * nothing counts as connected, so the credential is revoked at the end of its
+ * first lease.
  */
-export const DEFAULT_CLI_CREDENTIAL_TTL_MS = 12 * 60 * 60 * 1000;
+export const DEFAULT_CLI_CREDENTIAL_LEASE_MS = 5 * 60 * 1000;
+
+/**
+ * How often the launcher checks each {@link DEV_SERVER_CREDENTIAL_PATH}
+ * credential's control connection, in milliseconds: every two seconds. A check
+ * reads the connected-client view only; it reaches the store only to renew the
+ * lease (at most every third of {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}) or to
+ * revoke the credential.
+ */
+export const CLI_CREDENTIAL_CHECK_INTERVAL_MS = 2_000;
+
+/**
+ * How long a {@link DEV_SERVER_CREDENTIAL_PATH} credential outlives the loss of
+ * its dev server's control connection, in milliseconds: twenty seconds. It
+ * covers the preload reconnecting — a dev server restarting its worker, a
+ * dropped socket — and bounds how long a credential copied out of an exited
+ * dev server's environment keeps authenticating.
+ */
+export const CLI_CREDENTIAL_DISCONNECT_GRACE_MS = 20_000;
+
+/**
+ * The supervision of one {@link DEV_SERVER_CREDENTIAL_PATH} credential (see
+ * {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}), from its issuance until it is
+ * revoked or found gone.
+ */
+interface CliCredentialSupervision {
+  /** The credential, its current expiry and the state of its invalidation. */
+  readonly lease: CredentialLease;
+  /**
+   * When a control connection authenticated with the credential was last seen
+   * online, in epoch milliseconds; `undefined` until one first is.
+   */
+  lastConnectedAt: number | undefined;
+  /** Renewals that failed since the last one that succeeded; only the first of a run is logged. */
+  renewFailures: number;
+  /** The next check, while one is scheduled. */
+  timer: ScheduledTimer | undefined;
+}
 
 /**
  * Lifetime of a launched child's credential lease, in milliseconds.
@@ -806,6 +900,9 @@ export interface DevServerEnvAllowlist {
   readonly posixLowercaseNames: readonly string[];
 }
 
+/** The locale and time-zone variables: a program's language, message catalogue and clock. */
+const LOCALE_NAMES = ['LANG', 'LANGUAGE', 'TZ'] as const;
+
 /** What the platform needs to run a program: search path, identity, temp, locale. */
 const PLATFORM_RUNTIME_NAMES = [
   'PATH',
@@ -817,9 +914,7 @@ const PLATFORM_RUNTIME_NAMES = [
   'TMPDIR',
   'TMP',
   'TEMP',
-  'LANG',
-  'LANGUAGE',
-  'TZ',
+  ...LOCALE_NAMES,
 ] as const;
 
 /** What Windows needs to run a program, a `.cmd` shim and `cmd.exe` itself. */
@@ -987,6 +1082,286 @@ export function isForwardedToDevServer(
   );
 }
 
+/** The shape of {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST}. */
+export interface DevServerCommandEnvAllowlist {
+  /** Exact variable names a launch command may assign, upper-case; compared case-insensitively on Windows. */
+  readonly names: readonly string[];
+  /** Name prefixes a launch command may assign, upper-case; compared case-insensitively on Windows. */
+  readonly prefixes: readonly string[];
+  /**
+   * Names a launch command may assign only with a value that passes that
+   * name's own check: `NODE_OPTIONS` (see {@link LAUNCH_NODE_OPTIONS_ALLOWLIST})
+   * and `NODE_PATH` (absolute `node_modules` directories only, each one the
+   * service trusts — see {@link checkLaunchCommand}).
+   */
+  readonly valueCheckedNames: readonly string[];
+}
+
+/**
+ * The variables a request's launch command may assign with a leading
+ * `NAME=value` word — a **much narrower** list than
+ * {@link DEV_SERVER_ENV_ALLOWLIST}, because an assignment arrives in a request
+ * rather than from the service's own environment, and a variable that
+ * changes what the platform, Node or a package manager loads (`LD_PRELOAD`,
+ * `NODE_OPTIONS=--require …`, `BASH_ENV`, `npm_config_node_options`, `PATH`)
+ * would run code of the requester's choosing inside the child despite
+ * `shell: false` (CWE-78). A name is admitted when it is one of `names` or
+ * starts with one of `prefixes` — case-insensitively on Windows, exactly
+ * elsewhere — or is one of `valueCheckedNames` with a value that passes its
+ * check ({@link checkLaunchAssignment}):
+ *
+ * - the dev server's own settings: `NODE_ENV`, `PORT`, `HOST`, `HOSTNAME`,
+ *   `WATCHPACK_POLLING`, `CHOKIDAR_USEPOLLING`, `NEXT_TELEMETRY_DISABLED`,
+ *   `NEXT_OTEL_VERBOSE`, and the application's public build-time values
+ *   `NEXT_PUBLIC_*`;
+ * - terminal and locale: `TERM`, `COLORTERM`, `FORCE_COLOR`, `NO_COLOR`,
+ *   `CI`, `LANG`, `LANGUAGE`, `TZ`, and `LC_*`;
+ * - the target's database: `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGDATABASE`,
+ *   `PGUSER`, `PGPASSWORD`, `PGSSLMODE`;
+ * - shared developer configuration: `DEBUGGEN_LOG_LEVEL`;
+ * - value-checked: `NODE_OPTIONS` (diagnostic and memory flags only, see
+ *   {@link LAUNCH_NODE_OPTIONS_ALLOWLIST}) and `NODE_PATH` (absolute paths of
+ *   `node_modules` directories only, and — checked by
+ *   {@link checkLaunchCommand} — existing ones owned by the service's user
+ *   that no one else can write).
+ *
+ * Deliberately absent, so a launch command assigning one is refused before
+ * anything is minted or spawned: `PATH`, `HOME`, `SHELL`, `TMPDIR` and
+ * `XDG_*` (what finds and configures executables), the Windows runtime
+ * variables (`COMSPEC`, `SYSTEMROOT`, `PATHEXT` …), the proxy and CA/TLS
+ * variables, the toolchain homes (`PNPM_HOME`, `VOLTA_HOME`, `BUN_INSTALL`,
+ * `COREPACK_*`, `NVM_*`, `FNM_*`), every other `DEBUGGEN_*` — the three
+ * wiring keys included, which the launcher alone sets — `npm_config_*`,
+ * `LD_*` and `DYLD_*` (dynamic-loader injection), `BASH_ENV` and `ENV`
+ * (shell start-up files), every other `NEXT_*` — Next.js's internal switches
+ * redirect what it serves and where it reports: `NEXT_PRIVATE_DEV_DIR`
+ * replaces the project directory `next dev` serves, `NEXT_TRACE_UPLOAD_FULL`
+ * widens what `--experimental-upload-trace` sends off the machine,
+ * `NEXT_DIST_DIR` moves the build output — and anything unrecognised.
+ * Variables a target application reads for itself belong in the project's
+ * own `.env` files, which Next.js loads without any help from this service.
+ *
+ * The service's **own** environment is judged by the wider
+ * {@link DEV_SERVER_ENV_ALLOWLIST}, which still forwards every `NEXT_*`: those
+ * values are the developer's, set before the service started, not a
+ * request's. Widening this list is a security decision: every name added
+ * here is one a request may set.
+ */
+export const DEV_SERVER_COMMAND_ENV_ALLOWLIST: DevServerCommandEnvAllowlist = Object.freeze({
+  names: Object.freeze([
+    'NODE_ENV',
+    ...DEV_SERVER_NAMES,
+    'NEXT_TELEMETRY_DISABLED',
+    'NEXT_OTEL_VERBOSE',
+    ...TERMINAL_NAMES,
+    ...LOCALE_NAMES,
+    ...DATABASE_NAMES,
+    ...SHARED_DEVELOPER_NAMES,
+  ]),
+  prefixes: Object.freeze(['NEXT_PUBLIC_', 'LC_']),
+  valueCheckedNames: Object.freeze([PRELOAD_ENV_KEYS.nodeOptions, 'NODE_PATH']),
+});
+
+/** The shape of {@link LAUNCH_NODE_OPTIONS_ALLOWLIST}. */
+export interface LaunchNodeOptionsAllowlist {
+  /** Flags that take no value, e.g. `--enable-source-maps`. */
+  readonly booleanFlags: readonly string[];
+  /**
+   * Flags that take one value, as `--flag=value` or `--flag value`; the value
+   * must match {@link LAUNCH_NODE_OPTIONS_ALLOWLIST}'s `valuePattern`.
+   */
+  readonly valuedFlags: readonly string[];
+  /** What a valued flag's value must match: 1–64 characters of `A–Z a–z 0–9 . _ : + -`. */
+  readonly valuePattern: RegExp;
+}
+
+/**
+ * The only Node options an assigned `NODE_OPTIONS` may hold: diagnostics
+ * (warnings, deprecations, source maps, uncaught-exception traces) and memory
+ * or parser limits. Every flag that loads or evaluates code or opens a
+ * debugger — `--require`/`-r`, `--import`, `--loader`,
+ * `--experimental-loader`, `--inspect*`, `--eval`, `--openssl-config`,
+ * `--env-file`, and every flag not listed — is refused, because the value
+ * reaches the child's Node verbatim. The service appends its own preload
+ * `--import` after the assigned value (see {@link appendNodeOptions}); an
+ * empty value is allowed and clears an inherited `NODE_OPTIONS`.
+ */
+export const LAUNCH_NODE_OPTIONS_ALLOWLIST: LaunchNodeOptionsAllowlist = Object.freeze({
+  booleanFlags: Object.freeze([
+    '--enable-source-maps',
+    '--no-deprecation',
+    '--no-warnings',
+    '--trace-warnings',
+    '--trace-deprecation',
+    '--trace-uncaught',
+    '--trace-exit',
+    '--throw-deprecation',
+    '--pending-deprecation',
+  ]),
+  valuedFlags: Object.freeze([
+    '--max-old-space-size',
+    '--max-semi-space-size',
+    '--max-http-header-size',
+    '--stack-trace-limit',
+    '--unhandled-rejections',
+    '--dns-result-order',
+    '--disable-warning',
+  ]),
+  valuePattern: /^[A-Za-z0-9._:+-]{1,64}$/,
+});
+
+/** Membership over {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST}'s exact names. */
+const LAUNCH_ASSIGNMENT_NAME_SET: ReadonlySet<string> = new Set(
+  DEV_SERVER_COMMAND_ENV_ALLOWLIST.names,
+);
+
+/** Membership over {@link LAUNCH_NODE_OPTIONS_ALLOWLIST}'s boolean flags. */
+const LAUNCH_BOOLEAN_FLAG_SET: ReadonlySet<string> = new Set(
+  LAUNCH_NODE_OPTIONS_ALLOWLIST.booleanFlags,
+);
+
+/** Membership over {@link LAUNCH_NODE_OPTIONS_ALLOWLIST}'s valued flags. */
+const LAUNCH_VALUED_FLAG_SET: ReadonlySet<string> = new Set(
+  LAUNCH_NODE_OPTIONS_ALLOWLIST.valuedFlags,
+);
+
+/** The last path segment a `NODE_PATH` entry must name. */
+const NODE_MODULES_SEGMENT = 'node_modules';
+
+/** The variable whose directories Node searches for modules, as `NODE_PATH` spells it on every platform. */
+const NODE_PATH_NAME = 'NODE_PATH';
+
+/**
+ * Why a launch command's `NAME=value` assignment is refused — the
+ * `details.reason` of {@link parseLaunchCommand}'s refusal:
+ *
+ * - `'env-assignment-not-allowed'` — the name is not on
+ *   {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST};
+ * - `'node-options-not-allowed'` — a `NODE_OPTIONS` value holding a word
+ *   {@link LAUNCH_NODE_OPTIONS_ALLOWLIST} does not admit;
+ * - `'node-path-not-allowed'` — a `NODE_PATH` value with an entry that is not
+ *   an absolute path of a `node_modules` directory; {@link checkLaunchCommand}
+ *   answers the same reason for an entry that is not a directory the service
+ *   trusts ({@link isTrustedNodePathDirectory}).
+ */
+export type LaunchAssignmentRefusal =
+  'env-assignment-not-allowed' | 'node-options-not-allowed' | 'node-path-not-allowed';
+
+/**
+ * Check one `NAME=value` assignment of a launch command against
+ * {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST}: the name must be on the list —
+ * compared case-insensitively on `win32`, exactly elsewhere — and a
+ * `NODE_OPTIONS` or `NODE_PATH` value must pass its own check:
+ *
+ * - `NODE_OPTIONS`: split on whitespace, every word is a
+ *   {@link LAUNCH_NODE_OPTIONS_ALLOWLIST} boolean flag, or a valued flag as
+ *   `--flag=value` or `--flag value` whose value matches its `valuePattern`
+ *   (the separate value may not start with `-`); empty is allowed;
+ * - `NODE_PATH`: split on `:` (`;` on Windows), every entry is non-empty,
+ *   absolute for the platform, free of NUL, CR and LF, and its last segment is
+ *   `node_modules`. This check is syntactic and reads no filesystem; that
+ *   each entry is a directory only the service's user can write is
+ *   {@link checkLaunchCommand}'s check.
+ *
+ * @param name The assigned variable name.
+ * @param value The assigned value.
+ * @param platform Whose name and path semantics apply. Default: this process's.
+ * @returns `undefined` when the assignment is allowed, else why it is refused.
+ *
+ * @example
+ * ```ts
+ * checkLaunchAssignment('NEXT_TELEMETRY_DISABLED', '1', 'linux');           // → undefined
+ * checkLaunchAssignment('LD_PRELOAD', '/tmp/x.so', 'linux');                // → 'env-assignment-not-allowed'
+ * checkLaunchAssignment('NODE_OPTIONS', '--require=/tmp/x.js', 'linux');    // → 'node-options-not-allowed'
+ * ```
+ */
+export function checkLaunchAssignment(
+  name: string,
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): LaunchAssignmentRefusal | undefined {
+  if (typeof name !== 'string' || name.length === 0 || typeof value !== 'string') {
+    return 'env-assignment-not-allowed';
+  }
+  const key = platform === 'win32' ? name.toUpperCase() : name;
+  if (key === PRELOAD_ENV_KEYS.nodeOptions) {
+    return isAllowedLaunchNodeOptions(value) ? undefined : 'node-options-not-allowed';
+  }
+  if (key === 'NODE_PATH') {
+    return isAllowedLaunchNodePath(value, platform) ? undefined : 'node-path-not-allowed';
+  }
+  const listed =
+    LAUNCH_ASSIGNMENT_NAME_SET.has(key) ||
+    DEV_SERVER_COMMAND_ENV_ALLOWLIST.prefixes.some((prefix) => key.startsWith(prefix));
+  return listed ? undefined : 'env-assignment-not-allowed';
+}
+
+/**
+ * Whether a launch command may make the assignment `name=value`: exactly
+ * when {@link checkLaunchAssignment} finds nothing to refuse.
+ *
+ * @param name The assigned variable name.
+ * @param value The assigned value.
+ * @param platform Whose name and path semantics apply. Default: this process's.
+ * @returns `true` when the assignment reaches the child.
+ */
+export function isAllowedLaunchAssignment(
+  name: string,
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return checkLaunchAssignment(name, value, platform) === undefined;
+}
+
+/** Whether every word of an assigned `NODE_OPTIONS` is an allowlisted flag; see {@link checkLaunchAssignment}. */
+function isAllowedLaunchNodeOptions(value: string): boolean {
+  const words = value.split(/\s+/).filter((word) => word.length > 0);
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index] ?? '';
+    if (LAUNCH_BOOLEAN_FLAG_SET.has(word)) {
+      continue;
+    }
+    const equals = word.indexOf('=');
+    if (equals > 0) {
+      if (
+        !LAUNCH_VALUED_FLAG_SET.has(word.slice(0, equals)) ||
+        !LAUNCH_NODE_OPTIONS_ALLOWLIST.valuePattern.test(word.slice(equals + 1))
+      ) {
+        return false;
+      }
+      continue;
+    }
+    const next = words[index + 1];
+    if (
+      !LAUNCH_VALUED_FLAG_SET.has(word) ||
+      next === undefined ||
+      next.startsWith('-') ||
+      !LAUNCH_NODE_OPTIONS_ALLOWLIST.valuePattern.test(next)
+    ) {
+      return false;
+    }
+    index += 1;
+  }
+  return true;
+}
+
+/** Whether every entry of an assigned `NODE_PATH` is an absolute `node_modules` directory. */
+function isAllowedLaunchNodePath(value: string, platform: NodeJS.Platform): boolean {
+  const windows = platform === 'win32';
+  const entries = value.split(windows ? ';' : ':');
+  return entries.every((entry) => {
+    if (entry.length === 0 || /[\0\r\n]/.test(entry)) {
+      return false;
+    }
+    if (windows ? !WINDOWS_ROOTED_PATH.test(entry) : !isAbsolutePosix(entry)) {
+      return false;
+    }
+    const segments = entry.split(windows ? /[\\/]+/ : /\/+/).filter((part) => part.length > 0);
+    const last = segments.at(-1) ?? '';
+    return windows ? last.toLowerCase() === NODE_MODULES_SEGMENT : last === NODE_MODULES_SEGMENT;
+  });
+}
+
 /** Input of {@link buildDevServerEnv}. */
 export interface DevServerEnvInput {
   /**
@@ -996,11 +1371,13 @@ export interface DevServerEnvInput {
   readonly parentEnv: ParentEnvironment;
   /**
    * The launch command's explicit `NAME=value` assignments
-   * ({@link ParsedLaunchCommand.env}) — the target-app environment the
-   * developer approved. Forwarded whatever their names, applied after the
-   * filtered parent (so an assigned `NODE_OPTIONS` replaces the inherited one
-   * and is then appended to), and overridden only by the three `DEBUGGEN_*`
-   * wiring keys. Default: none.
+   * ({@link ParsedLaunchCommand.env}) — the dev-server settings the developer
+   * approved. Every one must pass {@link checkLaunchAssignment}
+   * ({@link DEV_SERVER_COMMAND_ENV_ALLOWLIST}); {@link parseLaunchCommand}
+   * already refuses any other, and this function checks again rather than
+   * trust its caller. Applied after the filtered parent, so an assigned
+   * `NODE_OPTIONS` replaces the inherited one and is then appended to.
+   * Default: none.
    */
   readonly launchEnv?: Readonly<Record<string, string>> | undefined;
   /** Absolute path of the project; becomes `DEBUGGEN_PROJECT_ROOT`. */
@@ -1025,29 +1402,33 @@ export interface DevServerEnvInput {
  *
  * 1. the `parentEnv` variables {@link isForwardedToDevServer} admits
  *    ({@link DEV_SERVER_ENV_ALLOWLIST}), byte for byte in their own spelling;
- * 2. `launchEnv`, the launch command's explicit `NAME=value` assignments,
- *    whatever their names, replacing a same-named parent variable;
+ * 2. `launchEnv`, the launch command's explicit `NAME=value` assignments —
+ *    each one admitted by {@link checkLaunchAssignment}
+ *    ({@link DEV_SERVER_COMMAND_ENV_ALLOWLIST}) — replacing a same-named
+ *    parent variable;
  * 3. exactly the four {@link PRELOAD_ENV_KEYS}: `NODE_OPTIONS` — the assigned
  *    value, else the inherited one — appended with the preload's `--import`
  *    flag (see {@link appendNodeOptions}), and the three `DEBUGGEN_*` wiring
- *    keys assigned, overwriting any inherited or assigned value, because a
- *    stale credential must never reach the child.
+ *    keys assigned, overwriting any inherited value, because a stale
+ *    credential must never reach the child.
  *
  * Every other service variable — `ANTHROPIC_API_KEY`, `DEBUGGEN_HOME`, the
  * editor's `VSCODE_*`, a cloud credential — is dropped, so service-only
  * credentials never reach the target app and its dependencies; a developer
- * gives the app more variables through its own `.env` files or `NAME=value`
- * in the launch command. On `win32` names compare case-insensitively, so a
- * `Path` or `Node_Options` is matched and replaced rather than duplicated
- * under a second spelling. Inputs are never mutated, and `undefined` values
- * are dropped, so the result is a clean `Record<string, string>`.
+ * gives the app more variables through its own `.env` files. On `win32` names
+ * compare case-insensitively, so a `Path` or `Node_Options` is matched and
+ * replaced rather than duplicated under a second spelling. Inputs are never
+ * mutated, and `undefined` values are dropped, so the result is a clean
+ * `Record<string, string>`.
  *
  * @param input The service environment, the launch assignments and the four values.
  * @returns A fresh environment object for `spawn`.
  * @throws DebuggenError `PROJECT_NOT_FOUND` for a relative project root, and
- * `CONFIG_INVALID` for an empty credential, a relative preload path or an
- * ingest endpoint that is not an absolute `http(s)` URL. No message, hint or
- * detail ever carries the credential.
+ * `CONFIG_INVALID` for an empty credential, a relative preload path, an
+ * ingest endpoint that is not an absolute `http(s)` URL, or a `launchEnv`
+ * assignment {@link checkLaunchAssignment} refuses (`details.reason:
+ * "launch-env-not-allowed"`). No message, hint or detail ever carries the
+ * credential, an assigned name or an assigned value.
  */
 export function buildDevServerEnv(input: DevServerEnvInput): Record<string, string> {
   if (typeof input.projectRoot !== 'string' || !isAbsolutePath(input.projectRoot)) {
@@ -1076,6 +1457,22 @@ export function buildDevServerEnv(input: DevServerEnvInput): Record<string, stri
   const importFlag = buildPreloadImportFlag(input.preloadPath);
   const platform = input.platform ?? process.platform;
   const identity = (name: string): string => (platform === 'win32' ? name.toUpperCase() : name);
+  // Defence in depth: the parser refuses these before a credential exists, but
+  // an assignment that selects a loader or overrides wiring must never reach a
+  // child whatever path built the input. Neither the name nor the value is
+  // echoed, since either may carry an inline secret.
+  for (const [name, value] of Object.entries(input.launchEnv ?? {})) {
+    if (typeof value === 'string' && !isAllowedLaunchAssignment(name, value, platform)) {
+      throw new DebuggenError(
+        'CONFIG_INVALID',
+        'The launch environment holds an assignment a dev-server launch may not make.',
+        {
+          hint: 'Assign only the variables DEV_SERVER_COMMAND_ENV_ALLOWLIST admits, as parseLaunchCommand checks them.',
+          details: { reason: 'launch-env-not-allowed' },
+        },
+      );
+    }
+  }
 
   // One slot per variable identity (the upper-cased name on Windows), holding
   // the spelling that supplied the value: a later layer replaces an earlier
@@ -1099,7 +1496,7 @@ export function buildDevServerEnv(input: DevServerEnvInput): Record<string, stri
     slots.set(id, [name, value]);
   }
 
-  // Layer 2: the launch command's explicit assignments, whatever their names.
+  // Layer 2: the launch command's explicit assignments, each checked above.
   for (const [name, value] of Object.entries(input.launchEnv ?? {})) {
     if (typeof value !== 'string') {
       continue;
@@ -1112,7 +1509,8 @@ export function buildDevServerEnv(input: DevServerEnvInput): Record<string, stri
     slots.set(id, [name, value]);
   }
 
-  // Layer 3: the wiring keys are never taken from either layer above.
+  // Layer 3: the wiring keys are never taken from either layer above (the
+  // allowlist keeps them out of layer 2; this keeps the invariant local).
   for (const key of [
     PRELOAD_ENV_KEYS.ingestUrl,
     PRELOAD_ENV_KEYS.token,
@@ -1640,11 +2038,11 @@ export interface ParsedLaunchCommand {
   readonly args: readonly string[];
   /**
    * Leading `NAME=value` assignments (`NODE_ENV=development next dev`): the
-   * {@link DevServerEnvInput.launchEnv} of the child. They are forwarded
-   * whatever their names — unlike the service's own variables, which pass
-   * only through {@link DEV_SERVER_ENV_ALLOWLIST} — and applied before the
-   * preload variables, so an assigned `NODE_OPTIONS` is appended to and an
-   * assigned `DEBUGGEN_*` wiring key is overridden.
+   * {@link DevServerEnvInput.launchEnv} of the child. Each one passed
+   * {@link checkLaunchAssignment} ({@link DEV_SERVER_COMMAND_ENV_ALLOWLIST});
+   * they are applied before the preload variables, so an assigned
+   * `NODE_OPTIONS` is appended to, and no `DEBUGGEN_*` wiring key can be among
+   * them.
    */
   readonly env: Readonly<Record<string, string>>;
 }
@@ -1652,14 +2050,42 @@ export interface ParsedLaunchCommand {
 /**
  * Parse a request's `command` with {@link splitCommandLine}: leading
  * environment assignments are separated out, the next word is the executable,
- * and the rest are its arguments. An unquoted shell operator (`&&`, `|`, `;`,
- * `>` …) is refused, because without a shell it would silently become an
- * argument: a command that needs one belongs in a `package.json` script.
+ * and the rest are its arguments. Refused, each before anything is minted or
+ * spawned:
+ *
+ * - an unquoted shell operator (`&&`, `|`, `;`, `>` …) — `shell-operator`:
+ *   without a shell it would silently become an argument, so a command that
+ *   needs one belongs in a `package.json` script;
+ * - an assignment {@link checkLaunchAssignment} refuses —
+ *   `env-assignment-not-allowed` for a name off
+ *   {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST} (`LD_PRELOAD`, `PATH`,
+ *   `DEBUGGEN_TOKEN` …), `node-options-not-allowed` for a `NODE_OPTIONS` that
+ *   would load or evaluate code (`--require`, `--import`, `--inspect` …),
+ *   `node-path-not-allowed` for a `NODE_PATH` entry that is not an absolute
+ *   `node_modules` directory. `details.position` is the assignment's 1-based
+ *   word index; neither its name nor its value is echoed.
+ *
+ * Which executable may run, and whether an assigned `NODE_PATH` names only
+ * trusted directories, is {@link checkLaunchCommand}'s decision, made on the
+ * parsed result.
  *
  * @param command The request's command line.
+ * @param platform Whose variable-name and path semantics the assignments are
+ * checked under. Default: this process's.
  * @returns The parsed command, or `DEV_SERVER_LAUNCH_FAILED` with the fix as its hint.
+ *
+ * @example
+ * ```ts
+ * parseLaunchCommand('NEXT_TELEMETRY_DISABLED=1 pnpm run dev', 'linux');
+ * // → ok({ file: 'pnpm', args: ['run', 'dev'], env: { NEXT_TELEMETRY_DISABLED: '1' } })
+ * parseLaunchCommand('LD_PRELOAD=/tmp/x.so pnpm run dev', 'linux');
+ * // → err(… details: { reason: 'env-assignment-not-allowed', position: 1 })
+ * ```
  */
-export function parseLaunchCommand(command: string): Result<ParsedLaunchCommand, DebuggenError> {
+export function parseLaunchCommand(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): Result<ParsedLaunchCommand, DebuggenError> {
   const tokenized = tokenizeCommand(command);
   if (isErr(tokenized)) {
     return tokenized;
@@ -1683,7 +2109,13 @@ export function parseLaunchCommand(command: string): Result<ParsedLaunchCommand,
       break;
     }
     const equals = word.text.indexOf('=');
-    env.push([word.text.slice(0, equals), word.text.slice(equals + 1)]);
+    const name = word.text.slice(0, equals);
+    const value = word.text.slice(equals + 1);
+    const refusal = checkLaunchAssignment(name, value, platform);
+    if (refusal !== undefined) {
+      return err(assignmentError(refusal, index + 1));
+    }
+    env.push([name, value]);
   }
 
   const file = words[index]?.text;
@@ -1699,12 +2131,773 @@ export function parseLaunchCommand(command: string): Result<ParsedLaunchCommand,
   );
 }
 
+/**
+ * The hint of every command refusal that has no more specific one: the forms
+ * {@link checkLaunchCommand} accepts, and where anything else belongs.
+ */
+const COMMAND_FORMS_HINT =
+  'Pass one of the accepted forms — a package-manager run of one of the project\'s dev-server scripts ("pnpm run dev --port 4174", "npm run dev -- --port 4174", "yarn dev --port 4174", "bun run dev"), "next dev" with its port, hostname and bundler options, or Node running the project\'s node_modules/next/dist/bin/next dev — where quotes are honoured and nothing is expanded; or omit the command to use the dev script detected from package.json. Anything else belongs in a package.json script that runs next dev.';
+
 /** A refusal of a request's command; the command itself is never echoed. */
-function commandError(reason: string, message: string): DebuggenError {
+function commandError(
+  reason: string,
+  message: string,
+  hint: string = COMMAND_FORMS_HINT,
+  details: Readonly<Record<string, string | number>> = {},
+): DebuggenError {
   return new DebuggenError('DEV_SERVER_LAUNCH_FAILED', message, {
-    hint: 'Pass a single command such as "pnpm run dev" (quotes are honoured, nothing is expanded), or omit the command to use the dev script detected from package.json.',
-    details: { reason },
+    hint,
+    details: { reason, ...details },
   });
+}
+
+/** The fixed message and hint of each {@link LaunchAssignmentRefusal}; none echoes the assignment. */
+const ASSIGNMENT_REFUSALS: Readonly<
+  Record<LaunchAssignmentRefusal, { readonly message: string; readonly hint: string }>
+> = Object.freeze({
+  'env-assignment-not-allowed': Object.freeze({
+    message: 'The dev-server command assigns an environment variable a launch command may not set.',
+    hint: `A launch command may assign only ${[
+      ...DEV_SERVER_COMMAND_ENV_ALLOWLIST.names,
+      ...DEV_SERVER_COMMAND_ENV_ALLOWLIST.prefixes.map((prefix) => `${prefix}*`),
+    ].join(
+      ', ',
+    )}, and a checked NODE_OPTIONS or NODE_PATH. Put any other variable the app needs in the project's own .env files, which Next.js loads itself.`,
+  }),
+  'node-options-not-allowed': Object.freeze({
+    message:
+      "The dev-server command's NODE_OPTIONS assignment holds an option a launch command may not pass.",
+    hint: `An assigned NODE_OPTIONS may hold only ${[
+      ...LAUNCH_NODE_OPTIONS_ALLOWLIST.booleanFlags,
+      ...LAUNCH_NODE_OPTIONS_ALLOWLIST.valuedFlags.map((flag) => `${flag}=<value>`),
+    ].join(
+      ', ',
+    )}. Flags that load or evaluate code or open a debugger are refused; the service attaches its own telemetry preload.`,
+  }),
+  'node-path-not-allowed': Object.freeze({
+    message:
+      "The dev-server command's NODE_PATH assignment is not a list of absolute node_modules directories.",
+    hint: "Assign NODE_PATH only absolute paths of node_modules directories, separated by ':' (';' on Windows).",
+  }),
+});
+
+/** The refusal of the assignment at 1-based word `position`; names the position, never the word. */
+function assignmentError(refusal: LaunchAssignmentRefusal, position: number): DebuggenError {
+  const { message, hint } = ASSIGNMENT_REFUSALS[refusal];
+  return commandError(refusal, message, hint, { position });
+}
+
+// ---------------------------------------------------------------------------
+// Which command may run: the dev-server command policy (CWE-78)
+// ---------------------------------------------------------------------------
+
+/** The package managers whose script runner a launch command may name, by bare binary. */
+const PACKAGE_MANAGER_BINARIES: ReadonlySet<string> = new Set(['pnpm', 'npm', 'yarn', 'bun']);
+
+/**
+ * Yarn's own commands. `yarn <name>` runs a script only when `<name>` is not
+ * one of these — `yarn install`, `yarn dlx`, `yarn exec` or `yarn node` run
+ * Yarn itself — so a bare `yarn <name>` is a script run for every other name.
+ */
+const YARN_BUILTIN_COMMANDS: ReadonlySet<string> = new Set([
+  'add',
+  'audit',
+  'bin',
+  'cache',
+  'config',
+  'create',
+  'dlx',
+  'exec',
+  'global',
+  'info',
+  'init',
+  'install',
+  'link',
+  'node',
+  'npm',
+  'pack',
+  'patch',
+  'plugin',
+  'publish',
+  'rebuild',
+  'remove',
+  'run',
+  'set',
+  'unlink',
+  'unplug',
+  'up',
+  'upgrade',
+  'version',
+  'why',
+  'workspace',
+  'workspaces',
+]);
+
+/**
+ * The word that ends npm's own options and hands the rest to the script. npm
+ * requires it before any dev-server option; pnpm, Yarn and Bun would pass it
+ * to the script verbatim, so for them it is refused.
+ */
+const END_OF_OPTIONS = '--';
+
+/** One valued option of {@link DEV_SERVER_ARGUMENT_ALLOWLIST}. */
+export interface DevServerValuedOption {
+  /** The long spelling, accepted as `--flag value` and `--flag=value`: `--port`. */
+  readonly long: string;
+  /** The short spelling, accepted as `-f value` only: `-p`. */
+  readonly short: string;
+  /** What the value is, as the refusal hint names it: `port 1-65535`. */
+  readonly valueName: string;
+  /** What the whole value must match. A separate value may also never start with `-`. */
+  readonly valuePattern: RegExp;
+}
+
+/** The shape of {@link DEV_SERVER_ARGUMENT_ALLOWLIST}. */
+export interface DevServerArgumentAllowlist {
+  /** Options that take no value, matched as whole words: `--turbopack`. */
+  readonly booleanOptions: readonly string[];
+  /** Options that take exactly one value, each with the value's pattern. */
+  readonly valuedOptions: readonly DevServerValuedOption[];
+}
+
+/**
+ * A TCP port in canonical decimal, `1`–`65535`: no sign, no leading zero, no
+ * `0` — exactly what `next dev --port` binds without reinterpretation.
+ */
+const TCP_PORT_PATTERN =
+  /^(?:[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$/;
+
+/**
+ * The **only** arguments a launch command may hand the dev server — the
+ * `next dev` options that choose where it listens and which bundler it
+ * uses, and nothing else — applied to every accepted form: after `dev` in
+ * `next dev …` and in Node running `…/node_modules/next/dist/bin/next dev …`,
+ * and after the script in a package-manager run (after npm's `--`):
+ *
+ * - valued: `-p`/`--port` (a TCP port, `1`–`65535`) and `-H`/`--hostname`
+ *   (a loopback host only: `localhost`, `127.0.0.1`, `::1` or `[::1]`), as
+ *   `--flag value` or `--flag=value`, and the short spelling as `-p value`
+ *   only;
+ * - boolean: `--turbo`, `--turbopack`, `--webpack`, `--disable-source-maps`,
+ *   `--no-server-fast-refresh`.
+ *
+ * The hostname is loopback-only because the service, its credentials and the
+ * extension's host permissions are loopback-only: an instrumented dev server
+ * bound to another interface would serve the developer's app, with its
+ * telemetry hooks armed, to other machines.
+ *
+ * **No positional argument is accepted at all**: `next dev <directory>`
+ * serves whatever directory it names, so `next dev /home/dev/private` or
+ * `pnpm run dev /elsewhere` would serve — and hand the preload's credential
+ * to — a tree outside the project. Every other option is refused, among them
+ * `--inspect` (a debugger any local process can attach to),
+ * `--experimental-upload-trace` (sends the debugging trace, which Next.js
+ * documents as sensitive, to any URL), `--experimental-https` (downloads the
+ * `mkcert` binary from the network, runs it and installs a local certificate
+ * authority into the user's trust stores), `--experimental-https-key`/`-cert`/
+ * `-ca` (read files the request names), `--experimental-cpu-prof`,
+ * `--internal-trace`, `--experimental-next-config-strip-types`, every Node
+ * loader or eval flag (`-e`, `-r`, `--require`, `--import`), `--` and any
+ * shell syntax. Widening this list is a security decision: every option added
+ * here is one a request may pass to a process holding a live credential.
+ */
+export const DEV_SERVER_ARGUMENT_ALLOWLIST: DevServerArgumentAllowlist = Object.freeze({
+  booleanOptions: Object.freeze([
+    '--turbo',
+    '--turbopack',
+    '--webpack',
+    '--disable-source-maps',
+    '--no-server-fast-refresh',
+  ]),
+  valuedOptions: Object.freeze([
+    Object.freeze({
+      long: '--port',
+      short: '-p',
+      valueName: 'port 1-65535',
+      valuePattern: TCP_PORT_PATTERN,
+    }),
+    Object.freeze({
+      long: '--hostname',
+      short: '-H',
+      valueName: 'loopback host: localhost, 127.0.0.1 or ::1',
+      valuePattern: /^(?:localhost|127\.0\.0\.1|::1|\[::1\])$/,
+    }),
+  ]),
+});
+
+/** Membership over {@link DEV_SERVER_ARGUMENT_ALLOWLIST}'s boolean options. */
+const DEV_SERVER_BOOLEAN_OPTION_SET: ReadonlySet<string> = new Set(
+  DEV_SERVER_ARGUMENT_ALLOWLIST.booleanOptions,
+);
+
+/** {@link DEV_SERVER_ARGUMENT_ALLOWLIST}'s valued options by long spelling. */
+const DEV_SERVER_LONG_OPTIONS: ReadonlyMap<string, DevServerValuedOption> = new Map(
+  DEV_SERVER_ARGUMENT_ALLOWLIST.valuedOptions.map((option) => [option.long, option]),
+);
+
+/** {@link DEV_SERVER_ARGUMENT_ALLOWLIST}'s valued options by short spelling. */
+const DEV_SERVER_SHORT_OPTIONS: ReadonlyMap<string, DevServerValuedOption> = new Map(
+  DEV_SERVER_ARGUMENT_ALLOWLIST.valuedOptions.map((option) => [option.short, option]),
+);
+
+/** How {@link checkLaunchCommand} accepted a command. */
+export type LaunchCommandForm = 'package-script' | 'framework-cli' | 'node-framework-cli';
+
+/** What {@link checkLaunchCommand} answers for a command it accepts. */
+export interface AcceptedLaunchCommand {
+  /**
+   * `'package-script'` — `pnpm|npm|bun run <script>`, `npm run-script
+   * <script>`, `yarn [run] <script>`; `'framework-cli'` — `next dev`;
+   * `'node-framework-cli'` — Node running `…/node_modules/next/dist/bin/next dev`.
+   */
+  readonly form: LaunchCommandForm;
+  /** The `package.json` script a `'package-script'` run starts; absent for the other forms. */
+  readonly script?: string;
+}
+
+/**
+ * Why {@link checkLaunchCommand} refused a command — its `details.reason`:
+ *
+ * - `'executable-not-allowed'` — the executable, or what it is asked to do,
+ *   is none of the accepted forms: a shell, `env`, `npx`/`pnpx`/`bunx`,
+ *   `pnpm exec`/`dlx`, a Yarn built-in, an interpreter, any other binary, or a
+ *   framework CLI run without its dev subcommand;
+ * - `'script-not-declared'` — a package-manager run names no script, or one
+ *   that is not among the project's dev-server scripts (`context.scripts`):
+ *   undeclared, declared but not starting a dev server (`deploy`, `lint`,
+ *   `postinstall`), or the manifest could not be read;
+ * - `'argument-not-allowed'` — an argument is not on
+ *   {@link DEV_SERVER_ARGUMENT_ALLOWLIST} (a positional such as a directory,
+ *   an unlisted option, a valued option without a valid value), a
+ *   package-manager option precedes the script, npm is handed an argument
+ *   before its `--`, or pnpm, Yarn or Bun is handed `--`; `details.argument`
+ *   is its 1-based index after the executable;
+ * - `'dev-cli-untrusted'` — Node is asked to run something other than a
+ *   trusted `node_modules/next/dist/bin/next` (a Node option, another script,
+ *   a missing file, or one another user could have written).
+ */
+export type LaunchCommandRefusal =
+  'executable-not-allowed' | 'script-not-declared' | 'argument-not-allowed' | 'dev-cli-untrusted';
+
+/** What {@link checkLaunchCommand} judges a parsed command against. */
+export interface LaunchCommandContext {
+  /**
+   * The project root as the caller gave it, in its native spelling: the
+   * child's working directory, and what a relative framework-CLI path
+   * resolves against.
+   */
+  readonly projectRoot: string;
+  /**
+   * The only scripts a package-manager run may start: the names of the
+   * project's dev-server scripts ({@link DevServerDetection.devServerScripts}
+   * — the selected dev script and every script that runs `next dev`), never
+   * every script `package.json` declares; `undefined` when the manifest was
+   * not read, which admits no package-manager run at all.
+   */
+  readonly scripts: readonly string[] | undefined;
+  /** Whose executable-name and path semantics apply. Default: this process's. */
+  readonly platform?: NodeJS.Platform | undefined;
+  /**
+   * The Node that runs this service — the only absolute executable a command
+   * may name, compared by real path. Default: `process.execPath`.
+   */
+  readonly nodeExecutablePath?: string | undefined;
+  /**
+   * Whether the framework-CLI script Node is asked to run is a file the
+   * service trusts to execute. Default: {@link isTrustedDevCliFile}.
+   */
+  readonly isTrustedFile?: ((path: string) => boolean) | undefined;
+  /**
+   * Whether a directory an assigned `NODE_PATH` names is one the service
+   * trusts the child to load modules from. Default:
+   * {@link isTrustedNodePathDirectory}.
+   */
+  readonly isTrustedDirectory?: ((path: string) => boolean) | undefined;
+  /**
+   * The canonical path of an executable, or `undefined` when it cannot be
+   * resolved. Default: `fs.realpathSync.native`.
+   */
+  readonly realpath?: ((path: string) => string | undefined) | undefined;
+}
+
+/**
+ * What {@link checkLaunchCommand} judges: the executable and its arguments,
+ * and — when the command came from {@link parseLaunchCommand} — its leading
+ * `NAME=value` assignments, whose `NODE_PATH` directories must be trusted.
+ */
+export type CheckedLaunchCommand = Pick<ParsedLaunchCommand, 'file' | 'args'> & {
+  readonly env?: ParsedLaunchCommand['env'] | undefined;
+};
+
+/**
+ * Decide whether a parsed launch command may run at all — **which program
+ * starts**, the half of CWE-78 that `spawn(…, { shell: false })` does not
+ * cover: with no shell option, `sh -c 'curl … | sh'` still runs, because `sh`
+ * is simply the executable. Exactly three forms are accepted, and nothing is
+ * configurable to widen them:
+ *
+ * 1. **A package-manager run of a dev-server script** — bare `pnpm`, `npm`,
+ *    `yarn` or `bun`, then `run <script>` (npm also `run-script <script>`),
+ *    or `yarn <script>` for a name that is no Yarn built-in (the form
+ *    `./detect.ts`'s `packageManagerRunArgs` produces). No package-manager
+ *    option may precede the script, and the script must be one of
+ *    `context.scripts` — the project's dev-server scripts, never merely any
+ *    script `package.json` declares (`deploy`, `db:reset`, `postinstall`).
+ *    After the script come dev-server options, and how depends on the
+ *    runner: **npm** reads every option before `--` as its own
+ *    configuration (`--node-options=…`), so it takes nothing before `--` and
+ *    the options only after it (`npm run dev -- --port 4174`); **pnpm, Yarn
+ *    and Bun** hand every word after the script to it verbatim — `--`
+ *    included, which Next.js would then read as the end of its options,
+ *    turning `--port` into a directory — so they take the options directly
+ *    and refuse `--` (`pnpm run dev --port 4174`).
+ * 2. **The framework's dev CLI** — bare `next` (see `FRAMEWORK_DEV_CLIS`),
+ *    its `dev` subcommand, then dev-server options.
+ * 3. **Node running the framework's dev CLI** — bare `node` (on Windows also
+ *    `node.exe`, case-insensitively) or an absolute path whose real path is
+ *    the service's own Node; then, with no Node option before it, a script
+ *    resolved against the project root whose path ends in
+ *    `/node_modules/next/dist/bin/next` and that `context.isTrustedFile`
+ *    accepts; then `dev` and dev-server options.
+ *
+ * In every form the dev-server options are only those
+ * {@link DEV_SERVER_ARGUMENT_ALLOWLIST} lists — where the server listens and
+ * which bundler it uses — and **no positional argument** is accepted, since
+ * `next dev <directory>` would serve a tree outside the project. Anything a
+ * developer needs beyond these forms belongs in a `package.json` script that
+ * runs `next dev`, which form 1 then runs. Executable names compare
+ * case-insensitively on Windows; script names and arguments always exactly.
+ *
+ * When the command carries its assignments (`parsed.env`), an assigned
+ * `NODE_PATH` must also name only directories the service trusts: each entry
+ * is absolute, ends in `node_modules` (as {@link checkLaunchAssignment}
+ * already checked) and passes `context.isTrustedDirectory` — by default an
+ * existing directory, symlinks followed, owned by the service's user and
+ * writable by neither its group nor anyone else. Otherwise the reason is
+ * `'node-path-not-allowed'`. A `NODE_PATH` the service inherited from its
+ * own environment is the developer's and is not judged here.
+ *
+ * **The trust boundary.** Together with {@link isTrustedDevCliFile}, this is
+ * what the service defends: a request can make the child run only code that
+ * is already owned by the service's own user and writable by no one else —
+ * the project's dependencies, the service's own Node. It does not defend
+ * against that same user, who can write such a file and already has code
+ * execution as that user, so a file only they can write is not a boundary
+ * this service claims.
+ *
+ * @param parsed The executable, its arguments and, optionally, its
+ * assignments, as {@link parseLaunchCommand} split them.
+ * @param context The project, its dev-server scripts and the checks' collaborators.
+ * @returns The accepted form (and, for a script run, the script), or
+ * `DEV_SERVER_LAUNCH_FAILED` with a {@link LaunchCommandRefusal} reason (or
+ * `'node-path-not-allowed'`) and a hint naming the fix. Nothing the command
+ * holds is echoed.
+ *
+ * @example
+ * ```ts
+ * checkLaunchCommand({ file: 'pnpm', args: ['run', 'dev'] }, { projectRoot, scripts: ['dev'] });
+ * // → ok({ form: 'package-script', script: 'dev' })
+ * checkLaunchCommand({ file: 'sh', args: ['-c', 'curl … | sh'] }, { projectRoot, scripts: ['dev'] });
+ * // → err(… details: { reason: 'executable-not-allowed' })
+ * checkLaunchCommand(
+ *   { file: 'next', args: ['dev'], env: { NODE_PATH: '/tmp/planted/node_modules' } },
+ *   { projectRoot, scripts: ['dev'] },
+ * );
+ * // → err(… details: { reason: 'node-path-not-allowed' }) unless that directory is trusted
+ * ```
+ */
+export function checkLaunchCommand(
+  parsed: CheckedLaunchCommand,
+  context: LaunchCommandContext,
+): Result<AcceptedLaunchCommand, DebuggenError> {
+  const platform = context.platform ?? process.platform;
+  const accepted = checkLaunchExecutable(parsed, context, platform);
+  if (isErr(accepted)) {
+    return accepted;
+  }
+  return hasTrustedNodePath(parsed.env, context, platform)
+    ? accepted
+    : err(untrustedNodePathError());
+}
+
+/** Which program {@link checkLaunchCommand} would start, judged on the executable and its arguments. */
+function checkLaunchExecutable(
+  parsed: CheckedLaunchCommand,
+  context: LaunchCommandContext,
+  platform: NodeJS.Platform,
+): Result<AcceptedLaunchCommand, DebuggenError> {
+  const file = typeof parsed.file === 'string' ? parsed.file : '';
+  const args = parsed.args;
+  const bare = platform === 'win32' ? file.toLowerCase() : file;
+
+  if (PACKAGE_MANAGER_BINARIES.has(bare)) {
+    return checkPackageScriptRun(bare, args, context.scripts);
+  }
+  const cli = FRAMEWORK_DEV_CLIS.find((entry) => entry.binary === bare);
+  if (cli !== undefined) {
+    if (args[0] !== cli.subcommand) {
+      return err(commandPolicyError('executable-not-allowed'));
+    }
+    const refused = firstRefusedDevServerArgument(args, 1);
+    return refused === undefined
+      ? ok(Object.freeze({ form: 'framework-cli' }))
+      : err(commandPolicyError('argument-not-allowed', refused));
+  }
+  if (isServiceNode(file, platform, context)) {
+    return checkNodeFrameworkCliRun(args, context, platform);
+  }
+  return err(commandPolicyError('executable-not-allowed'));
+}
+
+/**
+ * Whether every `NODE_PATH` assignment among `env` — matched
+ * case-insensitively on Windows — passes the syntactic check of
+ * {@link checkLaunchAssignment} and names only directories
+ * `context.isTrustedDirectory` accepts. No assignment is trivially trusted.
+ */
+function hasTrustedNodePath(
+  env: ParsedLaunchCommand['env'] | undefined,
+  context: LaunchCommandContext,
+  platform: NodeJS.Platform,
+): boolean {
+  if (env === undefined) {
+    return true;
+  }
+  const windows = platform === 'win32';
+  const trusted = context.isTrustedDirectory ?? isTrustedNodePathDirectory;
+  for (const [name, value] of Object.entries(env)) {
+    if ((windows ? name.toUpperCase() : name) !== NODE_PATH_NAME) {
+      continue;
+    }
+    if (typeof value !== 'string' || !isAllowedLaunchNodePath(value, platform)) {
+      return false;
+    }
+    const entries = value.split(windows ? ';' : ':');
+    if (!entries.every((entry) => answersTrue(() => trusted(entry)))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The refusal of a syntactically valid `NODE_PATH` that names a directory the
+ * service does not trust — fixed text; the path is never echoed.
+ */
+function untrustedNodePathError(): DebuggenError {
+  return commandError(
+    'node-path-not-allowed',
+    "The dev-server command's NODE_PATH assignment names a directory the service does not trust to load modules from.",
+    "Assign NODE_PATH only existing node_modules directories owned by the service's user that neither its group nor anyone else can write; reinstall the dependencies there if the directory is missing or writable by others.",
+  );
+}
+
+/**
+ * Whether a filesystem entry, as `statSync` reported it, could only have been
+ * written by the service's own user: on POSIX it is owned by this process's
+ * uid and neither its group nor anyone else may write it (`(mode & 0o022) ===
+ * 0`). Windows has no POSIX owner or mode bits to compare, so there the
+ * existence and kind checks of the callers are the whole of the check.
+ */
+function isWritableOnlyByServiceUser(stats: {
+  readonly uid: number;
+  readonly mode: number;
+}): boolean {
+  if (process.platform === 'win32' || typeof process.getuid !== 'function') {
+    return true;
+  }
+  return stats.uid === process.getuid() && (stats.mode & 0o022) === 0;
+}
+
+/**
+ * The default trust check of a framework-CLI script Node is asked to run:
+ * the path, symlinks followed, is a regular file — and on POSIX one owned by
+ * the service's own user that neither its group nor anyone else may write
+ * (`(mode & 0o022) === 0`), so no other account can have planted or edited
+ * the code the dev server would run. A path that cannot be read is untrusted.
+ *
+ * This is the trust boundary {@link checkLaunchCommand} states: a request can
+ * run only code already owned by the service's user and writable by no one
+ * else. A file that same user can write is not a boundary this service
+ * defends — whoever can write it already runs code as that user.
+ *
+ * @param path The resolved, absolute path of the script.
+ * @returns `true` when the file may run.
+ */
+export function isTrustedDevCliFile(path: string): boolean {
+  try {
+    const stats = statSync(path);
+    return stats.isFile() && isWritableOnlyByServiceUser(stats);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The default trust check of a directory an assigned `NODE_PATH` names: the
+ * path, symlinks followed, is an existing directory — and on POSIX one owned
+ * by the service's own user that neither its group nor anyone else may write,
+ * so no other account can add or replace a module the child would resolve
+ * from it. A missing path, a file, or one that cannot be read is untrusted.
+ * The same trust boundary as {@link isTrustedDevCliFile} applies.
+ *
+ * @param path An absolute `NODE_PATH` entry.
+ * @returns `true` when the child may load modules from it.
+ *
+ * @example
+ * ```ts
+ * isTrustedNodePathDirectory('/home/dev/storefront/node_modules'); // → true when this user owns it, mode 0755
+ * isTrustedNodePathDirectory('/tmp/planted/node_modules');         // → false when missing or mode 0777
+ * ```
+ */
+export function isTrustedNodePathDirectory(path: string): boolean {
+  try {
+    const stats = statSync(path);
+    return stats.isDirectory() && isWritableOnlyByServiceUser(stats);
+  } catch {
+    return false;
+  }
+}
+
+/** Form 1 of {@link checkLaunchCommand}: a package-manager run of a dev-server script. */
+function checkPackageScriptRun(
+  manager: string,
+  args: readonly string[],
+  scripts: readonly string[] | undefined,
+): Result<AcceptedLaunchCommand, DebuggenError> {
+  const first = args[0];
+  if (first === undefined) {
+    return err(commandPolicyError('script-not-declared'));
+  }
+  if (first.startsWith('-')) {
+    // A package-manager option (`--filter`, `-C`, `--node-options`) before the script.
+    return err(commandPolicyError('argument-not-allowed', 1));
+  }
+  let scriptIndex: number;
+  if (first === 'run' || (manager === 'npm' && first === 'run-script')) {
+    scriptIndex = 1;
+  } else if (manager === 'yarn' && !YARN_BUILTIN_COMMANDS.has(first)) {
+    scriptIndex = 0;
+  } else {
+    // `pnpm exec`, `pnpm dlx`, `npm install`, `yarn install`, `bun x` …
+    return err(commandPolicyError('executable-not-allowed'));
+  }
+
+  const script = args[scriptIndex];
+  if (script === undefined) {
+    return err(commandPolicyError('script-not-declared'));
+  }
+  if (script.startsWith('-')) {
+    return err(commandPolicyError('argument-not-allowed', scriptIndex + 1));
+  }
+  if (scripts === undefined || !scripts.includes(script)) {
+    return err(commandPolicyError('script-not-declared'));
+  }
+
+  let optionsStart = scriptIndex + 1;
+  if (manager === 'npm' && optionsStart < args.length) {
+    // npm reads an option before `--` as its own configuration and hands a
+    // bare word to the script as a positional, so nothing but `--` may follow
+    // the script directly; the dev-server options come after it.
+    if (args[optionsStart] !== END_OF_OPTIONS) {
+      return err(commandPolicyError('argument-not-allowed', optionsStart + 1));
+    }
+    optionsStart += 1;
+  }
+  // pnpm, Yarn and Bun pass every word after the script through verbatim, so
+  // a `--` among them would reach Next.js, which the allowlist refuses; for
+  // npm a second `--` is refused the same way.
+  const refused = firstRefusedDevServerArgument(args, optionsStart);
+  return refused === undefined
+    ? ok(Object.freeze({ form: 'package-script', script }))
+    : err(commandPolicyError('argument-not-allowed', refused));
+}
+
+/** Form 3 of {@link checkLaunchCommand}: the service's Node running a trusted framework CLI. */
+function checkNodeFrameworkCliRun(
+  args: readonly string[],
+  context: LaunchCommandContext,
+  platform: NodeJS.Platform,
+): Result<AcceptedLaunchCommand, DebuggenError> {
+  const script = args[0];
+  if (script === undefined || script.startsWith('-') || /[\0\r\n]/.test(script)) {
+    return err(commandPolicyError('dev-cli-untrusted'));
+  }
+  const resolved = (platform === 'win32' ? win32 : posix).resolve(context.projectRoot, script);
+  const cli = FRAMEWORK_DEV_CLIS.find((entry) => isFrameworkBinPath(resolved, entry, platform));
+  const trusted = context.isTrustedFile ?? isTrustedDevCliFile;
+  if (cli === undefined || !answersTrue(() => trusted(resolved))) {
+    return err(commandPolicyError('dev-cli-untrusted'));
+  }
+  if (args[1] !== cli.subcommand) {
+    return err(commandPolicyError('executable-not-allowed'));
+  }
+  const refused = firstRefusedDevServerArgument(args, 2);
+  return refused === undefined
+    ? ok(Object.freeze({ form: 'node-framework-cli' }))
+    : err(commandPolicyError('argument-not-allowed', refused));
+}
+
+/**
+ * Whether an executable is the service's own Node: bare `node` (on Windows
+ * also `node.exe`, case-insensitively), or an absolute path whose real path
+ * is the real path of `context.nodeExecutablePath`.
+ */
+function isServiceNode(
+  file: string,
+  platform: NodeJS.Platform,
+  context: LaunchCommandContext,
+): boolean {
+  const windows = platform === 'win32';
+  const bare = windows ? file.toLowerCase() : file;
+  if (bare === 'node' || (windows && bare === 'node.exe')) {
+    return true;
+  }
+  if (windows ? !WINDOWS_ROOTED_PATH.test(file) : !isAbsolutePosix(file)) {
+    return false;
+  }
+  const realpath = context.realpath ?? defaultRealpath;
+  const candidate = realpathOrUndefined(realpath, file);
+  const service = realpathOrUndefined(realpath, context.nodeExecutablePath ?? process.execPath);
+  if (candidate === undefined || service === undefined) {
+    return false;
+  }
+  return windows ? candidate.toLowerCase() === service.toLowerCase() : candidate === service;
+}
+
+/** Whether a resolved path names `entry`'s package binary under a `node_modules` directory. */
+function isFrameworkBinPath(
+  resolved: string,
+  entry: FrameworkDevCli,
+  platform: NodeJS.Platform,
+): boolean {
+  const suffix = `/node_modules/${entry.packageBin}`;
+  return platform === 'win32'
+    ? toPosix(resolved).toLowerCase().endsWith(suffix.toLowerCase())
+    : resolved.endsWith(suffix);
+}
+
+/**
+ * Walk `args` from index `start` against {@link DEV_SERVER_ARGUMENT_ALLOWLIST}
+ * and answer the 1-based index (after the executable) of the first word it
+ * does not admit, or `undefined` when every word is admitted:
+ *
+ * - a boolean option is admitted as the whole word (`--turbopack`; never
+ *   `--turbopack=1`);
+ * - a valued option is admitted as `--long=value`, or as `--long value` or
+ *   `-s value` where the separate value does not start with `-`, the value
+ *   matching the option's `valuePattern`; the refused index is the value's
+ *   when the value is wrong, the option's when it has none;
+ * - every other word — a positional, `--`, an unlisted option, `-p=4173` — is
+ *   refused where it stands.
+ *
+ * The walk mirrors how Next.js's option parser consumes the same words, so
+ * no word it would read as an option value can slip past as something else.
+ */
+function firstRefusedDevServerArgument(args: readonly string[], start: number): number | undefined {
+  for (let index = start; index < args.length; index += 1) {
+    const word = args[index] ?? '';
+    if (DEV_SERVER_BOOLEAN_OPTION_SET.has(word)) {
+      continue;
+    }
+    const equals = word.indexOf('=');
+    if (word.startsWith('--') && equals > 2) {
+      const option = DEV_SERVER_LONG_OPTIONS.get(word.slice(0, equals));
+      if (option === undefined || !option.valuePattern.test(word.slice(equals + 1))) {
+        return index + 1;
+      }
+      continue;
+    }
+    const option = DEV_SERVER_LONG_OPTIONS.get(word) ?? DEV_SERVER_SHORT_OPTIONS.get(word);
+    if (option === undefined) {
+      return index + 1;
+    }
+    const value = args[index + 1];
+    if (value === undefined) {
+      return index + 1;
+    }
+    if (value.startsWith('-') || !option.valuePattern.test(value)) {
+      return index + 2;
+    }
+    index += 1;
+  }
+  return undefined;
+}
+
+/** A path's real path through an injected resolver that may throw or answer anything. */
+function realpathOrUndefined(
+  realpath: (path: string) => string | undefined,
+  path: string,
+): string | undefined {
+  try {
+    const resolved: unknown = realpath(path);
+    return typeof resolved === 'string' && resolved.length > 0 ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether an injected predicate answered a literal `true`; a throw is `false`. */
+function answersTrue(predicate: () => unknown): boolean {
+  try {
+    return predicate() === true;
+  } catch {
+    return false;
+  }
+}
+
+/** The default real-path resolver: `fs.realpathSync.native`, `undefined` for any failure. */
+function defaultRealpath(path: string): string | undefined {
+  try {
+    return realpathSync.native(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The fixed message and hint of each {@link LaunchCommandRefusal}; none echoes the command. */
+const COMMAND_POLICY_REFUSALS: Readonly<
+  Record<LaunchCommandRefusal, { readonly message: string; readonly hint: string }>
+> = Object.freeze({
+  'executable-not-allowed': Object.freeze({
+    message:
+      'The dev-server command does not start a dev server in a form the service runs: shells, env, npx, package-manager exec and arbitrary programs are refused.',
+    hint: COMMAND_FORMS_HINT,
+  }),
+  'script-not-declared': Object.freeze({
+    message:
+      "The dev-server command runs no script that is one of this project's dev-server scripts, so it was not started.",
+    hint: "A package-manager run may start only one of the project's dev-server scripts: the detected dev script or another package.json script that runs next dev — never a script such as deploy, lint or postinstall. Run one of them, add the command you need as a script that runs next dev and run that, or omit the command to use the detected dev script.",
+  }),
+  'argument-not-allowed': Object.freeze({
+    message: 'The dev-server command passes an argument the service does not hand a dev server.',
+    hint: `After the dev command, only these Next.js dev options are passed: ${[
+      ...DEV_SERVER_ARGUMENT_ALLOWLIST.valuedOptions.map(
+        (option) => `${option.short}/${option.long} <${option.valueName}>`,
+      ),
+      ...DEV_SERVER_ARGUMENT_ALLOWLIST.booleanOptions,
+    ].join(
+      ', ',
+    )}. A positional argument such as a project directory, every other option and any shell syntax are refused, and no package-manager option may precede the script. npm takes the options only after -- ("npm run dev -- --port 4174"); pnpm, yarn and bun take them directly after the script, without -- ("pnpm run dev --port 4174"). Move anything else into a package.json script that runs next dev.`,
+  }),
+  'dev-cli-untrusted': Object.freeze({
+    message:
+      "The dev-server command runs Node with something other than the project's own framework dev CLI.",
+    hint: `Node may run only ${FRAMEWORK_DEV_CLIS.map(
+      (entry) => `node_modules/${entry.packageBin} ${entry.subcommand}`,
+    ).join(
+      ' or ',
+    )}, with no Node option before it, from a regular file owned by the service's user that no one else can write. Pass Node options through an assigned NODE_OPTIONS, reinstall the project's dependencies if that file is missing or writable by others, or launch the package.json dev script instead.`,
+  }),
+});
+
+/**
+ * The refusal of a command by {@link checkLaunchCommand}: fixed text, and for
+ * an argument its 1-based index after the executable — never the word.
+ */
+function commandPolicyError(refusal: LaunchCommandRefusal, argument?: number): DebuggenError {
+  const { message, hint } = COMMAND_POLICY_REFUSALS[refusal];
+  return commandError(refusal, message, hint, argument === undefined ? {} : { argument });
 }
 
 // ---------------------------------------------------------------------------
@@ -1935,16 +3128,19 @@ export interface ServerAgentCredentialIssueInput {
   /**
    * The expiry in epoch milliseconds. Always set by this launcher: the first
    * lease of a launched child ({@link DEFAULT_MANAGED_CREDENTIAL_LEASE_MS},
-   * renewed while the child runs), or the fixed lifetime of a credential for
-   * {@link DEV_SERVER_CREDENTIAL_PATH}.
+   * renewed while the child runs), or the first lease of a credential for
+   * {@link DEV_SERVER_CREDENTIAL_PATH} ({@link DEFAULT_CLI_CREDENTIAL_LEASE_MS},
+   * renewed while its dev server's control connection is online).
    */
   readonly expiresAt?: number | undefined;
   /**
    * `true` for a launched child's credential: a lease this service holds and
    * renews while the child runs, which the access boundary revokes on the next
    * start if this service crashed. Absent for a
-   * {@link DEV_SERVER_CREDENTIAL_PATH} credential, which a dev server the
-   * developer started holds on its own.
+   * {@link DEV_SERVER_CREDENTIAL_PATH} credential, which belongs to a dev
+   * server the developer started: the launcher renews and revokes it while it
+   * runs, and after a crash of this service it lapses within one
+   * {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}.
    */
   readonly lease?: boolean | undefined;
 }
@@ -2213,9 +3409,11 @@ export type SpawnLike = (
 ) => ChildProcessLike;
 
 /**
- * Send a signal to the process group led by `pid` — `0` only tests whether any
- * member is alive — throwing an `ESRCH` error when the group is gone, as
- * `process.kill` does. Default: `process.kill(-pid, signal)`.
+ * Send a signal to the process group led by `pid`, throwing an `ESRCH` error
+ * when the group is gone, as `process.kill` does. Default:
+ * `process.kill(-pid, signal)`. The launcher sends real signals only: `0`
+ * would say that *some* group of that id exists, never whose, so group
+ * membership after a leader's exit comes from a {@link ProcessGroupInspector}.
  */
 export type SignalProcessGroup = (pid: number, signal: NodeJS.Signals | 0) => void;
 
@@ -2282,8 +3480,26 @@ export interface DevServerLauncherDeps {
   readonly parentEnv?: ParentEnvironment | undefined;
   /** Default: `child_process.spawn`. */
   readonly spawnImpl?: SpawnLike | undefined;
-  /** Default: `process.kill(-pid, signal)`. */
+  /**
+   * Default: `process.kill(-pid, signal)`, for a real POSIX spawn only. The
+   * launcher signals a child's group directly only while the child (its
+   * leader) is unreaped; after it exits, only a group
+   * {@link DevServerLauncherDeps.processGroupInspector} verified.
+   */
   readonly signalProcessGroup?: SignalProcessGroup | undefined;
+  /**
+   * Who is in a child's process group, so that after the leader exits the
+   * launcher signals the group only while it holds a process the launcher
+   * saw in it before — never a bare, possibly recycled, group id. Default:
+   * {@link createProcessGroupInspector} over the service's environment when
+   * the default spawn and signaller are in use (a real POSIX spawn); an
+   * inspector that cannot tell whenever `spawnImpl` or `signalProcessGroup`
+   * is injected without one, so a test's fake pid is never looked up on the
+   * host — and a group that cannot be verified is never signalled. An
+   * inspector with `confirm` is also asked, synchronously, right before each
+   * such signal, and a group it does not confirm is not signalled.
+   */
+  readonly processGroupInspector?: ProcessGroupInspector | undefined;
   /** Default: `./detect.ts`'s {@link detectDevServer}. */
   readonly detect?: typeof detectDevServer | undefined;
   /** Default: `./detect.ts`'s {@link probeDevServer}. */
@@ -2317,6 +3533,28 @@ export interface DevServerLauncherDeps {
    * children injects one that answers for them.
    */
   readonly listenerOwnership?: ListenerOwnership | undefined;
+  /**
+   * The Node that runs this service: the only absolute executable a launch
+   * command may name ({@link checkLaunchCommand}, compared by real path).
+   * Default: `process.execPath`.
+   */
+  readonly nodeExecutablePath?: string | undefined;
+  /**
+   * Whether the framework-CLI script a launch command runs with Node is a
+   * file the service trusts to execute. Default: {@link isTrustedDevCliFile}.
+   */
+  readonly isTrustedDevCli?: ((path: string) => boolean) | undefined;
+  /**
+   * Whether a directory a launch command's `NODE_PATH` assignment names is
+   * one the service trusts the child to load modules from. Default:
+   * {@link isTrustedNodePathDirectory}.
+   */
+  readonly isTrustedDevDirectory?: ((path: string) => boolean) | undefined;
+  /**
+   * The canonical path of an executable a launch command names, or
+   * `undefined` when it cannot be resolved. Default: `fs.realpathSync.native`.
+   */
+  readonly realpath?: ((path: string) => string | undefined) | undefined;
   /** Existence check for preload candidates. Default: a regular file at the path. */
   readonly fileExists?: ((path: string) => boolean) | undefined;
   /** Existence check for a project root. Default: a directory at the path. */
@@ -2343,8 +3581,12 @@ export interface DevServerLauncherDeps {
   readonly readyProbeTimeoutMs?: number | undefined;
   /** Default {@link DEFAULT_STOP_GRACE_MS}. */
   readonly stopGraceMs?: number | undefined;
-  /** Default {@link DEFAULT_CLI_CREDENTIAL_TTL_MS}. */
-  readonly cliCredentialTtlMs?: number | undefined;
+  /** Default {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}. */
+  readonly cliCredentialLeaseMs?: number | undefined;
+  /** Default {@link CLI_CREDENTIAL_CHECK_INTERVAL_MS}. */
+  readonly cliCredentialCheckIntervalMs?: number | undefined;
+  /** Default {@link CLI_CREDENTIAL_DISCONNECT_GRACE_MS}. */
+  readonly cliCredentialDisconnectGraceMs?: number | undefined;
   /** Default {@link DEFAULT_MANAGED_CREDENTIAL_LEASE_MS}. */
   readonly managedCredentialLeaseMs?: number | undefined;
   /** Default: the global `setTimeout`. */
@@ -2391,7 +3633,10 @@ export interface LaunchedDevServer {
   readonly status: LaunchedDevServerStatus;
   /** The executable's name (no arguments). */
   readonly command: string;
-  /** The `package.json` script it runs, when the command was derived from one. */
+  /**
+   * The `package.json` script it runs, when it runs one: the detected dev
+   * script, or the script a request's package-manager run named.
+   */
   readonly script?: string;
 }
 
@@ -2566,9 +3811,20 @@ export interface DevServerLauncher {
    */
   stop(input: DevServerStopInput): Promise<Result<{ readonly stopped: boolean }, DebuggenError>>;
   /**
-   * Mint a time-bounded `server-agent` credential for a dev server the caller
-   * starts itself — the logic behind {@link DEV_SERVER_CREDENTIAL_PATH}. The
-   * route authorises (editor role and project scope); this validates and mints.
+   * Mint a `server-agent` credential for a dev server the caller starts
+   * itself — the logic behind {@link DEV_SERVER_CREDENTIAL_PATH}. The route
+   * authorises (editor role and project scope); this validates, mints and
+   * supervises. Runs synchronously from its entry to the issuer's `issue`.
+   *
+   * The credential is a lease of {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}: the
+   * answer's `expiresAt` is the end of the first lease. The launcher renews it
+   * while a `server-agent` control connection authenticated with it is online
+   * ({@link DevServerLauncherDeps.serverAgentConnections}), revokes it
+   * {@link CLI_CREDENTIAL_DISCONNECT_GRACE_MS} after that connection is gone —
+   * the dev server exited — or at the end of the first lease when no preload
+   * ever connected with it, and revokes it on {@link dispose}. {@link stop},
+   * {@link stopForSession} and {@link stopAll} never touch it: this service did
+   * not start its dev server.
    */
   issueCredential(
     input: DevServerCredentialRequest,
@@ -3709,6 +4965,396 @@ async function runLookup(
 }
 
 // ---------------------------------------------------------------------------
+// Process-group identity: which processes a group id names right now
+// ---------------------------------------------------------------------------
+
+/**
+ * One live process as a {@link ProcessGroupInspector} reports it. The pair
+ * (`pid`, `startToken`) identifies a process across time: a recycled pid
+ * belongs to a process that started later, so its token differs.
+ */
+export interface ProcessIdentity {
+  /** The process id. */
+  readonly pid: number;
+  /** The id of the process group it belongs to. */
+  readonly pgid: number;
+  /**
+   * When the process started, as the operating system records it — opaque,
+   * compared for equality only: the `starttime` field of `/proc/<pid>/stat`
+   * (clock ticks since boot, typically 1/100 s) on Linux, `ps`'s `lstart`
+   * (to the second) elsewhere. Two processes share a token only when the
+   * same pid is handed out again within one tick (or second) of the first
+   * one's start — which sequential pid allocation cannot do: the counter
+   * must wrap the whole pid space first.
+   */
+  readonly startToken: string;
+}
+
+/**
+ * The live members of a process group. The launcher asks after a launched
+ * child's leader has exited, when a bare group id no longer proves whose
+ * group it is: the kernel may have handed the id to an unrelated process
+ * ({@link DevServerLauncherDeps.processGroupInspector}).
+ */
+export interface ProcessGroupInspector {
+  /**
+   * Every live (non-zombie) process whose process group id is `pgid`, or
+   * `undefined` when the operating system could not tell. Never rejects,
+   * never throws and never logs what a lookup read.
+   *
+   * @param pgid The process group id: the launched child's pid.
+   */
+  members(pgid: number): Promise<readonly ProcessIdentity[] | undefined>;
+  /**
+   * Confirm, **synchronously**, that one process is still exactly the one
+   * `identity` describes: `true` — that pid exists, is not a zombie, is in
+   * process group `identity.pgid` and has `identity.startToken`; `false` —
+   * it is not (gone, a zombie, in another group, or another process on a
+   * recycled pid); `undefined` — the operating system could not tell. Never
+   * throws and never logs what it read.
+   *
+   * Synchronous by contract: the launcher calls it immediately before a
+   * group signal, with no `await` in between, so nothing else in the service
+   * runs between the answer and the delivery. Optional: an inspector that
+   * could only answer by blocking the event loop (a `ps` command) omits it,
+   * and the launcher then relies on the listing alone.
+   *
+   * @param identity A member the launcher pinned in the child's group.
+   */
+  confirm?(identity: ProcessIdentity): boolean | undefined;
+}
+
+/**
+ * Options of {@link createProcessGroupInspector}: those of
+ * {@link ListenerOwnershipOptions} — `platform`, the Linux `fs`, the `ps`
+ * command runner, the environment `ps` runs with, and its timeout — plus the
+ * synchronous reader of the Linux `confirm`.
+ */
+export interface ProcessGroupInspectorOptions extends ListenerOwnershipOptions {
+  /**
+   * Read a whole file synchronously as UTF-8 text, throwing an errno-coded
+   * error (`ENOENT`, `ESRCH`, `EACCES`…) the way `node:fs` does: how the
+   * Linux {@link ProcessGroupInspector.confirm} reads `/proc/<pid>/stat`.
+   * Default: `fs.readFileSync(path, 'utf8')`.
+   */
+  readonly readFileSync?: ((path: string) => string) | undefined;
+}
+
+/** The `ps` arguments that print every process's pid, group, state and start time, headerless. */
+const PS_GROUP_ARGS: readonly string[] = Object.freeze([
+  '-A',
+  '-o',
+  'pid=',
+  '-o',
+  'pgid=',
+  '-o',
+  'stat=',
+  '-o',
+  'lstart=',
+]);
+
+/** One `ps` row of {@link PS_GROUP_ARGS}: pid, pgid, state, then the start time to the end of the line. */
+const PS_GROUP_ROW = /^\s*(\d{1,10})\s+(\d{1,10})\s+(\S+)\s+(\S.*?)\s*$/;
+
+/** The field index (after the command name's last `)`) of a `/proc/<pid>/stat` line's state. */
+const STAT_STATE_FIELD = 0;
+
+/** The field index of the process group id, after the last `)`. */
+const STAT_PGRP_FIELD = 2;
+
+/** The field index of the start time (clock ticks since boot), after the last `)`. */
+const STAT_STARTTIME_FIELD = 19;
+
+/** A start token's longest accepted length; anything longer is a malformed answer. */
+const MAX_START_TOKEN_LENGTH = 256;
+
+/** The inspector a launcher uses when it may not look at the host's processes: it cannot tell. */
+const UNVERIFIABLE_GROUP_INSPECTOR: ProcessGroupInspector = Object.freeze({
+  members: (): Promise<readonly ProcessIdentity[] | undefined> => Promise.resolve(undefined),
+});
+
+/**
+ * Create the default {@link ProcessGroupInspector} for a platform.
+ *
+ * - **Linux** (and Android): `/proc` alone, no command. Every
+ *   `/proc/<pid>/stat` is read and split after the **last** `)` — the command
+ *   name before it is parenthesised and may hold `)` or spaces — for the state
+ *   (field 0), the process group (field 2) and the start time (field 19).
+ *   Zombies (`Z`) and dead entries (`X`) are no members, and a process that
+ *   vanishes mid-listing is skipped; any other read failure, or a line in any
+ *   other shape, is `undefined`. `confirm` reads the one
+ *   `/proc/<pid>/stat` synchronously through `options.readFileSync` and
+ *   parses it the same way: a missing process (`ENOENT`, `ESRCH`) is
+ *   `false`, any other failure or shape `undefined`.
+ * - **macOS and other POSIX systems**: `ps -A -o pid= -o pgid= -o stat= -o
+ *   lstart=` (`/bin/ps` on macOS, `ps` on the service's `PATH` elsewhere),
+ *   through `execFile` semantics with the lookup environment and timeout of
+ *   {@link createListenerOwnership}; `lstart`, whitespace collapsed, is the
+ *   start token, and a state starting with `Z` is no member. A non-zero exit,
+ *   a timeout or any row in another shape is `undefined`. There is no
+ *   `confirm`: a synchronous `ps` would block the service's event loop.
+ * - **Windows**: `undefined` and no `confirm` — there are no process groups
+ *   to verify.
+ *
+ * Only the validated group id is compared against; nothing is interpolated
+ * into a command, and nothing a lookup read is logged or kept.
+ *
+ * @param options Platform, filesystem, synchronous reader, command runner and
+ * environment; all optional.
+ * @returns The inspector. It holds no resources between calls.
+ *
+ * @example
+ * ```ts
+ * const inspector = createProcessGroupInspector({ env: process.env });
+ * await inspector.members(child.pid); // → [{ pid, pgid, startToken }, …] or undefined
+ * inspector.confirm?.(pinned);        // → true while that very process is still in the group (Linux)
+ * ```
+ */
+export function createProcessGroupInspector(
+  options: ProcessGroupInspectorOptions = {},
+): ProcessGroupInspector {
+  const platform = options.platform ?? process.platform;
+  const list = groupListingFor(options, platform);
+  const confirm = groupConfirmationFor(options, platform);
+  return Object.freeze({
+    members: async (pgid: number): Promise<readonly ProcessIdentity[] | undefined> => {
+      if (validPid(pgid) === undefined || list === undefined) {
+        return undefined;
+      }
+      try {
+        const members = await list(pgid);
+        return members === undefined ? undefined : Object.freeze(members);
+      } catch {
+        // A listing that fails in a way it did not anticipate cannot tell.
+        return undefined;
+      }
+    },
+    ...(confirm === undefined ? {} : { confirm }),
+  });
+}
+
+/**
+ * The synchronous confirmation for the configured platform: `/proc` on Linux
+ * and Android, none elsewhere (see {@link createProcessGroupInspector}).
+ */
+function groupConfirmationFor(
+  options: ProcessGroupInspectorOptions,
+  platform: NodeJS.Platform,
+): ((identity: ProcessIdentity) => boolean | undefined) | undefined {
+  if (platform !== 'linux' && platform !== 'android') {
+    return undefined;
+  }
+  const read = options.readFileSync ?? defaultReadFileSync;
+  return (identity) => {
+    try {
+      return procConfirmsIdentity(read, identity);
+    } catch {
+      // A confirmation that fails in a way it did not anticipate cannot tell.
+      return undefined;
+    }
+  };
+}
+
+/**
+ * Linux: whether `/proc/<pid>/stat` still shows `identity` — the same pid,
+ * alive (no `Z` or `X` state), in the same group, with the same start time.
+ * `false` when the process is gone; `undefined` for an identity that is no
+ * identity, or a read or line the kernel would not produce.
+ */
+function procConfirmsIdentity(
+  read: (path: string) => string,
+  identity: ProcessIdentity,
+): boolean | undefined {
+  const pid = validPid(identity.pid);
+  const pgid = validPid(identity.pgid);
+  if (pid === undefined || pgid === undefined || typeof identity.startToken !== 'string') {
+    return undefined;
+  }
+  let stat: unknown;
+  try {
+    stat = read(`${PROC_ROOT}/${String(pid)}/stat`);
+  } catch (error) {
+    return isVanished(error) ? false : undefined;
+  }
+  const entry = typeof stat === 'string' ? groupEntryOfStat(stat) : undefined;
+  if (entry === undefined) {
+    return undefined;
+  }
+  return (
+    entry.state !== 'Z' &&
+    entry.state !== 'X' &&
+    entry.pgid === pgid &&
+    entry.startToken === identity.startToken
+  );
+}
+
+/** One platform's group listing over a validated group id; `undefined` where there is none. */
+type GroupListing = (pgid: number) => Promise<ProcessIdentity[] | undefined>;
+
+/** The listing for the configured platform, or `undefined` on Windows. */
+function groupListingFor(
+  options: ProcessGroupInspectorOptions,
+  platform: NodeJS.Platform,
+): GroupListing | undefined {
+  switch (platform) {
+    case 'linux':
+    case 'android': {
+      const fs = options.fs ?? defaultOwnershipFs;
+      return (pgid) => procGroupMembers(fs, pgid);
+    }
+    case 'win32':
+      return undefined;
+    default: {
+      const run = options.runCommand ?? defaultRunCommand;
+      const ps = platform === 'darwin' ? DARWIN_LOOKUP_COMMANDS.ps : POSIX_LOOKUP_COMMANDS.ps;
+      const commandOptions: ListenerOwnershipCommandOptions = {
+        timeoutMs: positiveOr(options.commandTimeoutMs, DEFAULT_LISTENER_LOOKUP_TIMEOUT_MS),
+        env: lookupEnvironment(options.env ?? process.env, platform),
+      };
+      return (pgid) => psGroupMembers(run, ps, commandOptions, pgid);
+    }
+  }
+}
+
+/** Linux: the members of `pgid` from every `/proc/<pid>/stat`. */
+async function procGroupMembers(
+  fs: ListenerOwnershipFs,
+  pgid: number,
+): Promise<ProcessIdentity[] | undefined> {
+  let names: readonly string[];
+  try {
+    names = await fs.readdir(PROC_ROOT);
+  } catch {
+    return undefined;
+  }
+  const members: ProcessIdentity[] = [];
+  for (const name of names) {
+    const pid = DECIMAL_NAME_PATTERN.test(name) ? validPid(Number(name)) : undefined;
+    if (pid === undefined) {
+      continue;
+    }
+    let stat: string;
+    try {
+      stat = await fs.readFile(`${PROC_ROOT}/${String(pid)}/stat`);
+    } catch (error) {
+      if (isVanished(error)) {
+        continue;
+      }
+      return undefined;
+    }
+    const entry = groupEntryOfStat(stat);
+    if (entry === undefined) {
+      return undefined;
+    }
+    if (entry.pgid === pgid && entry.state !== 'Z' && entry.state !== 'X') {
+      members.push({ pid, pgid, startToken: entry.startToken });
+    }
+  }
+  return members;
+}
+
+/**
+ * The state, group and start time in a `/proc/<pid>/stat` line, read after
+ * the **last** `)`; `undefined` for a line in any other shape.
+ */
+function groupEntryOfStat(
+  stat: string,
+): { readonly state: string; readonly pgid: number; readonly startToken: string } | undefined {
+  const close = stat.lastIndexOf(')');
+  if (close < 0) {
+    return undefined;
+  }
+  const fields = stat
+    .slice(close + 1)
+    .trim()
+    .split(/\s+/);
+  const state = fields[STAT_STATE_FIELD];
+  const pgrp = fields[STAT_PGRP_FIELD];
+  const start = fields[STAT_STARTTIME_FIELD];
+  if (
+    state === undefined ||
+    !/^[A-Za-z]$/.test(state) ||
+    pgrp === undefined ||
+    !DECIMAL_NAME_PATTERN.test(pgrp) ||
+    start === undefined ||
+    !/^\d{1,20}$/.test(start)
+  ) {
+    return undefined;
+  }
+  return { state, pgid: Number(pgrp), startToken: start };
+}
+
+/** macOS and other POSIX systems: the members of `pgid` from one `ps` listing. */
+async function psGroupMembers(
+  run: ListenerOwnershipRunCommand,
+  ps: string,
+  options: ListenerOwnershipCommandOptions,
+  pgid: number,
+): Promise<ProcessIdentity[] | undefined> {
+  const outcome = await runLookup(run, ps, PS_GROUP_ARGS, options);
+  if (outcome === undefined || outcome.exitCode !== 0) {
+    return undefined;
+  }
+  const members: ProcessIdentity[] = [];
+  for (const line of outcome.stdout.split(/\r?\n/)) {
+    if (line.trim().length === 0) {
+      continue;
+    }
+    const row = PS_GROUP_ROW.exec(line);
+    const pid = validPid(Number(row?.[1]));
+    const group = validPid(Number(row?.[2]));
+    const state = row?.[3];
+    const startToken = row?.[4]?.replace(/\s+/g, ' ');
+    if (
+      pid === undefined ||
+      group === undefined ||
+      state === undefined ||
+      startToken === undefined ||
+      startToken.length > MAX_START_TOKEN_LENGTH
+    ) {
+      return undefined;
+    }
+    if (group === pgid && !state.startsWith('Z')) {
+      members.push({ pid, pgid, startToken });
+    }
+  }
+  return members;
+}
+
+/**
+ * The members of an inspector's answer that identify processes of group
+ * `pgid` — each field validated, since the answer crosses a port — or
+ * `undefined` for an answer that is no listing at all.
+ */
+function groupMembersOf(answer: unknown, pgid: number): readonly ProcessIdentity[] | undefined {
+  if (!Array.isArray(answer)) {
+    return undefined;
+  }
+  const members: ProcessIdentity[] = [];
+  for (const entry of answer as readonly unknown[]) {
+    if (typeof entry !== 'object' || entry === null) {
+      return undefined;
+    }
+    const pid = validPid('pid' in entry ? entry.pid : undefined);
+    const group = validPid('pgid' in entry ? entry.pgid : undefined);
+    const startToken: unknown = 'startToken' in entry ? entry.startToken : undefined;
+    if (
+      pid === undefined ||
+      group === undefined ||
+      typeof startToken !== 'string' ||
+      startToken.length === 0 ||
+      startToken.length > MAX_START_TOKEN_LENGTH
+    ) {
+      return undefined;
+    }
+    if (group === pgid) {
+      members.push({ pid, pgid, startToken });
+    }
+  }
+  return members;
+}
+
+// ---------------------------------------------------------------------------
 // Launched-child state
 // ---------------------------------------------------------------------------
 
@@ -3977,6 +5623,20 @@ class ChildState {
    */
   signalFailures = 0;
   lastSignalFailure: DevServerSignalFailure | undefined;
+  /**
+   * The members of the child's process group the launcher has verified, as
+   * pid → start token ({@link ProcessIdentity}): taken from listings made
+   * while the leader was unreaped, or that held a member already pinned. A
+   * listing after the leader exited is the child's group only when it still
+   * holds one of these, which a recycled group id cannot.
+   */
+  readonly groupPins = new Map<number, string>();
+  /**
+   * Set once the group is no longer the launcher's to signal after the
+   * leader's exit — it was gone, held no pinned member (a recycled id), or
+   * could not be listed. Nothing is sent to the group id again.
+   */
+  groupReleased = false;
 
   #markExited: () => void = () => undefined;
 
@@ -4180,7 +5840,12 @@ interface LauncherSettings {
   /** Each readiness probe's timeout; never above {@link LauncherSettings.readyTimeoutMs}. */
   readonly readyProbeTimeoutMs: number;
   readonly stopGraceMs: number;
-  readonly cliCredentialTtlMs: number;
+  /** One lease of a {@link DEV_SERVER_CREDENTIAL_PATH} credential. */
+  readonly cliCredentialLeaseMs: number;
+  /** How often each {@link DEV_SERVER_CREDENTIAL_PATH} credential is checked. */
+  readonly cliCredentialCheckIntervalMs: number;
+  /** How long such a credential outlives its dev server's control connection. */
+  readonly cliCredentialDisconnectGraceMs: number;
   readonly leaseMs: number;
 }
 
@@ -4194,6 +5859,36 @@ interface LaunchTicket {
 
 /** How often a stopping process group is re-checked for survivors, in milliseconds. */
 const GROUP_POLL_INTERVAL_MS = 100;
+
+/**
+ * Whose a child's process group is, per one listing (see the launcher's
+ * `#pinGroup`): `'verified'` — still the child's, with members; `'gone'` —
+ * nothing holds the id; `'foreign'` — only processes never seen in it hold
+ * it, after the leader exited; `'unknown'` — it could not be listed.
+ */
+type GroupVerdict = 'verified' | 'gone' | 'foreign' | 'unknown';
+
+/**
+ * One listing of a child's process group: its {@link GroupVerdict}, and — for
+ * a `'verified'` listing only — the members it held, every one of them
+ * pinned by the listing itself (see the launcher's `#pinGroup`).
+ */
+interface GroupReading {
+  readonly verdict: GroupVerdict;
+  readonly members: readonly ProcessIdentity[];
+}
+
+/** A reading with no members to act on: the verdict alone. */
+function groupReading(verdict: Exclude<GroupVerdict, 'verified'>): GroupReading {
+  return { verdict, members: [] };
+}
+
+/** How a bounded wait ended: whether its condition held, and after how long. */
+interface WaitOutcome {
+  readonly met: boolean;
+  /** The sum of the timer delays waited, in milliseconds. */
+  readonly elapsedMs: number;
+}
 
 /** How many ended session ids are remembered, so a launch still in flight for one is refused. */
 const MAX_ENDED_SESSIONS = 1_024;
@@ -4216,6 +5911,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
   readonly #platform: NodeJS.Platform;
   readonly #spawn: SpawnLike;
   readonly #signalGroup: SignalProcessGroup | undefined;
+  readonly #groupInspector: ProcessGroupInspector;
   readonly #detect: typeof detectDevServer;
   readonly #probe: typeof probeDevServer;
   readonly #ownership: ListenerOwnership;
@@ -4264,11 +5960,26 @@ class DevServerLauncherImpl implements DevServerLauncher {
     // spawn the child leads its own group and a stop signals the whole tree;
     // an injected spawn (a test's fake child) gets group signalling only when
     // it injects the signaller too, so no fake pid is ever signalled for real.
+    const realGroups =
+      deps.signalProcessGroup === undefined &&
+      deps.spawnImpl === undefined &&
+      this.#platform !== 'win32';
     this.#signalGroup =
       deps.signalProcessGroup ??
       (deps.spawnImpl === undefined && this.#platform !== 'win32'
         ? defaultSignalProcessGroup
         : undefined);
+    // The host's process table is read only for the host's own children: an
+    // injected spawn or signaller without an inspector gets one that cannot
+    // tell, so a group is signalled after its leader exits only when verified.
+    this.#groupInspector =
+      deps.processGroupInspector ??
+      (realGroups
+        ? createProcessGroupInspector({
+            platform: this.#platform,
+            env: deps.parentEnv ?? process.env,
+          })
+        : UNVERIFIABLE_GROUP_INSPECTOR);
     this.#detect = deps.detect ?? detectDevServer;
     this.#probe = deps.probe ?? probeDevServer;
     this.#ownership =
@@ -4286,7 +5997,15 @@ class DevServerLauncherImpl implements DevServerLauncher {
         readyTimeoutMs,
       ),
       stopGraceMs: positiveOr(deps.stopGraceMs, DEFAULT_STOP_GRACE_MS),
-      cliCredentialTtlMs: positiveOr(deps.cliCredentialTtlMs, DEFAULT_CLI_CREDENTIAL_TTL_MS),
+      cliCredentialLeaseMs: positiveOr(deps.cliCredentialLeaseMs, DEFAULT_CLI_CREDENTIAL_LEASE_MS),
+      cliCredentialCheckIntervalMs: positiveOr(
+        deps.cliCredentialCheckIntervalMs,
+        CLI_CREDENTIAL_CHECK_INTERVAL_MS,
+      ),
+      cliCredentialDisconnectGraceMs: positiveOr(
+        deps.cliCredentialDisconnectGraceMs,
+        CLI_CREDENTIAL_DISCONNECT_GRACE_MS,
+      ),
       leaseMs: positiveOr(deps.managedCredentialLeaseMs, DEFAULT_MANAGED_CREDENTIAL_LEASE_MS),
     };
   }
@@ -4519,7 +6238,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
       );
     }
 
-    const command = this.#resolveCommand(request.command, detection);
+    const command = this.#resolveCommand(request.command, root, detection);
     if (isErr(command)) {
       return command;
     }
@@ -4637,6 +6356,9 @@ class DevServerLauncherImpl implements DevServerLauncher {
     this.#registry.set(root.key, state);
     // The child is alive: keep its lease from lapsing under it.
     this.#scheduleRenewal(lease);
+    // …and pin its process group while the leader is unreaped, so the group
+    // can still be told apart from a recycled id once the leader exits.
+    this.#pinGroupInBackground(state);
     this.#log('info', 'Spawned a dev server with the telemetry preload attached', {
       projectRoot: root.key,
       pid: state.pid,
@@ -4658,6 +6380,8 @@ class DevServerLauncherImpl implements DevServerLauncher {
     if (outcome.kind === 'ready' && !state.stopRequested && !state.hasExited) {
       state.status = 'ready';
       state.devServerUrl = outcome.url;
+      // A ready framework has started its server workers: pin them too.
+      this.#pinGroupInBackground(state);
       this.#log('info', 'The launched dev server is ready', {
         projectRoot: root.key,
         pid: state.pid,
@@ -4850,14 +6574,37 @@ class DevServerLauncherImpl implements DevServerLauncher {
     return isErr(built) ? built : ok({ ...built.value, windowsVerbatimArguments: true });
   }
 
-  /** The command to spawn: the request's, or the package manager plus the detected dev script. */
+  /**
+   * The command to spawn: the request's, or the package manager plus the
+   * detected dev script — either way parsed and checked against the
+   * dev-server command policy ({@link parseLaunchCommand}'s assignment
+   * allowlist, then {@link checkLaunchCommand}, which is handed the parsed
+   * assignments so an assigned `NODE_PATH` is judged too) before anything is
+   * minted, so a shell, an interpreter, a script that starts no dev server,
+   * a loader or modules from an untrusted directory never start. A
+   * package-manager run records the script it starts.
+   */
   #resolveCommand(
     requested: string | undefined,
+    root: ProjectRootForms,
     detection: DevServerDetection,
   ): Result<ResolvedCommand, DebuggenError> {
+    const policy: LaunchCommandContext = {
+      projectRoot: root.native,
+      scripts: detection.devServerScripts,
+      platform: this.#platform,
+      nodeExecutablePath: this.#deps.nodeExecutablePath ?? process.execPath,
+      isTrustedFile: this.#deps.isTrustedDevCli ?? isTrustedDevCliFile,
+      isTrustedDirectory: this.#deps.isTrustedDevDirectory ?? isTrustedNodePathDirectory,
+      realpath: this.#deps.realpath,
+    };
     if (requested !== undefined && requested.trim().length > 0) {
-      const parsed = parseLaunchCommand(requested);
-      return isErr(parsed) ? parsed : ok({ ...parsed.value, script: undefined });
+      const parsed = parseLaunchCommand(requested, this.#platform);
+      if (isErr(parsed)) {
+        return parsed;
+      }
+      const accepted = checkLaunchCommand(parsed.value, policy);
+      return isErr(accepted) ? accepted : ok({ ...parsed.value, script: accepted.value.script });
     }
 
     const script = detection.devScript?.name;
@@ -4883,7 +6630,19 @@ class DevServerLauncherImpl implements DevServerLauncher {
         ),
       );
     }
-    return ok({ file, args, env: {}, script });
+    // The derived run is checked like a request's: a selected script whose
+    // name a runner reads as its own command (`yarn install`) or option is
+    // refused rather than handed to the package manager. Detection selected
+    // the script from the manifest itself, so it counts as a dev-server
+    // script even when the detection carries no script list.
+    const accepted = checkLaunchCommand(
+      { file, args },
+      {
+        ...policy,
+        scripts: detection.devServerScripts ?? (script === undefined ? undefined : [script]),
+      },
+    );
+    return isErr(accepted) ? accepted : ok({ file, args, env: {}, script });
   }
 
   // -------------------------------------------------------------------------
@@ -5334,9 +7093,12 @@ class DevServerLauncherImpl implements DevServerLauncher {
   }
 
   /**
-   * Stop a child: `SIGTERM` (to its process group when group signalling is
-   * on, else to the child), then — once the grace period passes with the
-   * leader or any group member still alive — `SIGKILL`. The credential is
+   * Stop a child: its process group's members are pinned while the leader is
+   * unreaped, then `SIGTERM` goes to the group (when group signalling is on,
+   * else to the child); once the grace period passes with the leader still
+   * alive, or a verified member of its group left after it exited, `SIGKILL`
+   * follows — to the group directly while the leader is unreaped, else only
+   * to a group {@link #signalExitedGroup} verified. The credential is
    * revoked whatever the outcome. The registry entry is removed once the exit
    * is observed; a child that outlived the whole ladder is kept (see
    * {@link DevServerSurvivor}). Shared by every stop path, so concurrent
@@ -5381,17 +7143,43 @@ class DevServerLauncherImpl implements DevServerLauncher {
     if (state.status !== 'failed') {
       state.status = 'stopping';
     }
-    this.#sendSignal(state, 'SIGTERM');
-    const graceful = await this.#waitUntil(
-      () => state.hasExited && !this.#groupAlive(state),
-      this.#settings.stopGraceMs,
-    );
+    if (this.#signalGroup !== undefined) {
+      // Pin the group's members while the leader is still unreaped: once it
+      // exits on SIGTERM, only a pinned member proves the group is its own.
+      await this.#pinGroup(state);
+    }
+    if (state.hasExited) {
+      // The leader exited while its group was being listed: from here on the
+      // group is signalled only as verified.
+      await this.#signalExitedGroup(state, 'SIGTERM');
+    } else {
+      // Synchronously, as the leader is unreaped: the direct group signal is
+      // safe, and nothing else runs between the decision and the delivery.
+      this.#sendSignal(state, 'SIGTERM');
+    }
+    // The leader first, then whatever it left in its group, within one grace.
+    const grace = this.#settings.stopGraceMs;
+    const leader = await this.#waitUntil(() => state.hasExited, grace);
+    let graceful = leader.met;
+    if (graceful && this.#signalGroup !== undefined) {
+      const drained = await this.#waitUntilAsync(
+        () => this.#groupDrained(state),
+        grace - leader.elapsedMs,
+      );
+      graceful = drained.met;
+    }
     let escalated = false;
     if (!graceful) {
       escalated = true;
-      this.#sendSignal(state, 'SIGKILL');
-      if (this.#platform === 'win32') {
-        this.#killWindowsTree(state, pid);
+      if (state.hasExited) {
+        // A verified member outlived the grace; the leader is gone, so its
+        // group is signalled only as verified again, right now.
+        await this.#signalExitedGroup(state, 'SIGKILL');
+      } else {
+        this.#sendSignal(state, 'SIGKILL');
+        if (this.#platform === 'win32') {
+          this.#killWindowsTree(state, pid);
+        }
       }
       await this.#waitUntil(() => state.hasExited, KILL_CONFIRM_MS);
     }
@@ -5479,51 +7267,240 @@ class DevServerLauncherImpl implements DevServerLauncher {
 
   /**
    * After the leader exited on its own, end whatever it left in its process
-   * group: `SIGTERM`, then `SIGKILL` if anything survives the grace period.
+   * group — as verified by {@link #signalExitedGroup}, never by a bare group
+   * id: `SIGTERM`, then, when a verified member is still there once the grace
+   * period passes, `SIGKILL`. A group that is gone, recycled or cannot be
+   * listed is not signalled at all.
    */
   async #reapGroup(state: ChildState): Promise<void> {
-    if (!this.#groupAlive(state)) {
+    if (this.#signalGroup === undefined || state.pid === undefined) {
       return;
     }
-    this.#sendSignal(state, 'SIGTERM');
-    const gone = await this.#waitUntil(() => !this.#groupAlive(state), this.#settings.stopGraceMs);
-    if (!gone) {
-      this.#sendSignal(state, 'SIGKILL');
+    if (!(await this.#signalExitedGroup(state, 'SIGTERM'))) {
+      return;
+    }
+    const drained = await this.#waitUntilAsync(
+      () => this.#groupDrained(state),
+      this.#settings.stopGraceMs,
+    );
+    if (!drained.met) {
+      await this.#signalExitedGroup(state, 'SIGKILL');
     }
   }
 
   /**
-   * Signal the child's process group when group signalling is on (the group
-   * includes the leader), else — or when the group cannot be signalled — the
-   * child alone.
+   * Signal a child whose leader is still unreaped: its process group when
+   * group signalling is on — safe exactly now, because an unreaped leader
+   * keeps its pid, so no other process can lead a group of that id — else,
+   * or when the group cannot be signalled, the child alone. After the exit
+   * this sends nothing; {@link #signalExitedGroup} is the only way to reach
+   * the group then.
    */
   #sendSignal(state: ChildState, signal: NodeJS.Signals): void {
+    if (state.hasExited) {
+      return;
+    }
     const pid = state.pid;
     if (pid !== undefined && this.#signalGroup !== undefined) {
       try {
         this.#signalGroup(pid, signal);
         return;
-      } catch (error) {
-        if (errnoCodeOf(error) === 'ESRCH' && state.hasExited) {
-          return;
-        }
+      } catch {
+        // The group could not be signalled (the child has not led one yet,
+        // or may not be signalled that way): the child alone, below.
       }
     }
-    if (!state.hasExited) {
-      // Delivery can fail — `kill` throws, or answers `false` for a signal
-      // Node did not deliver (a process that vanished without an exit event,
-      // or one this account may not signal). Not fatal to the stop, because
-      // the escalation step or the exit handler follows; but recorded, never
-      // swallowed, and a child that is still running when the ladder ends is
-      // reported as a survivor.
-      try {
-        if (!state.child.kill(signal)) {
-          this.#noteSignalFailure(state, { signal, refusal: 'not-delivered' });
-        }
-      } catch (error) {
+    // Delivery can fail — `kill` throws, or answers `false` for a signal
+    // Node did not deliver (a process that vanished without an exit event,
+    // or one this account may not signal). Not fatal to the stop, because
+    // the escalation step or the exit handler follows; but recorded, never
+    // swallowed, and a child that is still running when the ladder ends is
+    // reported as a survivor.
+    try {
+      if (!state.child.kill(signal)) {
+        this.#noteSignalFailure(state, { signal, refusal: 'not-delivered' });
+      }
+    } catch (error) {
+      this.#noteSignalFailure(state, { signal, refusal: 'threw', ...describeException(error) });
+    }
+  }
+
+  /**
+   * Signal the process group of a child whose leader has exited, only once
+   * {@link #pinGroup} has verified — immediately before — that the group
+   * still holds a process pinned in it earlier. A group that is gone, holds
+   * no pinned member (its id was recycled) or cannot be listed is released:
+   * never signalled again, and — unless it is simply gone — logged once.
+   *
+   * The listing is asynchronous, so the service may run other work before it
+   * answers. When the inspector can also answer synchronously
+   * ({@link ProcessGroupInspector.confirm}, on Linux), a pinned member of that
+   * listing is confirmed once more **in the same synchronous step that
+   * delivers the signal** — no `await` in between — and a group none of whose
+   * listed pins still confirms is released silently, as gone. Without
+   * `confirm` the listing alone stands.
+   *
+   * What remains is the width of that final step: were the confirmed member
+   * to exit and an unrelated process to take over its group id between the
+   * confirming read and the `kill` system call, that process would be
+   * signalled. Node exposes no pidfd, so no pid-based signal is free of such
+   * a syscall-width window; confirmation shrinks it from the leader's whole
+   * lifetime after exit — and then from an asynchronous listing — to two
+   * adjacent system calls.
+   *
+   * @returns Whether the signal was sent.
+   */
+  async #signalExitedGroup(state: ChildState, signal: NodeJS.Signals): Promise<boolean> {
+    const pid = state.pid;
+    const signalGroup = this.#signalGroup;
+    if (pid === undefined || signalGroup === undefined || state.groupReleased) {
+      return false;
+    }
+    const reading = await this.#pinGroup(state);
+    if (reading.verdict !== 'verified') {
+      this.#releaseGroup(state, reading.verdict);
+      return false;
+    }
+    // From here to the signal nothing awaits: the confirmation and the
+    // delivery run in one synchronous step.
+    if (!this.#confirmsPinnedMember(state, reading.members)) {
+      this.#releaseGroup(state, 'gone');
+      return false;
+    }
+    try {
+      signalGroup(pid, signal);
+      return true;
+    } catch (error) {
+      if (errnoCodeOf(error) === 'ESRCH') {
+        this.#releaseGroup(state, 'gone');
+      } else {
         this.#noteSignalFailure(state, { signal, refusal: 'threw', ...describeException(error) });
       }
+      return false;
     }
+  }
+
+  /**
+   * Whether nothing verified is left in a child's group to wait for: the
+   * group is gone, or it is released because it could not be verified
+   * (which is logged). `false` while a verified member remains.
+   */
+  async #groupDrained(state: ChildState): Promise<boolean> {
+    if (state.groupReleased) {
+      return true;
+    }
+    const { verdict } = await this.#pinGroup(state);
+    if (verdict === 'verified') {
+      return false;
+    }
+    this.#releaseGroup(state, verdict);
+    return true;
+  }
+
+  /**
+   * Whether the group inspector confirms, synchronously and right now, that a
+   * member pinned in the listing just taken is still that very process in the
+   * child's group ({@link ProcessGroupInspector.confirm}). Asks the listed
+   * members whose (pid, start token) pair is pinned, in listing order, until
+   * one answers `true`. An inspector without `confirm` leaves the listing's
+   * verdict standing (`true`); one whose every answer is `false` or cannot
+   * tell, or that throws, does not confirm (`false`).
+   */
+  #confirmsPinnedMember(state: ChildState, members: readonly ProcessIdentity[]): boolean {
+    const inspector = this.#groupInspector;
+    if (typeof inspector.confirm !== 'function') {
+      return true;
+    }
+    for (const member of members) {
+      if (state.groupPins.get(member.pid) !== member.startToken) {
+        continue;
+      }
+      let answer: unknown;
+      try {
+        // Called as a method, so an inspector object keeps its `this`.
+        answer = inspector.confirm(member);
+      } catch {
+        answer = undefined;
+      }
+      if (answer === true) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * List the child's process group and decide whose it is.
+   *
+   * A listing is **trusted** when the leader was unreaped both before and
+   * after it — Node reports `exit` in the same step that reaps the child, so
+   * the leader held its pid, and with it the group id, throughout — or when
+   * it holds a pinned (pid, start token) pair, a process that was in the
+   * child's group before and still is, which a recycled id cannot hold. A
+   * trusted listing's members are pinned.
+   *
+   * @returns The {@link GroupReading}: `'verified'` — a trusted listing with
+   * members, which the reading carries; `'gone'` — no process has the group
+   * id; `'foreign'` — processes do, none of them pinned, and the leader has
+   * exited (a recycled id); `'unknown'` — the group could not be listed.
+   */
+  async #pinGroup(state: ChildState): Promise<GroupReading> {
+    const pid = state.pid;
+    if (pid === undefined || this.#signalGroup === undefined) {
+      return groupReading('unknown');
+    }
+    const unreapedBefore = !state.hasExited;
+    let answer: unknown;
+    try {
+      answer = await this.#groupInspector.members(pid);
+    } catch {
+      answer = undefined;
+    }
+    const members = groupMembersOf(answer, pid);
+    if (members === undefined) {
+      return groupReading('unknown');
+    }
+    const unreapedThroughout = unreapedBefore && !state.hasExited;
+    const holdsPinned = members.some(
+      (member) => state.groupPins.get(member.pid) === member.startToken,
+    );
+    if (!unreapedThroughout && !holdsPinned) {
+      return groupReading(members.length === 0 ? 'gone' : 'foreign');
+    }
+    for (const member of members) {
+      if (state.groupPins.size < MAX_OWNERSHIP_TREE_SIZE || state.groupPins.has(member.pid)) {
+        state.groupPins.set(member.pid, member.startToken);
+      }
+    }
+    return members.length === 0 ? groupReading('gone') : { verdict: 'verified', members };
+  }
+
+  /** Pin a live child's group without holding up the caller; `dispose` awaits it. */
+  #pinGroupInBackground(state: ChildState): void {
+    if (this.#signalGroup === undefined || state.pid === undefined) {
+      return;
+    }
+    this.#track(this.#pinGroup(state).then(() => undefined));
+  }
+
+  /**
+   * Stop signalling a child's group for good. A group that could not be
+   * verified is logged once, under closed fields — the project, the pid and
+   * the verdict — so a worker left running is explained, never hidden.
+   */
+  #releaseGroup(state: ChildState, verdict: Exclude<GroupVerdict, 'verified'>): void {
+    if (state.groupReleased) {
+      return;
+    }
+    state.groupReleased = true;
+    if (verdict === 'gone') {
+      return;
+    }
+    this.#log(
+      'warn',
+      "A launched dev server's process group could not be verified after its leader exited, so it is not signalled",
+      { projectRoot: state.key, pid: state.pid, verdict },
+    );
   }
 
   /**
@@ -5543,20 +7520,6 @@ class DevServerLauncherImpl implements DevServerLauncher {
     });
   }
 
-  /** Whether any process in the child's group is alive (`false` without group signalling). */
-  #groupAlive(state: ChildState): boolean {
-    const pid = state.pid;
-    if (pid === undefined || this.#signalGroup === undefined) {
-      return false;
-    }
-    try {
-      this.#signalGroup(pid, 0);
-      return true;
-    } catch (error) {
-      return errnoCodeOf(error) === 'EPERM';
-    }
-  }
-
   /**
    * End a process tree on Windows, where there are no process groups to signal.
    *
@@ -5564,9 +7527,13 @@ class DevServerLauncherImpl implements DevServerLauncher {
    * a `taskkill` that cannot start — synchronously, or through the `error`
    * event a missing binary produces — leaves the stop to the bounded exit wait
    * that follows, so its failure is reported under its closed class and code
-   * rather than raised or dropped.
+   * rather than raised or dropped. It runs only while the child is unreaped:
+   * `taskkill /pid` of an exited child's id could end a process that reused it.
    */
   #killWindowsTree(state: ChildState, pid: number): void {
+    if (state.hasExited) {
+      return;
+    }
     const backstopFailed = (error: unknown): void => {
       this.#log('warn', 'The Windows process-tree backstop could not run', {
         projectRoot: state.key,
@@ -5591,24 +7558,25 @@ class DevServerLauncherImpl implements DevServerLauncher {
   }
 
   /**
-   * Resolve `true` as soon as `condition` holds, or `false` once `timeoutMs`
-   * has elapsed. Elapsed time is the sum of the timer delays, so the bound
-   * holds under an injected timer and a frozen clock alike.
+   * Resolve `met: true` as soon as `condition` holds, or `met: false` once
+   * `timeoutMs` has elapsed, with the time waited either way. Elapsed time is
+   * the sum of the timer delays, so the bound holds under an injected timer
+   * and a frozen clock alike.
    */
-  #waitUntil(condition: () => boolean, timeoutMs: number): Promise<boolean> {
+  #waitUntil(condition: () => boolean, timeoutMs: number): Promise<WaitOutcome> {
     if (condition()) {
-      return Promise.resolve(true);
+      return Promise.resolve({ met: true, elapsedMs: 0 });
     }
-    return new Promise<boolean>((resolve) => {
+    return new Promise<WaitOutcome>((resolve) => {
       let elapsed = 0;
       const step = (): void => {
         const delay = Math.max(1, Math.min(GROUP_POLL_INTERVAL_MS, timeoutMs - elapsed));
         this.#setTimeout(() => {
           elapsed += delay;
           if (condition()) {
-            resolve(true);
+            resolve({ met: true, elapsedMs: elapsed });
           } else if (elapsed >= timeoutMs) {
-            resolve(false);
+            resolve({ met: false, elapsedMs: elapsed });
           } else {
             step();
           }
@@ -5616,6 +7584,41 @@ class DevServerLauncherImpl implements DevServerLauncher {
       };
       step();
     });
+  }
+
+  /**
+   * {@link #waitUntil} for a condition that must itself wait — a process-group
+   * listing. The same injected timer paces it, every
+   * {@link GROUP_POLL_INTERVAL_MS} at most, and only the timer delays count
+   * towards `timeoutMs`; a bound already spent (`timeoutMs <= 0`) checks once.
+   * A condition that rejects counts as not met.
+   */
+  async #waitUntilAsync(
+    condition: () => Promise<boolean>,
+    timeoutMs: number,
+  ): Promise<WaitOutcome> {
+    const holds = async (): Promise<boolean> => {
+      try {
+        return await condition();
+      } catch {
+        return false;
+      }
+    };
+    if (await holds()) {
+      return { met: true, elapsedMs: 0 };
+    }
+    let elapsed = 0;
+    while (elapsed < timeoutMs) {
+      const delay = Math.max(1, Math.min(GROUP_POLL_INTERVAL_MS, timeoutMs - elapsed));
+      await new Promise<void>((resolve) => {
+        this.#setTimeout(resolve, delay);
+      });
+      elapsed += delay;
+      if (await holds()) {
+        return { met: true, elapsedMs: elapsed };
+      }
+    }
+    return { met: false, elapsedMs: elapsed };
   }
 
   /** Remove a state from the registry, if it is still the one registered for its project. */
@@ -5914,6 +7917,11 @@ class DevServerLauncherImpl implements DevServerLauncher {
     await this.#sweep((state) => !state.survivedTermination);
     await Promise.allSettled([...this.#reapers]);
 
+    // Nothing supervises a credential route lease after this, so each one is
+    // revoked now: the dev server the developer started keeps running, and its
+    // preload goes inert like a launched child's would.
+    await this.#releaseCliLeases();
+
     // The last chance to revoke what earlier attempts could not: no retry is
     // scheduled after this, and whatever is still pending lapses with its lease.
     const pending = [...this.#pendingRevocations];
@@ -6006,7 +8014,10 @@ class DevServerLauncherImpl implements DevServerLauncher {
     }
 
     const projectRoot = normalizePosix(toPosix(parsed.data.projectRoot.trim()));
-    const requestedExpiry = Math.floor(this.#now() + this.#settings.cliCredentialTtlMs);
+    // The first lease. Not flagged `lease: true`: that marks a launched child's
+    // credential, which a restarted service revokes as an orphan; this one is
+    // bounded by its supervision below and, after a crash, by this expiry.
+    const requestedExpiry = Math.floor(this.#now() + this.#settings.cliCredentialLeaseMs);
     const issued = await this.#issue({ projectRoot, expiresAt: requestedExpiry });
     if (isErr(issued)) {
       return issued;
@@ -6039,6 +8050,21 @@ class DevServerLauncherImpl implements DevServerLauncher {
         ),
       );
     }
+
+    const lease = new CredentialLease({
+      projectRoot,
+      token: issued.value.token,
+      credentialId: nonEmpty(issued.value.credentialId),
+      expiresAt: body.data.expiresAt,
+    });
+    if (this.#disposed) {
+      // The shutdown began while the issuer answered: its release of the
+      // supervised leases may already have run, so nothing would renew or
+      // revoke this one. It is revoked instead of handed out.
+      await this.#releaseCredential(lease);
+      return err(shutdownError());
+    }
+    this.#superviseCliLease(lease);
     this.#log(
       'info',
       'Issued a server-agent credential for a dev server started outside the service',
@@ -6048,6 +8074,231 @@ class DevServerLauncherImpl implements DevServerLauncher {
       },
     );
     return ok(body.data);
+  }
+
+  /**
+   * The {@link DEV_SERVER_CREDENTIAL_PATH} credentials under supervision (see
+   * {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}), each until it is revoked or found
+   * gone. `stop`, `stopForSession` and `stopAll` never read it: this service
+   * did not start those dev servers. {@link DevServerLauncher.dispose} revokes
+   * every one still here.
+   */
+  readonly #cliLeases = new Map<CredentialLease, CliCredentialSupervision>();
+
+  /** Start supervising a credential route lease; its first check runs one check interval from now. */
+  #superviseCliLease(lease: CredentialLease): void {
+    const supervision: CliCredentialSupervision = {
+      lease,
+      lastConnectedAt: undefined,
+      renewFailures: 0,
+      timer: undefined,
+    };
+    this.#cliLeases.set(lease, supervision);
+    this.#scheduleCliLeaseCheck(supervision);
+  }
+
+  /**
+   * Schedule the next check of a credential route lease. Nothing is scheduled
+   * once the credential is being released or is gone, or after `dispose`
+   * began — the shutdown releases every supervised lease itself.
+   */
+  #scheduleCliLeaseCheck(supervision: CliCredentialSupervision): void {
+    const { lease } = supervision;
+    if (this.#disposed || lease.releaseRequested || lease.invalidated) {
+      return;
+    }
+    supervision.timer = this.#backgroundTimer(() => {
+      supervision.timer = undefined;
+      void this.#checkCliLease(supervision);
+    }, this.#settings.cliCredentialCheckIntervalMs);
+  }
+
+  /**
+   * One check of a credential route lease, then the next one scheduled — so
+   * two checks of one lease never overlap, however long a renewal takes:
+   *
+   * - **Connected** (an online control connection authenticated with it): the
+   *   connection is recorded, and the lease is renewed to one lease from now
+   *   once at most two thirds of a lease remain — every
+   *   {@link LEASE_RENEWALS_PER_LEASE}th of a lease, so two consecutive
+   *   renewals may fail before it lapses under a running dev server.
+   * - **Disconnected** after it had connected: revoked once the connection has
+   *   been gone for the disconnect grace — the dev server exited.
+   * - **Never connected**: revoked at the end of its first lease.
+   * - **Lease over** whatever the connection (every renewal failed): revoked,
+   *   or found lapsed.
+   *
+   * A connection view that is absent or throws counts as not connected.
+   */
+  async #checkCliLease(supervision: CliCredentialSupervision): Promise<void> {
+    const { lease } = supervision;
+    if (this.#disposed) {
+      return;
+    }
+    if (lease.releaseRequested || lease.invalidated) {
+      this.#forgetCliLease(supervision);
+      return;
+    }
+    try {
+      const now = this.#now();
+      const leaseMs = this.#settings.cliCredentialLeaseMs;
+      const renewEveryMs = Math.max(1, Math.floor(leaseMs / LEASE_RENEWALS_PER_LEASE));
+      if (this.#isCliCredentialConnected(lease)) {
+        supervision.lastConnectedAt = now;
+        if (lease.expiresAt - now <= leaseMs - renewEveryMs) {
+          const supervised = await this.#renewCliLease(supervision, now);
+          // The renewal may have awaited the issuer: a shutdown that began
+          // meanwhile releases this lease itself.
+          if (!supervised || this.#disposed || lease.releaseRequested) {
+            return;
+          }
+        }
+      } else if (
+        supervision.lastConnectedAt !== undefined &&
+        now - supervision.lastConnectedAt >= this.#settings.cliCredentialDisconnectGraceMs
+      ) {
+        await this.#endCliLease(supervision, 'disconnected');
+        return;
+      }
+      if (this.#now() >= lease.expiresAt) {
+        await this.#endCliLease(
+          supervision,
+          supervision.lastConnectedAt === undefined ? 'never-connected' : 'lease-over',
+        );
+        return;
+      }
+    } catch (error) {
+      this.#log(
+        'warn',
+        'Checking the credential lease of a dev server started outside the service failed; it is checked again',
+        { projectRoot: lease.projectRoot, errorCode: errnoCodeOf(error) },
+      );
+    }
+    this.#scheduleCliLeaseCheck(supervision);
+  }
+
+  /**
+   * Whether an online `server-agent` control connection authenticated with
+   * the lease's credential. `false` without a connection view, and when the
+   * view throws (logged): no evidence of a running dev server.
+   */
+  #isCliCredentialConnected(lease: CredentialLease): boolean {
+    const connections = this.#deps.serverAgentConnections;
+    if (connections === undefined) {
+      return false;
+    }
+    try {
+      return connections.isCredentialConnected(lease.tokenHash);
+    } catch (error) {
+      this.#log(
+        'warn',
+        'Credential lease supervision could not read the connected server agents; the dev server counts as disconnected',
+        { projectRoot: lease.projectRoot, errorCode: errnoCodeOf(error) },
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Extend a credential route lease to one lease from `now`, with the outcome
+   * handling a launched child's renewal has: `ok(true)` extends it; `ok(false)`
+   * — revoked or rotated away — is final, so supervision ends without a
+   * revocation; an `Err` or a throw is retried at the next check, and only
+   * the first failure of a run is logged.
+   *
+   * @returns Whether the lease is still supervised.
+   */
+  async #renewCliLease(supervision: CliCredentialSupervision, now: number): Promise<boolean> {
+    const { lease } = supervision;
+    const expiresAt = Math.floor(now + this.#settings.cliCredentialLeaseMs);
+    const input = lease.renewInput(expiresAt);
+    if (input === undefined) {
+      this.#forgetCliLease(supervision);
+      return false;
+    }
+
+    let outcome: 'renewed' | 'gone' | 'failed';
+    try {
+      const result: unknown = await this.#deps.credentials.renew(input);
+      outcome = isOkResultOf(result, true)
+        ? 'renewed'
+        : isOkResultOf(result, false)
+          ? 'gone'
+          : 'failed';
+    } catch {
+      outcome = 'failed';
+    }
+
+    if (outcome === 'renewed') {
+      lease.expiresAt = Math.max(lease.expiresAt, expiresAt);
+      supervision.renewFailures = 0;
+      return true;
+    }
+    if (outcome === 'gone') {
+      lease.lapse();
+      this.#forgetCliLease(supervision);
+      this.#log(
+        'warn',
+        "A dev server's server-agent credential no longer exists (revoked or rotated); its telemetry is refused until a new credential is requested",
+        { projectRoot: lease.projectRoot },
+      );
+      return false;
+    }
+    supervision.renewFailures += 1;
+    if (supervision.renewFailures === 1) {
+      this.#log(
+        'warn',
+        'Renewing the credential lease of a dev server started outside the service failed; it is retried at every check',
+        { projectRoot: lease.projectRoot, expiresAt: lease.expiresAt },
+      );
+    }
+    return true;
+  }
+
+  /**
+   * End a credential route lease: stop supervising it and revoke it through
+   * {@link #releaseCredential}, whose retries take over a revocation the store
+   * refuses until it succeeds or the lease lapses.
+   */
+  async #endCliLease(
+    supervision: CliCredentialSupervision,
+    cause: 'disconnected' | 'never-connected' | 'lease-over',
+  ): Promise<void> {
+    this.#forgetCliLease(supervision);
+    const released = await this.#releaseCredential(supervision.lease);
+    const because =
+      cause === 'disconnected'
+        ? 'its dev server disconnected'
+        : cause === 'never-connected'
+          ? 'no dev server connected with it during its first lease'
+          : 'its lease ended without a renewal';
+    this.#log(
+      'info',
+      `The server-agent credential of a dev server started outside the service is revoked: ${because}`,
+      { projectRoot: supervision.lease.projectRoot, revocationPending: !released },
+    );
+  }
+
+  /** Stop supervising a credential route lease: its check timer is cleared and it is forgotten. */
+  #forgetCliLease(supervision: CliCredentialSupervision): void {
+    this.#clearTimer(supervision.timer);
+    supervision.timer = undefined;
+    this.#cliLeases.delete(supervision.lease);
+  }
+
+  /**
+   * Revoke every supervised credential route lease — the shutdown's step. A
+   * revocation the store refuses joins the pending revocations, which the
+   * shutdown's last sweep tries once more.
+   */
+  async #releaseCliLeases(): Promise<void> {
+    const supervised = [...this.#cliLeases.values()];
+    for (const supervision of supervised) {
+      this.#forgetCliLease(supervision);
+    }
+    await Promise.allSettled(
+      supervised.map((supervision) => this.#releaseCredential(supervision.lease)),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -6313,6 +8564,11 @@ class DevServerLauncherImpl implements DevServerLauncher {
 
 /** A command resolved for `spawn`, with the script it came from, if any. */
 interface ResolvedCommand extends ParsedLaunchCommand {
+  /**
+   * The `package.json` script a package-manager run starts — the detected dev
+   * script, or the one a request's accepted `pnpm run <script>` names;
+   * `undefined` for the framework-CLI forms.
+   */
   readonly script: string | undefined;
 }
 
@@ -6598,6 +8854,11 @@ const defaultOwnershipFs: ListenerOwnershipFs = Object.freeze({
   readdir: (path: string): Promise<readonly string[]> => readdir(path),
   readlink: (path: string): Promise<string> => readlink(path),
 });
+
+/** The default synchronous reader of {@link ProcessGroupInspectorOptions}: `fs.readFileSync` as UTF-8. */
+function defaultReadFileSync(path: string): string {
+  return readFileSync(path, 'utf8');
+}
 
 /**
  * The default {@link ListenerOwnershipRunCommand}: `execFile` with no shell,

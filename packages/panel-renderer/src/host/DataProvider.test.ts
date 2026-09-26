@@ -19,7 +19,8 @@
  *   `PANEL_INVALID` rejection before anything is sent — never dropped, which
  *   would turn a panel-bound read into a live one — and binding itself never
  *   throws, because it runs during a render. A refusal describes the value by
- *   kind and never echoes it (AAP 0.5.2).
+ *   kind and never echoes it, so no caller-supplied text reaches its message,
+ *   hint or details.
  */
 
 import { DebuggenError } from '@debuggen/shared';
@@ -80,7 +81,7 @@ function wireResolver() {
 /**
  * The context a recording resolver received on its only call.
  *
- * @param resolve - A resolver called exactly once.
+ * @param resolve A resolver called exactly once.
  * @returns Its second argument.
  */
 function onlyContext(
@@ -97,7 +98,7 @@ function onlyContext(
 /**
  * Await a refusal and return it as a `DebuggenError`.
  *
- * @param pending - A call expected to reject with a typed error.
+ * @param pending A call expected to reject with a typed error.
  * @returns The rejection.
  */
 async function refusal(pending: Promise<unknown>): Promise<DebuggenError> {
@@ -115,7 +116,7 @@ async function refusal(pending: Promise<unknown>): Promise<DebuggenError> {
 /**
  * The parts of an error a reader or a log can see, serialised for a leak check.
  *
- * @param error - A refusal.
+ * @param error A refusal.
  * @returns Its message, hint and details as one string.
  */
 function visible(error: DebuggenError): string {

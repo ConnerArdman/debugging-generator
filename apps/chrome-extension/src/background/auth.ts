@@ -113,6 +113,7 @@ import type {
 } from '@debuggen/protocol';
 import {
   isPlainRecord,
+  isReadProof,
   pairCompleteResponseSchema,
   parseServiceOrigin,
   WS_CLOSE_UNAUTHORIZED,
@@ -167,15 +168,30 @@ export const PAIRING_CODE_LENGTH = 8;
  * Versioned so a later build can change the shape without trusting an older
  * one. What is read back is untrusted data from an earlier worker generation
  * (or an earlier build), so it is validated on every read: the version must be
- * {@link STORED_CREDENTIAL_VERSION}, and the credential must satisfy the very
- * schema — `pairCompleteResponseSchema` — that validated it when the service
- * issued it.
+ * {@link STORED_CREDENTIAL_VERSION}, and the credential and its read proof must
+ * satisfy the very schema — `pairCompleteResponseSchema` — that validated them
+ * when the service issued them.
  */
 export interface StoredDevtoolsCredential {
   /** Always {@link STORED_CREDENTIAL_VERSION}. */
   readonly version: typeof STORED_CREDENTIAL_VERSION;
   /** The devtools credential exactly as `POST /pair/complete` returned it. */
   readonly token: PairCompleteResponse['token'];
+  /**
+   * The read proof `POST /pair/complete` returned with {@link token}, which
+   * every DevTools read carries (`READ_PROOF_HEADER`). Every record this build
+   * writes has one. A record an earlier build wrote has none: it still reads as
+   * paired, and its first read — refused by the service as `UNAUTHORIZED` —
+   * drops it through {@link DevtoolsCredentialStore.handleUnauthorized}, so the
+   * developer pairs again. ⚠️ As secret as the token.
+   */
+  readonly readProof?: PairCompleteResponse['readProof'];
+}
+
+/** A credential this store holds, with the read proof issued with it when it has one. */
+interface HeldCredential {
+  readonly token: string;
+  readonly readProof: string | undefined;
 }
 
 /**
@@ -375,6 +391,20 @@ export interface DevtoolsCredentialStore {
   readonly getToken: () => Promise<string | undefined>;
 
   /**
+   * The read proof issued with the held credential, which the service requires
+   * as `READ_PROOF_HEADER` on every DevTools read (`session.get`, `panel.get`,
+   * `panel.getById`, `modifications.list`). Read with the same freshness as
+   * {@link getToken}: storage first when this worker generation holds nothing.
+   *
+   * @returns The proof, or `undefined` when no credential is held or the held
+   * one was stored by an earlier build without a proof — whose reads the
+   * service then refuses as `UNAUTHORIZED`, which {@link handleUnauthorized}
+   * turns into a new pairing. ⚠️ As secret as the credential: handed only to
+   * the protocol HTTP client, never logged.
+   */
+  readonly getReadProof: () => Promise<string | undefined>;
+
+  /**
    * Redeem a one-time pairing code for a devtools credential.
    *
    * The code is trimmed and must then have {@link PAIRING_CODE_LENGTH}
@@ -385,8 +415,9 @@ export interface DevtoolsCredentialStore {
    * failure — is returned exactly as the client produced it, never retried.
    *
    * On success the credential is installed on the shared `HttpClient`
-   * (`setToken(store.getToken)`), written to storage, and the state moves to
-   * `'paired'`, which is the listeners' cue to connect the socket.
+   * (`setToken(store.getToken)`), written to storage with the read proof issued
+   * with it, and the state moves to `'paired'`, which is the listeners' cue to
+   * connect the socket.
    *
    * A second call while one is in flight does not spend another attempt: the
    * same code joins the attempt already running, and a different code waits for
@@ -481,22 +512,33 @@ export interface DevtoolsCredentialStore {
  * @returns The credential, or `undefined`.
  */
 function wellFormedToken(candidate: unknown): string | undefined {
-  const parsed = pairCompleteResponseSchema.safeParse({ token: candidate });
-  return parsed.success ? parsed.data.token : undefined;
+  const parsed = pairCompleteResponseSchema.shape.token.safeParse(candidate);
+  return parsed.success ? parsed.data : undefined;
 }
 
 /**
  * Read a {@link StoredDevtoolsCredential} back from untrusted storage data.
  *
  * @param value What storage held under {@link DEVTOOLS_TOKEN_STORAGE_KEY}.
- * @returns The credential when the record has the current version and a
- * well-formed token; otherwise `undefined`, which reads as "not paired".
+ * @returns The credential when the record has the current version, a
+ * well-formed token and either a well-formed read proof or none at all (a
+ * record an earlier build wrote); otherwise `undefined`, which reads as "not
+ * paired". A malformed read proof makes the whole record unreadable rather than
+ * a credential without one.
  */
-function decodeStoredCredential(value: unknown): string | undefined {
+function decodeStoredCredential(value: unknown): HeldCredential | undefined {
   if (!isPlainRecord(value) || value.version !== STORED_CREDENTIAL_VERSION) {
     return undefined;
   }
-  return wellFormedToken(value.token);
+  const token = wellFormedToken(value.token);
+  if (token === undefined) {
+    return undefined;
+  }
+  const { readProof } = value;
+  if (readProof === undefined) {
+    return { token, readProof: undefined };
+  }
+  return isReadProof(readProof) ? { token, readProof } : undefined;
 }
 
 /**
@@ -650,6 +692,8 @@ export function createDevtoolsCredentialStore(
 
   /** The credential, while one is known to exist. Never a cached absence. */
   let memo: string | undefined;
+  /** The read proof issued with {@link memo}; `undefined` whenever it is, or when it has none. */
+  let memoProof: string | undefined;
   /** Whether this worker generation has established the state at all. */
   let known = false;
   /** Bumped whenever {@link memo} changes. */
@@ -722,8 +766,9 @@ export function createDevtoolsCredentialStore(
   };
 
   /** Hold a credential that has not been presented to any client yet. */
-  const adopt = (token: string): void => {
-    memo = token;
+  const adopt = (held: HeldCredential): void => {
+    memo = held.token;
+    memoProof = held.readProof;
     generation += 1;
     presented = false;
     known = true;
@@ -733,13 +778,14 @@ export function createDevtoolsCredentialStore(
   /** Hold no credential. */
   const forget = (): void => {
     memo = undefined;
+    memoProof = undefined;
     generation += 1;
     presented = false;
     known = true;
   };
 
   /** Read the stored credential. Fulfils with `undefined` on any failure. */
-  const readStored = async (): Promise<string | undefined> => {
+  const readStored = async (): Promise<HeldCredential | undefined> => {
     const outcome = await fromPromise(
       Promise.resolve().then(() => storage.get(DEVTOOLS_TOKEN_STORAGE_KEY)),
       'STORE_ERROR',
@@ -756,15 +802,15 @@ export function createDevtoolsCredentialStore(
     if (raw === undefined) {
       return undefined;
     }
-    const token = decodeStoredCredential(raw);
-    if (token === undefined && !reportedUnreadable) {
+    const held = decodeStoredCredential(raw);
+    if (held === undefined && !reportedUnreadable) {
       reportedUnreadable = true;
       logger.warn(
         'The stored devtools credential is unreadable and is ignored; pairing again replaces it.',
         KEY_FIELDS,
       );
     }
-    return token;
+    return held;
   };
 
   /**
@@ -799,8 +845,12 @@ export function createDevtoolsCredentialStore(
   };
 
   /** Write the credential record. Fulfils with the outcome; never rejects. */
-  const persist = (token: string): Promise<Result<void, DebuggenError>> => {
-    const record: StoredDevtoolsCredential = { version: STORED_CREDENTIAL_VERSION, token };
+  const persist = (token: string, readProof: string): Promise<Result<void, DebuggenError>> => {
+    const record: StoredDevtoolsCredential = {
+      version: STORED_CREDENTIAL_VERSION,
+      token,
+      readProof,
+    };
     return fromPromise(
       Promise.resolve().then(() => storage.set({ [DEVTOOLS_TOKEN_STORAGE_KEY]: record })),
       'STORE_ERROR',
@@ -830,9 +880,9 @@ export function createDevtoolsCredentialStore(
     if (!isPlainRecord(change)) {
       return;
     }
-    const previous = decodeStoredCredential(change.oldValue);
+    const previous = decodeStoredCredential(change.oldValue)?.token;
     const next = decodeStoredCredential(change.newValue);
-    if (previous !== memo || next === memo) {
+    if (previous !== memo || next?.token === memo) {
       return;
     }
     if (next === undefined) {
@@ -877,6 +927,14 @@ export function createDevtoolsCredentialStore(
       presented = true;
     }
     return memo;
+  };
+
+  const getReadProof = async (): Promise<string | undefined> => {
+    ensureSubscribed();
+    await hydrate();
+    // The proof of the credential held now, for the same reason getToken
+    // answers with the freshest value.
+    return memo === undefined ? undefined : memoProof;
   };
 
   /**
@@ -934,7 +992,8 @@ export function createDevtoolsCredentialStore(
     }
 
     const token = wellFormedToken(response.value.token);
-    if (token === undefined) {
+    const { readProof } = response.value;
+    if (token === undefined || !isReadProof(readProof)) {
       logger.error('The pairing response carried no usable credential.', KEY_FIELDS);
       return err(
         workerError(
@@ -945,8 +1004,8 @@ export function createDevtoolsCredentialStore(
       );
     }
 
-    adopt(token);
-    const saved = await persist(token);
+    adopt({ token, readProof });
+    const saved = await persist(token, readProof);
     if (!saved.ok) {
       logger.warn('Paired, but the devtools credential could not be saved to extension storage.', {
         ...KEY_FIELDS,
@@ -1114,6 +1173,7 @@ export function createDevtoolsCredentialStore(
 
   return Object.freeze({
     getToken,
+    getReadProof,
     completePairing,
     handleUnauthorized,
     clearToken,

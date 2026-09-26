@@ -1,6 +1,6 @@
 /**
- * Acceptance test 1, "Slow Button" (AAP §0.8.4): the demo's "Place order"
- * control is slow, and the product must explain why from real evidence.
+ * The "Slow Button" acceptance test: the demo's "Place order" control is slow,
+ * and the product must explain why from real evidence.
  *
  * One workflow test drives the whole product — code analysis, a validated and
  * applied instrumentation plan, a real capture of a real click on the demo's
@@ -75,7 +75,7 @@
  * a second, idempotent guarantee).
  *
  * Failure text names kinds, span ids, paths and counts only — never a raw
- * attribute value, a header, a full URL or statement text (AAP §0.5.2).
+ * attribute value, a header, a full URL or statement text.
  */
 
 import { realpath } from 'node:fs/promises';
@@ -171,7 +171,7 @@ import { DEFAULT_WAIT_TIMEOUT_MS, POLL_INTERVALS_MS } from './helpers/service';
 // The question, the page and the control
 // ---------------------------------------------------------------------------
 
-/** The demonstrated question of AAP §0.1.2, asked verbatim. */
+/** The question of `docs/DEMO.md`'s first walkthrough, asked verbatim. */
 const QUESTION = 'Why is this button slow?';
 
 /** The storefront page the defect is reproduced on. */
@@ -282,18 +282,19 @@ const PAYLOAD_ATTRIBUTE_PATTERN =
  */
 const NUMERIC_LITERAL_PATTERN = /(?<![\w$.])\d+(?:\.\d+)?(?![\w.])/;
 
-/** The instrument stage's closing row (AAP §0.1.2, Step 8: "Ready to capture"). */
+/** The instrument stage's closing row: "Ready to capture". */
 const READY_TO_CAPTURE_PATTERN = /^ready to capture$/i;
 
 /**
  * The signal rows the instrument stage must report done for this question:
- * the server and database tiers the correlated trace below depends on (AAP
- * §0.1.2, Step 8 wording). Both are served by the dev server's preload, which
- * is attached before the session starts. The page-side signals ("Network
- * tracing", "React renders", …) are armed through the page agent, which may
- * report only after installation ran; they are then listed as unavailable with
- * a reason and a hint, and armed when the agent reports, which the captured
- * fetch and interaction spans prove.
+ * the server and database tiers the correlated trace below depends on, by the
+ * labels the progress view shows (`docs/ARCHITECTURE.md`, "Progress from real
+ * findings"). Both are served by the dev server's preload, which is attached
+ * before the session starts. The page-side signals ("Network tracing", "React
+ * renders", …) are armed through the page agent, which may report only after
+ * installation ran; they are then listed as unavailable with a reason and a
+ * hint, and armed when the agent reports, which the captured fetch and
+ * interaction spans prove.
  */
 const ARMED_SIGNAL_LABELS = ['Server spans', 'Database tracing'] as const;
 
@@ -312,7 +313,7 @@ const LATER_STAGES = [
   'generate-panel',
 ] as const satisfies readonly ProgressStage[];
 
-/** The per-tier durations the slow-interaction panel is about (AAP §0.6.5). */
+/** The per-tier durations the slow-interaction panel is about. */
 const TIER_METRICS = [
   'total_duration',
   'frontend_duration',
@@ -334,11 +335,11 @@ const SAME_PRODUCER_TOLERANCE_MS = 1;
 /**
  * Nesting slack between the browser agent and the Node preload. Each converts
  * its own monotonic clock to epoch milliseconds (`performance.timeOrigin` and
- * OpenTelemetry `hrTime`) and nothing aligns the two beyond that (AAP §0.2.3:
- * the per-producer clock offset is informational), so a server span may appear
- * to start a few milliseconds before the fetch that caused it. 100 ms bounds
- * that skew on one machine by orders of magnitude while staying far below the
- * request itself.
+ * OpenTelemetry `hrTime`) and nothing aligns the two beyond that
+ * (`docs/ARCHITECTURE.md`, "Time base": the per-producer clock offset is
+ * informational), so a server span may appear to start a few milliseconds
+ * before the fetch that caused it. 100 ms bounds that skew on one machine by
+ * orders of magnitude while staying far below the request itself.
  */
 const CROSS_PRODUCER_TOLERANCE_MS = 100;
 
@@ -2136,8 +2137,8 @@ test.describe('slow checkout interaction', () => {
     const spec = fromWorkflow(panelSpec, 'the generated panel');
     const evidence = fromWorkflow(run, 'the workflow evidence');
 
-    // The product's own validator accepts it, and it is not the fallback view
-    // (AAP §0.5.5), which is never acceptance evidence.
+    // The product's own validator accepts it, and it is not the fallback view,
+    // which is never acceptance evidence.
     expectValidPanelSpec(spec, { message: 'The generated panel:' });
     const validated = validatePanelSpec(spec);
     expect(validated.ok, 'validatePanelSpec rejects the generated panel.').toBe(true);

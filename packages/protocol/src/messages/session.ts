@@ -396,7 +396,7 @@ export type SessionCreatedPayload = z.infer<typeof sessionCreatedPayloadSchema>;
  * unbound, a cleanup completed. It is also the frame that *replays* a session:
  * reopening one from the editor's Sessions tree sends this payload and the
  * latest `panel.generated` from stored data, and both surfaces re-render from
- * them exactly as they did while the session ran (AAP §0.4.2).
+ * them exactly as they did while the session ran.
  *
  * ## Two names, one shape, and why that is deliberate
  *
@@ -405,8 +405,8 @@ export type SessionCreatedPayload = z.infer<typeof sessionCreatedPayloadSchema>;
  * how much they would cost to get wrong:
  *
  * 1. `messages/index.ts` needs **two registry entries**, because
- *    `session.created` and `session.updated` are two message types in AAP
- *    §0.4.2 and the envelope's union enumerates types, not shapes.
+ *    `session.created` and `session.updated` are two distinct message types
+ *    and the envelope's union enumerates types, not shapes.
  * 2. Consumers react differently — the editor reveals its view on creation and
  *    refreshes in place on an update — and two named types keep that difference
  *    expressible without a flag inside the payload.
@@ -419,7 +419,7 @@ export type SessionCreatedPayload = z.infer<typeof sessionCreatedPayloadSchema>;
  *
  * ## Whole records, not deltas
  *
- * Every frame carries the complete record, as AAP §0.4.2 specifies, and that is
+ * Every frame carries the complete session record, never a delta, and that is
  * what makes each frame self-sufficient: a client that missed frames — an MV3
  * service worker the browser suspended, an editor that reconnected after a
  * service restart — is fully current again on the next one, with no base
@@ -617,9 +617,9 @@ const MAX_DEV_SERVER_URL_LENGTH = 2048;
  *
  * A dev-server URL is stored on the session record and shown in both user
  * interfaces, so one that carried a credential would copy it into the store and
- * onto the screen (AAP §0.5.2). A value the URL parser refuses is reported as
- * free of user information here, because the preceding `z.url` check already
- * refuses it with its own, more precise issue.
+ * onto the screen. A value the URL parser refuses is reported as free of user
+ * information here, because the preceding `z.url` check already refuses it
+ * with its own, more precise issue.
  *
  * @param value A string that has passed the absolute-URL check.
  * @returns `false` only when the parsed URL carries a user name or password.
@@ -726,8 +726,8 @@ export const sessionCreateRequestSchema = z.strictObject({
   /**
    * The dev-server URL the editor found answering, when it found one.
    *
-   * A session is created "with a `projectRoot` and the project's dev-server
-   * URL (probed or launched)" (AAP §0.2.3). A dev server the service launched is
+   * A session is created with a `projectRoot` and the project's dev-server
+   * URL, found by a probe or a launch. A dev server the service launched is
    * known to the service already; one the developer started themselves is not,
    * and the editor is what knows where it serves — its `debuggen.devServerUrl`
    * setting, probed immediately before this request. So the editor forwards
@@ -762,14 +762,13 @@ export type SessionCreateRequest = z.infer<typeof sessionCreateRequestSchema>;
  * follow-up stage either re-derives an answer from the stored capture
  * (`generated → analyzing → generated`) or requires a new one
  * (`generated → planning → instrumenting → ready`), and both paths store new
- * analysis and panel versions rather than overwriting the old (AAP §0.4.2). A
- * client learns which path was taken from the frames that follow, never from
- * this request.
+ * analysis and panel versions rather than overwriting the old. A client learns
+ * which path was taken from the frames that follow, never from this request.
  *
  * ## Idempotency: `attemptId`
  *
  * The request is keyed by `attemptId` (see `../session-record.ts`'s
- * `followUpAttemptIdSchema`), never by its text (AAP §0.5.4):
+ * `followUpAttemptIdSchema`), never by its text:
  *
  * | `attemptId` names … | The service … |
  * | --- | --- |

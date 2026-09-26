@@ -753,7 +753,7 @@ function boundedName(name: string): string {
 }
 
 /**
- * `[function]`, or `[function handleCheckout]` when the name is readable.
+ * `[function]`, or `[function handleSubmit]` when the name is readable.
  *
  * The name is the whole point — it is what tells a developer that the callback
  * prop changing identity on every render is theirs — and `fn.toString()`,
@@ -807,7 +807,7 @@ function componentName(type: unknown): string | undefined {
 
 /**
  * The element's component name: a host tag (`div`), a component name
- * (`ProductCard`), a React built-in (`fragment`), or {@link ANONYMOUS_COMPONENT}.
+ * (`UserAvatar`), a React built-in (`fragment`), or {@link ANONYMOUS_COMPONENT}.
  *
  * One level of `memo`/`forwardRef` unwrapping is applied, because an anonymous
  * wrapper around a named component is the common case and reporting it as
@@ -867,7 +867,7 @@ function readArrayLength(value: object): number {
 }
 
 /**
- * `Array(48) ["sku-1", { id: number }, …]` — the length, then at most
+ * `Array(12) ["item-1", { id: number }, …]` — the length, then at most
  * {@link MAX_ARRAY_ELEMENTS} summarised elements.
  *
  * The length alone answers most render questions ("the list grew"), and the

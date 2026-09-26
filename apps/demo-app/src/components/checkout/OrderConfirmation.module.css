@@ -222,8 +222,8 @@
 
 /* The line's settled figure. `Price` supplies the family, the size and the weight; this keeps the
  * numerals tabular if the caller renders plain text here instead, and states the family for the
- * same reason. The inline-end alignment is `.lineAmounts`' - a `justify-self` here would describe
- * a grid item this element no longer is. */
+ * same reason. The inline-end alignment is `.lineAmounts`' - this element is a flex item of that
+ * column rather than a grid item, so a `justify-self` here would have no effect. */
 .lineTotal {
   font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-variant-numeric: tabular-nums;
@@ -239,10 +239,10 @@
  * page's main column and in the narrower checkout column, and neither knows what the other is
  * doing - `.root` is the size container that makes that possible.
  *
- * 26 rather than the 22 a single figure needed: a line's money column now carries the units at
- * their captured price, the line's discount and its settled amount, so the widest thing it has to
- * hold beside a two-line product name is a phrase rather than one figure, and the point at which
- * the two stop fitting side by side moves out with it.
+ * The threshold is 26rem because a line's money column carries the units at their captured price,
+ * the line's discount and its settled amount, so the widest thing it holds beside a two-line
+ * product name is a phrase rather than a single figure; below this width the two stop fitting side
+ * by side.
  *
  * Nothing here re-aligns the money. `.lineAmounts` keeps its own inline-end alignment, so the
  * figures stay on the inline-end edge once stacked and the column they form with the totals below
@@ -410,11 +410,8 @@
  * on the primary ink colour and the brand accent carries the underline, because the accent is a
  * fill colour and does not clear text contrast on this surface at this size.
  *
- * BLITZY [A11Y]: the amber underline measures about 2.15:1 against --ls-surface, below the 3:1
- * recommendation for a non-text indicator. Implemented as the shared token contract specifies -
- * `globals.css` carries the same note against --ls-accent - rather than silently darkened, and it
- * is never the only thing marking the link: the text is underlined, sits at 17.9:1 on this
- * surface and takes a --ls-focus ring when focused. Flagged for design review. */
+ * The accent colour is never the only thing marking the link: the text is underlined and sits at
+ * 17.9:1 on this surface, and it takes a --ls-focus ring when focused. */
 .actionLink {
   border-radius: var(--ls-radius-sm, 4px);
   color: var(--ls-text, #0f172a);

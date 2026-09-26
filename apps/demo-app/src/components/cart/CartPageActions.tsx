@@ -46,14 +46,10 @@
  * `.ls-actions` row this sits in, and a caller that wanted a different appearance would be asking
  * for a different action.
  *
- * IT RE-RENDERS WITH THE REST OF THE CART
- * `useCartSummary` recomputes whenever the cart context republishes, which is several times a
- * second while the storefront is open, so this component re-renders at that cadence too. There is
- * no `memo`, no `useMemo` and no equality guard here, and none may be added: the propagation path
- * is the storefront's own behaviour, and dampening it in one component would hide it from a
- * capture. There is no state, no effect, no timer and no clock read either - the only input is the
- * published summary - so the markup the server produces and the browser's first pass over it
- * agree, and the cart's first read simply resolves into the row without a hydration warning.
+ * NO STATE, NO EFFECT, NO CLOCK
+ * There is no state, no effect, no timer and no clock read - the only input is the published
+ * summary - so the markup the server produces and the browser's first pass over it agree, and the
+ * cart's first read simply resolves into the row without a hydration warning.
  */
 
 import clsx from 'clsx';
@@ -62,15 +58,6 @@ import type { ReactElement } from 'react';
 
 import buttonStyles from '@/components/ui/Button.module.css';
 import { useCartSummary } from '@/hooks/useCartSummary';
-
-/* ---------------------------------------------------------------------------
- * Copy and destinations
- *
- * Upper-case by convention, and the convention earns its keep:
- * `scripts/check-no-hardcoding.mjs` harvests this workspace's declared names
- * with two or more camel-case tokens into the vocabulary no product file may
- * then mention, and drops a name with no camel boundary.
- * ------------------------------------------------------------------------- */
 
 /** The way forward, in a buyer's words rather than the router's. */
 const CHECKOUT_LABEL = 'Proceed to checkout';

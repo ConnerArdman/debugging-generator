@@ -13,18 +13,17 @@
  *     accessible text query rather than legible only as a colour or a class, and
  *     the views below it still render — a deterministic summary of a real
  *     capture is worth reading, and a failure is never presented as a
- *     successful analysis (AAP 0.5.5, 0.5.3).
+ *     successful analysis.
  *   - **Observed evidence never blurs into inferred cause.** The two registers
  *     render as two separately labelled regions, neither inside the other, and
  *     the summary's `headline` — non-evidentiary prose, which "can never become
- *     a Fact" — appears in the panel but never inside the observed-facts region
- *     (AAP 0.2.3, 0.8.4).
+ *     a Fact" — appears in the panel but never inside the observed-facts region.
  *   - **A location travels unmodified.** Activating a `sourceLink` node's chip,
  *     and separately a likely cause's suggested-location chip, reports the very
  *     location the document carried: every field, including `symbol`,
  *     `endLine`, `resolvedBy` and `confidence`. This is hop 1 of the
  *     click-to-source chain, and the hops after it can only be as accurate as
- *     what leaves here (AAP 0.4.2).
+ *     what leaves here.
  *   - **The document is read, never written.** The specification is held by the
  *     store, carried by the transport and rendered by two surfaces at once, so a
  *     convenience sort or a filled-in default here would change what a developer
@@ -33,9 +32,9 @@
  *
  * Alongside those, the theme case pins the design system's own contract — the
  * theme attribute is applied for every `PanelTheme`, resolved through the
- * tokens' helper rather than through a literal (AAP 0.6.3, 0.6.4) — the
- * recursion case proves a nested layout is rendered level by level with stable
- * keys, and the empty-layout case pins the distinction between "this panel
+ * tokens' helper rather than through a literal — the recursion case proves a
+ * nested layout is rendered level by level with stable keys, and the
+ * empty-layout case pins the distinction between "this panel
  * specifies no views" (a state) and "this panel failed" (an error), which the
  * fallback case pins from the other side.
  *
@@ -59,7 +58,7 @@
  *     specification's `sessionId` with each query, a document that moves to
  *     another session re-asks under the new one, and a document with no usable
  *     session is an error rather than a request the service cannot route
- *     (`POST /sessions/:id/panel-data`, AAP 0.4.2). The two seam rules the host
+ *     (`POST /sessions/:id/panel-data`). The two seam rules the host
  *     relies on — the provider refuses a blank session before its resolver
  *     runs, and the query hook hands a view the wire's `null` "last page"
  *     marker as the one end-of-data value, `undefined` — are pinned here too,
@@ -87,11 +86,14 @@
  * The last block pins the failure contract every query-backed node renders
  * through, because the host tier is where its three halves meet: the query
  * hook's faithful error codes and one-alert-per-burst announcement policy, the
- * pure helpers that compose an error state's props (one query format, one
- * lead-plus-cause message, integration remedies behind the technical details
- * rather than on the hint line), and the primitive that draws them — with the
- * focus key on its retry control and the single-ellipsis convention of the
- * loading label beside it.
+ * pure helpers that compose an error state's props (one query format, a fixed
+ * lead followed only by an authored, presentable cause, allowlisted details,
+ * integration remedies behind the technical details rather than on the hint
+ * line), and the primitive that draws them — with the focus key on its retry
+ * control and the single-ellipsis convention of the loading label beside it.
+ * Hostile rejections — a private path, a statement, a credential, a salvaged
+ * error-shaped object — are driven through both the hook and the helpers, and
+ * none of their text may reach the screen.
  *
  * The final block pins the other half of that focus key: the node frame
  * `NodeRenderer` draws around every node keeps keyboard focus inside the node
@@ -134,7 +136,8 @@
  *   - **In-file synthetic builders, no fixture files**, and nothing imported
  *     from a sibling suite: test files in this repository do not depend on each
  *     other.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4). Every title, statement,
+ *   - **Generic fixture vocabulary only**, because the renderer holds no
+ *     behaviour keyed to any application's names. Every title, statement,
  *     caption, id and path below is obviously synthetic product prose naming no
  *     application, demonstration or otherwise.
  *   - **Queries by role and accessible name**, scoped with `within` wherever a
@@ -304,7 +307,7 @@ vi.mock(import('../components/SourceLink'), async (importOriginal) => {
  * Every string a case queries by is declared once here, so that an assertion
  * names the same value the builder wrote. Nothing below is read out of an
  * inspected project, and nothing names an application: these are placeholders
- * chosen to be unmistakably placeholders (AAP 0.5.4).
+ * chosen to be unmistakably placeholders.
  * ---------------------------------------------------------------------------
  */
 
@@ -418,7 +421,8 @@ const CITATION_TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
 const CITATION_SPAN_ID = '00f067aa0ba902b7';
 
 /**
- * The accessible name of the observed region, as AAP 0.7.3 fixes it.
+ * The accessible name of the observed region, as the renderer contract in
+ * `docs/ARCHITECTURE.md` names it.
  *
  * Restated here rather than imported because `../layout/SummaryHeader` keeps its
  * two captions private, which is correct — they are its copy, not a shared
@@ -428,7 +432,7 @@ const CITATION_SPAN_ID = '00f067aa0ba902b7';
  */
 const OBSERVED_REGION_NAME = 'Observed';
 
-/** The accessible name of the likely-cause region, as AAP 0.8.4 fixes it. */
+/** The accessible name of the likely-cause region, as the same renderer contract names it. */
 const LIKELY_CAUSE_REGION_NAME = 'Likely cause';
 
 /** The title of the outermost container of {@link makeNestedLayout}. */
@@ -1447,7 +1451,7 @@ afterEach(() => {
 
 /*
  * ---------------------------------------------------------------------------
- * The theme contract (AAP 0.6.3, 0.6.4)
+ * The theme contract
  * ---------------------------------------------------------------------------
  */
 
@@ -1489,7 +1493,7 @@ describe('PanelHost theme application', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Observed facts against inferred causes (AAP 0.2.3, 0.8.4)
+ * Observed facts against inferred causes
  * ---------------------------------------------------------------------------
  */
 
@@ -1557,7 +1561,7 @@ describe('PanelHost summary registers', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * What a gesture reports to the host (AAP 0.4.2)
+ * What a gesture reports to the host
  * ---------------------------------------------------------------------------
  */
 
@@ -1792,7 +1796,7 @@ describe('the action-form adapters the host relies on', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The fallback notice (AAP 0.5.5, 0.5.3)
+ * The fallback notice
  * ---------------------------------------------------------------------------
  */
 
@@ -2101,7 +2105,7 @@ describe('PanelHost fallback notice', () => {
 
     // In the accessibility tree, not merely on the surface: the notice was
     // found by its words, and it is announced politely rather than left to a
-    // colour or a class to carry (AAP 0.6.4 forbids either as the sole signal).
+    // colour or a class to carry, since neither may ever be the sole signal.
     expect(banner.getAttribute('role')).toBe('status');
     expect(banner.getAttribute('aria-live')).toBe('polite');
 
@@ -2240,7 +2244,7 @@ describe('PanelHost layout rendering', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The query lifecycle, through the host (AAP 0.6.2, 0.5.5)
+ * The query lifecycle, through the host
  * ---------------------------------------------------------------------------
  */
 
@@ -2294,7 +2298,8 @@ describe('PanelHost query lifecycle', () => {
     );
 
     // The rejection is an error state carrying the failure's own code — never
-    // a view drawn over no data, and never still loading (AAP 0.5.5).
+    // a view drawn over no data, and never still loading: a failure is never
+    // presented as a result.
     const alert = await within(stack).findByRole('alert');
     expect(alert.textContent).toContain(PROVIDER_FAILURE_CODE);
     expect(within(stack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
@@ -2327,7 +2332,7 @@ describe('PanelHost query lifecycle', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Session routing: every query names its panel's session (AAP 0.4.2)
+ * Session routing: every query names its panel's session
  * ---------------------------------------------------------------------------
  */
 
@@ -2618,7 +2623,7 @@ describe('the session-addressed data seam the host relies on', () => {
 /*
  * ---------------------------------------------------------------------------
  * The host data contract: the service's body becomes the view a component
- * reads, and nothing malformed reaches a component as data (AAP 0.4.2, 0.5.5)
+ * reads, and nothing malformed reaches a component as data
  * ---------------------------------------------------------------------------
  */
 
@@ -3467,7 +3472,7 @@ describe('PanelHost re-rendering', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The document outline, and inert citations (AAP 0.6.4)
+ * The document outline, and inert citations
  * ---------------------------------------------------------------------------
  */
 
@@ -3647,10 +3652,10 @@ describe('PanelHost treatment of the specification', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Cross-view selection through the real host (B2-F21)
+ * Cross-view selection through the real host
  *
- * The panel has one selected event, and every view that draws it marks it
- * (AAP 0.7.3: evidence chips "select the underlying events"). These cases draw
+ * The panel has one selected event, and every view that draws it marks it:
+ * an evidence chip selects the underlying event everywhere. These cases draw
  * the two event-bearing tables a panel most often pairs — a `table` node (the
  * span table) and an `eventLog` node — over the same three records, through
  * the real host and the real views, and select from each of the three places a
@@ -3938,7 +3943,7 @@ describe('PanelHost cross-view selection', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Cross-view selection between the charts and the tables (B1-F24, B2-F21)
+ * Cross-view selection between the charts and the tables
  *
  * The same one-selection rule, drawn through the real host across views of
  * different shapes: the timeline's canvas and grid, the waterfall's tree and
@@ -4140,8 +4145,8 @@ describe('PanelHost cross-view selection between charts and tables', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The failure contract: one error state, one wording, one alert per burst
- * (B1-F14, B1-F16, B2-F12, B2-F14)
+ * The failure contract: one error state, one wording, no foreign text, one
+ * alert per burst
  * ---------------------------------------------------------------------------
  */
 
@@ -4158,6 +4163,58 @@ describe('the failure contract every query-backed node renders', () => {
   /** The generic lead every failed next page's message opens with. */
   const PAGE_LEAD =
     'The next page of this view could not be loaded. The rows already shown are unaffected.';
+
+  /** The renderer's fixed sentence for a rejection that says nothing usable about itself. */
+  const GENERIC_CAUSE = "The request for this view's data failed.";
+
+  /** The renderer's fixed sentence for a rejection carrying HTTP 503. */
+  const HTTP_503_CAUSE = "The request for this view's data failed with HTTP 503.";
+
+  /** The renderer's fixed sentence for a transport timeout. */
+  const TIMEOUT_CAUSE = "The connection carrying this view's data failed (TimeoutError).";
+
+  /** The product-wide marker an unpresentable detail value is replaced with. */
+  const REDACTED = '[redacted]';
+
+  /** A private absolute path, of the kind an `ENOENT` message or a stack carries. */
+  const PRIVATE_PATH = '/Users/dev/app/.env';
+
+  /** An upper-case statement with a positional parameter, as a driver error quotes it. */
+  const PRIVATE_STATEMENT = 'SELECT password_hash FROM accounts WHERE id = $1';
+
+  /**
+   * A provider key and a bearer credential, in the shapes the redaction layer
+   * recognises. Assembled from fragments at run time so that no tracked file
+   * holds a contiguous credential for the repository's secret scan to find.
+   */
+  const PROVIDER_KEY_SHAPE = ['sk', 'ant', 'api03', 'Qx7Lm2Pz'.repeat(3)].join('-');
+  const BEARER_TOKEN_BODY = 'Rt5Vw8Yz'.repeat(2);
+
+  /** A rejection message carrying every kind of private text at once. */
+  const PRIVATE_MESSAGE = `${PRIVATE_PATH}: ENOENT while running ${PRIVATE_STATEMENT} with ${PROVIDER_KEY_SHAPE} and Bearer ${BEARER_TOKEN_BODY}`;
+
+  /** A lower-case statement with an inline literal, as a driver error quotes it. */
+  const PRIVATE_LOWER_STATEMENT = "select password_hash from accounts where id = 'alice'";
+
+  /** A short password, which no value pattern can recognise on its own. */
+  const SHORT_PASSWORD = 'hunter2';
+
+  /**
+   * Substrings of {@link PRIVATE_MESSAGE}, {@link PRIVATE_LOWER_STATEMENT} and
+   * {@link SHORT_PASSWORD}, none of which may reach the screen.
+   */
+  const PRIVATE_FRAGMENTS: readonly string[] = [
+    PRIVATE_PATH,
+    'Users/dev',
+    PRIVATE_STATEMENT,
+    'password_hash',
+    PROVIDER_KEY_SHAPE,
+    BEARER_TOKEN_BODY,
+    'ENOENT',
+    PRIVATE_LOWER_STATEMENT,
+    "'alice'",
+    SHORT_PASSWORD,
+  ];
 
   /**
    * Words that belong to whoever integrated a host, never to the reader of a
@@ -4238,6 +4295,23 @@ describe('the failure contract every query-backed node renders', () => {
    */
   function makeRejectingProvider(makeCause: () => Error): StubProvider {
     const resolve = vi.fn<DataQueryResolver>(() => Promise.reject(makeCause()));
+
+    return { provider: createDataProvider(resolve), resolve };
+  }
+
+  /**
+   * A provider whose every call fails with a fresh value of any kind — a
+   * string, an error-shaped object — as a hand-written provider may. The
+   * resolver throws, and the factory's `async` query turns the throw into the
+   * rejection the hook receives, unchanged.
+   *
+   * @param makeCause Builds the thrown value for one call.
+   * @returns The provider and its recorded resolver.
+   */
+  function makeThrowingProvider(makeCause: () => unknown): StubProvider {
+    const resolve = vi.fn<DataQueryResolver>(() => {
+      throw makeCause();
+    });
 
     return { provider: createDataProvider(resolve), resolve };
   }
@@ -4577,9 +4651,345 @@ describe('the failure contract every query-backed node renders', () => {
     );
 
     const failure = await settledFailure('unavailable view');
-    expect(within(failure).getByText(`${VIEW_LEAD} Service Unavailable.`).tagName).toBe('P');
+    expect(within(failure).getByText(`${VIEW_LEAD} ${HTTP_503_CAUSE}`).tagName).toBe('P');
+    expect(failure.textContent).not.toContain('Service Unavailable');
     const detailsBlock = within(failure).getByRole('group', { name: DETAILS_NAME, hidden: true });
     expect(JSON.parse(detailsBlock.textContent ?? '')).toEqual({ status: 503 });
+  });
+
+  /** One hostile value a provider may fail with, and what its error state must show. */
+  interface HostileRejectionCase {
+    /** What the value is, for the case title. */
+    readonly name: string;
+    /** Builds the value the provider fails with. */
+    readonly cause: () => unknown;
+    /** The code the error state shows. */
+    readonly code: string;
+    /** The whole message line: the lead, and at most the renderer's fixed sentence. */
+    readonly message: string;
+    /** The technical details, parsed, or `undefined` for no details block. */
+    readonly details: Readonly<Record<string, unknown>> | undefined;
+  }
+
+  const HOSTILE_REJECTIONS: readonly HostileRejectionCase[] = [
+    {
+      name: 'a plain error quoting a path, a statement and two credentials',
+      cause: () => new Error(PRIVATE_MESSAGE),
+      code: 'INTERNAL',
+      message: `${VIEW_LEAD} ${GENERIC_CAUSE}`,
+      details: { errorName: 'Error' },
+    },
+    {
+      name: 'an HTTP 503 whose message is a private path',
+      cause: () => Object.assign(new Error(PRIVATE_MESSAGE), { status: 503 }),
+      code: 'TRANSPORT_DISCONNECTED',
+      message: `${VIEW_LEAD} ${HTTP_503_CAUSE}`,
+      details: { status: 503 },
+    },
+    {
+      name: 'a timeout whose message is a private path',
+      cause: () => Object.assign(new Error(PRIVATE_MESSAGE), { name: 'TimeoutError' }),
+      code: 'TRANSPORT_DISCONNECTED',
+      message: `${VIEW_LEAD} ${TIMEOUT_CAUSE}`,
+      details: { name: 'TimeoutError' },
+    },
+    {
+      name: 'a bare string',
+      cause: () => PRIVATE_MESSAGE,
+      code: 'INTERNAL',
+      message: `${VIEW_LEAD} ${GENERIC_CAUSE}`,
+      details: undefined,
+    },
+    {
+      name: 'a typed error the provider copied from a plain exception',
+      cause: () => DebuggenError.from(new Error(`${PRIVATE_PATH}: ENOENT`), 'STORE_ERROR'),
+      code: 'STORE_ERROR',
+      message: VIEW_LEAD,
+      details: undefined,
+    },
+    {
+      name: 'an error-shaped object claiming the typed brand',
+      cause: () => ({
+        __isDebuggenError__: true,
+        name: 'DebuggenError',
+        code: 'STORE_ERROR',
+        message: PRIVATE_MESSAGE,
+        hint: `Open ${PRIVATE_PATH} and retry.`,
+      }),
+      code: 'STORE_ERROR',
+      message: VIEW_LEAD,
+      details: undefined,
+    },
+    {
+      name: 'a typed error embedding a lower-case statement it keeps as its cause',
+      cause: () => {
+        const raw = new Error(PRIVATE_LOWER_STATEMENT);
+        return new DebuggenError('STORE_ERROR', `Query failed: ${raw.message}`, {
+          hint: 'Retry in a moment.',
+          cause: raw,
+        });
+      },
+      code: 'STORE_ERROR',
+      message: VIEW_LEAD,
+      details: undefined,
+    },
+    {
+      name: 'a typed error embedding a lower-case statement with no cause',
+      cause: () => new DebuggenError('STORE_ERROR', `Query failed: ${PRIVATE_LOWER_STATEMENT}`),
+      code: 'STORE_ERROR',
+      message: VIEW_LEAD,
+      details: undefined,
+    },
+    {
+      name: 'a typed error with a short password under credential-named and unvouched details',
+      cause: () =>
+        new DebuggenError('STORE_ERROR', 'The store refused the read.', {
+          details: { password: SHORT_PASSWORD, note: SHORT_PASSWORD, attempts: 2 },
+        }),
+      code: 'STORE_ERROR',
+      message: `${VIEW_LEAD} The store refused the read.`,
+      details: { password: REDACTED, note: REDACTED, attempts: 2 },
+    },
+  ];
+
+  it.each(HOSTILE_REJECTIONS)(
+    'shows none of the text of $name',
+    async ({ cause, code, message, details }) => {
+      const { provider } = makeThrowingProvider(cause);
+
+      render(
+        <FailureProbes
+          provider={provider}
+          sessionId={SESSION_ID}
+          probes={[{ label: 'hostile view', query: { source: 'metrics' } }]}
+        />,
+      );
+
+      const failure = await settledFailure('hostile view');
+
+      // The code survives; the message is the lead and, at most, the
+      // renderer's own sentence; no hint line is drawn from foreign text.
+      within(failure).getByText(code);
+      const lines = Array.from(failure.querySelectorAll('.dg-error-state__message'));
+      expect(lines.map((line) => line.textContent)).toEqual([message]);
+
+      const detailsBlock = within(failure).queryByRole('group', {
+        name: DETAILS_NAME,
+        hidden: true,
+      });
+      if (details === undefined) {
+        expect(detailsBlock).toBeNull();
+      } else {
+        expect(JSON.parse(detailsBlock?.textContent ?? '')).toEqual(details);
+      }
+
+      const shown = failure.textContent ?? '';
+      for (const fragment of PRIVATE_FRAGMENTS) {
+        expect(shown).not.toContain(fragment);
+      }
+    },
+  );
+
+  it("withholds the message and hint of an error whose text is a foreign value's", () => {
+    const retry = vi.fn<() => void>();
+    const copied = DebuggenError.from(new Error(`${PRIVATE_PATH}: ENOENT`), 'STORE_ERROR');
+    const salvaged = DebuggenError.from({
+      __isDebuggenError__: true,
+      code: 'STORE_ERROR',
+      message: 'The store is locked.',
+      hint: 'Close the other session, then retry.',
+    });
+    const reRaisedCopy = new DebuggenError(copied.code, copied.message, { cause: copied });
+    const fromString = DebuggenError.from(PRIVATE_MESSAGE);
+
+    // Prose of the provider's own around a foreign cause is withheld too, even
+    // when the words look harmless: provenance, not the wording, decides.
+    const raw = new Error('the disk is full');
+    const prefixed = new DebuggenError('STORE_ERROR', `Read failed: ${raw.message}`, {
+      hint: 'Free some space, then retry.',
+      cause: raw,
+    });
+    const prefixedDeep = new DebuggenError('STORE_ERROR', 'The store could not answer.', {
+      cause: prefixed,
+    });
+
+    for (const error of [copied, salvaged, reRaisedCopy, fromString, prefixed, prefixedDeep]) {
+      const props = queryFailureProps(
+        { error, announcement: undefined, retry },
+        { source: 'spans' },
+      );
+
+      expect(props.message).toBe(VIEW_LEAD);
+      expect(props.hint).toBeUndefined();
+      expect(props.code).toBe(error.code);
+    }
+
+    // The salvaged code is the one the imitation named, even though its
+    // words are not shown.
+    expect(salvaged.code).toBe('STORE_ERROR');
+  });
+
+  it('withholds authored text that carries a path, a URL, a credential or a statement', () => {
+    const retry = vi.fn<() => void>();
+    const unpresentable = [
+      `The index at ${PRIVATE_PATH} is stale.`,
+      'The file C:\\Users\\dev\\app\\.env is locked.',
+      'Open ~/.config/app to fix it.',
+      'The service at http://127.0.0.1:43117/health refused the call.',
+      'Write to dev@example.com for access.',
+      `The key ${PROVIDER_KEY_SHAPE} was refused.`,
+      `The header Bearer ${BEARER_TOKEN_BODY} was refused.`,
+      'The call sent password=hunter2 to the service.',
+      `The statement ${PRIVATE_STATEMENT} failed.`,
+      'The statement DELETE FROM accounts failed.',
+      `Query failed: ${PRIVATE_LOWER_STATEMENT}`,
+      "The row where name = 'alice' is locked.",
+      `The digest ${'a1b2c3d4'.repeat(6)} did not match.`,
+      'The first line.\nThe stack follows.',
+      `A cause that runs on ${'and on '.repeat(80)}`,
+    ];
+
+    for (const text of unpresentable) {
+      const inMessage = new DebuggenError(PROVIDER_FAILURE_CODE, text, {
+        hint: 'Retry in a moment.',
+      });
+      const inHint = new DebuggenError(PROVIDER_FAILURE_CODE, 'The request was refused.', {
+        hint: text,
+      });
+
+      const messageProps = queryFailureProps(
+        { error: inMessage, announcement: undefined, retry },
+        { source: 'metrics' },
+      );
+      expect(messageProps.message).toBe(VIEW_LEAD);
+      expect(messageProps.hint).toBe('Retry in a moment.');
+
+      const hintProps = queryFailureProps(
+        { error: inHint, announcement: undefined, retry },
+        { source: 'metrics' },
+      );
+      expect(hintProps.message).toBe(`${VIEW_LEAD} The request was refused.`);
+      expect(hintProps.hint).toBeUndefined();
+    }
+  });
+
+  it('keeps an authored, presentable message and hint, including prose that reads like SQL', () => {
+    const retry = vi.fn<() => void>();
+    const presentable = [
+      {
+        message: 'The channel to the service is closed.',
+        hint: 'Start the local service, then retry.',
+      },
+      {
+        message: 'The selected event is no longer in the capture.',
+        hint: 'Select the event again from the panel or the live tail.',
+      },
+      {
+        message: 'The service refused the bearer credential.',
+        hint: 'Update the order of the columns and set a filter, then retry.',
+      },
+    ];
+
+    for (const { message, hint } of presentable) {
+      const props = queryFailureProps(
+        {
+          error: new DebuggenError(PROVIDER_FAILURE_CODE, message, { hint }),
+          announcement: undefined,
+          retry,
+        },
+        { source: 'events' },
+      );
+
+      expect(props.message).toBe(`${VIEW_LEAD} ${message}`);
+      expect(props.hint).toBe(hint);
+    }
+
+    // A typed error that re-raises another with the same words, as a host
+    // adapter adding its query context does, is still authored.
+    const original = new DebuggenError(
+      PROVIDER_FAILURE_CODE,
+      'The channel to the service is closed.',
+    );
+    const reRaised = new DebuggenError(original.code, original.message, { cause: original });
+    expect(
+      queryFailureProps({ error: reRaised, announcement: undefined, retry }, { source: 'events' })
+        .message,
+    ).toBe(`${VIEW_LEAD} The channel to the service is closed.`);
+  });
+
+  it('shows only approved diagnostic fields with presentable values in the details', () => {
+    const retry = vi.fn<() => void>();
+    const error = new DebuggenError(PROVIDER_FAILURE_CODE, 'The request was refused.', {
+      details: {
+        attempts: 3,
+        field: 'data.origin',
+        endpoint: 'panel-data',
+        source: '/private/var/app/.env',
+        auth: 'Bearer abc.def',
+        password: SHORT_PASSWORD,
+        apiToken: 42,
+        note: 'panel-data',
+        nested: { a: 1 },
+        'bad key!': 1,
+        count: Infinity,
+        skipped: undefined,
+        degraded: false,
+        missing: null,
+      },
+    });
+
+    const props = queryFailureProps({ error, announcement: undefined, retry }, { source: 'spans' });
+
+    // Text survives only under an approved diagnostic key and only when it is
+    // presentable; a secret-named key is withheld whatever its value's shape,
+    // and a count, a flag or `null` survives under any other identifier key.
+    expect(props.details).toBe(
+      JSON.stringify(
+        {
+          attempts: 3,
+          field: 'data.origin',
+          endpoint: 'panel-data',
+          source: REDACTED,
+          auth: REDACTED,
+          password: REDACTED,
+          apiToken: REDACTED,
+          note: REDACTED,
+          nested: REDACTED,
+          count: REDACTED,
+          degraded: false,
+          missing: null,
+        },
+        null,
+        2,
+      ),
+    );
+
+    // Nothing that survives the allowlist leaves no details block at all.
+    const bare = new DebuggenError(PROVIDER_FAILURE_CODE, 'The request was refused.', {
+      details: { 'not an identifier': PRIVATE_PATH, skipped: undefined },
+    });
+    expect(
+      queryFailureProps({ error: bare, announcement: undefined, retry }, { source: 'spans' })
+        .details,
+    ).toBeUndefined();
+  });
+
+  it('draws no details, and does not throw, for details that throw when read', () => {
+    const retry = vi.fn<() => void>();
+    const hostile = Object.defineProperty({ attempts: 1 }, 'exploding', {
+      enumerable: true,
+      get(): never {
+        throw new Error(PRIVATE_PATH);
+      },
+    });
+    const error = new DebuggenError(PROVIDER_FAILURE_CODE, 'The request was refused.', {
+      details: hostile,
+    });
+
+    const props = queryFailureProps({ error, announcement: undefined, retry }, { source: 'spans' });
+
+    expect(props.details).toBeUndefined();
+    expect(props.message).toBe(`${VIEW_LEAD} The request was refused.`);
   });
 
   it('keeps integration instructions off the hint line and in the details', async () => {
@@ -4673,8 +5083,7 @@ describe('the failure contract every query-backed node renders', () => {
     // Every query-backed view the catalogue names, titled with its own label and
     // reading its first source, each failing with the same transport fault.
     // Where the probe cases above pin the hook, helpers and primitive, this case
-    // pins the call sites: every view's error branch, through the host, at once
-    // (B1-F16, B2-F14).
+    // pins the call sites: every view's error branch, through the host, at once.
     const layout = Object.values(PANEL_NODE_CATALOG)
       .filter((entry) => entry.requiresQuery)
       .map((entry) => {
@@ -4693,7 +5102,7 @@ describe('the failure contract every query-backed node renders', () => {
         } as PanelNode;
       });
     // Thirteen visualization components, of which only the source-link leaf
-    // reads no captured data (AAP 0.6.2).
+    // reads no captured data.
     expect(layout).toHaveLength(12);
 
     const { provider, resolve } = makeRejectingProvider(() =>
@@ -4716,12 +5125,11 @@ describe('the failure contract every query-backed node renders', () => {
     const failures = Array.from(container.querySelectorAll<HTMLElement>('.dg-error-state'));
 
     for (const failure of failures) {
-      // One title, one lead followed by the provider's own cause, one code.
+      // One title, one lead followed by the renderer's fixed HTTP sentence —
+      // never the rejection's own text — and one code.
       expect(within(failure).getByText(QUERY_FAILURE_TITLE)).toBeTruthy();
       const messages = Array.from(failure.querySelectorAll('.dg-error-state__message'));
-      expect(messages.map((line) => line.textContent)).toEqual([
-        `${VIEW_LEAD} Service Unavailable.`,
-      ]);
+      expect(messages.map((line) => line.textContent)).toEqual([`${VIEW_LEAD} ${HTTP_503_CAUSE}`]);
       within(failure).getByText(PROVIDER_FAILURE_CODE);
       expect(failure.textContent).not.toMatch(INTEGRATION_VOCABULARY);
 
@@ -4785,7 +5193,6 @@ describe('the failure contract every query-backed node renders', () => {
 /*
  * ---------------------------------------------------------------------------
  * Focus after a retry: the node frame keeps keyboard focus inside the node
- * (B1-F14, B2-F12)
  * ---------------------------------------------------------------------------
  */
 

@@ -97,10 +97,11 @@ export default defineConfig({
   platform: 'node',
 
   /**
-   * Declarations are non-negotiable: `dist/index.d.ts` is the `types` condition
-   * of the `exports` map and therefore what both consumers compile against, so
-   * a broken declaration step here fails their typecheck rather than this
-   * build.
+   * Declarations are non-negotiable: `dist/index.d.ts` is the packed-tarball
+   * entry of the `exports` map's source-first `types` array, the only types a
+   * consumer outside the repository gets. Inside it, both consumers compile
+   * against this project's `.tsbuild` declarations (root tsconfig.json,
+   * `"// no-aliases"`).
    *
    * The three overrides below are each required, not defensive, and they are
    * the same block `packages/shared/tsup.config.ts` carries for the identical

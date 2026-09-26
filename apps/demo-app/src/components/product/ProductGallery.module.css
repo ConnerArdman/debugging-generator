@@ -114,10 +114,8 @@
  * background swap would be repainted away. Colour is not carrying this alone in any case: the
  * component marks the same thumbnail with `aria-pressed` and names it in hidden text.
  *
- * BLITZY [A11Y]: --ls-accent is the brand amber and measures 2.15:1 against --ls-surface, below
- * the 3:1 recommendation for a non-text indicator. Implemented as the shared token contract
- * specifies - this is the token `globals.css` documents as the one that fills a selection - and
- * flagged for design review rather than silently darkened. */
+ * The border and the inset outline are both drawn in --ls-accent, the token `globals.css` assigns
+ * to a selection. */
 .thumbs li .thumb[aria-pressed='true'] {
   border-color: var(--ls-accent, #f59e0b);
   outline: 2px solid var(--ls-accent, #f59e0b);

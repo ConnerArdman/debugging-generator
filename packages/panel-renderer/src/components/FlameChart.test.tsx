@@ -8,9 +8,9 @@
  *
  *   - **Own time is measured against the interval UNION of a frame's children,
  *     never their sum.** Children overlap as a matter of routine — one route
- *     handler firing two calls in parallel is the ordinary case (AAP 0.4.2) —
- *     and subtracting a sum reports a negative own time for such a parent,
- *     which is then either clamped to nothing or drawn inverted. Either way the
+ *     handler firing two calls in parallel is the ordinary case — and
+ *     subtracting a sum reports a negative own time for such a parent, which
+ *     is then either clamped to nothing or drawn inverted. Either way the
  *     reader is told something false about where the time went. The fixture
  *     below is built so that the two implementations cannot agree: a 100 ms
  *     parent with two 55 ms children overlapping inside a 60 ms window has an
@@ -20,26 +20,27 @@
  *     bottom-up flame — the orientation the name suggests — would invert the
  *     whole message, and only the document order and the row positions can tell
  *     the two apart.
- *   - **The picture is never the only representation** (AAP 0.6.4). The `<svg>`
- *     is `role="img"` with a text alternative, and beneath it every frame the
+ *   - **The picture is never the only representation.** The `<svg>` is
+ *     `role="img"` with a text alternative, and beneath it every frame the
  *     chart draws is a row of a keyboard-reachable tree. A frame neither shows
  *     is named in a note or in the partial-result notice, so a reduction is
  *     always stated and never silent — and where more of the trace is in
  *     memory, the notice offers it.
- *   - **Nothing here presents itself as a profiler** (AAP 0.6.6). The product
- *     samples no stacks and measures no CPU time; this component renders the
- *     recorded nesting of measured spans, and says so on screen. One assertion
- *     scans everything a reader or a screen reader can reach — text, accessible
+ *   - **Nothing here presents itself as a profiler.** The product samples no
+ *     stacks and measures no CPU time; this component renders the recorded
+ *     nesting of measured spans, and says so on screen. One assertion scans
+ *     everything a reader or a screen reader can reach — text, accessible
  *     names, SVG titles — for profiling vocabulary, which is the durable guard
  *     against a future well-meaning label change.
  *
- * Alongside those, AAP 0.8.3 asks every component suite in this folder for the
- * three states of a query-backed view — loading, empty and error — and for the
- * click-to-source payload. Each state is driven through a stub `DataProvider`
- * that respectively never settles, resolves an empty trace — or `null`, the
- * service's answer when no trace matched — and rejects; the
- * payload cases assert what the host actually receives, because every hop after
- * this one acts blind on the object it is handed (AAP 0.4.2, hop 1 of five).
+ * Alongside those, every component suite in this folder covers the three states
+ * of a query-backed view — loading, empty and error — and the click-to-source
+ * payload. Each state is driven through a stub `DataProvider` that respectively
+ * never settles, resolves an empty trace — or `null`, the service's answer when
+ * no trace matched — and rejects; the payload cases assert what the host
+ * actually receives, because every hop after this one acts blind on the object
+ * it is handed (this is the first hop of the path `docs/ARCHITECTURE.md` traces
+ * under "A click, end to end").
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -74,10 +75,10 @@
  *     an element method is on `scrollIntoView`, a request the component makes
  *     of the browser rather than a size it reads: it records whether a
  *     selection made elsewhere asked for its row to be revealed.
- *   - **Generic fixture vocabulary only** (AAP 0.5.2, 0.5.4): operation names, a
- *     file path and a symbol that belong to no application, demonstration or
- *     otherwise. `scripts/check-no-hardcoding.mjs` scans this text with the rest
- *     of `packages/**`.
+ *   - **Generic fixture vocabulary only**: operation names, a file path and a
+ *     symbol that belong to no application, demonstration or otherwise.
+ *     `scripts/check-no-hardcoding.mjs` skips test files, so this suite keeps
+ *     the product's neutral vocabulary by convention.
  *   - **Queries by role and accessible name.** The canvas, the tree, its rows
  *     and their controls are all reached that way; a class is read only off an
  *     element already obtained semantically, since no `jest-dom` matcher is
@@ -123,12 +124,11 @@ import { FlameChart } from './FlameChart';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Every string below is application-neutral (AAP 0.5.4): no component, route,
- * service or symbol of any inspected project appears here, in the fixtures or
- * in the comments. The identifiers are shaped as a capture shapes them — a
- * 32-hex trace id, 16-hex span ids, epoch-millisecond start times and
- * millisecond durations — because the component reads those fields and formats
- * them.
+ * Every string below is application-neutral: no component, route, service or
+ * symbol of any inspected project appears here, in the fixtures or in the
+ * comments. The identifiers are shaped as a capture shapes them — a 32-hex
+ * trace id, 16-hex span ids, epoch-millisecond start times and millisecond
+ * durations — because the component reads those fields and formats them.
  * ---------------------------------------------------------------------------
  */
 
@@ -186,9 +186,10 @@ const RETRY_NAME = 'Retry';
 const FAILING_QUERY_NAME = 'Failing query';
 
 /*
- * The shared error-state contract, spelled out rather than read back from
- * `../host/useQuery`, so this suite pins the words a reader sees on this node
- * instead of restating whatever the contract currently holds (B1-F16, B2-F14).
+ * The shared error-state contract — the one wording every failed node in the
+ * panel uses — spelled out rather than read back from `../host/useQuery`, so
+ * this suite pins the words a reader sees on this node instead of restating
+ * whatever the contract currently holds.
  */
 
 /** The first line of a node whose own data could not be loaded. */
@@ -236,7 +237,8 @@ function errorStateParts(alert: HTMLElement): {
 const FRAME_NAME_PATTERN = /^example\./;
 
 /**
- * The vocabulary this view must never use about itself (AAP 0.6.6).
+ * The vocabulary this view must never use about itself: it renders measured
+ * spans, not a sampled profile.
  *
  * Deliberately broad stems rather than whole words: "CPU", "sample",
  * "sampled", "sampling", "profile", "profiler" and "profiling" all fail it, so
@@ -605,7 +607,7 @@ function resolvingProvider(tree: TraceTree): StubProvider {
  *   keeps it from throwing inside a render — and it words the refusal exactly
  *   as the host does.
  *
- * @param variant - How the payload's `nodeCount` is broken.
+ * @param variant How the payload's `nodeCount` is broken.
  * @returns The stub provider.
  */
 function wrongShapeProvider(variant: 'missing' | 'mistyped'): StubProvider {
@@ -647,7 +649,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -1143,7 +1145,7 @@ const CHAIN_TREE = makeTree([nest(CHAIN_EVENTS)]);
  * implementation that subtracted the sum would compute −10 ms and, after the
  * non-negative clamp every duration goes through, display 0 ms instead. The two
  * answers are therefore distinguishable on screen, which is the whole point of
- * this shape (AAP 0.4.2: parallel work inside one interaction is ordinary).
+ * this shape: parallel work inside one interaction is ordinary.
  * ---------------------------------------------------------------------------
  */
 
@@ -1579,7 +1581,7 @@ describe('FlameChart states', () => {
     expect(busy.parentElement?.classList.contains('dg-flame__loading')).toBe(true);
 
     // Nothing is drawn yet: no picture, no text equivalent, and above all no
-    // empty state — an unsettled query is not an answer (AAP 0.5.5).
+    // empty state — an unsettled query is not an answer.
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
@@ -1952,7 +1954,7 @@ describe('FlameChart hierarchy', () => {
     await screen.findByRole('tree');
 
     // One entry per node in the trace — the text equivalent is complete, not a
-    // sample of it (AAP 0.6.4).
+    // sample of it.
     expect(frameRows()).toHaveLength(CHAIN_TREE.nodeCount);
 
     for (const [index, event] of CHAIN_EVENTS.entries()) {
@@ -1969,7 +1971,7 @@ describe('FlameChart hierarchy', () => {
       // The hierarchy is carried in the list too: a row states its level for a
       // screen reader and hands its depth to the stylesheet as the indentation
       // to apply — the only inline value this view contributes, and a token
-      // reference rather than a length (AAP 0.6.4).
+      // reference rather than a length.
       expect(row.getAttribute('aria-level')).toBe(String(index + 1));
       expect(row.getAttribute('style')).toContain(`--dgc-depth: ${String(index)}`);
     }
@@ -1999,10 +2001,10 @@ describe('FlameChart hierarchy', () => {
     await screen.findByRole('tree');
 
     // A label is text on its frame's fill, so its colour is the fill's paired
-    // ink (AAP 0.6.3's 4.5:1 text bar), not one colour for every frame: on the
-    // light scale no single ink clears it on every fill. The pairs themselves
-    // are measured by the token suite; this checks the view wires each label
-    // to its own frame's pair.
+    // ink (held to the 4.5:1 text contrast bar), not one colour for every
+    // frame: on the light scale no single ink clears that bar on every fill.
+    // The pairs themselves are measured by the token suite; this checks the
+    // view wires each label to its own frame's pair.
     const kindByName = new Map(CHAIN_EVENTS.map((event) => [event.name, event.kind]));
     const labels = Array.from(canvas().querySelectorAll('text.dg-flame__frame-label'));
     expect(labels.length).toBeGreaterThan(0);
@@ -2038,7 +2040,7 @@ describe('FlameChart hierarchy', () => {
 
     await screen.findByRole('tree');
 
-    // The on-screen statement AAP 0.6.6 requires: what a bar actually is.
+    // The on-screen statement of what a bar actually is.
     expect(screen.getByText(/recorded operation/i)).toBeDefined();
 
     // Everything a reader or a screen reader can reach: the rendered text, the
@@ -2204,7 +2206,7 @@ describe('FlameChart interactions', () => {
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2).
+    // this one acts on the object it is handed.
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -2544,7 +2546,24 @@ describe('FlameChart keyboard', () => {
   });
 });
 
-describe('FlameChart bounded tree', () => {
+/**
+ * The time a case that pages through a long tree or draws full windows is
+ * allowed, in milliseconds.
+ *
+ * Each full window is two thousand frames with their labels and titles, which
+ * the test DOM builds in about a second, and the bounded tree's paging cases
+ * turn every page of a long tree; a case that pages through several windows or
+ * pages exceeds the runner's five-second default on a shared, loaded machine
+ * without anything being wrong. Generous, not unbounded: a window or page that
+ * never settles still fails the case.
+ */
+const WINDOW_CASE_TIMEOUT_MS = 30_000;
+
+/*
+ * Its paging cases turn every page of a long tree, so the group runs under
+ * {@link WINDOW_CASE_TIMEOUT_MS} rather than the default.
+ */
+describe('FlameChart bounded tree', { timeout: WINDOW_CASE_TIMEOUT_MS }, () => {
   it('renders one page of a long tree while every row states its place', async () => {
     const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
     const stub = resolvingProvider(tree);
@@ -3645,17 +3664,6 @@ function pagingControl(name: string): HTMLButtonElement {
 function pagedSiblingName(index: number): string {
   return `example.step.${String(index).padStart(3, '0')}`;
 }
-
-/**
- * The time a case that draws full windows is allowed, in milliseconds.
- *
- * Each full window is two thousand frames with their labels and titles, which
- * the test DOM builds in about a second; a case that pages through
- * several windows exceeds the runner's five-second default on a shared, loaded
- * machine without anything being wrong. Generous, not unbounded: a window that
- * never settles still fails the case.
- */
-const WINDOW_CASE_TIMEOUT_MS = 30_000;
 
 /*
  * Every case below draws at least one full window, so the group runs under

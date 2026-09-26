@@ -52,6 +52,9 @@ import {
   type ModelProvider,
   type ModelRequest,
   type ModelTextResponse,
+  type PromptFile,
+  type PromptLoader,
+  type PromptStage,
   type StructuredAttempt,
   type ToolCallsResponse,
   type ToolDefinition,
@@ -78,6 +81,9 @@ import {
 import type { ProgressRow, SessionProgress } from '../../sessions/progress.js';
 import {
   CONTEXT_LIMITS,
+  STAGE_PLACEHOLDERS,
+  createContextBuilder,
+  redactQuestionText,
   type ContextBuilder,
   type PipelineCodeHandles,
   type PipelineStageContext,
@@ -493,11 +499,17 @@ class ScriptedProvider implements ModelProvider {
  *
  * - `mirror` reproduces the real builder's documented contract: every hint
  *   list at the top level of the structured input (sorted keys) beside
- *   `target` and `currentUrl`, the raw question rendered into the prompt
+ *   `target` and `currentUrl`, the question rendered into the prompt
  *   **only**, the stage's prompt version in the metadata, the context's signal
  *   on the request, and the real `assertOutboundSafe` run before the request is
  *   returned. `onBuild` runs just before the guard, for tests that must change
- *   the world between building and sending.
+ *   the world between building and sending. One deliberate difference: the
+ *   stub renders the question **unredacted**, where the real builder renders
+ *   `redactQuestionText`'s output. A credential left in a question therefore
+ *   stands, here, for a builder that failed to redact, and the stage's answer
+ *   to that — the guard's refusal, no provider call — is what those tests pin.
+ *   The real builder's redaction is pinned with the real builder at the end of
+ *   this suite and in `../context-builder.test.ts`.
  * - `fail` answers with the given error, as a refused or unbuildable request.
  * - `throw` throws, as a builder defect.
  */
@@ -2024,5 +2036,181 @@ describe('privacy (AAP §0.5.2)', () => {
         expect(isScalar || isStringList).toBe(true);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Question redaction, end to end through the real context builder
+// ---------------------------------------------------------------------------
+
+/**
+ * A prompt loader holding one in-memory understand template that names exactly
+ * the stage's placeholder set, each value on its own line. Every other stage
+ * and version is refused, as the real loader refuses what it does not hold.
+ */
+function understandPromptLoader(): PromptLoader {
+  const text = STAGE_PLACEHOLDERS.understand.map((key) => `${key}:\n{{${key}}}`).join('\n');
+  const file = (stage: PromptStage, version: string): Result<PromptFile, DebuggenError> =>
+    stage === UNDERSTAND && version === BUILDER_DEFAULT_VERSION
+      ? ok({ stage, version, text, path: `/virtual/prompts/${stage}/${version}.md` })
+      : err(new DebuggenError('CONFIG_INVALID', `The test library holds no ${stage} ${version}.`));
+  return {
+    promptsDir: '/virtual/prompts',
+    manifestPath: '/virtual/prompts/manifest.json',
+    load: (stage) => file(stage, BUILDER_DEFAULT_VERSION),
+    loadVersion: file,
+    versions: () =>
+      ok(
+        Object.fromEntries(
+          PROMPT_STAGES.map((stage) => [stage, BUILDER_DEFAULT_VERSION]),
+        ) as Record<PromptStage, string>,
+      ),
+    clearCache: () => undefined,
+  };
+}
+
+/** One run of the stage over the real context builder, and what it sent. */
+interface RealBuilderRun {
+  readonly result: Result<UnderstandStageResult, DebuggenError>;
+  readonly provider: ScriptedProvider;
+  readonly records: readonly LogRecord[];
+}
+
+/** Runs the stage for `question` with the real context builder and a provider answering validly once. */
+async function runWithRealBuilder(question: string): Promise<RealBuilderRun> {
+  const provider = new ScriptedProvider([answer(VALID_UNDERSTANDING)]);
+  const log = capturedLogger();
+  const stage = createUnderstandStage({
+    contextBuilder: createContextBuilder({
+      promptLoader: understandPromptLoader(),
+      logger: log.logger,
+      config: { provider: 'deterministic' },
+      now: steppingClock(),
+    }),
+    provider,
+    progress: new RecordingProgress(),
+    logger: log.logger,
+  });
+  const probe = stageContext({ question });
+  const result = await stage.run(probe.context, {});
+  return { result, provider, records: [...log.records, ...probe.contextLog.records] };
+}
+
+/** The one request a run sent, or a test failure. */
+function sentRequest(run: RealBuilderRun): ModelRequest {
+  const [call] = run.provider.structuredCalls;
+  if (call === undefined || run.provider.structuredCalls.length !== 1) {
+    throw new Error('Expected exactly one provider call.');
+  }
+  return call.request;
+}
+
+/** A question carrying a value no request may send, and what may be sent of it. */
+interface SensitiveQuestion {
+  readonly label: string;
+  readonly question: string;
+  /** The only form of the question the prompt may carry. */
+  readonly redacted: string;
+  /** Substrings of the raw question no prompt, input or log record may contain. */
+  readonly leaks: readonly string[];
+  /** Lower-case fragments of the value that no question hint may contain. */
+  readonly fragments: readonly string[];
+}
+
+/**
+ * A queried route whose value no content rule recognises, the same route with
+ * a punctuation-only value, and two pasted header lines with values too short
+ * for any credential-shape rule. Header lines are assembled from fragments.
+ */
+function sensitiveQuestions(): readonly SensitiveQuestion[] {
+  const code = ['ZIP', '42'].join('');
+  const bangs = '!'.repeat(4);
+  const bearer = ['S3', 'CRET'].join('');
+  const cookie = ['ab', 'c'].join('');
+  return [
+    {
+      label: 'a queried route',
+      question: `Why is /reset?code=${code} slow?`,
+      redacted: 'Why is /reset?code=? slow?',
+      leaks: [code, `code=${code}`],
+      fragments: ['zip', '42'],
+    },
+    {
+      label: 'a punctuation-only query value',
+      question: `Why is /reset?code=${bangs} slow?`,
+      redacted: 'Why is /reset?code=? slow?',
+      leaks: [bangs, `code=${bangs}`],
+      fragments: [],
+    },
+    {
+      label: 'a pasted authorization header',
+      question: ['Author', 'ization: ', 'Bea', 'rer ', bearer].join(''),
+      redacted: 'Authorization: [redacted]',
+      leaks: [bearer],
+      fragments: ['cret', 'bearer'],
+    },
+    {
+      label: 'a pasted cookie header',
+      question: ['Coo', 'kie: ', 'session=', cookie].join(''),
+      redacted: 'Cookie: [redacted]',
+      leaks: [['session=', cookie].join('')],
+      fragments: ['session', cookie],
+    },
+  ];
+}
+
+describe('question redaction through the real context builder', () => {
+  it.each(sensitiveQuestions())(
+    'understands $label, sending only its redacted form and no hint made from its value',
+    async ({ question, redacted, leaks, fragments }) => {
+      const run = await runWithRealBuilder(question);
+      expect(expectOk(run.result).understanding).toEqual(VALID_UNDERSTANDING);
+      const request = sentRequest(run);
+
+      expect(request.prompt).toContain(`question:\n${redacted}\n`);
+      const sent = [request.prompt, JSON.stringify(request.input)];
+      for (const leak of leaks) {
+        for (const text of [...sent, ...run.records.map(serializeRecord)]) {
+          expect(text).not.toContain(leak);
+        }
+      }
+
+      // The hints are the tokenizer's projection of the redacted question, exactly.
+      const hints = tokenizeQuestion(redactQuestionText(question, Number.POSITIVE_INFINITY).text);
+      expect(request.input['tokens']).toEqual(hints.tokens);
+      expect(request.input['identifierCandidates']).toEqual(hints.identifierCandidates);
+      expect(request.input['signalTerms']).toEqual(hints.signalTerms);
+      for (const hint of lexicalStrings(hints)) {
+        for (const fragment of fragments) {
+          expect(hint.toLowerCase()).not.toContain(fragment);
+        }
+      }
+    },
+  );
+
+  it('the tokenizer would have made hints of every value the redaction removes', () => {
+    // Not vacuous: read raw, each value with letters or digits becomes a hint (a punctuation-only
+    // value is the one the tokenizer drops by itself, so only the prompt could have leaked it).
+    for (const { question, fragments } of sensitiveQuestions()) {
+      const raw = lexicalStrings(tokenizeQuestion(question)).join(' ').toLowerCase();
+      for (const fragment of fragments) {
+        expect({ fragment, found: raw.includes(fragment) }).toEqual({ fragment, found: true });
+      }
+    }
+  });
+
+  it('sends byte-identical requests for questions that differ only in a query value', async () => {
+    const first = sentRequest(await runWithRealBuilder('Why is /reset?code=ZIP42 slow?'));
+    const second = sentRequest(await runWithRealBuilder('Why is /reset?code=QRS77 slow?'));
+    expect(second.prompt).toBe(first.prompt);
+    expect(stableStringify(second.input)).toBe(stableStringify(first.input));
+  });
+
+  it('keeps wording invariance: wording-only variants still send one structured input', async () => {
+    const inputs: string[] = [];
+    for (const variant of WORDING_VARIANTS) {
+      inputs.push(stableStringify(sentRequest(await runWithRealBuilder(variant)).input));
+    }
+    expect(new Set(inputs).size).toBe(1);
   });
 });

@@ -725,7 +725,7 @@ export const DEFAULT_MAX_QUEUED_MESSAGES = 200;
  * a project, running a model stage on the same event loop — while keeping the
  * `connecting` state short enough that the pill a developer is looking at moves
  * on to "Reconnecting…" and the backoff curve takes over, and it is well inside
- * the roughly thirty-second idle window of an MV3 service worker (AAP §0.5.5).
+ * the roughly thirty-second idle window of an MV3 service worker.
  *
  * The value is deliberately none of the other numbers this client schedules —
  * the curve's 500 … 10 000 ms delays and the {@link CLIENT_HELLO_TIMEOUT_MS}

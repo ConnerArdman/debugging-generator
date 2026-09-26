@@ -6,7 +6,7 @@
  * It claims the `'db-query-tracking'` action type in `'runtime'` mode, because
  * the spans it is responsible for are produced by an instrumentation that
  * already exists inside the dev-server preload
- * (`packages/telemetry/src/node/register.ts`, AAP §0.5.1). Nothing here writes
+ * (`packages/telemetry/src/node/register.ts`). Nothing here writes
  * to a developer's project: {@link InstallResult.applied} is **always** empty,
  * no module under `../patch/**` is imported, and no filesystem, network,
  * environment or process API is touched. This adapter *arms a signal*; it does
@@ -32,8 +32,9 @@
  * driver value, corroborated by `ProjectSummary.databaseAccess.style` — both
  * of which `@debuggen/code-analysis` derives from the same call sites. No model
  * name, table name, delegate method, client variable name or import specifier
- * appears as a literal anywhere below, which is AAP §0.5.4's rule and what
- * `scripts/check-no-hardcoding.mjs` reads this file with ts-morph to enforce.
+ * appears as a literal anywhere below — the product carries no built-in
+ * knowledge of any project — and `scripts/check-no-hardcoding.mjs` reads this
+ * file with ts-morph to enforce that.
  *
  * That is not only a policy: it is where the truth actually lives. The driver
  * handles of a project normally sit in a *different module* from the call
@@ -45,10 +46,10 @@
  * ## Which query sites it anchors on
  *
  * Only ones the dev server can actually execute. The mapper's spans are runtime
- * hooks the preload installs in the **dev-server process** (AAP §0.5.1), and a
- * seed, migration, script, test or configuration module runs in a process of
- * its own — the ORM's seed command, a test runner — so a query it issues is
- * never observed, and an anchor on it promises evidence that never arrives.
+ * hooks the preload installs in the **dev-server process**, and a seed,
+ * migration, script, test or configuration module runs in a process of its own
+ * — the ORM's seed command, a test runner — so a query it issues is never
+ * observed, and an anchor on it promises evidence that never arrives.
  * Such modules are recognised by `@debuggen/code-analysis`'s
  * `isToolingModulePath`, which is built from published tool conventions rather
  * than from any project's vocabulary, and are left out before ranking.
@@ -63,12 +64,11 @@
  *
  * The mapper's spans need the preload loaded in the target project's
  * dev-server process, and a developer who started that server themselves does
- * not have it. AAP §0.5.5 names this case explicitly, and the answer is a
- * *report*, never an exception and never a rejected promise: one
- * {@link UnavailableSignal} whose `reason` states what was observed and whose
- * `hint` carries the exact relaunch instruction, so the capture proceeds with
- * the signals that *are* available. Three outcomes, and the third is as
- * important as the others:
+ * not have it. The answer is a *report*, never an exception and never a
+ * rejected promise: one {@link UnavailableSignal} whose `reason` states what
+ * was observed and whose `hint` carries the exact relaunch instruction, so the
+ * capture proceeds with the signals that *are* available. Three outcomes, and
+ * the third is as important as the others:
  *
  * | Observed | Reported |
  * | --- | --- |
@@ -181,7 +181,7 @@ export const PRISMA_ADAPTER_ID = 'prisma';
  * there stops this file from compiling. The value is compared against
  * `DbCallNodeData.driver`, which is where the indexer recorded the
  * classification — never against a client variable name, an import specifier
- * or a delegate method (AAP §0.5.4).
+ * or a delegate method.
  */
 const PRISMA_DRIVER = PRISMA_ADAPTER_ID satisfies DbDriver;
 
@@ -189,9 +189,9 @@ const PRISMA_DRIVER = PRISMA_ADAPTER_ID satisfies DbDriver;
  * The capture signal this adapter reports on.
  *
  * `satisfies CaptureSignal` against `../schema/readiness.ts`'s closed
- * vocabulary, so the name that appears in a readiness row and in AAP §0.5.5's
- * "Could not enable ‹signal›: ‹reason›." sentence cannot drift from the one the
- * service and the preload agree on.
+ * vocabulary, so the name that appears in a readiness row and in the
+ * developer-facing "Could not enable ‹signal›: ‹reason›." sentence cannot
+ * drift from the one the service and the preload agree on.
  */
 const PRISMA_SIGNAL = PRISMA_ADAPTER_ID satisfies CaptureSignal;
 
@@ -432,7 +432,8 @@ const PRISMA_RUNTIME_HOOKS: readonly string[] = Object.freeze([
 // Every knob is injected and fully defaulted, and the defaults are exported so
 // a suite asserts against the shipped values instead of restating them. None of
 // them is read from the environment: this adapter learns about the machine it
-// runs on from `InstrumentationContext` and from nowhere else (AAP §0.2.3).
+// runs on from `InstrumentationContext` — the one input the adapter contract
+// gives it — and from nowhere else.
 // ---------------------------------------------------------------------------
 
 /**
@@ -507,7 +508,8 @@ export const PRISMA_ADAPTER_LIMITS = Object.freeze({
 });
 
 /**
- * The wording defaults for the relaunch hint of AAP §0.5.5.
+ * The wording defaults for the relaunch hint a missing preload is reported
+ * with.
  *
  * Exported for the same reason {@link PRISMA_ADAPTER_LIMITS} is, and split from
  * it because these are *words and specifiers* rather than bounds. Both are
@@ -544,8 +546,8 @@ export const PRISMA_RELAUNCH_DEFAULTS = Object.freeze({
  * owns the launcher — so it can hand the developer the command it would run
  * rather than leaving this adapter to compose one from a convention. Injected
  * as data for the same reason the clock is: a hint assembled from an
- * environment read could not be asserted, and a hint assembled from a path
- * written into this repository would be AAP §0.5.4's failure in a string.
+ * environment read could not be asserted, and a hint naming a path inside this
+ * repository would be right only for the checkout it came from.
  */
 export interface PrismaRelaunchDescriptor {
   /**
@@ -611,8 +613,8 @@ export interface PrismaAdapterOptions {
    * Present so a caller can capture this adapter's diagnostic lines without a
    * session; the context's logger is used when it is absent. Either way the
    * lines are bound with this adapter's id and carry paths, counts and signal
-   * names only — never a statement, an argument object or a connection string
-   * (AAP §0.5.2).
+   * names only — never a statement, an argument object or a connection
+   * string.
    */
   readonly logger?: Logger | undefined;
 
@@ -832,7 +834,7 @@ function readinessClock(
 // Two questions, both answered from indexed facts: *does this project query
 // through the mapper* (the capability probe) and *which declarations do the
 // querying* (the planner's candidates). Neither consults the filesystem, a
-// manifest, an import specifier or a name (AAP §0.5.4).
+// manifest, an import specifier or a name.
 // ---------------------------------------------------------------------------
 
 /**
@@ -857,10 +859,10 @@ function prismaCallSites(graph: CodeGraph): readonly CodeNodeOf<'db-call'>[] {
  *
  * The corroborating half of the capability probe. It is derived from the same
  * `db-call` nodes by `summarizeProject`, so it cannot contradict
- * {@link prismaCallSites} — it is read as well because it is the field AAP
- * §0.5.4 names, and because a summary produced by a newer indexer that learned
- * to classify a call this graph revision does not should still let the adapter
- * claim the project.
+ * {@link prismaCallSites} — it is read as well because it is the project-level
+ * record of how the project reaches its database, and because a summary
+ * produced by a newer indexer that learned to classify a call this graph
+ * revision does not should still let the adapter claim the project.
  *
  * @param summary The project summary.
  * @returns `true` when the style names the mapper.
@@ -1007,7 +1009,7 @@ interface PrismaOwnerGroup {
    * Recorded by the indexer per call site where it could determine one. Safe to
    * carry into a rationale — it is a name from the developer's own schema, at
    * the level `DbCallNodeData` is bounded to, and never a statement, an argument
-   * object or anything describing a row (AAP §0.5.2).
+   * object or anything describing a row.
    */
   readonly operations: readonly string[];
 }
@@ -1091,7 +1093,7 @@ function groupByOwner(
 // Three tiers, strongest first, and every one of them is a *graph resolution*
 // of a name the understanding supplied. A candidate is never selected because
 // its name resembled the question; it is selected because a query the code
-// graph executed returned the declaration it belongs to (AAP §0.5.4).
+// graph executed returned the declaration it belongs to.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1431,8 +1433,7 @@ function compareCandidates(left: RankedCandidate, right: RankedCandidate): numbe
 // port check, no environment read: the service holds the `server-agent`
 // connection and puts what it knows on the context, and an adapter that went
 // looking for its own evidence could contradict it and tell a developer a
-// signal is ready when the frames the product needs are not arriving
-// (AAP §0.2.3).
+// signal is ready when the frames the product needs are not arriving.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1523,7 +1524,7 @@ function observePreload(
 }
 
 /**
- * One signal gap, in the two words AAP §0.5.5 puts in front of a developer.
+ * One signal gap, as the reason and hint pair put in front of a developer.
  *
  * The same pair serves {@link InstallResult.unavailable} and the non-available
  * readiness row, because they are read in the same sentence: a readiness row
@@ -1588,8 +1589,7 @@ function describeGap(
 }
 
 /**
- * Composes the relaunch instruction, in the order of preference AAP §0.5.5
- * establishes.
+ * Composes the relaunch instruction, the most exact form available first.
  *
  * 1. **An injected descriptor.** The service owns the dev-server launcher, so
  *    when it supplies the command it would run, that command is the truth and
@@ -1610,7 +1610,7 @@ function describeGap(
  *
  * Nothing here reads the environment, and no path inside this repository is
  * named — the preload is identified by its published module specifier, which is
- * what `--import` resolves (AAP §0.5.4).
+ * what `--import` resolves.
  *
  * @param context The session's context.
  * @param options The resolved options.
@@ -1711,7 +1711,7 @@ function isAborted(context: InstrumentationContext): boolean {
  * The session fields every log line from this adapter carries.
  *
  * Ids, a counter and a signal name: nothing that could carry a statement, an
- * argument object or a credential (AAP §0.5.2).
+ * argument object or a credential.
  *
  * @param context The session's context.
  * @returns The common fields.
@@ -1743,11 +1743,11 @@ function runtimeHookList(): string[] {
  *   database even though the signal list did not say so.
  *
  * When neither holds this adapter proposes **nothing**, and that silence is a
- * guarantee rather than a shortcoming: AAP §0.5.1 promises that an unrelated
- * plan collects no database telemetry, so a question about why a component
- * re-renders must not end with this product reading a developer's SQL. The
- * category is not consulted — `../schema/target.ts` is explicit that nothing
- * downstream may treat it as the only input to a decision.
+ * guarantee rather than a shortcoming: an unrelated plan collects no database
+ * telemetry, so a question about why a component re-renders must not end with
+ * this product reading a developer's SQL. The category is not consulted —
+ * `../schema/target.ts` is explicit that nothing downstream may treat it as the
+ * only input to a decision.
  *
  * @param understanding The validated Stage 1 artifact.
  * @param directlyPointed Whether a seed resolved onto a query owner.
@@ -1778,7 +1778,7 @@ function wantsDatabaseEvidence(
  * what will be observed.
  *
  * No statement text, no argument object and no literal table or model name
- * written by this file ever appears here (AAP §0.5.2, §0.5.4).
+ * written by this file ever appears here.
  *
  * @param group The candidate the action is built for.
  * @returns A bounded, single-line rationale.
@@ -2006,8 +2006,7 @@ function rankCandidates(
  *
  * - `applied` is **always empty**. No bytes reach the developer's project, no
  *   modification record is constructed and no journal entry is made, which is
- *   what makes this adapter's contribution reversible by construction
- *   (AAP §0.5.1).
+ *   what makes this adapter's contribution reversible by construction.
  * - `serverSignals` is the deterministic derivation of
  *   `../schema/readiness.ts`, narrowed to this adapter's key. The mapping from
  *   an action type to a signal key lives there and is never restated here, and
@@ -2133,7 +2132,7 @@ function reportReadiness(
  * turns the instrumentation off, by sending `server-agent.config` with no
  * `captureId` — which makes the preload call `disable()` on its instrumentation
  * and clear the global hook, so what remains loaded is inert and the
- * application keeps serving (AAP §0.5.1).
+ * application keeps serving.
  *
  * The hook is listed as disabled for a session end and for a rollback, and
  * **not** for the service-start reconciliation: the hooks of a crashed

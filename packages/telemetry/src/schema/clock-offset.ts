@@ -2,14 +2,15 @@
  * The per-producer clock offset: an **informational** estimate of how far a
  * producer's clock sits from the clock of the HTTP server that answered it.
  *
- * AAP 0.2.3 fixes the time base of every telemetry event — `startTime` is Unix
- * epoch milliseconds as the producer stamped it — and states that no clock
- * alignment is applied "beyond a recorded per-producer `clockOffsetMs` (server
- * `Date` header versus local clock, informational)". This module is the one
- * definition of that measurement: its bound, the parser for the header it is
- * taken from, and the estimator both producers run. The value it yields travels
- * on each event as the optional `clockOffsetMs` field declared in `./event.ts`
- * and is persisted by the service in `telemetry_events.clock_offset_ms`.
+ * Every telemetry event has one time base — `startTime` is Unix epoch
+ * milliseconds as the producer stamped it — and no clock alignment is applied
+ * beyond a recorded per-producer `clockOffsetMs` (server `Date` header versus
+ * local clock, informational; `docs/ARCHITECTURE.md` §5.2). This module is the
+ * one definition of that measurement: its bound, the parser for the header it
+ * is taken from, and the estimator both producers run. The value it yields
+ * travels on each event as the optional `clockOffsetMs` field declared in
+ * `./event.ts` and is persisted by the service in
+ * `telemetry_events.clock_offset_ms`.
  *
  * ## What is measured, and against what
  *

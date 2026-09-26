@@ -103,21 +103,19 @@
  *
  * There is deliberately no `cursor: pointer` here. The card itself is not a target - it
  * takes no click handler, no `role` and no tab stop - so a pointer cue spanning the whole
- * surface promised that the artwork, the product code and the price could be clicked, and
- * every one of them does nothing when they are. The cue belongs to the elements that do
- * answer a press, and each of them already carries it: `Button.module.css` declares
- * `cursor: pointer` on the control, and a link is a pointer by the browser's own default.
- * What the attribute signals instead is that the card *contains* something to act on, which
- * is what the border tint and the lift below say without claiming a target the box has not
- * got.
+ * surface would promise that the artwork, the product code and the price can be clicked,
+ * and none of them answers a press. The cue belongs to the elements that do answer one,
+ * and each of them already carries it: `Button.module.css` declares `cursor: pointer` on
+ * the control, and a link is a pointer by the browser's own default. What the attribute
+ * signals instead is that the card *contains* something to act on, which is what the
+ * border tint and the lift below say without claiming a target the box has not got.
  *
  * Only `box-shadow` and `border-color` ever change, so no geometry moves and a pointer
- * crossing the grid cannot reflow the page - which matters here, because this storefront
- * deliberately exhibits render behaviour that a shifting layout would be mistaken for.
+ * crossing the grid never reflows the page.
  *
  * The change is not gated behind `(hover: hover)`: it is decorative, a hover that sticks on
- * a touch device costs a reader nothing, and the gate would drop the affordance entirely in
- * the headless and emulated environments that report no hovering pointer. */
+ * a touch device costs a reader nothing, and the gate would drop the affordance entirely
+ * for any browser that reports no hovering pointer. */
 .root[data-interactive='true'] {
   transition:
     box-shadow 160ms ease-out,
@@ -134,8 +132,8 @@
  * Every focusable thing this application puts inside a card draws its own indicator - the
  * document's `:focus-visible` rule in `app/globals.css` covers anything that declares
  * nothing, and `Button.module.css`, `Pill.module.css` and the catalog tile's own link rule
- * each refine it - so an outline on the card as well painted a second ring concentric with
- * the first, in the same colour at a different offset. Two rings for one focused element
+ * each refine it - so an outline on the card as well would paint a second ring concentric
+ * with the first, in the same colour at a different offset. Two rings for one focused element
  * tell a reader there are two things focused, and the outer one is the wrong shape: it
  * surrounds a box that cannot be focused at all.
  *

@@ -49,15 +49,54 @@
  *
  * `src/main.ts` runs start-up modification reconciliation first and this sweep
  * second, before the service accepts a client, and the editor command
- * `debuggen.purgeSessions` is meant to run it on demand while the service
- * serves. Because reconciliation has already moved every `pending`, `applied`
- * and `failed` record to `reverted` or `conflict` by the time the start-up
- * sweep runs, `conflict` is the realistic open state here — which is why the
- * conflict exemption is the rule that protects real developer data. A session
+ * `debuggen.purgeSessions` runs it on demand while the service serves —
+ * **scoped** to the editor's workspace (see "Scoped sweeps" below), while the
+ * start-up pass stays machine-wide. Because reconciliation has already moved
+ * every `pending`, `applied` and `failed` record to `reverted` or `conflict`
+ * by the time the start-up sweep runs, `conflict` is the realistic open state
+ * here — which is why the conflict exemption is the rule that protects real
+ * developer data. A session
  * still holding some *other* open record is not purged either: the journal is
  * the only description of a patched file, so the session is retained and the
  * fact is reported as a {@link RetentionIssue} for the next reconciliation to
  * settle.
+ *
+ * ## Scoped sweeps
+ *
+ * An on-demand purge acts for one editor, whose credential may act only on
+ * projects under the workspace folders it announced (AAP 0.5.6), so it must
+ * not remove another workspace's state (CWE-863). {@link RetentionOptions.scope}
+ * narrows every rule to the projects the scope admits, and to state whose
+ * project is known:
+ *
+ * - **Aged sessions** — an aged session is considered only when the scope
+ *   admits its stored project root, read by id before anything else about it;
+ *   any other session is skipped entirely — not decided, not retained, not
+ *   reported. The root of a session never changes, so the check needs no place
+ *   in the deleting transaction.
+ * - **Orphan backups** — `backups/<sessionId>/` is walked only for a session
+ *   whose row still exists and whose root the scope admits. A directory whose
+ *   row is gone has no known project, and a stray file directly under
+ *   `backups/` belongs to none: both are left to the machine-wide start-up
+ *   sweep.
+ * - **Index caches** — an entry is removed only when it records at least one
+ *   project root and the scope admits every one; an entry that records none,
+ *   or one outside the scope, is kept. A file-shaped entry must be a readable
+ *   document recording a root. A directory-shaped entry is inspected whole
+ *   rather than sampled: it is removed only when it holds at most
+ *   {@link MAX_INDEX_METADATA_FILES} `*.json` documents and no subdirectory,
+ *   every document was read, each records at least one root, and the scope
+ *   admits every root recorded; otherwise it is kept, and why is logged at
+ *   `debug`.
+ *
+ * A scope may answer asynchronously — `session.purge`'s resolves each root to
+ * its canonical location on disk, so a link inside workspace A that points
+ * into B is B's — and every answer is awaited before, never inside, the
+ * `BEGIN IMMEDIATE` transaction that decides a session. A scope that throws,
+ * rejects or answers anything but `true` is read as "outside" — the direction
+ * that keeps data — and only the failure's code is logged. Every other
+ * guarantee of this module holds unchanged in a scoped sweep, and the
+ * machine-wide start-up sweep removes exactly what it removed before.
  *
  * ## Atomic per session
  *
@@ -274,7 +313,8 @@ export interface RetentionIssue {
    * What the problem is about: a session id for `session`, a path relative to
    * `$DEBUGGEN_HOME` for `backup` and `index-cache`, or the operation's name
    * (`sessions.listRetentionCandidates`, `modifications.scanSessionBackupReferences`,
-   * `sessions.list`, `checkpoint`, `vacuum`) for `database`.
+   * `sessions.list`, `sessions.getAccessTarget`, `checkpoint`, `vacuum`) for
+   * `database`.
    */
   readonly target: string;
 
@@ -282,8 +322,45 @@ export interface RetentionIssue {
   readonly message: string;
 }
 
+/**
+ * Which projects one sweep may remove state of: `true` — or a promise of
+ * `true` — for a project root the sweep may act on. Handed normalised absolute
+ * roots — a session's stored root, or one an index-cache entry records. See
+ * {@link RetentionOptions.scope}.
+ *
+ * The answer may be asynchronous so a scope can resolve a root on disk: the
+ * one `session.purge` builds admits a root only when its **canonical**
+ * location lies under one of the editor's canonical workspace folders, so a
+ * link inside workspace A that resolves into workspace B is not A's. The sweep
+ * awaits every answer before — never inside — the transaction that decides a
+ * session. Anything but `true`, a throw and a rejection all keep the item.
+ *
+ * @example A scope that resolves each root, as `session.purge` builds one
+ * ```ts
+ * const scope: RetentionScope = async (projectRoot) => {
+ *   if (isErr(requireProjectScope(principal, projectRoot))) return false;
+ *   const canonical = await canonicalizePath(projectRoot);
+ *   return !isErr(canonical) && canonicalFolders.some((folder) => isWithin(folder, canonical.value));
+ * };
+ * ```
+ */
+export type RetentionScope = (projectRoot: string) => boolean | Promise<boolean>;
+
 /** Tuning for one {@link runRetention} call. Every member is optional. */
 export interface RetentionOptions {
+  /**
+   * Limits the sweep to the state of the projects the scope admits — how
+   * `session.purge` runs it for one editor's announced workspace (AAP 0.5.6;
+   * CWE-863). Absent, as on the start-up path, the sweep is machine-wide. The
+   * module overview's "Scoped sweeps" states what each rule then keeps; in
+   * short, nothing whose project is unknown or outside the scope is removed,
+   * read beyond its owner, or reported, and an index-cache entry is removed
+   * only once every document it holds was read and attributed to an admitted
+   * project. The predicate may answer asynchronously and is awaited outside
+   * every transaction.
+   */
+  readonly scope?: RetentionScope | undefined;
+
   /**
    * The retention window in days, overriding `config.retentionDays` for this
    * call. A finite, non-negative number; `0` purges everything eligible.
@@ -520,8 +597,13 @@ const MAX_INDEX_METADATA_BYTES = 64 * 1024 * 1024;
 /**
  * How many `*.json` files directly inside a directory-shaped index-cache entry
  * are consulted for a `projectRoot` before the entry is judged by age alone.
+ *
+ * A scoped sweep never samples: it reads every document of an entry holding at
+ * most this many, and keeps — without reading — one holding more, because a
+ * document left unread could record another workspace's project. Exported so
+ * the suite builds its boundary fixtures from the bound itself.
  */
-const MAX_INDEX_METADATA_FILES = 8;
+export const MAX_INDEX_METADATA_FILES = 8;
 
 /**
  * How deep the survey of a tree about to be removed descends. A session backup
@@ -580,6 +662,8 @@ interface SweepSettings {
   readonly graceDays: number;
   readonly dryRun: boolean;
   readonly vacuum: boolean;
+  /** {@link RetentionOptions.scope}; `undefined` for a machine-wide sweep. */
+  readonly scope: RetentionScope | undefined;
 }
 
 /** Everything one sweep's phases share. */
@@ -1293,6 +1377,11 @@ function resolveSettings(
     return err(invalidSetting('orphanBackupGraceDays', 'a finite, non-negative number of days'));
   }
 
+  const { scope } = options;
+  if (scope !== undefined && typeof scope !== 'function') {
+    return err(invalidSetting('scope', 'a predicate over project roots'));
+  }
+
   let now: number;
   try {
     now = (deps.now ?? nowEpochMs)();
@@ -1319,7 +1408,85 @@ function resolveSettings(
     graceDays,
     dryRun: options.dryRun === true,
     vacuum: options.vacuum === true,
+    scope,
   });
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The scope of an on-demand sweep
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Whether the sweep may act on state of `projectRoot`: always for a
+ * machine-wide sweep, otherwise when {@link RetentionOptions.scope} admits the
+ * normalised root. The answer is awaited, so a scope may resolve the root on
+ * disk; no caller holds a transaction open across this call. A scope that
+ * throws, rejects, or answers anything but `true` keeps the state; a throw or
+ * a rejection is logged by code only.
+ */
+async function admits(context: SweepContext, projectRoot: string): Promise<boolean> {
+  const { scope } = context.settings;
+  if (scope === undefined) {
+    return true;
+  }
+  try {
+    return (await scope(normalizePosix(projectRoot))) === true;
+  } catch (caught) {
+    context.logger.warn('the retention scope check failed; the item is kept', {
+      code: DebuggenError.from(caught, 'INTERNAL').code,
+    });
+    return false;
+  }
+}
+
+/**
+ * Whether a scoped sweep may act on the session `sessionId` — or on the
+ * `backups/<sessionId>` directory named for it: its row must exist and the
+ * scope admit its stored project root. Always `true` for a machine-wide sweep,
+ * which reads nothing here. A row that is gone, or a name that is no session's
+ * id, has no known project and is outside every scope; a read the store
+ * refuses is recorded as an issue and read as outside too. Settled before the
+ * session's deciding transaction opens, so awaiting the scope never holds the
+ * write lock.
+ */
+async function sessionInScope(
+  context: SweepContext,
+  state: SweepState,
+  sessionId: SessionId,
+): Promise<boolean> {
+  if (context.settings.scope === undefined) {
+    return true;
+  }
+  const target = context.deps.sessions.getAccessTarget(sessionId);
+  if (isErr(target)) {
+    recordIssue(context, state, 'database', 'sessions.getAccessTarget', target.error);
+    return false;
+  }
+  return target.value !== undefined && (await admits(context, target.value.projectRoot));
+}
+
+/**
+ * Whether a scoped sweep may remove an index-cache entry that records `roots`:
+ * only when it records at least one and the scope admits every one, asked one
+ * root at a time and stopping at the first it refuses. Always `true` for a
+ * machine-wide sweep.
+ */
+async function cacheEntryInScope(
+  context: SweepContext,
+  roots: readonly string[],
+): Promise<boolean> {
+  if (context.settings.scope === undefined) {
+    return true;
+  }
+  if (roots.length === 0) {
+    return false;
+  }
+  for (const root of roots) {
+    if (!(await admits(context, root))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1578,6 +1745,10 @@ function retainActive(
  * hashes and the diff — so the row must outlive the window too. Everything
  * else is decided, atomically with the deletion, by {@link decideSession}.
  *
+ * In a scoped sweep a session outside the scope is skipped before any of
+ * that: nothing about it is read beyond its project root, and it appears in no
+ * list of the report.
+ *
  * @returns Whether the session was deleted (in a dry run: would have been).
  */
 async function purgeCandidate(
@@ -1586,6 +1757,12 @@ async function purgeCandidate(
   candidate: RetentionCandidate,
 ): Promise<boolean> {
   const sessionId = candidate.id;
+
+  // Settled here, before the deciding transaction below opens: an asynchronous
+  // scope is never awaited while `BEGIN IMMEDIATE` holds the write lock.
+  if (!(await sessionInScope(context, state, sessionId))) {
+    return false;
+  }
 
   const conflicts = await context.deps.modifications.listConflicts(sessionId);
   if (isErr(conflicts)) {
@@ -2060,9 +2237,15 @@ function linkLeftInPlace(entry: string): DebuggenError {
  * probes run **after** Rule 1, so they see the records the purge removed. A
  * directory Rule 1 would have removed in a dry run is skipped, so its files
  * are never counted twice.
+ *
+ * A scoped sweep judges only the entries named for a session whose stored
+ * project root the scope admits ({@link sessionInScope}), and of those only
+ * directories: an entry named for no session, or for a session outside the
+ * scope, is not even inspected, and stray files wait for a machine-wide sweep.
  */
 async function sweepOrphanBackups(context: SweepContext, state: SweepState): Promise<void> {
   const { settings } = context;
+  const scoped = settings.scope !== undefined;
   const rootTarget = relativeToHome(settings.home, settings.backupsDir);
 
   const root = await inspectDirectory(settings.home, settings.backupsDir);
@@ -2093,6 +2276,9 @@ async function sweepOrphanBackups(context: SweepContext, state: SweepState): Pro
     if (state.removedDirectories.has(path)) {
       continue;
     }
+    if (scoped && !(await sessionInScope(context, state, name))) {
+      continue;
+    }
     const entry = relativeToHome(settings.home, path);
 
     let stats: Stats | undefined;
@@ -2113,10 +2299,11 @@ async function sweepOrphanBackups(context: SweepContext, state: SweepState): Pro
       await walkBackupDirectory(context, state, path, identityOf(stats), root.identity);
       continue;
     }
-    if (stats.isFile() && stats.mtimeMs < settings.graceCutoff) {
+    if (!scoped && stats.isFile() && stats.mtimeMs < settings.graceCutoff) {
       // Not a layout the backup store writes: a stray file directly under
       // backups/ sits in no session's directory, so no record resolves to it,
-      // and it is judged by the grace window like any other orphan.
+      // and it is judged by the grace window like any other orphan. It
+      // belongs to no project, so only a machine-wide sweep judges it.
       await removeOrphan(context, state, {
         path,
         name,
@@ -2195,13 +2382,21 @@ function projectRootsOf(document: unknown): string[] {
  * top-level `projectRoot` is accepted as well so a format revision does not
  * silently turn every entry into an mtime-only one. The file is opened without
  * following a link, must still be the file the walk inspected, and must be no
- * larger than {@link MAX_INDEX_METADATA_BYTES}. Any failure — unreadable,
- * oversized, not JSON — answers `[]`, which sends the entry down the
- * modification-time branch; the document's content is never logged.
+ * larger than {@link MAX_INDEX_METADATA_BYTES}. The document's content is
+ * never logged.
+ *
+ * @returns The roots it records — `[]` for a JSON document that records none —
+ * or `undefined` when it could not be read: unreadable, replaced since the
+ * walk, oversized, or not JSON. The machine-wide sweep reads both the same
+ * way, sending the entry down the modification-time branch; a scoped sweep
+ * tells them apart only to say why it kept an entry, and keeps it either way.
  */
-async function readRecordedProjectRoots(path: string, expected: Stats): Promise<string[]> {
+async function readRecordedProjectRoots(
+  path: string,
+  expected: Stats,
+): Promise<string[] | undefined> {
   if (expected.size > MAX_INDEX_METADATA_BYTES) {
-    return [];
+    return undefined;
   }
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
@@ -2213,12 +2408,12 @@ async function readRecordedProjectRoots(path: string, expected: Stats): Promise<
       opened.ino !== expected.ino ||
       opened.size > MAX_INDEX_METADATA_BYTES
     ) {
-      return [];
+      return undefined;
     }
     const text = await handle.readFile({ encoding: 'utf8' });
     return projectRootsOf(JSON.parse(text) as unknown);
   } catch {
-    return [];
+    return undefined;
   } finally {
     await handle?.close().catch(() => undefined);
   }
@@ -2246,7 +2441,11 @@ function isActiveRoot(roots: readonly string[], active: ReadonlySet<string>): bo
  *
  * Otherwise the entry is eligible. The fallback is safe because a cache is a
  * derived artifact: removing one that was still wanted costs one re-index on
- * the project's next session, never data.
+ * the project's next session, never data. A scoped sweep has no such
+ * fallback: it removes only an entry that records at least one root and whose
+ * recorded roots the scope all admits ({@link cacheEntryInScope}), so an entry
+ * that records none — an unreadable or rootless document, or any file that is
+ * not a `*.json` document — is kept.
  */
 async function sweepIndexFile(
   context: SweepContext,
@@ -2260,10 +2459,13 @@ async function sweepIndexFile(
   if (stats.mtimeMs >= cutoff) {
     return;
   }
-  if (path.endsWith(INDEX_ENTRY_EXTENSION)) {
-    if (isActiveRoot(await readRecordedProjectRoots(path, stats), active)) {
-      return;
-    }
+  // An unreadable document records no root: the machine-wide sweep judges it
+  // by age, and `cacheEntryInScope` keeps it from a scoped one.
+  const roots = path.endsWith(INDEX_ENTRY_EXTENSION)
+    ? ((await readRecordedProjectRoots(path, stats)) ?? [])
+    : [];
+  if (isActiveRoot(roots, active) || !(await cacheEntryInScope(context, roots))) {
+    return;
   }
 
   if (!dryRun) {
@@ -2277,14 +2479,90 @@ async function sweepIndexFile(
   state.bytesReclaimed += stats.size;
 }
 
+/** One `*.json` document directly inside a directory-shaped cache entry, as the walk saw it. */
+interface IndexDocument {
+  readonly path: string;
+  readonly stats: Stats;
+}
+
+/**
+ * Why a scoped sweep keeps a directory-shaped cache entry it could not
+ * attribute whole. Logged at `debug`, never reported: in a scoped sweep an
+ * entry whose project is not established is nobody's to report.
+ */
+type UnattributedReason =
+  'too-many-documents' | 'nested-directory' | 'unreadable-document' | 'rootless-document';
+
+/** What {@link attributeScopedDirectory} established about one directory-shaped entry. */
+type DirectoryAttribution =
+  | { readonly kind: 'attributed'; readonly roots: readonly string[] }
+  | { readonly kind: 'active' }
+  | { readonly kind: 'unattributed'; readonly reason: UnattributedReason };
+
+/**
+ * Attributes a directory-shaped cache entry, for a **scoped** sweep, by
+ * inspecting all of it: every document it holds is read, none is skipped.
+ *
+ * The entry is attributed only when every one of these holds, checked in this
+ * order and stopping at the first that fails:
+ *
+ * 1. it holds at most {@link MAX_INDEX_METADATA_FILES} `*.json` documents — a
+ *    larger one is not read at all (`too-many-documents`);
+ * 2. it holds no subdirectory, whose content this one-level walk never reads
+ *    and the tree removal would take with it (`nested-directory`);
+ * 3. every document was read (`unreadable-document`) and records at least one
+ *    project root (`rootless-document`).
+ *
+ * A document recording a project active inside the window answers `active`,
+ * exactly as the machine-wide rule keeps it. Otherwise the answer carries
+ * every root every document recorded, for {@link cacheEntryInScope} to judge:
+ * one root outside the scope keeps the whole entry.
+ */
+async function attributeScopedDirectory(
+  documents: readonly IndexDocument[],
+  nestedDirectories: number,
+  active: ReadonlySet<string>,
+): Promise<DirectoryAttribution> {
+  if (documents.length > MAX_INDEX_METADATA_FILES) {
+    return { kind: 'unattributed', reason: 'too-many-documents' };
+  }
+  if (nestedDirectories > 0) {
+    return { kind: 'unattributed', reason: 'nested-directory' };
+  }
+  const recorded: string[] = [];
+  for (const document of documents) {
+    const roots = await readRecordedProjectRoots(document.path, document.stats);
+    if (roots === undefined) {
+      return { kind: 'unattributed', reason: 'unreadable-document' };
+    }
+    if (roots.length === 0) {
+      return { kind: 'unattributed', reason: 'rootless-document' };
+    }
+    if (isActiveRoot(roots, active)) {
+      return { kind: 'active' };
+    }
+    recorded.push(...roots);
+  }
+  return { kind: 'attributed', roots: recorded };
+}
+
 /**
  * Judges one directory-shaped cache entry.
  *
  * Its age is the newest modification time among the directory and its direct
- * children, its project roots come from up to {@link MAX_INDEX_METADATA_FILES}
- * `*.json` files directly inside it, and it is removed as a whole tree. It is
- * never descended into beyond that one level, and an entry whose children
- * cannot be inspected is kept.
+ * children, and it is removed as a whole tree. It is never descended into
+ * beyond that one level, and an entry whose children cannot be inspected is
+ * kept. Who owns it depends on the sweep:
+ *
+ * - **Machine-wide** (start-up): its project roots come from up to
+ *   {@link MAX_INDEX_METADATA_FILES} `*.json` files directly inside it, and it
+ *   is kept only when one of them records a project active inside the window.
+ * - **Scoped** (`session.purge`): it is inspected whole by
+ *   {@link attributeScopedDirectory} — every document read, each recording a
+ *   root, no subdirectory — and removed only when every root recorded is
+ *   admitted by the scope. Anything less keeps it, with the reason logged at
+ *   `debug`: a document the sweep did not read may belong to another
+ *   workspace, and removing the tree would remove that workspace's state.
  */
 async function sweepIndexDirectory(
   context: SweepContext,
@@ -2294,7 +2572,7 @@ async function sweepIndexDirectory(
   stats: Stats,
   root: NodeIdentity,
 ): Promise<void> {
-  const { home, cutoff, dryRun } = context.settings;
+  const { home, cutoff, dryRun, scope } = context.settings;
   const target = relativeToHome(home, path);
 
   let names: string[];
@@ -2306,7 +2584,8 @@ async function sweepIndexDirectory(
   }
 
   let newest = stats.mtimeMs;
-  const documents: { readonly path: string; readonly stats: Stats }[] = [];
+  let nestedDirectories = 0;
+  const documents: IndexDocument[] = [];
   for (const name of names) {
     const child = joinPosix(path, name);
     let childStats: Stats | undefined;
@@ -2321,7 +2600,9 @@ async function sweepIndexDirectory(
       continue;
     }
     newest = Math.max(newest, childStats.mtimeMs);
-    if (
+    if (childStats.isDirectory()) {
+      nestedDirectories += 1;
+    } else if (
       childStats.isFile() &&
       !childStats.isSymbolicLink() &&
       name.endsWith(INDEX_ENTRY_EXTENSION)
@@ -2333,8 +2614,32 @@ async function sweepIndexDirectory(
   if (newest >= cutoff) {
     return;
   }
-  for (const document of documents.slice(0, MAX_INDEX_METADATA_FILES)) {
-    if (isActiveRoot(await readRecordedProjectRoots(document.path, document.stats), active)) {
+  if (scope === undefined) {
+    // The machine-wide rule, unchanged: a sample of the documents decides
+    // whether an active project still owns the entry.
+    for (const document of documents.slice(0, MAX_INDEX_METADATA_FILES)) {
+      const roots = (await readRecordedProjectRoots(document.path, document.stats)) ?? [];
+      if (isActiveRoot(roots, active)) {
+        return;
+      }
+    }
+  } else {
+    const attribution = await attributeScopedDirectory(documents, nestedDirectories, active);
+    if (attribution.kind === 'active') {
+      return;
+    }
+    if (attribution.kind === 'unattributed') {
+      context.logger.debug(
+        'a scoped sweep kept an index-cache directory it could not attribute whole',
+        {
+          target,
+          reason: attribution.reason,
+          documents: documents.length,
+        },
+      );
+      return;
+    }
+    if (!(await cacheEntryInScope(context, attribution.roots))) {
       return;
     }
   }
@@ -2562,6 +2867,10 @@ function toReport(cutoff: number, state: SweepState, durationMs: number): Retent
  * — is retained however old its last update, and so is one whose journal
  * holds a conflict or still describes a patched file.
  *
+ * With {@link RetentionOptions.scope} the sweep acts only on the state of the
+ * projects the scope admits (see "Scoped sweeps" in the module overview);
+ * without it — the start-up pass — it is machine-wide.
+ *
  * Asynchronous because of the filesystem work; the database work is
  * synchronous, one `BEGIN IMMEDIATE` transaction per candidate that decides
  * and deletes it atomically — the cascade removes its telemetry, panels,
@@ -2572,7 +2881,7 @@ function toReport(cutoff: number, state: SweepState, durationMs: number): Retent
  *
  * @param deps The store, the four repositories, the resolved paths and window,
  * and optionally a logger and a clock.
- * @param options Window overrides, `dryRun` and `vacuum`.
+ * @param options Window overrides, `dryRun`, `vacuum` and `scope`.
  * @returns `Ok` with the report — per-item problems are in
  * {@link RetentionReport.errors} — or `Err` only when the sweep cannot run at
  * all: `CONFIG_INVALID` for a configuration, option or clock it cannot use,
@@ -2653,6 +2962,7 @@ export async function runRetention(
   const report = toReport(settings.value.cutoff, state, performance.now() - startedAt);
   logger.info('retention sweep finished', {
     dryRun: settings.value.dryRun,
+    scoped: settings.value.scope !== undefined,
     retentionDays: settings.value.retentionDays,
     orphanBackupGraceDays: settings.value.graceDays,
     cutoff: report.cutoff,

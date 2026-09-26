@@ -1,12 +1,11 @@
 /**
  * `FlameChart` — nested SPAN TIMING drawn as an icicle, plus the readable list
- * that carries the same hierarchy in text (AAP 0.6.2, node catalog type
- * `flame`).
+ * that carries the same hierarchy in text (node catalog type `flame`).
  *
  * ## WHAT THIS VIEW IS, AND WHAT IT IS NOT
  *
- * AAP 0.6.6 records this component as a deliberate gap with a stated
- * resolution: the product has no profiler, samples no call stacks and measures
+ * This component is the product's stated equivalent of a flame graph, not a
+ * flame graph: the product has no profiler, samples no call stacks and measures
  * no CPU time, so what a reader sees here is the **recorded nesting of
  * measured spans** — a bar per captured operation, its width its measured
  * duration, its children beneath it. Nothing in this file, its labels, its
@@ -67,7 +66,7 @@
  * tier, its measured duration, its own time, a source chip where the span
  * resolved to a place in the project, and a disclosure control where its
  * subtree can fold. That tree is the keyboard path, the screen-reader path and
- * the path a test asserts against (AAP 0.6.4 puts accessibility above visual
+ * the path a test asserts against (accessibility takes precedence over visual
  * fidelity), and it is complete: a frame the chart draws is a row the tree
  * carries, and a frame neither shows is named in a note rather than dropped.
  *
@@ -133,10 +132,10 @@
  * Data arrives only through the node's `DataQuery`, resolved by `../host/useQuery`
  * against the host's `DataProvider`; interactions leave only through
  * `../host/PanelActions`. This component opens no socket, calls no `fetch` and
- * knows no URL (AAP 0.1.2, 0.4.2). Selecting a frame reports a
- * `PanelEventRef`; a source chip, and Shift+Enter on its row, forward its
- * location field for field; folding a subtree reports `onExpand` with this
- * node's id.
+ * knows no URL (`docs/ARCHITECTURE.md`, "The renderer contract"). Selecting a
+ * frame reports a `PanelEventRef`; a source chip, and Shift+Enter on its row,
+ * forward its location field for field; folding a subtree reports `onExpand`
+ * with this node's id.
  *
  * The selected frame is not this view's to keep. It is the panel host's one
  * shared selection, read through `useViewSelection` and matched with
@@ -145,7 +144,7 @@
  * selection made in either moves both. Outside a host the view falls back to
  * its own last activation.
  *
- * ## APPEARANCE IS A CLASS CONTRACT (AAP 0.6.4)
+ * ## APPEARANCE IS A CLASS CONTRACT
  *
  * Every colour, length, font and radius lives in `../styles/components.css` and
  * resolves to a `--dg-*` token. This file contributes two kinds of inline value
@@ -293,13 +292,13 @@ import { SourceLink } from './SourceLink';
  * Geometry
  *
  * Every constant below is in SVG user units of the fixed logical canvas, the
- * permitted structural form of AAP 0.6.4 — not a CSS length and not a design
- * token. The stylesheet scales the whole drawing uniformly to its container,
- * so these keep their proportions to the frames and the text at every panel
- * width. The canvas width is not restated here: it is `../utils/scale`'s
- * `CHART_VIEWBOX_WIDTH`, which the timeline shares. Neither is the vertical
- * rhythm: row height and row gutter come from `../utils/scale`, so this view
- * shares one pitch with the timeline and the waterfall.
+ * structural form of value the design system permits — not a CSS length and
+ * not a design token. The stylesheet scales the whole drawing uniformly to its
+ * container, so these keep their proportions to the frames and the text at
+ * every panel width. The canvas width is not restated here: it is
+ * `../utils/scale`'s `CHART_VIEWBOX_WIDTH`, which the timeline shares. Neither
+ * is the vertical rhythm: row height and row gutter come from `../utils/scale`,
+ * so this view shares one pitch with the timeline and the waterfall.
  * ---------------------------------------------------------------------------
  */
 
@@ -365,11 +364,11 @@ const MAX_ICICLE_DEPTH = 32;
 /**
  * The depth at which a subtree arrives folded: 12.
  *
- * The graceful degradation AAP asks of a very large trace. A frame at or below
- * this depth that has children starts folded behind its own disclosure
- * control, so a deep trace opens as something a reader can take in and every
- * folded frame is one activation away from its detail. The fold is always
- * announced (`aria-expanded`), always reversible, and always counted in a note.
+ * Graceful degradation for a very large trace. A frame at or below this depth
+ * that has children starts folded behind its own disclosure control, so a deep
+ * trace opens as something a reader can take in and every folded frame is one
+ * activation away from its detail. The fold is always announced
+ * (`aria-expanded`), always reversible, and always counted in a note.
  */
 const AUTO_FOLD_DEPTH = 12;
 
@@ -386,7 +385,7 @@ const ROW_NAME_BUDGET = 96;
 
 /**
  * This node type's catalog entry — the single registry of what a `flame` node
- * may read (AAP 0.6.2).
+ * may read.
  *
  * Two things come from it rather than from a literal in this file: the view's
  * own label, and the source vocabulary the query guard below enforces. Its
@@ -406,12 +405,12 @@ const TRACE_SOURCE = 'trace';
  * Copy
  *
  * Every string a reader sees, in one place, so none of it can drift into
- * naming a framework, a route or a component of any particular project (AAP
- * 0.5.2, 0.5.4) and none of it can imply a sampling profile (AAP 0.6.6).
+ * naming a framework, a route or a component of any particular project and
+ * none of it can imply a sampling profile.
  * ---------------------------------------------------------------------------
  */
 
-/** The honesty note AAP 0.6.6 requires on screen. */
+/** The on-screen honesty note: what a bar is, so the view never reads as a profile. */
 const MEASURE_NOTE =
   'Each bar is one recorded operation: its width is the duration that was measured and its children are the operations it made.';
 
@@ -424,15 +423,16 @@ const EMPTY_TITLE = 'No trace';
 /*
  * The error states take their title, lead, query block and layout from the one
  * contract in `../host/useQuery` (`queryFailureProps`, `unsupportedQueryProps`,
- * `formatDataQuery`), so this view words a failure exactly as every other node
- * does (B1-F16, B2-F14). The host's response check (`../host/DataProvider`)
- * already refuses a trace missing any member this view reads, so that refusal
- * reaches this view as an ordinary failed query. The shape guard below stays
- * as defence in depth — a member present but of the wrong type still passes
- * the host's presence check — and words its refusal with the host's own
- * sentence and hint (`unreadableDataMessage`, `REFUSED_RESPONSE_HINT`), so a
- * reader meets one fault in one form whichever check caught it. The one string
- * of its own is the shape it requires, for the diagnostics.
+ * `formatDataQuery`): the panel has one error-state design, so this view words a
+ * failure exactly as every other node does. The host's response check
+ * (`../host/DataProvider`) already refuses a trace missing any member this view
+ * reads, so that refusal reaches this view as an ordinary failed query. The
+ * shape guard below stays as defence in depth — a member present but of the
+ * wrong type still passes the host's presence check — and words its refusal
+ * with the host's own sentence and hint (`unreadableDataMessage`,
+ * `REFUSED_RESPONSE_HINT`), so a reader meets one fault in one form whichever
+ * check caught it. The one string of its own is the shape it requires, for the
+ * diagnostics.
  */
 
 /** The shape the guard requires, for the closed "Technical details" disclosure. */
@@ -777,9 +777,9 @@ interface WindowState {
  * React's `CSSProperties` is an interface, so TypeScript infers no index
  * signature for it and a literal holding a custom property is not assignable to
  * it. Nothing but a `--dgc-*` value may appear in an object of this type: a
- * colour, a length or a radius here would be the hardcoded CSS value AAP 0.6.4
- * forbids, and a value the stylesheet can compute itself belongs in
- * `../styles/components.css`.
+ * colour, a length or a radius here would be a hardcoded CSS value, which the
+ * design system forbids, and a value the stylesheet can compute itself belongs
+ * in `../styles/components.css`.
  */
 type CssVariableStyle = CSSProperties & Record<`--${string}`, string>;
 
@@ -813,8 +813,8 @@ function isTraceQuery(query: DataQuery): query is DataQuery & { source: typeof T
  * verifies before handing a page over, a provider that decoded something else
  * could still hand this component a payload typed as a trace and shaped like
  * something else. Reading it would then throw inside a render and take down the
- * panel, which is exactly the silent failure AAP 0.5.5 rules out — so the shape
- * is checked once, here, and a payload that fails becomes an error state.
+ * panel, a silent failure where every failure must be stated — so the shape is
+ * checked once, here, and a payload that fails becomes an error state.
  *
  * `null` fails this check and is not a failure: it is the service's own answer
  * for a capture in which no trace matched the query, which the caller renders
@@ -916,7 +916,7 @@ function ancestryBreadcrumb(frame: FlameFrame): string {
  *
  * Kept separate from the frame's measurements because it is a statement about
  * the *structure* rather than about the work: an inferred relationship must
- * never read as a measured one (AAP 0.4.2).
+ * never read as a measured one.
  */
 function provenanceOf(frame: FlameFrame): string | undefined {
   const notes: string[] = [];
@@ -1018,21 +1018,21 @@ function usableDurationMs(value: number): number {
  * ## Why a union and not a sum
  *
  * Children overlap as a matter of routine — one interaction can issue several
- * requests in parallel (AAP 0.4.2) — and two 400 ms calls that ran side by side
- * account for 400 ms of their parent's time, not 800 ms. Subtracting a sum
- * would report a negative own time for such a parent, and a negative width is
- * either clipped to nothing or drawn inverted: either way the reader is shown
- * something false about where the time went. So the children's intervals are
- * merged and the length of the merge is what is subtracted.
+ * requests in parallel — and two 400 ms calls that ran side by side account for
+ * 400 ms of their parent's time, not 800 ms. Subtracting a sum would report a
+ * negative own time for such a parent, and a negative width is either clipped
+ * to nothing or drawn inverted: either way the reader is shown something false
+ * about where the time went. So the children's intervals are merged and the
+ * length of the merge is what is subtracted.
  *
  * ## Why each child is clipped to the parent's window first
  *
  * A child can legitimately fall partly outside its parent's window: the browser
- * agent and the dev-server preload read their clocks independently (AAP 0.2.3),
- * and a call the parent did not await can outlive it. Time outside the parent's
- * window is not the parent's to account for. A child that clips to nothing is
- * dropped, which also excludes a non-finite bound, since every comparison
- * against one is false.
+ * agent and the dev-server preload read their clocks independently, and a call
+ * the parent did not await can outlive it. Time outside the parent's window is
+ * not the parent's to account for. A child that clips to nothing is dropped,
+ * which also excludes a non-finite bound, since every comparison against one is
+ * false.
  *
  * ## Why this lives here
  *
@@ -1150,11 +1150,11 @@ function frameLabelText(name: string, width: number): string | undefined {
  * the siblings on that row are disjoint in time. They are not always: a record
  * the correlator re-attached to the root lands on the root's child row while
  * it ran inside another child's window, parallel calls under one parent
- * overlap by construction (AAP 0.4.2), and a run of short operations that each
- * had to be widened to the minimum visible width can overlap once drawn even
- * though their measured windows did not. Drawn on one row, the later bar
- * paints over the earlier one and a reader sees one frame inside another — a
- * nesting the capture never recorded.
+ * overlap by construction, and a run of short operations that each had to be
+ * widened to the minimum visible width can overlap once drawn even though
+ * their measured windows did not. Drawn on one row, the later bar paints over
+ * the earlier one and a reader sees one frame inside another — a nesting the
+ * capture never recorded.
  *
  * ## The packing
  *
@@ -3329,7 +3329,7 @@ export function FlameChart(props: FlameChartProps): ReactElement {
         {/* A picture with a text alternative, deliberately: the rows beneath it
             are the representation a keyboard and a screen reader use, so the
             canvas announces what it shows instead of exposing one node per
-            bar (AAP 0.6.4).
+            bar.
 
             One fixed logical space, whatever the container: the `viewBox` is
             `CHART_VIEWBOX_WIDTH` units wide and exactly as tall as the drawn

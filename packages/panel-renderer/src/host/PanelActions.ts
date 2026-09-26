@@ -7,14 +7,13 @@
  * developer activates one of them it has exactly one way to say so — a callback
  * on this contract, reached either from a prop or from
  * {@link PanelActionsContext}. Nothing below the host layer opens a socket,
- * posts a message, calls `fetch` or knows a message name (AAP 0.1.2: "avoid
- * tightly coupling UI components directly to WebSocket implementation
- * details"; AAP 0.6.2: components "receive interactions through `PanelActions`"
- * and never open sockets or fetch). That is what lets the same thirteen
- * components render inside the Chrome DevTools panel, which reaches the local
- * service over a runtime port and a WebSocket, and inside the editor webview,
- * which reaches it through the extension host's own message channel — with no
- * component knowing the difference.
+ * posts a message, calls `fetch` or knows a message name: a component reports
+ * every interaction through `PanelActions` and depends on no detail of the
+ * transport behind it. That is what lets the same thirteen components render
+ * inside the Chrome DevTools panel, which reaches the local service over a
+ * runtime port and a WebSocket, and inside the editor webview, which reaches it
+ * through the extension host's own message channel — with no component knowing
+ * the difference.
  *
  * ## One contract, two spellings: what a host implements, what a view calls
  *
@@ -23,13 +22,13 @@
  *
  *   - **The host form, {@link PanelHostActions}** — `selectEvent(eventId)` and
  *     `openSource(location)`. This is the contract the two surfaces implement:
- *     the DevTools panel's `panel/actions.ts` and the editor webview (AAP 0.4.2
- *     names the hop `PanelActions.openSource`; the selection intent is keyed by
- *     the schema's own `EventRef.eventId`). It is what a surface hands to the
- *     panel host.
+ *     the DevTools panel's `panel/actions.ts` and the editor webview (the
+ *     click-to-source chain names the hop `PanelActions.openSource`; the
+ *     selection intent is keyed by the schema's own `EventRef.eventId`). It is
+ *     what a surface hands to the panel host.
  *   - **The view form, {@link PanelViewActions}** — `onSelectEvent(ref)` and
  *     `onOpenSource(location)`. This is the call surface the thirteen
- *     components use (AAP 0.6.2 names every component interaction
+ *     components use (every component interaction is named
  *     `onSelectEvent`/`onOpenSource`), and the only form
  *     {@link usePanelActions} ever returns.
  *
@@ -48,7 +47,8 @@
  * ## The click-to-source chain, and this module's place in it
  *
  * A source chip in a generated panel becomes an editor selection through a
- * fixed sequence of hops (AAP 0.2.3, 0.4.2):
+ * fixed sequence of hops, the same chain `docs/ARCHITECTURE.md` traces end to
+ * end:
  *
  * ```text
  * a source chip → PanelActions.openSource  ← THIS MODULE, hop 2
@@ -119,14 +119,15 @@
  *     rendered outside any host.
  *   - **Schema types reused, never restated.** The event pointer is picked from
  *     the schema's own `EventRef`, so a citation's field names and optionality
- *     have one definition (AAP 0.2.3); the renderer depends on the schema,
- *     never the reverse (AAP 0.6.2).
+ *     have one definition; the renderer depends on the schema, never the
+ *     reverse.
  *   - **Browser-safe.** The sibling `tsup.config.ts` builds with
  *     `platform: 'browser'`, so no Node builtin and no Node-only global appears
  *     here — and none is needed by a file that declares callbacks.
  *   - **Transport-blind.** The wire-protocol package is not a dependency of
- *     this package and must not become one (AAP 0.2.2, enforced by the root
- *     ESLint configuration): the protocol layer sits above the renderer, and
+ *     this package and must not become one (enforced by the root ESLint
+ *     configuration; the package layering is set out in
+ *     `docs/ARCHITECTURE.md`): the protocol layer sits above the renderer, and
  *     the two host applications own every socket.
  *   - **Extensionless relative specifiers** throughout this workspace, which
  *     resolves with `moduleResolution: "bundler"` — unlike the `.js`-suffixed
@@ -202,7 +203,7 @@ export type PanelEventRef = Pick<EventRef, 'eventId' | 'traceId' | 'spanId'>;
 
 /**
  * The action contract a **host surface implements**: the DevTools panel's
- * `panel/actions.ts` and the editor webview (AAP 0.4.2, 0.7.3).
+ * `panel/actions.ts` and the editor webview.
  *
  * Four members, and no fifth: the two a panel cannot be useful without are
  * required, and the two that only some views offer are optional, so a host that
@@ -243,7 +244,7 @@ export interface PanelHostActions {
    *
    * Drives the details drawer: the host resolves `eventId` against the capture
    * and shows the event's attributes, kind and tier badges, duration, parent
-   * chain and source chip (AAP 0.7.3). Reached from every view whose items are
+   * chain and source chip. Reached from every view whose items are
    * addressable — timeline and waterfall bars, log lines, flame cells, table
    * rows, tree nodes, and the summary header's evidence chips.
    *
@@ -315,8 +316,9 @@ export interface PanelHostActions {
 
 /**
  * The call surface a **view uses**: what {@link usePanelActions} returns and
- * what the thirteen components raise their interactions through (AAP 0.6.2
- * names them `onSelectEvent` and `onOpenSource`).
+ * what the thirteen components raise their interactions through, under the
+ * names every component interaction carries: `onSelectEvent` and
+ * `onOpenSource`.
  *
  * Same four intents as {@link PanelHostActions}, with the two required members
  * spelled the way the components call them:
@@ -608,10 +610,10 @@ export function usePanelActions(): PanelViewActions | undefined {
  * another: one chart highlights the span the developer clicked a moment ago
  * while the next highlights the one clicked now, and the details drawer shows a
  * third. The panel has one selected event, because the drawer shows one event
- * (AAP 0.7.3: evidence chips "select the underlying events"). The panel host
- * owns it and provides it through {@link PanelSelectionContext}; views read it
- * through {@link useViewSelection} (or {@link usePanelSelection}) and mark the
- * rows, bars and chips that stand for it, and they report a new selection
+ * and an evidence chip selects the events it cites. The panel host owns it and
+ * provides it through {@link PanelSelectionContext}; views read it through
+ * {@link useViewSelection} (or {@link usePanelSelection}) and mark the rows,
+ * bars and chips that stand for it, and they report a new selection
  * exactly as before, through {@link PanelViewActions.onSelectEvent} — which is
  * where the host records it. Under a host, no view keeps a selection of its own
  * for an event it can name.
@@ -720,7 +722,7 @@ export interface ViewSelection {
  * Mark the matching items with {@link matchesPanelSelection}: `dg-is-selected`
  * together with `aria-selected` on a grid row, tree item or list option, or
  * `aria-pressed` on a toggle-like chip, so the state is carried by an attribute
- * as well as by a colour (AAP 0.6.4). Never throws.
+ * as well as by a colour, never by the colour alone. Never throws.
  *
  * This is the one hook in this module that holds state, and the state is used
  * only while no host is mounted.
@@ -778,8 +780,8 @@ export function useSelectedEventId(): string | undefined {
  * match. A view that draws one span under another record's id — a tree built
  * by span id, a participant that collapsed one record — also matches when
  * **both** pointers name the same trace **and** the same span: that pair is the
- * span's own identity across tiers (AAP 0.2.3), so it cannot name a different
- * event. A single shared coordinate is never enough — two spans of different
+ * span's own identity across tiers, so it cannot name a different event. A
+ * single shared coordinate is never enough — two spans of different
  * traces may carry the same span id — and an absent coordinate never matches
  * an absent one.
  *

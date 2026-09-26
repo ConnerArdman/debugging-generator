@@ -6,7 +6,7 @@
  * target, a stack frame, a captured attribute preview. It is used by the visualization
  * components, by the source-location chip, by the empty/loading/error states and by the editor
  * webview, so the whole product renders such text at one size, in one font and with one set of
- * overflow rules (AAP 0.6.2).
+ * overflow rules.
  *
  * TIER 1 ATOM
  * It imports nothing from this folder, nothing from `../layout`, `../components` or `../host`,
@@ -31,7 +31,7 @@
  * handling is a stylesheet concern, not a string concern. A caller that needs a shortened value
  * shortens it before passing it in and says so with a `title`.
  *
- * PRIVACY: THIS IS THE END OF THE PIPELINE, NOT A STAGE IN IT (AAP 0.5.2)
+ * PRIVACY: THIS IS THE END OF THE PIPELINE, NOT A STAGE IN IT (see docs/SECURITY.md)
  * Everything reaching this component has already been redacted and truncated upstream - once in
  * the telemetry layer's redaction pass before any event is persisted or broadcast, and again by
  * the model provider's outbound guard. So this component performs NO redaction, and equally it
@@ -40,14 +40,14 @@
  * a helpful transformation here is looking at the wrong layer; redaction rules belong in the
  * telemetry package, and shortening belongs to the caller.
  *
- * APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE (AAP 0.6.4)
- * This file declares the class names and `src/styles/components.css` implements them. Nothing
- * here sets a colour, a length, a font or an inline style, and there is no literal CSS value in
- * this file at all:
+ * APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE
+ * This file declares the class names and `src/styles/components.css` implements them, resolving
+ * every visual value to a `--dg-*` token. Nothing here sets a colour, a length, a font or an
+ * inline style, and there is no literal CSS value in this file at all:
  *
  *   `dg-code`             the base, on both forms - the chip and tabular figures
  *   `dg-code--block`      the preformatted box (block form only)
- *   `dg-code--md`         the `--dg-mono-md` type role - 12/16 (AAP 0.6.3)
+ *   `dg-code--md`         the `--dg-mono-md` type role - 12/16
  *   `dg-code--sm`         the `--dg-mono-sm` type role - 11/16
  *   `dg-code--numeric`    marks numeric content; rendering is identical to the base
  *   `dg-code--wrap`       wrap long content instead of scrolling it
@@ -55,11 +55,11 @@
  * The two type roles are the only monospace sizes the design system has; both are complete `font`
  * shorthands over `--dg-font-mono`, and because that shorthand resets `font-variant`, the
  * stylesheet declares `font-variant-numeric` after it rather than before. Tabular figures are the
- * default for every Code, because AAP 0.6.3 pairs `--dg-font-mono` with `tabular-nums` for code,
- * SQL, paths and numeric columns: the stylesheet restores them on `dg-code` after every size
- * class, so digits line up in a column whatever the size. `dg-code--numeric` predates that
- * default and is kept for API stability - the `numeric` prop still emits it, marking content
- * whose digits are the point - but it no longer changes how anything renders.
+ * default for every Code, because the design system pairs `--dg-font-mono` with `tabular-nums` for
+ * code, SQL, paths and numeric columns: the stylesheet restores them on `dg-code` after every size
+ * class, so digits line up in a column whatever the size. `dg-code--numeric` adds nothing visual
+ * on top of that default: the `numeric` prop emits it for API stability and to mark content whose
+ * digits are the point.
  *
  * ACCESSIBILITY
  * The block form carries `tabIndex={0}`: a box that can scroll horizontally has to be reachable
@@ -81,7 +81,7 @@ import clsx from 'clsx';
 import type { HTMLAttributes, ReactElement, ReactNode, Ref, RefCallback, RefObject } from 'react';
 
 /**
- * The two monospace type roles of the design system (AAP 0.6.3), and deliberately the only two:
+ * The two monospace type roles of the design system, and deliberately the only two:
  * `md` resolves to `--dg-mono-md` and `sm` to `--dg-mono-sm`. There is no third monospace role to
  * select, so a caller that wants something denser or larger is asking for a token that does not
  * exist rather than for a prop value.
@@ -184,7 +184,7 @@ export interface CodeProps extends HTMLAttributes<HTMLElement> {
    * Which monospace type role to apply: `md` for text read on its own or beside body copy, `sm`
    * for a dense row where the surrounding interface text is already at its smallest. `md`
    * resolves to `--dg-mono-md` (12/16) and `sm` to `--dg-mono-sm` (11/16); those are the design
-   * system's only two monospace roles (AAP 0.6.3).
+   * system's only two monospace roles.
    *
    * @default 'md'
    */
@@ -194,9 +194,9 @@ export interface CodeProps extends HTMLAttributes<HTMLElement> {
    * Marks the content as numeric - a count, a duration, a size, an identifier made of digits - by
    * adding `dg-code--numeric`.
    *
-   * It no longer changes the rendering: every Code already renders tabular figures, so digits
-   * occupy identical widths and a column of numbers aligns on the decimal point rather than
-   * drifting (AAP 0.6.3 pairs the monospace family with `tabular-nums`). The prop is kept for API
+   * It does not change the rendering: every Code renders tabular figures, so digits occupy
+   * identical widths and a column of numbers aligns on the decimal point rather than drifting (the
+   * design system pairs the monospace family with `tabular-nums`). The prop exists for API
    * stability and so numeric content stays identifiable in the DOM.
    *
    * @default false

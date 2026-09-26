@@ -24,11 +24,14 @@
  * `vscode` is substituted with `vi.mock`, carrying only what resolution and
  * the document shell reach: `Uri.joinPath`, plus `commands.executeCommand` for
  * the default command runner (the cases inject their own through the
- * `executeCommand` seam).
+ * `executeCommand` seam). It also carries `workspace.openTextDocument` and
+ * `window.showTextDocument` as {@link editorOpens} spies, so the `openFile`
+ * cases can assert that the provider never opens a document itself: every
+ * location reaches the editor through `debuggen.openSource` and its gate.
  */
 
 import type * as vscode from 'vscode';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DebuggenError, err, ok } from '@debuggen/shared';
 import type { LogFields, Logger, LogLevel, Result } from '@debuggen/shared';
@@ -38,6 +41,16 @@ import type { ExtensionState } from '../state';
 import type { ActionResultStatus, WebviewRequestType, WebviewState } from '../webview-messages';
 import { MAX_IN_FLIGHT_REQUESTS, SessionViewProvider } from './session-view-provider';
 import type { SessionViewNotice } from './session-view-provider';
+
+/**
+ * The editor's direct document openers on the mocked `vscode`. The provider
+ * must never call either: each rejects, and the `openFile` cases assert that
+ * neither was called.
+ */
+const editorOpens = vi.hoisted(() => ({
+  openTextDocument: vi.fn(() => Promise.reject(new Error('the provider opened a document'))),
+  showTextDocument: vi.fn(() => Promise.reject(new Error('the provider showed a document'))),
+}));
 
 vi.mock('vscode', () => ({
   Uri: {
@@ -49,7 +62,18 @@ vi.mock('vscode', () => ({
   commands: {
     executeCommand: () => Promise.resolve(undefined),
   },
+  workspace: {
+    openTextDocument: editorOpens.openTextDocument,
+  },
+  window: {
+    showTextDocument: editorOpens.showTextDocument,
+  },
 }));
+
+beforeEach(() => {
+  editorOpens.openTextDocument.mockClear();
+  editorOpens.showTextDocument.mockClear();
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures and fakes
@@ -605,6 +629,7 @@ describe('SessionViewProvider — accepted webview frames', () => {
     ['endSession', 'debuggen.endSession'],
     ['launchDevServer', 'debuggen.launchDevServer'],
     ['pairChrome', 'debuggen.pairChrome'],
+    ['loadModifications', 'debuggen.showModifications'],
   ] as const)(
     'runs the command behind %s and accepts it once the command resolved',
     async (type, command) => {
@@ -633,6 +658,42 @@ describe('SessionViewProvider — accepted webview frames', () => {
       { command: 'debuggen.openSource', args: [validLocation()] },
     ]);
     expect(harness.posted).toStrictEqual([stateFrame()]);
+  });
+
+  it('hands a lexically safe, symlink-shaped openFile only to the gated debuggen.openSource and opens nothing itself', async () => {
+    // Each file passes the lexical parser — the last one because its `..`
+    // resolves back inside as text — yet on disk it may be reached through a
+    // link (`src/link → /etc`, a final-component link): only the command's
+    // canonical gate can tell, so the provider must not decide.
+    const files = ['src/link/passwd', 'src/link.ts', 'src/link/../link/passwd'];
+    const refused = {
+      level: 'warning',
+      message: 'Refused to open the source location.',
+    } as const;
+    const harness = resolveProvider({
+      command: ({ notify }) => {
+        // The gate refuses, as `openSourceLocation` does for an escaping link.
+        notify(refused);
+        return Promise.resolve(undefined);
+      },
+    });
+    for (const file of files) {
+      harness.send({ type: 'openFile', location: { ...validLocation(), file } });
+    }
+    await settle();
+
+    // Forwarded exactly as sent: neither resolved, normalised nor filtered.
+    expect(harness.commands).toStrictEqual(
+      files.map((file) => ({
+        command: 'debuggen.openSource',
+        args: [{ ...validLocation(), file }],
+      })),
+    );
+    expect(warnings(harness.records, INVALID_PAYLOAD_MESSAGE)).toStrictEqual([]);
+    // A refusal is shown and nothing falls back to opening the file directly.
+    expect(harness.posted).toContainEqual({ type: 'notice', ...refused });
+    expect(editorOpens.openTextDocument).not.toHaveBeenCalled();
+    expect(editorOpens.showTextDocument).not.toHaveBeenCalled();
   });
 
   it('answers ready with the current snapshot, logs only the validated type and posts no result', async () => {
@@ -726,6 +787,32 @@ describe('SessionViewProvider — request results are attributed to their own re
     expect(harness.posted).toStrictEqual([
       { type: 'notice', level: 'warning', message: 'Session ended; live updates are off.' },
       actionResult(id, 'endSession', 'failed'),
+      stateFrame(),
+    ]);
+  });
+
+  it('fails loadModifications when debuggen.showModifications warns that part of the journal is missing', async () => {
+    const harness = resolveProvider({
+      command: ({ notify }) => {
+        notify({
+          level: 'warning',
+          message: 'Loaded 2 of 5 file modifications recorded for this session.',
+        });
+        return Promise.resolve(undefined);
+      },
+    });
+    const id = requestId(1);
+    harness.send({ type: 'loadModifications', requestId: id });
+    await settle();
+
+    expect(harness.commands).toStrictEqual([{ command: 'debuggen.showModifications', args: [] }]);
+    expect(harness.posted).toStrictEqual([
+      {
+        type: 'notice',
+        level: 'warning',
+        message: 'Loaded 2 of 5 file modifications recorded for this session.',
+      },
+      actionResult(id, 'loadModifications', 'failed'),
       stateFrame(),
     ]);
   });

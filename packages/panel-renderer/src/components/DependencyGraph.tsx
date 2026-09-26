@@ -1,8 +1,7 @@
 /**
  * `DependencyGraph` — the correlated flow of an interaction as a STATIC layered
  * left-to-right graph: the event, the code it reached, the calls it made and the
- * datastore or external service it ended at, with an edge for every handover
- * (AAP 0.6.2).
+ * datastore or external service it ended at, with an edge for every handover.
  *
  * This module is the component behind the node catalog's `dependencyGraph`
  * type. It is the one structural view in the library — every other component
@@ -11,9 +10,9 @@
  *
  * ## THE RECORDED GAP: THE LAYOUT IS STATIC, AND THAT IS THE DESIGN
  *
- * AAP 0.6.6 records "interactive graph layout (drag, zoom) — not in v1; layered
- * static layout with hover and click; annotated as a follow-up". So this file
- * contains, deliberately and permanently until that follow-up is taken:
+ * Interactive graph layout (drag, zoom) is a recorded gap of this version: the
+ * graph is a layered static layout with hover and click. So this file contains,
+ * deliberately and for as long as that gap stands:
  *
  *   - no drag, no pan, no wheel zoom, no transform state, no gesture handler;
  *   - no force simulation and no layout library of any kind — the layered
@@ -33,8 +32,8 @@
  * ## DETERMINISM IS THE SUBSTANCE OF THIS VIEW
  *
  * This component appears in the excessive-render panel (trigger → provider →
- * consumers, AAP 0.6.5), where a developer compares one reading of a capture
- * with another. A graph that reshuffled between renders would read as noise and
+ * consumers), where a developer compares one reading of a capture with
+ * another. A graph that reshuffled between renders would read as noise and
  * would quietly undermine the evidence it exists to present, so the layout is
  * reproducible for any permutation of the payload:
  *
@@ -62,20 +61,20 @@
  * ## TWO REPRESENTATIONS OF ONE GRAPH, AND WHY BOTH ARE MANDATORY
  *
  * A picture of a graph is unreadable to a keyboard or a screen-reader user, so
- * this component renders the same data twice (AAP 0.6.4):
+ * this component renders the same data twice:
  *
  *   - **The canvas.** An SVG carrying `role="img"` and a text alternative that
  *     states how many participants, layers and relationships it holds and where
  *     the equivalent is. It is a picture: pointer hover and click, no tab stop,
  *     and every shape has an SVG `<title>` for the pointer user. A click on a
  *     shape selects its participant and, where the participant resolved to a
- *     source location, opens that location in the editor (AAP 0.6.2: "node →
- *     `onOpenSource` where a location exists") — the canvas has no chip of its
- *     own, so the shape carries both intents, and its title says so. That
- *     title is the user agent's — never shown on focus, never dismissible — so
- *     nothing it says is found there alone: the participant's grid row below
- *     always shows the same detail. Hovering a shape highlights it on the
- *     canvas, and Escape dismisses that highlight.
+ *     source location, opens that location in the editor through
+ *     `onOpenSource` — the canvas has no chip of its own, so the shape carries
+ *     both intents, and its title says so. That title is the user agent's —
+ *     never shown on focus, never dismissible — so nothing it says is found
+ *     there alone: the participant's grid row below always shows the same
+ *     detail. Hovering a shape highlights it on the canvas, and Escape
+ *     dismisses that highlight.
  *   - **The participants grid.** The `DataTable` primitive — one row per
  *     participant, ordered by layer and stating it, with the participant's
  *     label, its class, its timing, its outgoing relationships and its source
@@ -87,11 +86,11 @@
  *     the pointer or the selection — so nothing is reachable by hover alone,
  *     no tab stop is added to get there, and no row changes height under a
  *     pointer between the press and the release of a click (see
- *     {@link ParticipantCell}). A raw `<ul>` was the alternative and
- *     is not used: AAP 0.6.4 permits no raw `<table>` or bespoke list chrome
- *     above the primitives layer, `../styles/components.css` declares no rule
- *     for a list in this block, and `../styles/base.css` deliberately keeps
- *     user-agent list markers for any list that does not opt out in CSS.
+ *     {@link ParticipantCell}). A raw `<ul>` is not used: no raw `<table>` or
+ *     bespoke list chrome is permitted above the primitives layer,
+ *     `../styles/components.css` declares no rule for a list in this block,
+ *     and `../styles/base.css` deliberately keeps user-agent list markers for
+ *     any list that does not opt out in CSS.
  *
  * ## NO SELECTION IS EVER FABRICATED
  *
@@ -152,18 +151,20 @@
  * ## PRIVACY: EVERY LABEL IS DATA, AND ARRIVES REDACTED
  *
  * A participant's label is the identity the aggregate derived from records that
- * passed the redaction layer — an interaction and its target, a matched route, a
- * module and a symbol, a database system (AAP 0.5.2). This file renders labels
- * as given: it never parses one, never reassembles a URL or a statement from
- * one, and shortens one only to fit a box on the canvas (with the full text in
- * that shape's title, and in full, wrapped, in its grid row).
+ * passed the redaction layer (docs/SECURITY.md, "Redaction") — an interaction
+ * and its target, a matched route, a module and a symbol, a database system.
+ * This file renders labels as given: it never parses one, never reassembles a
+ * URL or a statement from one, and shortens one only to fit a box on the canvas
+ * (with the full text in that shape's title, and in full, wrapped, in its grid
+ * row).
  * The only vocabulary this file writes is generic product vocabulary: the six
  * participant classes of the closed telemetry domain and the column headings.
  * A specific component, function or route name here would be exactly the
- * hardcoded demo knowledge AAP 0.5.4 forbids and `scripts/check-no-hardcoding.mjs`
- * fails the build for.
+ * hardcoded demo knowledge the product forbids, which
+ * `scripts/check-no-hardcoding.mjs` fails the build for (docs/ARCHITECTURE.md,
+ * "Workspace layout and dependency layering").
  *
- * ## NO TRANSPORT, ONE QUERY (AAP 0.1.2, 0.4.2)
+ * ## NO TRANSPORT, ONE QUERY
  *
  * Data arrives only through the node's `DataQuery`, resolved by `../host/useQuery`
  * against the ambient `DataProvider`; interactions leave only through
@@ -201,14 +202,14 @@
  *     Nothing sizes the drawing from its container. The stylesheet, not this
  *     component, decides how the element sits in its scroll viewport, and that
  *     viewport scrolls a graph wider than the panel in the inline axis and a
- *     tall one in the block axis. A `viewBox` scaled to fit the panel was the
- *     alternative, and it shrank every label with the panel — to about a
- *     quarter of its type size in a docked DevTools panel. The boxes, the row
- *     gap and the column gap are the scale module's rhythm; the column gap
- *     widens beyond it only as far as the data requires, to hold the widest
- *     relationship count drawn inside a gap (see {@link columnGapOf}). The
- *     participants grid is the complete reading of a graph too large to take
- *     in at a glance, which is the other reason it is never virtualized.
+ *     tall one in the block axis. A `viewBox` scaled to fit the panel would
+ *     shrink every label with the panel — to about a quarter of its type size
+ *     in a docked DevTools panel — so the drawing is never scaled to fit. The
+ *     boxes, the row gap and the column gap are the scale module's rhythm; the
+ *     column gap widens beyond it only as far as the data requires, to hold the
+ *     widest relationship count drawn inside a gap (see {@link columnGapOf}).
+ *     The participants grid is the complete reading of a graph too large to
+ *     take in at a glance, which is the other reason it is never virtualized.
  *   - **The relationship curves carry no information of their own.** The
  *     stroke is the design system's edge treatment in
  *     `../styles/components.css`, whose contrast is owned and tested with the
@@ -233,7 +234,7 @@
  * telemetry fields that same entry declares in `reads`; this component reads
  * prepared participants and never a raw record.
  *
- * ## APPEARANCE IS A CLASS CONTRACT (AAP 0.6.4)
+ * ## APPEARANCE IS A CLASS CONTRACT
  *
  * No colour, length, radius or font appears in this module. The classes below
  * are implemented in `../styles/components.css` against `--dg-*` tokens; the
@@ -672,7 +673,7 @@ interface SpanColourKeyEntry {
  * participants are listed, which is deterministic for one graph. A colour that
  * equals a participant's class colour needs no entry: its class chip names it.
  *
- * @param rows - The participants, in the grid's canonical order.
+ * @param rows The participants, in the grid's canonical order.
  * @returns One entry per off-class colour, first seen first; empty when every
  *   participant is drawn in its class colour.
  */
@@ -800,9 +801,9 @@ function arrangeGraph(data: DependencyGraphData): GraphArrangement {
  *     count`, every one a whole number and `count` at least one.
  *
  * The protocol's guard on a `graph` result checks only its outer shape, and this
- * package may take `@debuggen/telemetry` as types only (AAP 0.2.2), so the
- * checks are written here, against those declared rules, and run before either
- * field can drive anything. A declaration that breaks a rule is **not used** —
+ * package may take `@debuggen/telemetry` as types only, so the checks are
+ * written here, against those declared rules, and run before either field can
+ * drive anything. A declaration that breaks a rule is **not used** —
  * no host selection, no inferred state — and is counted, so the view says under
  * the grid that part of the payload was inconsistent rather than repairing it
  * into a claim the capture never made. Nothing below derives a value the
@@ -918,12 +919,12 @@ function usableLineageOf(edge: DependencyGraphEdge): LineageTally | undefined {
  * - `measured`: every record joined its caller by nesting. So is an edge that
  *   declares no lineage, or an inconsistent one (which is reported instead).
  * - `inferred`: some records joined through a lineage attribution (an async
- *   continuation, AAP 0.4.2), and each of those attributions had exactly one
- *   candidate. Not measured, so it is told apart — but not in doubt either.
+ *   continuation), and each of those attributions had exactly one candidate.
+ *   Not measured, so it is told apart — but not in doubt either.
  * - `ambiguous`: at least one of those attributions chose among several open
  *   candidates. This, and only this, is the relationship the timeline dashes
- *   (AAP 0.4.2: the edge is dashed when `lineageAmbiguous` is set), so it is
- *   the only one dashed here.
+ *   (an edge is dashed when `lineageAmbiguous` is set; see docs/ARCHITECTURE.md,
+ *   "Async-continuation lineage"), so it is the only one dashed here.
  */
 type LineageState = 'measured' | 'inferred' | 'ambiguous';
 
@@ -957,7 +958,7 @@ const LINEAGE_STATE_CLASS: Readonly<Record<LineageState, string | undefined>> = 
  * The chip tone each lineage state reads in: the info tone for a relationship
  * inferred from a single candidate, the warning tone for one that was a choice
  * among several. The chip's text names the state in words either way, so
- * the tone is never the only signal (AAP 0.6.4).
+ * the tone is never the only signal.
  */
 const LINEAGE_TONE: Readonly<Record<LineageState, BadgeTone>> = Object.freeze({
   measured: 'neutral',
@@ -1173,11 +1174,11 @@ function buildColumns(rows: readonly ParticipantRow[]): readonly ParticipantColu
  *
  * Generic product vocabulary only, and every sentence states what the capture
  * holds rather than what it might mean. No value read out of an inspected
- * project is interpolated into any of it (AAP 0.5.4).
+ * project is interpolated into any of it.
  * ---------------------------------------------------------------------------
  */
 
-/** The recorded limitation of AAP 0.6.6, stated on screen rather than implied. */
+/** The static layout's recorded limitation, stated on screen rather than implied. */
 const STATIC_LAYOUT_NOTE =
   'This layout is static in this version: the table below details every participant, and selecting one there or on the picture highlights it in both. Clicking a participant on the picture also opens its source location in the editor when it has one, as its source chip in the table does. Dragging, panning and zooming are not available.';
 
@@ -1193,7 +1194,7 @@ const LOADING_LABEL = 'Loading the dependency graph…';
 // No failure copy lives here: both error states take their title, message,
 // hint, code and query block from the one contract in `../host/useQuery`
 // (`queryFailureProps`, `unsupportedQueryProps`), so this view words a failure
-// exactly as every other node does (B1-F16, B2-F14).
+// exactly as every other node does.
 
 /** Marks a relationship chip whose relationship was inferred rather than measured. */
 const INFERRED_LABEL = 'inferred';
@@ -1300,7 +1301,7 @@ function participantMetaText(node: DependencyGraphNode): string {
 /**
  * What a click on a shape does besides selecting it, for a participant with a
  * location. The path is the payload's own, project-relative and redacted
- * upstream (AAP 0.5.2); the sentence around it is product vocabulary.
+ * upstream; the sentence around it is product vocabulary.
  */
 function openSourceHint(file: string): string {
   return `Click to open ${file} in the editor.`;
@@ -1454,8 +1455,8 @@ function ParticipantCell({ row }: { readonly row: ParticipantRow }): ReactElemen
  * with a dashed outline, nothing for a measured relationship — and the words
  * themselves: the inferred share and the ambiguous part when either applies,
  * see {@link lineageSuffix}. So the distinction survives in text, where neither
- * a tone nor a dash pattern can reach (AAP 0.6.4: colour and pattern are never
- * the sole indicator).
+ * a tone nor a dash pattern can reach: colour and pattern are never the sole
+ * indicator.
  *
  * The chip is `dg-dependency-graph__relationship`, a class of its own rather
  * than the canvas curve's: the curve's rule is SVG paint (`fill`, `stroke`,
@@ -1526,10 +1527,10 @@ function SourceCell({ row }: { readonly row: ParticipantRow }): ReactElement {
  * A module constant because every cell is a function of its row alone.
  *
  * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
- * in `../primitives/DataTable`, AAP 0.6.4): `DataTable` resolves each role to
- * a track built from the design system's column floor and share tokens, the
- * same track every other table gives content of that kind, so no number here
- * decides how wide a column is. The roles follow the content:
+ * in `../primitives/DataTable`): `DataTable` resolves each role to a track
+ * built from the design system's column floor and share tokens, the same track
+ * every other table gives content of that kind, so no number here decides how
+ * wide a column is. The roles follow the content:
  *
  * - **Layer** and **Total time** are figures — a short layer number and a
  *   formatted duration — so they take `status` and `quantity`, the compact
@@ -1701,11 +1702,11 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
 
   // A click on a participant's shape: the selection above, then — where the
   // participant resolved to a location — that location opened in the editor,
-  // once (AAP 0.6.2). The object is the payload's own, handed over by
-  // reference and never copied or normalised, because every hop after this one
-  // acts on the object it receives (see `./SourceLink`). A collapse of several
-  // records carries no event coordinate but may well carry a location, so the
-  // two are decided independently.
+  // once. The object is the payload's own, handed over by reference and never
+  // copied or normalised, because every hop after this one acts on the object
+  // it receives (see `./SourceLink`). A collapse of several records carries no
+  // event coordinate but may well carry a location, so the two are decided
+  // independently.
   const handleNodeClick = useCallback(
     (row: ParticipantRow): void => {
       handleActivate(row);
@@ -1896,11 +1897,11 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
            * `dg-dependency-graph__edge`; its contrast against the canvas
            * surface is owned by the design tokens and tested with them, in
            * every theme, rather than decided here. This component writes no
-           * colour (AAP 0.6.4), and no information depends on the stroke
-           * alone: every relationship is also enumerated in text in the grid
-           * below, and an inferred or ambiguous one is named there in words as
-           * well as marked here — solid in the info tone, or dashed in the
-           * warning tone — by the state class the stylesheet implements.
+           * colour, and no information depends on the stroke alone: every
+           * relationship is also enumerated in text in the grid below, and an
+           * inferred or ambiguous one is named there in words as well as
+           * marked here — solid in the info tone, or dashed in the warning
+           * tone — by the state class the stylesheet implements.
            */}
           <g className="dg-dependency-graph__edges">
             {layout.edges.map((positioned) => (

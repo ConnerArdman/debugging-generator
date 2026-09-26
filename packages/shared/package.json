@@ -10,16 +10,16 @@
   "exports": {
     ".": {
       "types": [
-        "./dist/index.d.ts",
-        "./src/index.ts"
+        "./src/index.ts",
+        "./dist/index.d.ts"
       ],
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./node": {
       "types": [
-        "./dist/node/index.d.ts",
-        "./src/node/index.ts"
+        "./src/node/index.ts",
+        "./dist/node/index.d.ts"
       ],
       "import": "./dist/node/index.js",
       "default": "./dist/node/index.js"

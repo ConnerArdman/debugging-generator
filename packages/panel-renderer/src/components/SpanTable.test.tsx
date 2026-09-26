@@ -7,8 +7,8 @@
  * The `table` node draws one page of records that the coordination service has
  * already filtered, ordered and paged: `POST /sessions/:id/panel-data` applies
  * `filter`, `sort`, `limit` and `offset` and answers with `total` and
- * `nextOffset` (AAP 0.4.2). Two of the cases below are the mechanical proof of
- * that contract rather than tests of pixels:
+ * `nextOffset` (`docs/ARCHITECTURE.md`, "Panel data"). Two of the cases below
+ * are the mechanical proof of that contract rather than tests of pixels:
  *
  *   - **order preserved** renders a deliberately unsorted page and asserts the
  *     rows appear in the provider's own order, so a local `.sort()` of a
@@ -40,12 +40,13 @@
  * page past the end, or one the total says should hold rows, names that total
  * rather than claiming nothing matched.
  *
- * Alongside those, AAP 0.8.3 asks every component suite here for the three
- * states of a query-backed view — loading, empty and error — and for the
- * click-to-source payload. Each state is driven through a stub `DataProvider`
- * that respectively never settles, resolves an empty page and rejects; the
- * payload cases assert what the host actually receives, because every hop after
- * this one acts blind on the object it is handed (AAP 0.4.2, hop 1 of five).
+ * Alongside those, every component suite here covers the three states of a
+ * query-backed view — loading, empty and error — and the click-to-source
+ * payload. Each state is driven through a stub `DataProvider` that respectively
+ * never settles, resolves an empty page and rejects; the payload cases assert
+ * what the host actually receives, because every hop after this one acts blind
+ * on the object it is handed (this is the first hop of the path
+ * `docs/ARCHITECTURE.md` traces under "A click, end to end").
  *
  * ## Harness conventions (shared with `./SourceLink.test.tsx`)
  *
@@ -65,10 +66,10 @@
  *   - **In-file synthetic builders, no fixture files.** {@link makeEvent} and
  *     {@link makeNode} take overrides; nothing here is read from disk or shared
  *     with another suite.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): span names, a file path
- *     and a symbol that belong to no application, demonstration or otherwise.
- *     `scripts/check-no-hardcoding.mjs` scans this text with the rest of
- *     `packages/**`.
+ *   - **Generic fixture vocabulary only**: span names, a file path and a
+ *     symbol that belong to no application, demonstration or otherwise.
+ *     `scripts/check-no-hardcoding.mjs` skips test files, so this suite keeps
+ *     the product's neutral vocabulary by convention.
  *   - **Queries by role and accessible name.** The grid, its rows, its header
  *     controls, the chips and the footer button are all reached that way; a
  *     class is read only off an element already obtained semantically, since no
@@ -117,10 +118,10 @@ import { SpanTable } from './SpanTable';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Every string below is application-neutral (AAP 0.5.4): no component, route,
- * service or symbol of any inspected project appears here, in the fixtures or
- * in the comments. The identifiers are shaped as the capture shapes them — a
- * 32-hex trace id, 16-hex span ids, epoch-millisecond start times, millisecond
+ * Every string below is application-neutral: no component, route, service or
+ * symbol of any inspected project appears here, in the fixtures or in the
+ * comments. The identifiers are shaped as the capture shapes them — a 32-hex
+ * trace id, 16-hex span ids, epoch-millisecond start times, millisecond
  * durations — because the component reads those fields and formats them.
  * ---------------------------------------------------------------------------
  */
@@ -564,7 +565,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -980,7 +981,7 @@ describe('SpanTable states', () => {
     expect(busy.textContent).toBe(LOADING_LABEL);
 
     // Nothing is drawn yet: no grid, therefore no rows, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -996,7 +997,7 @@ describe('SpanTable states', () => {
 
     // Queried by a generic substring of the product's own copy rather than by a
     // restatement of the sentence, then checked to be exactly that: product
-    // vocabulary, naming no inspected project (AAP 0.5.4).
+    // vocabulary, naming no inspected project.
     const message = await screen.findByText(/no spans matched/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
     expect(message.textContent).toContain('spans');
@@ -1181,8 +1182,8 @@ describe('SpanTable rows', () => {
   it('renders rows in the order the provider returned them, without re-sorting', async () => {
     // The page is deliberately not in duration order (640 ms, 1175 ms, 12 ms)
     // while the node asks for `duration_desc`: the service applied the ordering
-    // it was given (AAP 0.4.2), so a component that re-ranked the page locally
-    // would show an order no response ever reported.
+    // it was given, so a component that re-ranked the page locally would show
+    // an order no response ever reported.
     const stub = resolvingProvider('spans', PROVIDER_ORDER);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -1616,7 +1617,7 @@ describe('SpanTable interactions', () => {
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2).
+    // this one acts on the object it is handed.
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -1687,7 +1688,7 @@ describe('SpanTable interactions', () => {
   });
 });
 
-describe('SpanTable keyboard (B2-F19)', () => {
+describe('SpanTable keyboard', () => {
   it('is one Tab stop, entered on the active row and left by the next Tab', async () => {
     const stub = resolvingProvider('spans', PROVIDER_ORDER);
     const user = userEvent.setup();
@@ -1880,7 +1881,7 @@ describe('SpanTable paging', () => {
     ).toBeDefined();
   });
 
-  it('announces the footer count politely as each page arrives (B2-F10)', async () => {
+  it('announces the footer count politely as each page arrives', async () => {
     const stub = pagingProvider('spans', [
       { data: [FUNCTION_ROW], total: 42, nextOffset: 5 },
       { data: [QUERY_ROW], total: 42, nextOffset: 6 },
@@ -1918,7 +1919,7 @@ describe('SpanTable paging', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     // A service that reported no total leaves this view unable to know whether
-    // more rows exist, and saying so is the only truthful option (AAP 0.4.2).
+    // more rows exist, and saying so is the only truthful option.
     const coverage = await screen.findByText(/^Showing 1 span\./);
     expect(coverage.textContent).toContain('not reported');
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
@@ -2608,13 +2609,14 @@ describe('SpanTable query bounds', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The panel's shared selection (B2-F21)
+ * The panel's shared selection
  *
  * Under the panel host the selected row is the panel's one selection — the
  * event any view or evidence chip last selected — rather than a state of this
- * table (AAP 0.7.3: evidence chips "select the underlying events"). These cases
- * provide that selection directly through `PanelSelectionContext`, which is
- * exactly what the host mounts, and re-render with another value to move it.
+ * table: an evidence chip selects the underlying events, and every view marks
+ * them. These cases provide that selection directly through
+ * `PanelSelectionContext`, which is exactly what the host mounts, and
+ * re-render with another value to move it.
  * ---------------------------------------------------------------------------
  */
 

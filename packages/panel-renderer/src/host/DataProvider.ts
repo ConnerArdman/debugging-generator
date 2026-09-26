@@ -8,20 +8,21 @@
  * host bridge. That is the whole point of the file. A visualization component
  * receives a `DataQuery` on its node, hands it to the ambient provider, and
  * renders what comes back; where the answer came from is the host surface's
- * business and nothing the library may depend on (AAP 0.1.2, 0.6.2).
+ * business and nothing the library may depend on.
  *
  * ## What it mirrors: the wire form and the view form
  *
  * The shape below is the client-side face of the service's panel-data contract,
- * `POST /sessions/:id/panel-data` (AAP 0.4.2): the route is addressed by a
- * session id, the request body is a `DataQuery` and the response is
- * discriminated on `source`. Each host surface implements this interface over
- * whatever channel it owns — the DevTools panel proxies the call through its
- * extension service worker, the editor webview through host messaging — and
- * both return the same {@link DataQueryResponse}. Because the two sides of that
- * contract are described once, in `@debuggen/panel-schema` (the query) and
- * `@debuggen/telemetry` (the results), nothing here restates a data shape: every
- * result type below is an `import type` from the package that owns it.
+ * `POST /sessions/:id/panel-data` (described in `docs/ARCHITECTURE.md`): the
+ * route is addressed by a session id, the request body is a `DataQuery` and the
+ * response is discriminated on `source`. Each host surface implements this
+ * interface over whatever channel it owns — the DevTools panel proxies the call
+ * through its extension service worker, the editor webview through host
+ * messaging — and both return the same {@link DataQueryResponse}. Because the
+ * two sides of that contract are described once, in `@debuggen/panel-schema`
+ * (the query) and `@debuggen/telemetry` (the results), nothing here restates a
+ * data shape: every result type below is an `import type` from the package that
+ * owns it.
  *
  * The contract has two spellings, and this module owns the one translation
  * between them:
@@ -496,9 +497,9 @@ export interface DataQueryOptions {
  *    request's `source`. Components switch on it.
  * 2. **Never dress a failure as data.** A failed call must reject. Resolving
  *    with an empty array, a zeroed result or any sentinel turns a failure into a
- *    plausible-looking empty panel, which AAP 0.5.5 forbids — a failure is never
- *    presented as a successful analysis. An empty result is legitimate only when
- *    the capture genuinely holds nothing for the query.
+ *    plausible-looking empty panel, and a failure is never presented as a
+ *    successful analysis. An empty result is legitimate only when the capture
+ *    genuinely holds nothing for the query.
  * 3. **Reject with a typed error where possible.** `DebuggenError` from
  *    `@debuggen/shared` carries the code and hint the error state renders, and
  *    its details reach the error state's "Technical details" disclosure. Any
@@ -522,8 +523,9 @@ export interface DataQueryOptions {
  *    component as a response with no `data` — which `./useQuery` refuses as a
  *    malformed response rather than drawing.
  * 6. **Preserve redaction.** Attribute values, URLs and statements arrive
- *    already redacted and truncated (AAP 0.5.2). An implementation must never
- *    enrich, expand or reconstruct them.
+ *    already redacted and truncated by the service (`docs/SECURITY.md` states
+ *    the rules). An implementation must never enrich, expand or reconstruct
+ *    them.
  * 7. **Stay referentially stable.** The provider object is passed through React
  *    context and is part of the query effect's dependencies, so a new object per
  *    render would refetch every node forever. Create it once per host surface
@@ -556,10 +558,10 @@ export interface DataProvider {
    * Resolve one page of one query for one session.
    *
    * @typeParam Source - The source named by `query.source`, inferred from it.
-   * @param sessionId - The session the query is addressed to: the `sessionId`
+   * @param sessionId The session the query is addressed to: the `sessionId`
    * of the panel specification being rendered, passed exactly as it carries it.
-   * @param query - The declarative request carried by the node being rendered.
-   * @param options - Per-call options; `signal` cancels the request and
+   * @param query The declarative request carried by the node being rendered.
+   * @param options Per-call options; `signal` cancels the request and
    * `panelId` names the panel whose capture answers it.
    * @returns The response for that source, with its paging counters.
    */
@@ -623,8 +625,8 @@ export interface DataQueryResolverContext extends DataQueryOptions {
  * );
  * ```
  *
- * @param query - The query to resolve, exactly as the node carried it.
- * @param context - The session to address and the per-call options.
+ * @param query The query to resolve, exactly as the node carried it.
+ * @param context The session to address and the per-call options.
  * @returns The response for the query's own source.
  */
 export type DataQueryResolver = (
@@ -642,7 +644,7 @@ export type DataQueryResolver = (
  * `/sessions//panel-data`, which no service answers meaningfully, so it is
  * refused before any transport runs.
  *
- * @param sessionId - The candidate session id.
+ * @param sessionId The candidate session id.
  * @returns `true` when the id is usable as a route segment's value.
  */
 export function isAddressableSessionId(sessionId: unknown): sessionId is string {
@@ -668,7 +670,7 @@ export function isAddressableSessionId(sessionId: unknown): sessionId is string 
  *
  * Every diagnostic names sources, field paths and value *kinds* only. A payload
  * holds redacted URLs, parameterized statements and prop-name summaries, and
- * none of it may reach an error message or its details (AAP 0.5.2).
+ * none of it may reach an error message or its details.
  * ---------------------------------------------------------------------------
  */
 
@@ -723,8 +725,8 @@ interface ResponseDefect {
 /**
  * A shallow check of one source's payload.
  *
- * @param payload - The payload, read from the response as `unknown`.
- * @param path - The payload's own path, prefixed to every defect's path.
+ * @param payload The payload, read from the response as `unknown`.
+ * @param path The payload's own path, prefixed to every defect's path.
  * @returns The first defect found, or `undefined` for a well-formed payload.
  */
 type PayloadGuard = (payload: unknown, path: string) => ResponseDefect | undefined;
@@ -736,7 +738,7 @@ type UnknownRecord = Readonly<Record<string, unknown>>;
  * Whether a value is a plain, non-array object, narrowing it to a record whose
  * every field is `unknown` — the same test as the protocol's `isPlainRecord`.
  *
- * @param value - Any value.
+ * @param value Any value.
  * @returns `true` for a non-null, non-array object.
  */
 function isUnknownRecord(value: unknown): value is UnknownRecord {
@@ -747,7 +749,7 @@ function isUnknownRecord(value: unknown): value is UnknownRecord {
  * Whether a value is an array, narrowing it to a readonly list of `unknown`
  * rather than to the `any[]` that `Array.isArray` alone would leave.
  *
- * @param value - Any value.
+ * @param value Any value.
  * @returns `true` for an array.
  */
 function isUnknownList(value: unknown): value is readonly unknown[] {
@@ -758,7 +760,7 @@ function isUnknownList(value: unknown): value is readonly unknown[] {
  * Whether a value is a non-negative whole number in the safe-integer range — the
  * protocol's `z.int().min(0)` for every paging counter.
  *
- * @param value - Any value.
+ * @param value Any value.
  * @returns `true` for `0`, `1`, `2`, … up to `Number.MAX_SAFE_INTEGER`.
  */
 function isNonNegativeInteger(value: unknown): value is number {
@@ -771,7 +773,7 @@ function isNonNegativeInteger(value: unknown): value is number {
  * Numbers are described by the property that disqualified them rather than by
  * their digits, which says why a counter was refused without echoing it.
  *
- * @param value - The value that was found where something else was expected.
+ * @param value The value that was found where something else was expected.
  * @returns A short noun phrase: `"null"`, `"an array"`, `"a fractional number"`.
  */
 function describeKind(value: unknown): string {
@@ -816,8 +818,8 @@ function describeKind(value: unknown): string {
  * The kind of a record's field, distinguishing an absent key from one that is
  * present and holds something unusable.
  *
- * @param record - The object the field was read from.
- * @param key - The field's name.
+ * @param record The object the field was read from.
+ * @param key The field's name.
  * @returns `"missing"` for a key the record does not own, else its kind.
  */
 function describeField(record: UnknownRecord, key: string): string {
@@ -830,7 +832,7 @@ function describeField(record: UnknownRecord, key: string): string {
  *
  * @typeParam List - The source's result type, e.g. `DataResultFor<'renders'>`;
  * its element type is what the keys are checked against.
- * @param keys - Required members of the element type every element must own.
+ * @param keys Required members of the element type every element must own.
  * @returns The guard.
  */
 function listGuard<List extends readonly object[]>(
@@ -894,7 +896,7 @@ interface RecordGuardSpec<Shape> {
  * where the source permits "nothing matched".
  *
  * @typeParam Shape - The source's result type, e.g. `DataResultFor<'trace'>`.
- * @param spec - See {@link RecordGuardSpec}.
+ * @param spec See {@link RecordGuardSpec}.
  * @returns The guard.
  */
 function recordGuard<Shape>(spec: RecordGuardSpec<Shape>): PayloadGuard {
@@ -988,9 +990,9 @@ interface PageEcho {
 /**
  * Read one whole-number paging counter off a response.
  *
- * @param record - The response.
- * @param counter - Which counter.
- * @param presence - Whether an absent counter is a defect.
+ * @param record The response.
+ * @param counter Which counter.
+ * @param presence Whether an absent counter is a defect.
  * @returns The counter (or `undefined` where absence is allowed), or the defect.
  */
 function readCounter(
@@ -1025,8 +1027,8 @@ function readCounter(
  * Read the next-page offset off a response: a non-negative whole number, or
  * the wire's `null` for "this is the last page".
  *
- * @param record - The response.
- * @param presence - Whether an absent key is a defect. The wire always states
+ * @param record The response.
+ * @param presence Whether an absent key is a defect. The wire always states
  * it, `null` included, so absence there is a producer that dropped it.
  * @returns The offset, `null`, or `undefined` where absence is allowed; or the defect.
  */
@@ -1053,8 +1055,8 @@ function readNextOffset(
 /**
  * Read and check all four paging counters of a response.
  *
- * @param record - The response.
- * @param presence - `'required'` for a paged wire member, `'optional'` for the view form.
+ * @param record The response.
+ * @param presence `'required'` for a paged wire member, `'optional'` for the view form.
  * @returns The counters, or the first defect among them.
  */
 function readPageEcho(
@@ -1096,7 +1098,7 @@ function readPageEcho(
 type ResponseForm = 'wire' | 'view';
 
 /*
- * Two audiences, two fields (B1-F16).
+ * Two audiences, two fields.
  *
  * A refusal is read by two different people. The reader of the panel sees the
  * error state's message and hint first, and can do exactly two things about a
@@ -1130,7 +1132,7 @@ export const REFUSED_RESPONSE_HINT =
  * for. What exactly was wrong is developer detail, carried in the refusal's
  * `details` and shown behind the error state's closed disclosure.
  *
- * @param source - The source that was requested.
+ * @param source The source that was requested.
  * @returns The message.
  */
 export function unreadableDataMessage(source: DataQuerySource): string {
@@ -1173,9 +1175,9 @@ const UNUSABLE_PANEL_ID_REMEDY =
  * phrases, nothing read out of the payload — beside the integration `remedy`
  * for the developer.
  *
- * @param source - The source that was requested.
- * @param defect - What was wrong, and where.
- * @param form - The form the response was checked as.
+ * @param source The source that was requested.
+ * @param defect What was wrong, and where.
+ * @param form The form the response was checked as.
  * @returns A fresh error.
  */
 function malformedResponseError(
@@ -1186,9 +1188,9 @@ function malformedResponseError(
   // The message names the source and nothing structural: the field path and
   // the two kind phrases are developer detail, and they travel in `details`,
   // which the error state keeps behind its closed "Technical details"
-  // disclosure (B1-F16). A view whose own, deeper shape check refuses a
-  // payload words it with this same sentence, so a reader meets one fault in
-  // one form whichever check caught it.
+  // disclosure. A view whose own, deeper shape check refuses a payload words
+  // it with this same sentence, so a reader meets one fault in one form
+  // whichever check caught it.
   return new DebuggenError('PROTOCOL_INVALID_MESSAGE', unreadableDataMessage(source), {
     hint: REFUSED_RESPONSE_HINT,
     details: {
@@ -1211,9 +1213,9 @@ function malformedResponseError(
  * branches carry the reader hint and put the integration remedy in the
  * details, as {@link malformedResponseError} does.
  *
- * @param requested - The source that was requested.
- * @param received - The value the response carried as its `source`.
- * @param form - The form the response was checked as.
+ * @param requested The source that was requested.
+ * @param received The value the response carried as its `source`.
+ * @param form The form the response was checked as.
  * @returns A fresh error.
  */
 function sourceMismatchError(
@@ -1248,9 +1250,9 @@ function sourceMismatchError(
  * Check a response's envelope — a plain object whose `source` is the one that
  * was requested — before anything inside it is read.
  *
- * @param requested - The source that was requested.
- * @param response - The response, as `unknown`.
- * @param form - The form the response is being checked as.
+ * @param requested The source that was requested.
+ * @param response The response, as `unknown`.
+ * @param form The form the response is being checked as.
  * @returns The response as a record, or the error it is refused with.
  */
 function checkEnvelope(
@@ -1279,9 +1281,9 @@ function checkEnvelope(
  * Check the payload a response carries under `member` against the requested
  * source's guard.
  *
- * @param requested - The source that was requested, which selects the guard.
- * @param record - The response whose envelope has already been checked.
- * @param member - Where the payload sits: the source's own name on the wire,
+ * @param requested The source that was requested, which selects the guard.
+ * @param record The response whose envelope has already been checked.
+ * @param member Where the payload sits: the source's own name on the wire,
  * `data` in the view form.
  * @returns The first defect found, or `undefined`.
  */
@@ -1305,7 +1307,7 @@ function payloadDefect(
  * reload instead; the integration remedy — which argument to pass, and where
  * `PanelHost` provides it — is in the details.
  *
- * @param source - The source of the query that could not be addressed. The
+ * @param source The source of the query that could not be addressed. The
  * unusable session value itself is not echoed.
  * @returns A fresh error.
  */
@@ -1324,7 +1326,7 @@ function unaddressedQueryError(source: DataQuerySource): DebuggenError {
  * Whether a value can name a panel: a string with a visible character — the
  * same test {@link isAddressableSessionId} applies to a session.
  *
- * @param panelId - The candidate panel id.
+ * @param panelId The candidate panel id.
  * @returns `true` when the id can be forwarded as the request's `panelId`.
  */
 function isUsablePanelId(panelId: unknown): panelId is string {
@@ -1342,8 +1344,8 @@ function isUsablePanelId(panelId: unknown): panelId is string {
  * the reader hint points at a reload and the integration remedy is in the
  * details. The value itself is never echoed, only its kind.
  *
- * @param source - The source of the query that was refused.
- * @param panelId - The unusable value, described by kind only.
+ * @param source The source of the query that was refused.
+ * @param panelId The unusable value, described by kind only.
  * @returns A fresh error.
  */
 function unusablePanelIdError(source: DataQuerySource, panelId: unknown): DebuggenError {
@@ -1371,9 +1373,9 @@ function unusablePanelIdError(source: DataQuerySource, panelId: unknown): Debugg
  * `panelId` key at all, which is what a resolver that serialises its context
  * must see.
  *
- * @param sessionId - The session the call names.
- * @param source - The query's source, for the refusal wording.
- * @param options - The caller's per-call options.
+ * @param sessionId The session the call names.
+ * @param source The query's source, for the refusal wording.
+ * @param options The caller's per-call options.
  * @returns The resolver context.
  * @throws {DebuggenError} `PROTOCOL_INVALID_MESSAGE` for an unusable session,
  * `PANEL_INVALID` for a present but unusable panel id.
@@ -1435,7 +1437,7 @@ function resolverContext(
  * opened, say — produces a rejected promise rather than an exception in the
  * middle of a render.
  *
- * @param resolve - The resolver to adapt. Called once per query.
+ * @param resolve The resolver to adapt. Called once per query.
  * @returns A provider that delegates every query to `resolve`.
  */
 export function createDataProvider(resolve: DataQueryResolver): DataProvider {
@@ -1500,8 +1502,8 @@ export function createDataProvider(resolve: DataQueryResolver): DataProvider {
  * ```
  *
  * @typeParam Source - The requested source, inferred from `query.source`.
- * @param query - The query the result answers; only its `source` is read.
- * @param result - The service's answer, as `unknown`: a parsed JSON body, or a
+ * @param query The query the result answers; only its `source` is read.
+ * @param result The service's answer, as `unknown`: a parsed JSON body, or a
  * {@link PanelDataResult} a transport already decoded.
  * @returns `ok(response)` in the view form, or `err(error)`.
  */
@@ -1564,8 +1566,8 @@ export function mapPanelDataResult<Source extends DataQuerySource>(
  * absent, `null` or a non-negative integer. It reads nothing else and changes
  * nothing: no element is re-sorted, filtered or copied.
  *
- * @param query - The query the response was returned for; only its `source` is read.
- * @param response - The provider's answer, as `unknown`.
+ * @param query The query the response was returned for; only its `source` is read.
+ * @param response The provider's answer, as `unknown`.
  * @returns `undefined` when the response may be drawn, or the
  * `PROTOCOL_INVALID_MESSAGE` error to report instead — its message and details
  * name the sources, the field and the kind of value found, never the value.
@@ -1613,8 +1615,8 @@ export function checkDataQueryResponse(
  * return type is uncorrelated with the request's source, because the factory
  * checks at runtime that the two agree.
  *
- * @param query - The query to resolve, exactly as the node carried it.
- * @param context - The session to address and the per-call options.
+ * @param query The query to resolve, exactly as the node carried it.
+ * @param context The session to address and the per-call options.
  * @returns The service's answer for the query's own source, in the wire form.
  */
 export type PanelDataResolver = (
@@ -1658,7 +1660,7 @@ export type PanelDataResolver = (
  * });
  * ```
  *
- * @param resolve - The resolver to adapt. Called once per query.
+ * @param resolve The resolver to adapt. Called once per query.
  * @returns A provider that delegates every query to `resolve` and maps its answer.
  */
 export function createPanelDataProvider(resolve: PanelDataResolver): DataProvider {
@@ -1713,8 +1715,8 @@ export function createPanelDataProvider(resolve: PanelDataResolver): DataProvide
  * return <PanelHost spec={spec} dataProvider={panelProvider} actions={actions} />;
  * ```
  *
- * @param provider - The provider to delegate to. Not modified.
- * @param panelId - The id of the panel specification the provider's queries
+ * @param provider The provider to delegate to. Not modified.
+ * @param panelId The id of the panel specification the provider's queries
  * belong to: the rendered `PanelSpec`'s own `id`.
  * @returns A provider that forwards every query to `provider` with `panelId` set.
  */
@@ -1745,8 +1747,9 @@ export function bindPanelIdentity(provider: DataProvider, panelId: string): Data
  *
  * The default is `undefined` rather than a stub implementation. A stub would
  * answer queries with invented emptiness, and an empty panel that looks
- * successful is exactly what AAP 0.5.5 rules out; absence is instead reported as
- * an error state by the hook, where a developer can see it.
+ * successful presents a failure as an answer, which the renderer never does;
+ * absence is instead reported as an error state by the hook, where a developer
+ * can see it.
  *
  * `PanelHost` provides it directly (`<DataProviderContext.Provider value={…}>`),
  * so this module exports no wrapper component: one less indirection between the

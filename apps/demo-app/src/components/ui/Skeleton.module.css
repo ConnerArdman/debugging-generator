@@ -38,9 +38,8 @@
  * Motion: the shimmer animates `background-position` across a gradient twice the width of the
  * box, and nothing else - no opacity fade, no transform, no shadow pulse. A full catalog paints
  * 48 of these at once, and one background sweep is the calmest of the options that still reads as
- * "loading"; it also keeps this page's own render behaviour attributable to the page rather than
- * to its placeholders. The reduced-motion rule at the end stops the sweep and leaves a flat,
- * outlined box, because a placeholder still has to look like a placeholder when it holds still.
+ * "loading". The reduced-motion rule at the end stops the sweep and leaves a flat, outlined box,
+ * because a placeholder still has to look like a placeholder when it holds still.
  */
 
 .root,
@@ -157,15 +156,8 @@
  * catch-all; a module that introduces motion owns what its still frame looks like, and for a
  * placeholder that means staying visible. Stopping the sweep on its own would freeze the box
  * mid-gradient, so the surface flattens to the resting grey and picks up a hairline outline:
- * unmistakably an empty box waiting for content, only no longer a moving one.
- *
- * BLITZY [A11Y]: in this still frame the fill measures 1.05:1 against the page and the hairline
- * 1.48:1, below the 3:1 WCAG 1.4.11 guidance for non-text contrast - measured in the browser, and
- * the reason the outline is here at all, since the fill alone would not read as a box. Both values
- * are the shared token contract's (`--ls-surface-sunken` over `--ls-surface`, `--ls-border` as the
- * hairline, which `app/globals.css` flags at the same ratio for every module that draws one), so
- * they are implemented as specified rather than quietly darkened here, where a one-off would also
- * put this box out of step with the cards and fields around it. Flagged for design review. */
+ * unmistakably an empty box waiting for content, only no longer a moving one. The outline is what
+ * makes the still box read as a box: the flat fill alone barely separates from the page. */
 @media (prefers-reduced-motion: reduce) {
   .root,
   .line {

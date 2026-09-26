@@ -8,8 +8,8 @@
  * result (`analysis.ts`), the protocol version (`version.ts`) and the transport
  * client SDK (`client/{ws-client,http-client}.ts`).
  *
- * Three separate surfaces compile against the artefact this file emits, and
- * against nothing else in the package, because AAP 0.4.2 holds both extensions
+ * Three separate surfaces load or bundle the artefact this file emits, and
+ * nothing else in the package, because AAP 0.4.2 holds both extensions
  * to importing `@debuggen/protocol` only and never service internals:
  *
  *   - `apps/local-service`   real Node 24 ESM, loaded from disk;
@@ -65,11 +65,11 @@
  * Shipping artefacts come from this file and land in `dist/`, which
  * `.gitignore` and `.prettierignore` both exclude, so the output is regenerated
  * from source on every CI run and never committed. Because the four workspace
- * dependencies are resolved through their own `exports` maps — that is, through
- * their `dist/` — `pnpm build` must run in topological order: `shared`, then
- * `telemetry`, then `instrumentation` and `panel-schema`, then this package.
- * `pnpm -r build` guarantees exactly that from the `dependencies` field, and it
- * is also why `pnpm verify` runs `pnpm build` before `pnpm typecheck`.
+ * dependencies' runtime conditions resolve into their own `dist/`, which the
+ * browser-bundle check below bundles, `pnpm build` must run in topological
+ * order: `shared`, then `telemetry`, then `instrumentation` and `panel-schema`,
+ * then this package. `pnpm -r build` guarantees exactly that from the
+ * `dependencies` field.
  *
  * ## The browser-bundle check
  *
@@ -327,10 +327,12 @@ export default defineConfig({
 
   /**
    * Declarations are the product of this package as much as the JavaScript is.
-   * `dist/index.d.ts` is the only place the three surfaces can learn the shape
-   * of a message: the envelope, the discriminated union over `type`, the HTTP
-   * request and response schemas, `SessionRecord`, `AnalysisResult` and the two
-   * client classes. The runtime values must stay in `dist/index.js` beside them —
+   * `dist/index.d.ts` is where a packed tarball carries the shape of a message:
+   * the envelope, the discriminated union over `type`, the HTTP request and
+   * response schemas, `SessionRecord`, `AnalysisResult` and the two client
+   * classes. Inside the repository the three surfaces read the same shapes from
+   * this project's `.tsbuild` declarations (root tsconfig.json,
+   * `"// no-aliases"`). The runtime values must stay in `dist/index.js` beside them —
    * `parseMessage`, the Zod schemas and the clients are called, not merely typed
    * — so the declaration step accompanies the JavaScript entry, it never
    * replaces it.
@@ -349,10 +351,10 @@ export default defineConfig({
    *   gate (`.tsbuild/`), which is not where this build writes. Disabling them
    *   for the declaration program alone leaves the gate untouched — `composite:
    *   true` stays in `tsconfig.json`, where `tsc -b` needs it — and keeps
-   *   `dist/` free of a stray `.tsbuildinfo`. It does not weaken the four
-   *   project references either: each dependency's `dist/index.d.ts` is resolved
-   *   through the pnpm workspace link and that package's `exports` map, exactly
-   *   as the runtime resolves it.
+   *   `dist/` free of a stray `.tsbuildinfo`. The program still resolves each of
+   *   the four workspace dependencies through the pnpm workspace link and its
+   *   `exports` map, whose source-first `types` entry supplies current source,
+   *   and the emitted declarations keep those imports external.
    * - `ignoreDeprecations` answers tsup 8.5.1 setting `baseUrl` on that program
    *   unconditionally (`baseUrl: compilerOptions.baseUrl || '.'`) — a value this
    *   repository deliberately never declares, because the four workspace

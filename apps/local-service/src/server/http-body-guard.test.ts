@@ -199,8 +199,12 @@ function buildApp(options: BuildOptions = {}): BuiltApp {
       startPairing: () => ok({ code: PAIRING_CODE, expiresAt: Date.now() + 60_000 }),
       completePairing: (request: PairingCompletionRequest) => {
         redeemed.push(request.code);
-        return ok({ token: 't'.repeat(43) });
+        // A redemption answers the credential and the read proof issued with it.
+        return ok({ token: 't'.repeat(43), readProof: 'r'.repeat(43) });
       },
+      // The revocation fence a route consults once it has read a body: every
+      // stand-in credential here stays live, so each body is judged on its own.
+      requireLiveCredential: () => ok(undefined),
     },
     config: { host: '127.0.0.1' },
     logger: noopLogger,

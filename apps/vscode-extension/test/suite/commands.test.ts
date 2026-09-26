@@ -1,130 +1,33 @@
 /**
- * The extension-host gate on command registration (AAP 0.7.1 Group 3, 0.8.3,
- * 0.8.5): it makes it impossible to contribute a command without registering
- * it, or to register one that is not contributed.
+ * Extension-host suite for the extension's commands (`pnpm test:vscode`).
  *
- * WHY A HOST SUITE. `src/commands/index.ts` types its handler table as
- * `Record<CommandId, CommandHandler>` over the {@link COMMAND_IDS} tuple, so an
- * id missing from the table is a compile error. The compiler cannot see
- * `package.json` or the editor's command registry, though, and the manifest
- * declares no `onCommand:` activation events (AAP 0.2.4): a contributed id that
- * `activate()` never registers appears in the Command Palette and fails when
- * invoked. This suite is the runtime half of the guarantee, run inside a real
- * VS Code by `pnpm test:vscode`:
+ * REGISTRY AND MANIFEST. The compiler ties handlers to {@link COMMAND_IDS} but
+ * cannot see `package.json` or the editor's registry, and the manifest has no
+ * `onCommand:` activation events, so an unregistered contributed id would be
+ * offered and fail. After activation the suite requires:
+ *   - {@link COMMAND_IDS}, `contributes.commands[].command` and the registered
+ *     `debuggen.*` ids (less those generated for contributed views) to be one
+ *     set, each of exactly the expected size;
+ *   - `EXTENSION_ID` in `test/helpers.ts` to be `<publisher>.<name>`;
+ *   - the argument-taking commands to be exactly those hidden from the
+ *     Command Palette (`menus.commandPalette` entries with `when: "false"`).
  *
- *   1. three sets must be identical — {@link COMMAND_IDS}, the
- *      `contributes.commands[].command` values of the loaded manifest, and the
- *      `debuggen.*` ids in `vscode.commands.getCommands(true)` after the
- *      extension has been activated through the helper. A drift names every
- *      offending id and the set(s) it is missing from; exact sizes are asserted
- *      as well, so a duplicate manifest entry cannot hide behind set semantics;
- *   2. `EXTENSION_ID` of `test/helpers.ts` is the manifest's
- *      `<publisher>.<name>`;
- *   3. the commands that require an argument are exactly the ones hidden from
- *      the Command Palette (`menus.commandPalette` entries with
- *      `when: "false"`), in both directions.
+ * SAFE EXECUTION. No test runs an extension command through `vscode.commands`:
+ * `debuggen.rotateServiceToken` and `debuggen.purgeSessions` would revoke
+ * credentials and delete stored sessions. The lifecycle blocks call the
+ * exported command functions directly; UI doubles record the command ids they
+ * are asked to run without running them, and unscripted collaborators are
+ * strict doubles that fail on first use. The editor's `DEBUGGEN_HOME` and
+ * deterministic provider are the throwaway ones from `.vscode-test.mjs`; each
+ * embedded service gets `hermeticEnv`, its own throwaway home and a loopback
+ * `findFreePort()` port, and patches only a scratch copy of
+ * `apps/local-service/test/fixtures/sample-project`. Children start through
+ * `spawnTracked`, directories through `createScratchDir`; the real-service
+ * `afterEach` stops and removes them and fails the case if a tracked process
+ * or stand-in dev server survives.
  *
- * WHAT THE REGISTRATION BLOCK NEVER DOES. It executes none of the extension's
- * registered commands: registration presence and manifest shape are what it
- * proves, and running `debuggen.rotateServiceToken` or `debuggen.purgeSessions`
- * would destroy state. It opens no network connection, spawns no process and
- * writes no file; the run's throwaway `DEBUGGEN_HOME`, the deterministic
- * provider and the generic fixture workspace come from `.vscode-test.mjs`.
- *
- * THE SESSION LIFECYCLE BLOCK. A second `describe` proves the editor's
- * session handoff — the invariant that the editor tracks at most one live
- * session and never replaces it in the store before the service has answered
- * `session.end` for it, which is what makes `deactivate()`'s single-session end
- * sufficient (AAP 0.5.1). It calls the exported `startSession`,
- * `reopenSession` and `endSession` functions directly — never through
- * `vscode.commands` — with a `CommandContext` built from doubles: the real
- * `ExtensionState`; a scripted service client whose every call is recorded in
- * order and which answers from the test's own script (so no socket or HTTP
- * request exists); a UI double that records notices, failures, confirmations
- * and the command ids it was asked to run without running any of them; guards
- * that answer a fixture project; and a recording logger. Every double outside
- * what the commands are expected to touch is a strict proxy that fails the
- * test on first use.
- *
- * THE REAL-SERVICE BLOCK. A third `describe`, "session lifecycle against a
- * real service", proves the same handoffs where the doubles cannot: against
- * the embedded service bundle (`dist/service/main.js`, deterministic
- * provider, spawned on a `findFreePort()` loopback port with its own throwaway
- * `DEBUGGEN_HOME`) whose real installer patches a scratch copy of
- * `apps/local-service/test/fixtures/sample-project`, and whose real cleanup
- * restores it. Every file of that copy is snapshotted (bytes and SHA-256)
- * before anything runs; a stand-in dev server, launched by the service's own
- * launcher, lets sessions be created. The commands run with a `CommandContext`
- * around the real `createServiceClient`:
- *
- *   - the editor credential is read from the service's `auth.json` by
- *     `createEditorCredentialStore`;
- *   - the socket announces the scratch project, and — wired as `activate()`
- *     wires it — the socket to the service owning the session in view is
- *     kept across a URL switch (`retainedEndpoint`) and released on the store
- *     change that moves the session elsewhere (`pruneRetainedConnections`);
- *   - the service-URL configuration can be switched the way a
- *     `debuggen.serviceUrl` change does;
- *   - HTTP goes over a direct `node:http` transport, because the extension
- *     host's platform `fetch` fails in VS Code 1.139 (see
- *     `loopbackHttpFetch`);
- *   - the client is wrapped only to log, in order, every `session.create`,
- *     `session.end`, `session.get` and `modifications.list`, with the endpoint
- *     it was addressed to and its answer, while the transport logs every
- *     request as it left.
- *
- * The rest of the context is real too: the `ExtensionState`, fed the pushed
- * frames exactly as `subscribeInbound` in `src/extension.ts` feeds it, and
- * the `SessionViewProvider`, resolved into a substitute webview whose command
- * runner sends `debuggen.startSession` to `startSession`. At every request,
- * every answer and every change of the active session the log also records
- * which project files differ from the snapshot at that instant, so "restored
- * before the next session existed" is observed, not inferred. The cases:
- *
- *   1. reopen handoff (INT-F26, API-F32): S1 patched through `startSession`;
- *      a second live session S2, created beside it, patching another file;
- *      `reopenSession(S2)` accepted. S1's end is answered `clean`, and S1's
- *      files equal the snapshot, before S2 becomes active.
- *      `endSessionsForShutdown` (deactivation's session work) then ends S2
- *      alone, the wire carries that one request, and the tree equals the
- *      snapshot.
- *   2. webview Retry (FE-F24): S1 patched. The service reports failed
- *      `instrument` steps, and the store is given what a failed stage pushes
- *      (`instrumentation.failed`, a `failed` record; see
- *      `failAtInstrument`). The view's `retryStage` restarts through
- *      `debuggen.startSession`, whose `session.create` is sent only after S1's
- *      end answered `clean`, with every file byte-identical to the snapshot.
- *   3. webview Retry with a conflict (FE-F24): a developer edit to S1's
- *      patched file makes the end answer `conflict`. Nothing is created, S1
- *      stays in view ended, and the notice names the file and its backup
- *      (AAP 0.5.5). The file keeps the developer's bytes, the backup the
- *      original.
- *   4. the owning endpoint with two real services (API-F30, INT-F19): S1
- *      patched at service A, then `debuggen.serviceUrl` switched to service B,
- *      which holds A's editor credential but not S1. A start at B, and in a
- *      fresh run the shutdown routine, must end S1 at A with its files
- *      restored, before anything is created at B; B must never receive a
- *      request about S1.
- *   5. deactivation in VS Code's order (API-F30, INT-F19): S1 patched at A;
- *      `endSessionsForShutdown` runs and, in the same synchronous turn, the
- *      store, the credential store and the client are disposed, as the
- *      extension host disposes `context.subscriptions` right after
- *      `deactivate()` returns its promise. The socket must stay open until
- *      the end settled, S1 must be ended `clean` at A by one request, and
- *      every file must equal the snapshot.
- *
- * Every child process is spawned through `spawnTracked`, every directory
- * through `createScratchDir`. After each case, `afterEach` stops the dev
- * servers the case launched (at each service that launched one, through a
- * teardown client of its own when the case disposed the editor side), releases
- * the editor side and stops the services. It then checks that no stand-in dev
- * server outlived them, runs `cleanupScratch()`, and fails when anything
- * survived.
- *
- * MOCHA GLOBALS. The `@vscode/test-cli` runner supplies Mocha's `bdd`
- * interface as globals and this workspace declares no `@types/mocha` (see the
- * `compilerOptions.types` notes in `tsconfig.json`), so the globals this suite
- * calls are declared below in module scope, as the sibling suites do.
+ * MOCHA GLOBALS. The `@vscode/test-cli` runner provides Mocha's `bdd` globals
+ * and the workspace has no `@types/mocha`, so the ones used are declared below.
  *
  * @module apps/vscode-extension/test/suite/commands
  */
@@ -225,6 +128,7 @@ import {
   stopTrackedProcesses,
   waitFor,
   waitForHttpOk,
+  writeFixtureFile,
 } from '../helpers';
 import type { ExtensionManifest, ManifestMenuItem, ProcessExit, TrackedProcess } from '../helpers';
 
@@ -860,6 +764,40 @@ function journalPage(records: readonly ModificationRecord[]): ModificationsRespo
     limit: MODIFICATIONS_PAGE_DEFAULT_LIMIT,
     offset: 0,
     nextOffset: null,
+  };
+}
+
+/**
+ * `count` distinct patch records of `sessionId`, in journal order, each on its
+ * own file.
+ */
+function patchRecords(sessionId: string, count: number): ModificationRecord[] {
+  return Array.from({ length: count }, (_, index) => ({
+    ...appliedPatch(sessionId),
+    id: `${sessionId}-mod-${String(index + 1)}`,
+    file: `src/lib/file-${String(index + 1)}.ts`,
+  }));
+}
+
+/**
+ * The `modifications.list` page the service answers for a journal of
+ * `records` whose diff budget ends every page after `pageSize` records: the
+ * window's slice, `total` the whole journal's count, and `nextOffset` past the
+ * slice until the journal ends.
+ */
+function budgetedJournalPage(
+  records: readonly ModificationRecord[],
+  pageSize: number,
+  window: ListPageRequest | undefined,
+): ModificationsResponse {
+  const offset = window?.offset ?? 0;
+  const end = Math.min(offset + pageSize, records.length);
+  return {
+    modifications: records.slice(offset, end),
+    total: records.length,
+    limit: window?.limit ?? MODIFICATIONS_PAGE_DEFAULT_LIMIT,
+    offset,
+    nextOffset: end < records.length ? end : null,
   };
 }
 
@@ -1954,6 +1892,170 @@ describe('session lifecycle (commands.test)', () => {
     assert.equal(harness.notices.length, 1);
     assert.equal(harness.notices[0]?.message, '1 file modification is recorded for this session.');
   });
+
+  it('debuggen.showModifications walks every page of a journal its diff budget splits and lists every record beside the total', async () => {
+    const { state, script } = harness;
+    const journal = patchRecords('S1', 5);
+    const windows: (ListPageRequest | undefined)[] = [];
+    state.adoptSession(sessionRecord('S1', { status: 'ended' }), ENDPOINT_A);
+    script.baseUrl = ENDPOINT_B;
+    script.socket = 'closed';
+    script.modifications = (_sessionId, _endpoint, window) => {
+      windows.push(window);
+      return Promise.resolve(ok(budgetedJournalPage(journal, 2, window)));
+    };
+
+    await showModifications(harness.ctx);
+
+    assert.deepEqual(harness.addressed, [
+      { call: 'modifications:S1', endpoint: ENDPOINT_A },
+      { call: 'modifications:S1', endpoint: ENDPOINT_A },
+      { call: 'modifications:S1', endpoint: ENDPOINT_A },
+    ]);
+    assert.deepEqual(windows, [undefined, { offset: 2 }, { offset: 4 }]);
+    assert.deepEqual(
+      state.modifications.map((record) => record.id),
+      journal.map((record) => record.id),
+      'every record of every page, in journal order',
+    );
+    assert.equal(state.modificationsTotal, 5);
+    const snapshot = state.toWebviewState();
+    assert.equal(snapshot.modifications.length, 5);
+    assert.equal(snapshot.modificationsTotal, 5, 'the view sees a complete journal');
+    assert.equal(harness.notices.length, 1);
+    assert.equal(harness.notices[0]?.level, 'info');
+    assert.equal(
+      harness.notices[0]?.message,
+      '5 file modifications are recorded for this session.',
+    );
+    assert.deepEqual(harness.failures, []);
+  });
+
+  it('debuggen.showModifications keeps the pages a later failure cut short, records the total and warns how many were loaded', async () => {
+    const { state, script } = harness;
+    const journal = patchRecords('S1', 5);
+    const pageFailure = new DebuggenError(
+      'TRANSPORT_DISCONNECTED',
+      'The connection to the local service was lost',
+    );
+    state.adoptSession(sessionRecord('S1', { status: 'ended' }), ENDPOINT_A);
+    script.socket = 'closed';
+    script.modifications = (_sessionId, _endpoint, window) =>
+      Promise.resolve(
+        window === undefined ? ok(budgetedJournalPage(journal, 2, window)) : err(pageFailure),
+      );
+
+    await showModifications(harness.ctx);
+
+    assert.equal(harness.addressed.length, 2);
+    assert.deepEqual(
+      state.modifications.map((record) => record.id),
+      journal.slice(0, 2).map((record) => record.id),
+    );
+    assert.equal(state.modificationsTotal, 5);
+    const snapshot = state.toWebviewState();
+    assert.equal(snapshot.modificationsTotal, 5);
+    assert.equal(snapshot.modifications.length, 2, 'the view can state 2 of 5');
+    assert.equal(harness.notices.length, 1);
+    const [notice] = harness.notices;
+    assert.equal(notice?.level, 'warning');
+    assert.equal(notice?.message, 'Loaded 2 of 5 file modifications recorded for this session.');
+    assert.ok(notice?.detail?.includes(pageFailure.message), notice?.detail);
+    assert.match(notice?.detail ?? '', /Load all modifications/);
+    assert.deepEqual(harness.failures, [], 'a partial read is not reported as a failed one');
+    assert.equal(
+      JSON.stringify(harness.logs).includes(journal[0]?.backupPath ?? '\u0000'),
+      false,
+      'no backup path reaches a log record',
+    );
+  });
+
+  it('with the WebSocket closed, an older debuggen.showModifications read finishing last keeps the newer count, so the list still reads as partial', async () => {
+    const { state, script } = harness;
+    const journal = patchRecords('S1', 3);
+    let answerOlderRead: (answer: Result<ModificationsResponse, DebuggenError>) => void = () =>
+      undefined;
+    const olderRead = new Promise<Result<ModificationsResponse, DebuggenError>>((resolve) => {
+      answerOlderRead = resolve;
+    });
+    let call = 0;
+    state.adoptSession(sessionRecord('S1', { status: 'ended' }), ENDPOINT_A);
+    script.socket = 'closed';
+    script.modifications = (_sessionId, _endpoint, window) => {
+      call += 1;
+      if (call === 1) {
+        return olderRead;
+      }
+      return Promise.resolve(
+        window === undefined
+          ? ok(budgetedJournalPage(journal, 2, window))
+          : err(new DebuggenError('TRANSPORT_DISCONNECTED', 'The local service stopped answering')),
+      );
+    };
+
+    const olderCommand = showModifications(harness.ctx);
+    const newerCommand = showModifications(harness.ctx);
+    await newerCommand;
+    answerOlderRead(ok(journalPage(journal.slice(0, 2))));
+    await olderCommand;
+
+    assert.equal(call, 3);
+    assert.equal(state.modificationsTotal, 3, 'the older, smaller count does not replace it');
+    const snapshot = state.toWebviewState();
+    assert.equal(snapshot.modifications.length, 2);
+    assert.equal(snapshot.modificationsTotal, 3, 'the view still states 2 of 3');
+    assert.deepEqual(
+      harness.notices.map((notice) => [notice.level, notice.message]),
+      [
+        ['warning', 'Loaded 2 of 3 file modifications recorded for this session.'],
+        ['warning', 'Loaded 2 of 3 file modifications recorded for this session.'],
+      ],
+    );
+    assert.deepEqual(harness.failures, []);
+  });
+
+  it('with the WebSocket closed, a conflicted debuggen.endSession reads every page of the journal before its notice', async () => {
+    const { state, script, answers } = harness;
+    const journal = patchRecords('S1', 3).map((record): ModificationRecord => ({
+      ...record,
+      status: 'conflict',
+    }));
+    const conflict = conflictOf('S1', 1);
+    state.adoptSession(sessionRecord('S1', { status: 'capturing' }), ENDPOINT_A);
+    script.socket = 'closed';
+    script.baseUrl = ENDPOINT_B;
+    answers.choice = undefined;
+    script.end = () => Promise.resolve(ok({ cleanup: 'conflict' }));
+    script.get = (sessionId) =>
+      Promise.resolve(
+        ok(
+          sessionRecord(sessionId, {
+            status: 'ended',
+            updatedAt: T0 + 60,
+            cleanup: { status: 'conflict', completedAt: T0 + 60, conflicts: [conflict] },
+          }),
+        ),
+      );
+    script.modifications = (_sessionId, _endpoint, window) =>
+      Promise.resolve(ok(budgetedJournalPage(journal, 2, window)));
+
+    await endSession(harness.ctx);
+
+    assert.deepEqual(harness.addressed, [
+      { call: 'end:S1', endpoint: ENDPOINT_A },
+      { call: 'get:S1', endpoint: ENDPOINT_A },
+      { call: 'modifications:S1', endpoint: ENDPOINT_A },
+      { call: 'modifications:S1', endpoint: ENDPOINT_A },
+    ]);
+    assert.deepEqual(
+      state.modifications.map((record) => [record.id, record.status]),
+      journal.map((record) => [record.id, 'conflict']),
+      'the store holds the whole journal',
+    );
+    assert.equal(state.modificationsTotal, 3);
+    assert.equal(harness.notices.length, 1);
+    assert.equal(harness.notices[0]?.message, editedSentence(conflict));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2026,27 +2128,61 @@ function sampleProjectFixture(): string {
 }
 
 /**
+ * The stand-in framework CLI's path under a `node_modules` directory — the
+ * shape the service's launch-command policy accepts for Node running a
+ * framework's dev CLI (`node …/node_modules/next/dist/bin/next dev`).
+ */
+const STAND_IN_DEV_CLI_SEGMENTS = ['node_modules', 'next', 'dist', 'bin', 'next'] as const;
+
+/**
  * The dev server command the service's launcher runs for the scratch project:
  * the stand-in of `apps/local-service/test/integration/harness.ts`, which
  * prints the `Local:` line the launcher detects and answers every request with
  * `ok`, run by the suite's Node ({@link resolveNodeExecutable}) — never by
- * `process.execPath`, which is Electron in the extension host. The launcher
- * runs it without a shell, so the single quotes are its literal quoting.
+ * `process.execPath`, which is Electron in the extension host. That Node also
+ * runs the service, so the launcher's policy accepts it as the service's own.
+ *
+ * The launcher runs only a package-manager script, `next dev`, or the
+ * service's Node running a framework's dev CLI from a `node_modules`
+ * directory — never `node -e` — so the stand-in source is written, per call,
+ * to a fresh scratch directory whose name carries {@link STAND_IN_MARKER} (so
+ * the teardown's `/proc/<pid>/cmdline` check still recognises it) as
+ * `node_modules/next/dist/bin/next`, beside a `package.json` that pins its
+ * CommonJS format, mode `0o644`: owned by this user and writable by no one
+ * else, which the launcher's trust check requires. `cleanupScratch` removes
+ * it. The launcher runs it without a shell, so the single quotes are its
+ * literal quoting.
  */
 function standInDevServerCommand(): string {
   const node = resolveNodeExecutable();
   if (node.includes("'")) {
     throw new Error(`The test Node path ${node} contains a single quote and cannot be quoted.`);
   }
-  const script = [
+  const source = [
     `const marker = "${STAND_IN_MARKER}";`,
     'const server = require("node:http").createServer((request, response) => {',
     ' response.end("ok"); });',
     'server.listen(0, "127.0.0.1", () => {',
     ' console.log("Local: http://127.0.0.1:" + String(server.address().port)); });',
     'process.on("SIGTERM", () => { server.close(() => process.exit(0)); });',
-  ].join('');
-  return `'${node}' -e '${script}'`;
+    '',
+  ].join('\n');
+  const dir = createScratchDir(`${STAND_IN_MARKER}-`);
+  const manifest = writeFixtureFile(
+    dir,
+    'node_modules/next/package.json',
+    `${JSON.stringify({ name: 'next', private: true, type: 'commonjs' })}\n`,
+  );
+  const cli = writeFixtureFile(dir, STAND_IN_DEV_CLI_SEGMENTS.join('/'), source);
+  // `writeFileSync` applies the process umask; pin the mode the trust check reads.
+  fs.chmodSync(manifest, 0o644);
+  fs.chmodSync(cli, 0o644);
+  if (cli.includes("'")) {
+    throw new Error(
+      `The stand-in dev CLI path ${cli} contains a single quote and cannot be quoted.`,
+    );
+  }
+  return `'${node}' '${cli}' dev`;
 }
 
 /** One file of a snapshot: its bytes and their SHA-256 (AAP §0.8.3). */
@@ -3318,7 +3454,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.deepEqual(problems, [], 'the case left something behind');
   });
 
-  it('INT-F26/API-F32 — S1 patched, live S2 reopened: S1 is restored before S2 is active, and deactivation ends S2 alone', async function () {
+  it('S1 patched, live S2 reopened: S1 is restored before S2 is active, and deactivation ends S2 alone', async function () {
     this.timeout(REAL_CASE_TIMEOUT_MS);
     const serviceA = await startRealService('A');
     const h = await harnessFor([serviceA]);
@@ -3413,7 +3549,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assertQuestionsNeverLogged(h, [ROUTE_QUESTION, POOL_QUESTION]);
   });
 
-  it('FE-F24 — webview Retry of a failed, patched session: the replacement is created only after S1 is ended and restored byte for byte', async function () {
+  it('webview Retry of a failed, patched session: the replacement is created only after S1 is ended and restored byte for byte', async function () {
     this.timeout(REAL_CASE_TIMEOUT_MS);
     const serviceA = await startRealService('A');
     const h = await harnessFor([serviceA]);
@@ -3465,7 +3601,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assertQuestionsNeverLogged(h, [ROUTE_QUESTION]);
   });
 
-  it('FE-F24 — webview Retry after a developer edit to the patched file: the end answers conflict, nothing is created, and file and backup are kept', async function () {
+  it('webview Retry after a developer edit to the patched file: the end answers conflict, nothing is created, and file and backup are kept', async function () {
     this.timeout(REAL_CASE_TIMEOUT_MS);
     const serviceA = await startRealService('A');
     const h = await harnessFor([serviceA]);
@@ -3557,7 +3693,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assertQuestionsNeverLogged(h, [ROUTE_QUESTION]);
   });
 
-  it('API-F30/INT-F19 — S1 patched at service A, debuggen.serviceUrl switched to B: a start at B ends S1 at A, restored, before any create, and B is never asked about S1', async function () {
+  it('S1 patched at service A, debuggen.serviceUrl switched to B: a start at B ends S1 at A, restored, before any create, and B is never asked about S1', async function () {
     this.timeout(REAL_CASE_TIMEOUT_MS);
     const serviceA = await startRealService('A');
     const serviceB = await startRealService('B', serviceA);
@@ -3608,7 +3744,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assertQuestionsNeverLogged(h, [ROUTE_QUESTION, POOL_QUESTION]);
   });
 
-  it('API-F30/INT-F19 — S1 patched at service A, debuggen.serviceUrl switched to B: deactivation ends S1 at A, restored, and B never receives an end for S1', async function () {
+  it('S1 patched at service A, debuggen.serviceUrl switched to B: deactivation ends S1 at A, restored, and B never receives an end for S1', async function () {
     this.timeout(REAL_CASE_TIMEOUT_MS);
     const serviceA = await startRealService('A');
     const serviceB = await startRealService('B', serviceA);
@@ -3660,7 +3796,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.deepEqual(h.differing(), [], 'the project must equal its snapshot after deactivation');
   });
 
-  it("API-F30/INT-F19 — deactivation in VS Code's order: the routine, then the store, credential store and client disposed in the same turn — S1 is ended clean at A and every file equals its snapshot", async function () {
+  it("deactivation in VS Code's order: the routine, then the store, credential store and client disposed in the same turn — S1 is ended clean at A and every file equals its snapshot", async function () {
     this.timeout(REAL_CASE_TIMEOUT_MS);
     const serviceA = await startRealService('A');
     const h = await harnessFor([serviceA]);

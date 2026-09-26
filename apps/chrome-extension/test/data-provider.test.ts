@@ -21,11 +21,15 @@
  *   then pages the trace for the ancestry. Each of the two passes has a page
  *   budget of its own; a pass that spends it reports where it stopped,
  *   distinctly from "not in the capture", and a later call resumes it there.
- *   A bounded trace cache, scoped by session, capture and trace, answers only
+ *   A lookup bound to a rendered panel sends that panel's id with every page
+ *   of both passes, so the service answers from that panel's capture. A
+ *   bounded trace cache, scoped by session, evidence scope (the lookup's
+ *   panel, or for a live lookup the store's capture) and trace, answers only
  *   when it holds the event *and* its complete chain and only while the panel
  *   is authorised for the session (it fails closed, and is emptied on port
- *   loss); an abort between pages rejects with the same failure an aborted
- *   query does.
+ *   loss); a capture change drops only live entries, a switch to another
+ *   panel only the other panels'. An abort between pages rejects with the
+ *   same failure an aborted query does.
  *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project (happy-dom). The provider's request function,
@@ -431,12 +435,6 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/*
- * ===========================================================================
- * Coalescing identical in-flight queries (PERF-F19)
- * ===========================================================================
- */
-
 describe('createPanelDataProvider — coalescing identical in-flight queries', () => {
   it('sends one request for two concurrent identical queries and resolves both', async () => {
     const harness = createHarness();
@@ -806,12 +804,6 @@ describe('buildEventParentChain', () => {
     expect(buildEventParentChain(TARGET, [elsewhere, ROOT])).toBeUndefined();
   });
 });
-
-/*
- * ===========================================================================
- * Resolving a selected event (FE-F07, PERF-F22)
- * ===========================================================================
- */
 
 describe('createPanelDataProvider — resolveEvent', () => {
   it('finds an event on the second page of its trace with its ancestors on the first', async () => {
@@ -1224,8 +1216,8 @@ describe('createPanelDataProvider — resolveEvent', () => {
     expect(harness.sent).toHaveLength(3);
     expect(harness.logs).toContainEqual(
       expect.objectContaining({
-        message: "Emptied the event drawer's trace cache.",
-        fields: { reason: 'capture-changed' },
+        message: 'Dropped cached traces the event drawer can no longer use.',
+        fields: { reason: 'capture-changed', count: 1 },
       }),
     );
   });
@@ -1424,5 +1416,234 @@ describe('createPanelDataProvider — resolveEvent', () => {
       (await rejectionOf(harness.provider.resolveEvent(SESSION_A, { eventId: ' ' }))).code,
     ).toBe('PROTOCOL_INVALID_MESSAGE');
     expect(harness.sent).toHaveLength(sentBefore);
+  });
+});
+
+describe('createPanelDataProvider — resolveEvent bound to a rendered panel', () => {
+  /** The rendered panel the lookups below read the evidence of. */
+  const PANEL_A = 'panel-test-a';
+  /** A second panel of the same session. */
+  const PANEL_B = 'panel-test-b';
+
+  it('sends the panel id with every page of the find and ancestry passes across the capture', async () => {
+    const capture = [
+      ROOT,
+      PARENT,
+      ...fillerEvents(DATA_QUERY_MAX_LIMIT + 10, 1_000),
+      TARGET,
+      ...fillerEvents(5, 20_000),
+    ];
+    const harness = createHarness({ capture });
+
+    const resolution = await harness.provider.resolveEvent(
+      SESSION_A,
+      { eventId: TARGET.id },
+      { panelId: PANEL_A },
+    );
+
+    expect(resolution).toMatchObject({ status: 'found', chainComplete: true, pagesRead: 3 });
+    expect(harness.sent.map((request) => request.payload.query)).toEqual([
+      { source: 'events', limit: DATA_QUERY_MAX_LIMIT, offset: 0, panelId: PANEL_A },
+      {
+        source: 'events',
+        limit: DATA_QUERY_MAX_LIMIT,
+        offset: DATA_QUERY_MAX_LIMIT,
+        panelId: PANEL_A,
+      },
+      {
+        source: 'events',
+        filter: { traceId: TRACE_T },
+        limit: DATA_QUERY_MAX_LIMIT,
+        offset: 0,
+        panelId: PANEL_A,
+      },
+    ]);
+  });
+
+  it('sends the panel id with every page of both passes within a known trace', async () => {
+    // The target opens its trace, so the find pass stops on the first page
+    // without the chain; the ancestry pass reads on to the page holding it.
+    const trace = [TARGET, ...traceSiblings(DATA_QUERY_MAX_LIMIT), PARENT, ROOT];
+    const harness = createHarness({ capture: trace });
+
+    const resolution = await harness.provider.resolveEvent(
+      SESSION_A,
+      { eventId: TARGET.id, traceId: TRACE_T },
+      { panelId: PANEL_A },
+    );
+
+    expect(resolution).toMatchObject({ status: 'found', chainComplete: true, pagesRead: 2 });
+    if (resolution.status === 'found') {
+      expect(buildEventParentChain(resolution.event, resolution.trace)).toEqual([ROOT, PARENT]);
+    }
+    expect(harness.sent.map((request) => request.payload.query)).toEqual([
+      {
+        source: 'events',
+        filter: { traceId: TRACE_T },
+        limit: DATA_QUERY_MAX_LIMIT,
+        offset: 0,
+        panelId: PANEL_A,
+      },
+      {
+        source: 'events',
+        filter: { traceId: TRACE_T },
+        limit: DATA_QUERY_MAX_LIMIT,
+        offset: DATA_QUERY_MAX_LIMIT,
+        panelId: PANEL_A,
+      },
+    ]);
+  });
+
+  it('sends no panel id at all for a live lookup', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    await harness.provider.resolveEvent(SESSION_A, { eventId: TARGET.id, traceId: TRACE_T });
+    expect(harness.sent).toHaveLength(1);
+    expect('panelId' in sentAt(harness, 0).payload.query).toBe(false);
+  });
+
+  it('refuses a blank panel id with PANEL_INVALID, sending nothing and consulting no cache', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    const target = { eventId: TARGET.id, traceId: TRACE_T };
+    await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A });
+    const sentBefore = harness.sent.length;
+    const checksBefore = harness.state.authorisationChecks.length;
+
+    for (const panelId of ['', '   ']) {
+      const error = await rejectionOf(
+        harness.provider.resolveEvent(SESSION_A, target, { panelId }),
+      );
+      expect(error.code).toBe('PANEL_INVALID');
+      // Only that the lookup was panel-bound is stated, never a panel id.
+      expect(error.details).toMatchObject({ source: 'events', panelBound: true, panelId: 'blank' });
+    }
+    expect(harness.sent).toHaveLength(sentBefore);
+    // The cache was never asked: its authorisation was not even checked.
+    expect(harness.state.authorisationChecks).toHaveLength(checksBefore);
+  });
+
+  it('never answers a panel-bound lookup from a live-cached trace', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    const target = { eventId: TARGET.id, traceId: TRACE_T };
+    await harness.provider.resolveEvent(SESSION_A, target);
+    expect(harness.sent).toHaveLength(1);
+
+    const bound = await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A });
+    expect(bound).toMatchObject({ status: 'found', chainComplete: true, pagesRead: 1 });
+    expect(harness.sent).toHaveLength(2);
+    expect(sentAt(harness, 1).payload.query).toMatchObject({ panelId: PANEL_A });
+
+    // Each scope now answers from its own entry.
+    await expect(
+      harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A }),
+    ).resolves.toMatchObject({ status: 'found', pagesRead: 0 });
+    await expect(harness.provider.resolveEvent(SESSION_A, target)).resolves.toMatchObject({
+      status: 'found',
+      pagesRead: 0,
+    });
+    expect(harness.sent).toHaveLength(2);
+  });
+
+  it('never answers a live lookup from a panel’s cached trace, with or without its trace', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    await harness.provider.resolveEvent(
+      SESSION_A,
+      { eventId: TARGET.id, traceId: TRACE_T },
+      { panelId: PANEL_A },
+    );
+    expect(harness.sent).toHaveLength(1);
+
+    // A traceless live lookup walks the cache: the panel's pool must not answer it.
+    const traceless = await harness.provider.resolveEvent(SESSION_A, { eventId: PARENT.id });
+    expect(traceless).toMatchObject({ status: 'found', pagesRead: 1 });
+    expect(harness.sent).toHaveLength(2);
+    expect('panelId' in sentAt(harness, 1).payload.query).toBe(false);
+
+    // A traceless lookup of the same panel is answered from that panel's pool.
+    await expect(
+      harness.provider.resolveEvent(SESSION_A, { eventId: ROOT.id }, { panelId: PANEL_A }),
+    ).resolves.toMatchObject({ status: 'found', pagesRead: 0 });
+    expect(harness.sent).toHaveLength(2);
+  });
+
+  it('never shares a cached trace between two panels', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    const target = { eventId: TARGET.id, traceId: TRACE_T };
+    await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A });
+
+    const other = await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_B });
+    expect(other).toMatchObject({ status: 'found', pagesRead: 1 });
+    expect(harness.sent).toHaveLength(2);
+    expect(sentAt(harness, 1).payload.query).toMatchObject({ panelId: PANEL_B });
+  });
+
+  it('drops the first panel’s traces when a lookup names another panel, keeping the live ones', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    const target = { eventId: TARGET.id, traceId: TRACE_T };
+    await harness.provider.resolveEvent(SESSION_A, target);
+    await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A });
+    await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_B });
+    expect(harness.sent).toHaveLength(3);
+    expect(harness.logs).toContainEqual(
+      expect.objectContaining({
+        message: 'Dropped cached traces the event drawer can no longer use.',
+        fields: { reason: 'panel-changed', count: 1 },
+      }),
+    );
+
+    // Back to the first panel: its entry went with the switch.
+    await expect(
+      harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A }),
+    ).resolves.toMatchObject({ status: 'found', pagesRead: 1 });
+    expect(harness.sent).toHaveLength(4);
+    // The live entry was never a panel's, so the switches left it in place.
+    await expect(harness.provider.resolveEvent(SESSION_A, target)).resolves.toMatchObject({
+      status: 'found',
+      pagesRead: 0,
+    });
+    expect(harness.sent).toHaveLength(4);
+  });
+
+  it('keeps a panel’s traces across a capture change, and drops only the live ones', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    const target = { eventId: TARGET.id, traceId: TRACE_T };
+    await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A });
+    await harness.provider.resolveEvent(SESSION_A, target);
+    expect(harness.sent).toHaveLength(2);
+
+    // A newer capture starts while the panel stays on screen.
+    harness.state.captureId = CAPTURE_ID_B;
+    await expect(
+      harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A }),
+    ).resolves.toMatchObject({ status: 'found', pagesRead: 0 });
+    await expect(harness.provider.resolveEvent(SESSION_A, target)).resolves.toMatchObject({
+      status: 'found',
+      pagesRead: 1,
+    });
+    expect(harness.sent).toHaveLength(3);
+    expect('panelId' in sentAt(harness, 2).payload.query).toBe(false);
+    expect(harness.logs).toContainEqual(
+      expect.objectContaining({
+        message: 'Dropped cached traces the event drawer can no longer use.',
+        fields: { reason: 'capture-changed', count: 1 },
+      }),
+    );
+  });
+
+  it('still fails closed for a panel-bound lookup while canServeCached answers false', async () => {
+    const harness = createHarness({ capture: [ROOT, PARENT, TARGET] });
+    const target = { eventId: TARGET.id, traceId: TRACE_T };
+    await harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A });
+
+    harness.state.canServeCached = false;
+    await expect(
+      harness.provider.resolveEvent(SESSION_A, target, { panelId: PANEL_A }),
+    ).resolves.toMatchObject({ status: 'found', pagesRead: 1 });
+    expect(harness.sent).toHaveLength(2);
+    expect(harness.logs).toContainEqual(
+      expect.objectContaining({
+        message: "Emptied the event drawer's trace cache.",
+        fields: { reason: 'not-authorised' },
+      }),
+    );
   });
 });

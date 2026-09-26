@@ -34,12 +34,6 @@
  * through the node, and not a page script posting an all-false `agent.config`
  * to its own window.
  */
-/* eslint-disable @typescript-eslint/unbound-method -- this suite compares the
-   *identity* of methods rather than calling them: `window.fetch` and the three
-   `XMLHttpRequest.prototype` members are read as values so that "the detach
-   restored exactly what it replaced" can be asserted with `toBe`. Binding them
-   would compare freshly created wrappers and assert nothing. The same applies
-   to the stub observer's own methods. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { bridgeFrameDetail, connectFakeBridge } from './__tests__/page-channel.js';
@@ -415,35 +409,62 @@ describe('deferred work that outlived its capture', () => {
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * Read a method slot as a value, for an identity comparison.
+ *
+ * The cases below assert that a detach put back exactly the function it
+ * replaced, so they compare slots with `toBe`; binding a method first would
+ * compare freshly created wrappers and assert nothing. The value read here is
+ * never called, so the lost receiver binding that
+ * `@typescript-eslint/unbound-method` guards against cannot arise.
+ * `Reflect.get` reads the slot exactly as `owner[key]` does, prototype chain
+ * and accessors included, so the comparison sees the same function object.
+ *
+ * @example
+ * ```ts
+ * const original = slot(XMLHttpRequest.prototype, 'open');
+ * attachFetch();
+ * detachFetch();
+ * expect(slot(XMLHttpRequest.prototype, 'open')).toBe(original);
+ * ```
+ *
+ * @param owner The object holding the slot: `window` or a prototype.
+ * @param key The slot's property name.
+ * @returns The slot's current value, typed `unknown` so it can only be compared.
+ */
+function slot<T extends object>(owner: T, key: keyof T & string): unknown {
+  return Reflect.get(owner, key);
+}
+
 describe('patch restoration the page refuses', () => {
   it('restores all four patched properties in a clean cycle', () => {
     const originals = {
-      fetch: window.fetch,
-      open: XMLHttpRequest.prototype.open,
-      send: XMLHttpRequest.prototype.send,
-      setRequestHeader: XMLHttpRequest.prototype.setRequestHeader,
+      fetch: slot(window, 'fetch'),
+      open: slot(XMLHttpRequest.prototype, 'open'),
+      send: slot(XMLHttpRequest.prototype, 'send'),
+      setRequestHeader: slot(XMLHttpRequest.prototype, 'setRequestHeader'),
     };
 
     attachFetch();
     expect(isFetchAttached()).toBe(true);
-    expect(window.fetch).not.toBe(originals.fetch);
+    expect(slot(window, 'fetch')).not.toBe(originals.fetch);
 
     detachFetch();
-    expect(window.fetch).toBe(originals.fetch);
-    expect(XMLHttpRequest.prototype.open).toBe(originals.open);
-    expect(XMLHttpRequest.prototype.send).toBe(originals.send);
-    expect(XMLHttpRequest.prototype.setRequestHeader).toBe(originals.setRequestHeader);
+    expect(slot(window, 'fetch')).toBe(originals.fetch);
+    expect(slot(XMLHttpRequest.prototype, 'open')).toBe(originals.open);
+    expect(slot(XMLHttpRequest.prototype, 'send')).toBe(originals.send);
+    expect(slot(XMLHttpRequest.prototype, 'setRequestHeader')).toBe(originals.setRequestHeader);
     expect(hasFetchResidue()).toBe(false);
   });
 
   it('restores the slots it can and retries the slot it cannot', () => {
     const prototype = XMLHttpRequest.prototype;
-    const originalSend = prototype.send;
-    const originalHeader = prototype.setRequestHeader;
-    const originalOpen = prototype.open;
+    const originalSend = slot(prototype, 'send');
+    const originalHeader = slot(prototype, 'setRequestHeader');
+    const originalOpen = slot(prototype, 'open');
 
     attachFetch();
-    const patchedOpen = prototype.open;
+    const patchedOpen = slot(prototype, 'open');
     expect(patchedOpen).not.toBe(originalOpen);
 
     // Sealed against reassignment: the restoring write throws.
@@ -458,9 +479,9 @@ describe('patch restoration the page refuses', () => {
       detachFetch();
 
       // The other two slots came back even though the first would not.
-      expect(prototype.send).toBe(originalSend);
-      expect(prototype.setRequestHeader).toBe(originalHeader);
-      expect(prototype.open).toBe(patchedOpen);
+      expect(slot(prototype, 'send')).toBe(originalSend);
+      expect(slot(prototype, 'setRequestHeader')).toBe(originalHeader);
+      expect(slot(prototype, 'open')).toBe(patchedOpen);
       expect(isFetchAttached()).toBe(false);
       expect(hasFetchResidue()).toBe(true);
 
@@ -475,18 +496,18 @@ describe('patch restoration the page refuses', () => {
     // The saved original was retained, so a later detach completes the job —
     // the module never loses the only reference that can undo its own patch.
     detachFetch();
-    expect(prototype.open).toBe(originalOpen);
+    expect(slot(prototype, 'open')).toBe(originalOpen);
     expect(hasFetchResidue()).toBe(false);
   });
 
   it('never strands a patch when the XMLHttpRequest constructor is replaced', () => {
     const prototypeA = XMLHttpRequest.prototype;
-    const originalOpenA = prototypeA.open;
-    const originalSendA = prototypeA.send;
+    const originalOpenA = slot(prototypeA, 'open');
+    const originalSendA = slot(prototypeA, 'send');
     const constructorA = globalThis.XMLHttpRequest;
 
     attachFetch();
-    const patchedOpenA = prototypeA.open;
+    const patchedOpenA = slot(prototypeA, 'open');
 
     const descriptor = Object.getOwnPropertyDescriptor(prototypeA, 'open');
     Object.defineProperty(prototypeA, 'open', {
@@ -496,8 +517,8 @@ describe('patch restoration the page refuses', () => {
     });
     try {
       detachFetch();
-      expect(prototypeA.open).toBe(patchedOpenA);
-      expect(prototypeA.send).toBe(originalSendA);
+      expect(slot(prototypeA, 'open')).toBe(patchedOpenA);
+      expect(slot(prototypeA, 'send')).toBe(originalSendA);
 
       // The page swaps the constructor — a polyfill, a mocking library, a
       // test double. A new install must not overwrite the reference that is
@@ -515,11 +536,11 @@ describe('patch restoration the page refuses', () => {
       }
       globalThis.XMLHttpRequest = ReplacementXhr as unknown as typeof XMLHttpRequest;
       const prototypeB = ReplacementXhr.prototype;
-      const originalOpenB = prototypeB.open;
+      const originalOpenB = slot(prototypeB, 'open');
 
       attachFetch();
       detachFetch();
-      expect(prototypeB.open).toBe(originalOpenB);
+      expect(slot(prototypeB, 'open')).toBe(originalOpenB);
 
       globalThis.XMLHttpRequest = constructorA;
     } finally {
@@ -531,7 +552,7 @@ describe('patch restoration the page refuses', () => {
 
     // Prototype A's residue was never forgotten across the replacement.
     detachFetch();
-    expect(prototypeA.open).toBe(originalOpenA);
+    expect(slot(prototypeA, 'open')).toBe(originalOpenA);
     expect(hasFetchResidue()).toBe(false);
     expect(getFetchStats().inFlight).toBe(0);
   });
@@ -729,9 +750,9 @@ describe('unreleased hooks, as the agent announces them', () => {
  * ---------------------------------------------------------------------------
  * Who can trigger the teardown
  *
- * AAP 0.5.1's "agent.config with all hooks false returns the browser agent to
- * dormant" is a capability, and the cases above show what the agent does once
- * it is exercised. These show who can exercise it: the bridge, through the
+ * An `agent.config` with every hook false returns the browser agent to
+ * dormant. That is a capability, and the cases above show what the agent does
+ * once it is exercised. These show who can exercise it: the bridge, through the
  * channel node it was handed — and not a page script, whatever it posts to its
  * own window or dispatches on the page, because the agent listens for bridge
  * frames on that node and nowhere else.

@@ -63,7 +63,15 @@
  * @module
  */
 
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -140,7 +148,12 @@ import {
   type Result,
 } from '@debuggen/shared';
 
-import type { ServiceConfig } from '../config.js';
+import {
+  STATE_HOME_OVERLAP_HINT,
+  STATE_HOME_OVERLAP_MESSAGE,
+  STATE_HOME_OVERLAP_REASON,
+  type ServiceConfig,
+} from '../config.js';
 import { detectDevServer, type DevServerDetection } from '../dev-server/detect.js';
 import { LOG_ERROR_FIELD_KEY } from '../logging.js';
 import type { CaptureOwner, SessionBroadcaster } from '../sessions/manager.js';
@@ -1884,8 +1897,10 @@ describe('progress checklist', () => {
       expect(row?.detail).toBe(gap.hint);
     }
 
-    // The requested configuration, drawn as the checklist used to be, would
-    // have checked every one of them — the false success this guards against.
+    // Drawn from the requested configuration alone, without the readiness
+    // verdict, the checklist would check every server signal although no
+    // preload is connected to produce one — the false success the
+    // verdict-based report prevents.
     const requested = rowMessages(
       {
         hooks: outcome.agentHooks,
@@ -3877,6 +3892,148 @@ describe('releaseInterruptedCapture', () => {
     expect(isErr(foreign)).toBe(true);
     expect(allMessages(h)).toEqual([]);
     expect(h.service.pendingDisarms(SESSION_ID)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The state root stays outside the project, re-checked at the patch sink
+// (AAP §0.4.2, CWE-200): the routes check before a session exists, but the
+// pipeline installs later, so every install checks again before it writes.
+// ---------------------------------------------------------------------------
+
+describe('the state root stays outside the project at the patch sink', () => {
+  /** A fresh, symlink-free directory this test removes afterwards. */
+  function scratchDirectory(): string {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-state-apart-')));
+    homes.push(directory);
+    return directory;
+  }
+
+  /** A second service over `h`'s doubles, with `overrides` applied to its deps. */
+  function serviceOver(
+    h: Harness,
+    overrides: Partial<InstrumentationServiceDeps>,
+  ): InstrumentationDriver {
+    return createInstrumentationService({ ...h.deps, ...overrides });
+  }
+
+  /**
+   * Asserts an install was refused by the separation check before anything
+   * was written: `FS_UNSAFE_PATH` with the overlap reason and `relation`, no
+   * installer call, no journal write, one `instrumentation.failed` frame that
+   * carries the check's own constant hint, and no `instrumentation.ready`.
+   */
+  function expectRefusedBeforeWriting(
+    h: Harness,
+    outcome: Awaited<ReturnType<InstrumentationDriver['install']>>,
+    relation: string,
+  ): void {
+    expect(isErr(outcome)).toBe(true);
+    if (isErr(outcome)) {
+      expect(outcome.error.code).toBe('FS_UNSAFE_PATH');
+      expect(outcome.error.message).toBe(STATE_HOME_OVERLAP_MESSAGE);
+      expect(outcome.error.details).toMatchObject({ reason: STATE_HOME_OVERLAP_REASON, relation });
+    }
+    expect(h.installer.calls).toHaveLength(0);
+    expect(h.journal.writes).toEqual([]);
+    const failed = framesOf(allMessages(h), 'instrumentation.failed');
+    expect(failed).toHaveLength(1);
+    expect(first(failed).payload.error.code).toBe('FS_UNSAFE_PATH');
+    expect(first(failed).payload.error.hint).toBe(STATE_HOME_OVERLAP_HINT);
+    const [failedFrame] = h.broadcaster.frames.filter(
+      (frame) => frame.message.type === 'instrumentation.failed',
+    );
+    expect(failedFrame?.kinds).toEqual(UI_KINDS);
+    expect(framesOf(allMessages(h), 'instrumentation.ready')).toEqual([]);
+    expect(progressCalls(h, 'stageFailed')).toHaveLength(1);
+  }
+
+  it('refuses a project root that is an ancestor of the state root, writing nothing into it', async () => {
+    const h = createHarness();
+    // The configured state root lies inside the harness directory, which is
+    // the project; it does not exist yet, as on a first run.
+    const service = serviceOver(h, { config: serviceConfig(join(h.home, 'state')) });
+
+    const outcome = await service.install(installRequest(h, buildPlan(), { projectRoot: h.home }));
+
+    expectRefusedBeforeWriting(h, outcome, 'home-inside-project');
+    expect(readdirSync(h.home)).toEqual([]);
+  });
+
+  it('refuses a project root reached through a symbolic link to an ancestor of the state root', async () => {
+    const h = createHarness();
+    const service = serviceOver(h, { config: serviceConfig(join(h.home, 'state')) });
+    const link = join(scratchDirectory(), 'project');
+    symlinkSync(h.home, link);
+
+    const outcome = await service.install(installRequest(h, buildPlan(), { projectRoot: link }));
+
+    expectRefusedBeforeWriting(h, outcome, 'home-inside-project');
+    expect(readdirSync(h.home)).toEqual([]);
+  });
+
+  it('checks every install, so a folder replaced by a link into the state root is refused the next time', async () => {
+    const h = createHarness();
+    const stateHome = join(h.home, 'state');
+    const inside = join(stateHome, 'projects', 'shop');
+    mkdirSync(inside, { recursive: true });
+    const service = serviceOver(h, { config: serviceConfig(stateHome) });
+    const shop = join(scratchDirectory(), 'shop');
+    mkdirSync(shop);
+
+    const first = await service.install(installRequest(h, buildPlan(), { projectRoot: shop }));
+
+    expect(isOk(first)).toBe(true);
+    expect(h.installer.calls).toHaveLength(1);
+
+    rmSync(shop, { recursive: true });
+    symlinkSync(inside, shop);
+    const second = await service.install(
+      installRequest(h, buildPlan({ sessionId: OTHER_SESSION_ID }), { projectRoot: shop }),
+    );
+
+    expect(isErr(second)).toBe(true);
+    if (isErr(second)) {
+      expect(second.error.code).toBe('FS_UNSAFE_PATH');
+      expect(second.error.details).toMatchObject({
+        reason: STATE_HOME_OVERLAP_REASON,
+        relation: 'project-inside-home',
+      });
+    }
+    expect(h.installer.calls).toHaveLength(1);
+  });
+
+  it('compares with the canonical state root it is given rather than the configured one', async () => {
+    const h = createHarness();
+    const project = scratchDirectory();
+    const service = serviceOver(h, { canonicalStateHome: join(project, '.debuggen') });
+
+    const refused = await service.install(installRequest(h, buildPlan(), { projectRoot: project }));
+
+    expectRefusedBeforeWriting(h, refused, 'home-inside-project');
+
+    // A project apart from the given root installs as usual.
+    const installed = await service.install(
+      installRequest(h, buildPlan({ sessionId: OTHER_SESSION_ID })),
+    );
+
+    expect(isOk(installed)).toBe(true);
+    expect(h.installer.calls).toHaveLength(1);
+  });
+
+  it('refuses every install when the canonical state root it is given is not absolute', async () => {
+    const h = createHarness();
+    const service = serviceOver(h, { canonicalStateHome: 'relative/state' });
+
+    const outcome = await service.install(installRequest(h, buildPlan()));
+
+    expect(isErr(outcome)).toBe(true);
+    if (isErr(outcome)) {
+      expect(outcome.error.code).toBe('INTERNAL');
+      expect(outcome.error.details).toMatchObject({ field: 'canonicalStateHome' });
+    }
+    expect(h.installer.calls).toHaveLength(0);
+    expect(framesOf(allMessages(h), 'instrumentation.failed')).toHaveLength(1);
   });
 });
 

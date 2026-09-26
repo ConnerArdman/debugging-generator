@@ -3,12 +3,12 @@
  * arm the product's two telemetry producers, and the readiness report that
  * gates "Ready to capture" — all defined here, once.
  *
- * AAP §0.9.1 lists `packages/instrumentation/src/schema/**` among the schema
- * sources that have a *single* definition, and these three shapes have more
+ * `packages/instrumentation/src/schema/**` is a schema source: every shape it
+ * declares has a *single* definition, and these three shapes have more
  * independent readers than any other in the package:
  *
  * - `@debuggen/protocol` embeds {@link AgentHookConfig} in `agent.config` and
- *   {@link ServerAgentSignals} in `server-agent.config` (AAP §0.4.2).
+ *   {@link ServerAgentSignals} in `server-agent.config`.
  * - `apps/local-service/src/instrumentation/service.ts` sends both frames, and
  *   `.../readiness.ts` aggregates the per-adapter {@link Readiness} reports
  *   the six adapters return.
@@ -36,9 +36,10 @@
  *   that a service built against an earlier revision of that file still arms
  *   the right signal.
  * - The dev-server preload (`packages/telemetry/src/node/control.ts`) sits
- *   *below* this package in the layering of AAP §0.2.2, so it too keeps its
- *   own structural mirror of {@link ServerAgentSignals} and of the
- *   signal→kind policy. Its six key names are the same six declared here, and
+ *   *below* this package in the workspace layering — `@debuggen/telemetry`
+ *   may not import `@debuggen/instrumentation` — so it too keeps its own
+ *   structural mirror of {@link ServerAgentSignals} and of the signal→kind
+ *   policy. Its six key names are the same six declared here, and
  *   the five server rows of {@link CAPTURE_SIGNAL_TO_TELEMETRY_KIND} are the
  *   exact mirror of its `SIGNAL_KINDS` table.
  *
@@ -50,13 +51,14 @@
  *
  * **No human-facing labels.** The progress wording a developer reads while a
  * session prepares ("Browser performance", "React renders", "Network tracing",
- * "Server spans", "Database tracing" — AAP §0.1.2's Step 8 display) belongs to
+ * "Server spans", "Database tracing" — the rows the progress display lists
+ * under "Preparing instrumentation" before "Ready to capture") belongs to
  * `apps/local-service/src/sessions/progress.ts`, and the `reason`/`hint` text
- * of an unavailable signal belongs to the adapter that could not enable it
- * (AAP §0.5.5). A label table here would be a second source of truth for
- * strings this module has no way to keep correct, so the signal *names* below
- * are identifiers — chosen to read sensibly inside "Could not enable ‹signal›:
- * ‹reason›." — and nothing more.
+ * of an unavailable signal belongs to the adapter that could not enable it. A
+ * label table here would be a second source of truth for strings this module
+ * has no way to keep correct, so the signal *names* below are identifiers —
+ * chosen to read sensibly inside "Could not enable ‹signal›: ‹reason›." — and
+ * nothing more.
  *
  * **No adapter ids.** Which adapter claims which signal lives in
  * `../registry.ts`, which imports this folder; asking the question here would
@@ -104,12 +106,12 @@ const MAX_ADAPTER_ID_LENGTH = 64;
 /**
  * Longest accepted readiness `reason`, in characters.
  *
- * A reason is the fragment that reads after "Could not enable ‹signal›: "
- * (AAP §0.5.5): one explanation, never a command or a stack trace, so five
- * hundred characters is far more than an honest one needs. It is narrower than
- * the 2000 characters `@debuggen/protocol` allows on `instrumentation.ready`'s
- * reason, which is the safe direction: a reason this layer accepts is one the
- * transport accepts too.
+ * A reason is the fragment that reads after "Could not enable ‹signal›: " in
+ * the unavailable-signal message: one explanation, never a command or a stack
+ * trace, so five hundred characters is far more than an honest one needs. It
+ * is narrower than the 2000 characters `@debuggen/protocol` allows on
+ * `instrumentation.ready`'s reason, which is the safe direction: a reason this
+ * layer accepts is one the transport accepts too.
  *
  * Exported so an adapter composing a reason at runtime measures it against this
  * number rather than restating it.
@@ -120,11 +122,12 @@ export const READINESS_REASON_MAX_LENGTH = 500;
  * Longest accepted readiness `hint`, in characters.
  *
  * Wider than {@link READINESS_REASON_MAX_LENGTH} because a hint legitimately
- * carries a command: AAP §0.5.5 requires the server-signal hint to name the
- * exact relaunch command when the dev server was started without the preload,
- * and that command embeds an absolute project root, a preload specifier and a
- * dev command whose lengths this product does not choose. A bound sized for a
- * sentence would cut exactly the part of the row a developer copies.
+ * carries a command: when the dev server was started without the preload, the
+ * server-signal hint names the exact command that relaunches it with the
+ * preload attached, and that command embeds an absolute project root, a
+ * preload specifier and a dev command whose lengths this product does not
+ * choose. A bound sized for a sentence would cut exactly the part of the row a
+ * developer copies.
  *
  * Equal to `@debuggen/protocol`'s `MAX_HINT_LENGTH`, the bound on the same
  * words when they travel as `instrumentation.ready`'s unavailable-signal hint
@@ -181,10 +184,10 @@ const C1_CONTROL_MAX = 0x9f;
  * `reason` and a `hint`. The two rules are there for different readers. Blank
  * rejection keeps an empty badge out of the VS Code modifications list and the
  * panel's session summary, where a readiness row is rendered as text. The
- * single-line rule is what makes AAP §0.5.5's sentence — "Could not enable
- * ‹signal›: ‹reason›." — a sentence: a `reason` carrying a line feed would
- * break the message in two, and a symbol name carrying one is not a name in
- * any language this product indexes.
+ * single-line rule is what makes the unavailable-signal message — "Could not
+ * enable ‹signal›: ‹reason›." — a sentence: a `reason` carrying a line feed
+ * would break the message in two, and a symbol name carrying one is not a name
+ * in any language this product indexes.
  */
 function isSingleLineText(value: string): boolean {
   if (value.trim().length === 0) {
@@ -214,13 +217,14 @@ const SINGLE_LINE_RULE_MESSAGE =
  * values.
  *
  * The same privacy rule `./modification.ts` applies, for the same reason: an
- * error raised this deep never passes through the redaction layer of AAP
- * §0.5.2, and it is logged, persisted with the session and rendered in two user
- * interfaces. A readiness `hint` can name a path inside the developer's home
- * directory and a `functions` list is a slice of their symbol names, so what
- * goes into `details` is the *shape* of the failure — which field, and what the
- * schema expected — never the data that caused it. Field paths and the schema's
- * own messages are everything a producer needs in order to be fixed.
+ * error raised this deep never passes through the telemetry redaction layer
+ * (`packages/telemetry/src/redaction/`), and it is logged, persisted with the
+ * session and rendered in two user interfaces. A readiness `hint` can name a
+ * path inside the developer's home directory and a `functions` list is a slice
+ * of their symbol names, so what goes into `details` is the *shape* of the
+ * failure — which field, and what the schema expected — never the data that
+ * caused it. Field paths and the schema's own messages are everything a
+ * producer needs in order to be fixed.
  *
  * @param error The Zod error from a failed `safeParse`.
  * @returns One entry per issue, `path` being the dotted path of the offending
@@ -264,8 +268,8 @@ function rejection(subject: string, hint: string, error: z.ZodError): DebuggenEr
 // The capture-signal vocabulary
 //
 // One name per thing a capture can observe, across both tiers. These are the
-// names a readiness row is keyed by, the names an `unavailable` report of AAP
-// §0.5.5 carries, and the names an adapter's capability catalog is written in.
+// names a readiness row is keyed by, the names an install's `unavailable`
+// report carries, and the names an adapter's capability catalog is written in.
 // ---------------------------------------------------------------------------
 
 /**
@@ -297,7 +301,7 @@ function rejection(subject: string, hint: string, error: z.ZodError): DebuggenEr
  *
  * Order is browser-then-server and is preserved rather than sorted, because
  * that is the order the two configuration shapes below, the readiness rows and
- * the AAP's own signal lists are read in.
+ * the progress display's signal rows are read in.
  */
 export const CAPTURE_SIGNALS = [
   'interactions',
@@ -382,7 +386,8 @@ export const BROWSER_CAPTURE_SIGNALS = [
 
 /**
  * The signals the dev-server preload supplies — the key set of
- * {@link ServerAgentSignals}, in the AAP §0.4.2 order.
+ * {@link ServerAgentSignals}, in the key order of the `signals` payload that
+ * `server-agent.config` carries.
  *
  * See {@link BROWSER_CAPTURE_SIGNALS} for why `fetch` is in both lists.
  */
@@ -465,7 +470,7 @@ export function telemetryKindsForSignal(signal: CaptureSignal): readonly Telemet
 //
 // What an adapter answers when asked whether the signals it claims can
 // actually be collected here, and the artifact the "Ready to capture" state of
-// AAP §0.1.2's Step 8 display is computed from.
+// the session progress display is computed from.
 // ---------------------------------------------------------------------------
 
 /**
@@ -476,7 +481,7 @@ export function telemetryKindsForSignal(signal: CaptureSignal): readonly Telemet
  *   performance entry type this browser does not implement, a React build
  *   without development-mode timings. Capture proceeds and the limitation is
  *   recorded, so the analysis stage can qualify what it concludes.
- * - `'unavailable'` — it will not be collected at all. AAP §0.5.5's
+ * - `'unavailable'` — it will not be collected at all. The developer-facing
  *   "Could not enable ‹signal›: ‹reason›. Continuing with: ‹enabled list›."
  *   is this status being reported.
  *
@@ -502,9 +507,9 @@ export const readinessStatusSchema = z.enum(READINESS_STATUSES);
  * transported and persisted as JSON, where an absent key is the one
  * representation every layer agrees on.
  *
- * Both strings are the adapter's own words (AAP §0.5.5): this module bounds
- * them and refuses a blank or multi-line value, and says nothing about their
- * content.
+ * Both strings are the adapter's own words, because only the adapter that
+ * could not enable a signal knows why: this module bounds them and refuses a
+ * blank or multi-line value, and says nothing about their content.
  */
 export const readinessSignalSchema = z.strictObject({
   /** The signal this row is about. */
@@ -530,9 +535,9 @@ export const readinessSignalSchema = z.strictObject({
   /**
    * What the developer can do about it.
    *
-   * The recovery path of AAP §0.5.5, and the reason that section's failures are
-   * actionable rather than merely honest: for a missing server signal this is
-   * the exact command that relaunches the dev server with the preload attached.
+   * The recovery path, and what makes an unavailable signal actionable rather
+   * than merely honest: for a missing server signal this is the exact command
+   * that relaunches the dev server with the preload attached.
    * Bounded by {@link READINESS_HINT_MAX_LENGTH}, which is wider than the
    * reason's because a command carries paths a sentence does not.
    */
@@ -679,11 +684,11 @@ export interface BuildReadinessInput {
  * What this function deliberately does **not** do is aggregate. Combining
  * several adapters' reports is the service's job
  * (`apps/local-service/src/instrumentation/readiness.ts`), and it is a
- * different question: alongside the rows, that module adds the preconditions of
- * AAP §0.7.1 Group 2 that no adapter can see — a relayed `agent.ready` for the
- * bound tab's current document with `installedBeforeReact = true`, and a
- * connected `server-agent` for the project whenever server signals are
- * planned — and turns the result into the "Ready to capture" state.
+ * different question: alongside the rows, that module adds the preconditions
+ * no adapter can see — a relayed `agent.ready` for the bound tab's current
+ * document with `installedBeforeReact = true`, and a connected `server-agent`
+ * for the project whenever server signals are planned — and turns the result
+ * into the "Ready to capture" state.
  *
  * It is a constructor, not a validator: it copies its input, derives the two
  * fields it owns and returns. A blank adapter id or an over-long row list
@@ -722,22 +727,22 @@ export function buildReadiness(input: BuildReadinessInput): Readiness {
 // ---------------------------------------------------------------------------
 // `AgentHookConfig` — what arms the page agent
 //
-// Sent as `agent.config { sessionId, captureId, hooks }` (AAP §0.4.2), and sent
-// again with every flag false to return the agent to dormant when a capture
-// ends (AAP §0.5.1). The seven keys mirror the page agent's attach functions
-// one for one.
+// Sent as `agent.config { sessionId, captureId, hooks }`, and sent again with
+// every flag false to return the agent to dormant when a capture ends. The
+// seven keys mirror the page agent's attach functions one for one.
 // ---------------------------------------------------------------------------
 
 /**
  * Which signals the page agent should observe.
  *
  * All seven flags are **required**, not optional, and that is the point rather
- * than strictness for its own sake: AAP §0.5.1 draws a line between *idling*
- * and *disabling*, and "every flag explicitly false" is how the disabled state
- * is expressed. An optional flag would make the dormant configuration and a
- * partially-specified one indistinguishable on the wire, and cleanup would have
- * no way to say "detach everything" that a reader could tell apart from "I did
- * not mention these".
+ * than strictness for its own sake: cleanup *disables* runtime hooks rather
+ * than *idling* them (`docs/ARCHITECTURE.md`, "End-of-session guarantee"), and
+ * "every flag explicitly false" is how the disabled state is expressed. An
+ * optional flag would make the dormant configuration and a partially-specified
+ * one indistinguishable on the wire, and cleanup would have no way to say
+ * "detach everything" that a reader could tell apart from "I did not mention
+ * these".
  *
  * Each key names the hook it arms:
  *
@@ -822,7 +827,7 @@ export const agentHookConfigSchema = z.strictObject({
  * The hook configuration the service sends to the page agent.
  *
  * Inferred from {@link agentHookConfigSchema}. `@debuggen/protocol` embeds this
- * type in `agent.config` (AAP §0.4.2); nothing redefines it.
+ * type in `agent.config`; nothing redefines it.
  */
 export type AgentHookConfig = z.infer<typeof agentHookConfigSchema>;
 
@@ -836,9 +841,8 @@ export type AgentHookConfig = z.infer<typeof agentHookConfigSchema>;
  * `Record<AgentHookKey, boolean>` would then be missing a required property of
  * {@link AgentHookConfig}.
  *
- * Order is the AAP's browser-signal order, which is also
- * {@link BROWSER_CAPTURE_SIGNALS}'s; the agent attaches in its own order, and
- * that order is its business.
+ * Order is the browser-signal order of {@link BROWSER_CAPTURE_SIGNALS}; the
+ * agent attaches in its own order, and that order is its business.
  */
 export const AGENT_HOOK_KEYS = [
   'interactions',
@@ -884,9 +888,9 @@ export function parseAgentHookConfig(value: unknown): Result<AgentHookConfig> {
  * Every hook off: the configuration that returns the page agent to dormant.
  *
  * This is what the service sends when a capture stops, when a session ends and
- * during cleanup (AAP §0.4.2, §0.5.1). Receiving it makes the agent detach its
- * listeners, restore the original `fetch` and `XMLHttpRequest`, and unsubscribe
- * its fiber-hook handlers — disabled, not idled.
+ * during cleanup. Receiving it makes the agent detach its listeners, restore
+ * the original `fetch` and `XMLHttpRequest`, and unsubscribe its fiber-hook
+ * handlers — disabled, not idled.
  *
  * Frozen, and safe to hand out directly: every value is a boolean, so there is
  * nothing inside it a recipient could mutate. {@link deriveAgentHookConfig}
@@ -906,19 +910,19 @@ export const DORMANT_AGENT_HOOK_CONFIG: AgentHookConfig = Object.freeze({
 // ---------------------------------------------------------------------------
 // `ServerAgentSignals` — what arms the dev-server preload
 //
-// Sent as `server-agent.config { sessionId?, captureId?, signals }` (AAP
-// §0.4.2), where an absent `captureId` means disable. The six key names are
-// the ones `packages/telemetry/src/node/control.ts` reads structurally.
+// Sent as `server-agent.config { sessionId?, captureId?, signals }`, where an
+// absent `captureId` means disable. The six key names are the ones
+// `packages/telemetry/src/node/control.ts` reads structurally.
 // ---------------------------------------------------------------------------
 
 /**
  * Which signals the dev-server preload should collect.
  *
- * The key names are a **wire contract** (AAP §0.4.2): the preload parses this
- * object key by key without importing this module, and its gate drops every
- * span whose kind no enabled signal admits. A rename here therefore does not
- * fail a build — it silently disables a signal, and the developer gets a
- * capture missing the backend evidence their question needed.
+ * The key names are a **wire contract**: the preload parses this object key
+ * by key without importing this module, and its gate drops every span whose
+ * kind no enabled signal admits. A rename here therefore does not fail a
+ * build — it silently disables a signal, and the developer gets a capture
+ * missing the backend evidence their question needed.
  *
  * `functions` is a list rather than a flag because function timing is planned
  * per symbol: it is the one signal that costs a modification to the
@@ -942,9 +946,9 @@ export const serverAgentSignalsSchema = z.strictObject({
    * Outgoing server-side request spans.
    *
    * The dev server's own `fetch` calls — how a call to an external service
-   * reaches the timeline as a child of the route handler that made it (AAP
-   * §0.4.2's correlated-trace target). Distinct from the browser's `fetch`
-   * flag; see {@link BROWSER_CAPTURE_SIGNALS}.
+   * reaches the correlated trace's timeline as a child of the route handler
+   * that made it. Distinct from the browser's `fetch` flag; see
+   * {@link BROWSER_CAPTURE_SIGNALS}.
    */
   fetch: z.boolean(),
 
@@ -1043,7 +1047,7 @@ export function parseServerAgentSignals(value: unknown): Result<ServerAgentSigna
  *
  * `server-agent.config` with no `captureId` carries this set, and receiving it
  * makes the preload disable its instrumentations and drop its tracer provider
- * so the framework's own spans become no-ops (AAP §0.5.1). It is also the value
+ * so the framework's own spans become no-ops. It is also the value
  * {@link deriveServerAgentSignals} reports — as a fresh, value-equal object —
  * for a plan that asks for nothing on this tier.
  *
@@ -1137,9 +1141,9 @@ const NO_AGENT_HOOKS: readonly AgentHookKey[] = Object.freeze([]);
  *   The pairing is also what satisfies the page agent's prerequisite: a tree is
  *   walked from the fiber root `browser/react.ts` retains, so the agent refuses
  *   a `componentTree` request whose `react` flag is off and reports it as an
- *   unavailable signal (AAP §0.5.5). No derivation here can produce that
- *   combination — this row is the only source of the flag — so the refusal is a
- *   guard against a hand-built configuration, not a case the planner reaches.
+ *   unavailable signal. No derivation here can produce that combination — this
+ *   row is the only source of the flag — so the refusal is a guard against a
+ *   hand-built configuration, not a case the planner reaches.
  * - `'state-tracking'` arms `react` as well as `state`, because
  *   `browser/state.ts`'s transitions are recorded *by* `browser/react.ts` while
  *   it walks a commit. Without the fiber hook there is no commit to walk, so
@@ -1183,8 +1187,8 @@ const PATCH_MODE: InstrumentationMode = 'patch';
  * through the span helper, and therefore belong in
  * {@link ServerAgentSignals.functions}.
  *
- * Both of AAP §0.1.2's patch types: `'function-timing'` times an arbitrary
- * named function, and `'server-span'` wraps a named server entry point the same
+ * Both patch-mode action types: `'function-timing'` times an arbitrary named
+ * function, and `'server-span'` wraps a named server entry point the same
  * way. The distinction between them is which adapter planned it and what the
  * developer is told, not how the span is emitted.
  */
@@ -1248,10 +1252,10 @@ function resolveActionTier(action: InstrumentationAction, options?: DeriveOption
  * `browser/interaction.ts` — which also mints the trace root every browser
  * event is attributed to. Without the interaction listener, requests go out
  * untraced, the server's spans start a trace of their own, and the
- * browser↔server correlation AAP §0.4.2 is built on breaks *silently*: the
- * capture still fills with events, and the timeline still renders — as two
- * unrelated trees. Forcing the flag costs one capture-phase listener; omitting
- * it costs the product's central claim.
+ * browser↔server correlation the cross-tier timeline is built on breaks
+ * *silently*: the capture still fills with events, and the timeline still
+ * renders — as two unrelated trees. Forcing the flag costs one capture-phase
+ * listener; omitting it costs the product's central claim.
  *
  * An empty action list, or one whose every action arms nothing, returns the
  * dormant configuration unchanged — including the forced flag, which is not
@@ -1321,11 +1325,12 @@ function compareSymbolNames(left: string, right: string): number {
  * installed.
  *
  * The gating is deliberately conservative, and that is a guarantee rather than
- * an optimisation: AAP §0.5.1 promises that *"an unrelated plan collects no
- * backend or database telemetry"*. A developer asking why a component
- * re-renders has not asked this product to read their SQL, so a purely
- * browser-side plan must produce {@link DISABLED_SERVER_AGENT_SIGNALS} — not
- * "the server signals with nothing much on them".
+ * an optimisation: a plan that does not ask for the server tier collects no
+ * backend or database telemetry (`docs/SECURITY.md`, "What is captured, and
+ * what is never captured"). A developer asking why a component re-renders has
+ * not asked this product to read their SQL, so a purely browser-side plan must
+ * produce {@link DISABLED_SERVER_AGENT_SIGNALS} — not "the server signals with
+ * nothing much on them".
  *
  * The derivation, in order:
  *
@@ -1346,8 +1351,8 @@ function compareSymbolNames(left: string, right: string): number {
  *    database or function span collected without them arrives as a flagged
  *    orphan instead of a row in a tree. `prisma` and `pg` both follow
  *    `'db-query-tracking'`, and `fetch` follows `'fetch-tracking'` — the dev
- *    server's outgoing requests, which is how the external-service call of AAP
- *    §0.4.2's correlated-trace target reaches the timeline.
+ *    server's outgoing requests, which is how a call to an external service
+ *    reaches the correlated trace's timeline.
  *
  * Why `prisma` and `pg` are not narrowed per driver: telling them apart would
  * mean knowing which adapter planned the action, and adapter ids live in

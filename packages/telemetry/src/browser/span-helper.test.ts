@@ -2,7 +2,8 @@
 /**
  * Colocated tests for `./span-helper.ts` — `globalThis.__DEBUGGEN__` in the
  * page, the browser twin of `../node/span-helper.ts` and the runtime half of
- * the reversible AST patch contract on the front end (AAP §0.5.1).
+ * the reversible AST patch contract on the front end (`docs/ARCHITECTURE.md`
+ * §7.2).
  *
  * ## What is on trial
  *
@@ -18,10 +19,10 @@
  * 3. **A returned promise ends the span when it settles**, the caller receives
  *    the same promise and its own `catch` runs, a thenable that calls both
  *    handlers produces one event, and a synchronous throw rethrows the same
- *    instance. The error's `name` is reported and its message never is
- *    (AAP §0.5.2). Vitest fails a run on an unhandled rejection, so every
- *    rejection case that lets the caller handle the rejection doubles as the
- *    "no manufactured rejection" check; each such case waits a macrotask so a
+ *    instance. The error's `name` is reported and its message never is.
+ *    Vitest fails a run on an unhandled rejection, so every rejection case
+ *    that lets the caller handle the rejection doubles as the "no
+ *    manufactured rejection" check; each such case waits a macrotask so a
  *    stray rejection would surface inside it.
  * 4. **Nothing the instrumentation does can throw into the page.** A hostile
  *    `meta`, a failing id generator and a throwing transport all degrade to
@@ -44,8 +45,8 @@
  *
  * Nothing here imports a Node built-in: `eslint.config.js` forbids one anywhere
  * under `src/browser/**`, tests included, because this directory is bundled
- * into the page-injected agent (AAP §0.2.2). Symbols and paths are neutral
- * vocabulary that names no particular project (AAP §0.5.4).
+ * into the page-injected agent. Symbols and paths are neutral vocabulary that
+ * names no particular project.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -972,7 +973,7 @@ describe('span() source location from meta', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Metadata hygiene (AAP §0.5.2)
+ * Metadata hygiene (the telemetry privacy bounds in `docs/SECURITY.md`)
  * ---------------------------------------------------------------------------
  */
 

@@ -1,84 +1,32 @@
 /**
- * .vscode-test.mjs — the `@vscode/test-cli` 0.0.15 configuration behind
- * `pnpm test:vscode`, the extension-host gate of AAP 0.8.5 (CI runs it as
- * `xvfb-run -a pnpm test:vscode`).
+ * `@vscode/test-cli` configuration behind `pnpm test:vscode` (CI: `xvfb-run -a pnpm test:vscode`):
+ * one `extension-host` configuration runs the activation, commands, open-location, uri-handler and
+ * packaged-vsix suites from `dist/test/suite/<name>.test.js`, compiled by `pretest:vscode`
+ * (`esbuild.mjs --tests`). A vacuous green is refused: the preflight requires every suite as source
+ * and compiled bundle, and no bundle without a source; mocha sets `failZero`, `forbidOnly` and
+ * `forbidPending`.
  *
- * ONE configuration, labelled `extension-host`, runs the five mocha suites of
- * AAP 0.7.1 Group 3 inside a real VS Code: activation, commands,
- * open-location, uri-handler and packaged-vsix.
+ * Hermeticity, so no run reads or writes the developer's state:
+ *   - a throwaway `<os.tmpdir()>/debuggen-vscode-test-XXXXXX/` holds `home/` (`DEBUGGEN_HOME`),
+ *     `user-data/` and `extensions/`; it is removed on exit, and a failed removal fails the run;
+ *   - inherited `DEBUGGEN_*` and `ANTHROPIC_*` variables are stripped and
+ *     `DEBUGGEN_PROVIDER=deterministic` is forced;
+ *   - the workspace is the generic fixture `test/fixtures/workspace`, never the repository root or
+ *     the demo application; its settings point `debuggen.serviceUrl` at an unbindable port and turn
+ *     `debuggen.autoStartService` off. VS Code ignores `machine`- and `application`-scoped settings
+ *     in a workspace, so those entries are mirrored into the throwaway user settings
+ *     ({@link userOnlyFixtureSettings});
+ *   - only the extension under development loads (`--disable-extensions`) and telemetry is off,
+ *     except the packaged-vsix suite's second window, which loads its VSIX on a throwaway profile.
  *
- * THE PATH CONTRACT. `esbuild.mjs --tests` compiles every
- * `test/suite/**` `*.test.ts` to `dist/test/suite/<name>.test.js` (CommonJS,
- * `vscode` and `mocha` external), and this file globs exactly that output.
- * `pretest:vscode` produces it, so `pnpm run test:vscode` always runs against a
- * fresh build. A change to either side changes the other in the same commit.
- *
- * A RUN THAT EXECUTES NOTHING IS A FAILURE. The runner resolves happily on
- * zero files and zero tests, so three guards stand in the way of a vacuous
- * green: the preflight below refuses to load the configuration unless every
- * required suite exists as a source AND as a compiled bundle (and no compiled
- * bundle is left over from a deleted suite); mocha's `failZero` fails a run
- * that registered no test; and `forbidOnly` / `forbidPending` fail a run in
- * which a stray `.only` or a skipped test silently narrowed what executed.
- *
- * HERMETICITY (AAP 0.10 baseline, 0.5.2, 0.5.6). Nothing a run does may touch
- * the developer's machine state or leave the machine:
- *   - a throwaway directory `<os.tmpdir()>/debuggen-vscode-test-XXXXXX/` is
- *     created when this file is evaluated. It holds `home/` (the run's
- *     `DEBUGGEN_HOME`, so the editor credential `auth.json`, the session store
- *     and backups never come from or go to the real `~/.debuggen`),
- *     `user-data/` and `extensions/` (a fresh VS Code profile, so no global
- *     state, setting or installed extension carries over from a previous run
- *     or from the developer's editor). It is removed when the CLI exits; a
- *     removal failure fails the run, because residue is a defect;
- *   - every inherited `DEBUGGEN_*` and `ANTHROPIC_*` variable is removed from
- *     the editor's environment (no ambient credential, ingest URL, port or API
- *     key reaches a test), then `DEBUGGEN_PROVIDER=deterministic` is forced, so
- *     no model provider is ever contacted;
- *   - the workspace is the generic fixture `test/fixtures/workspace`, never the
- *     repository root and never the demo application (AAP 0.5.4). Its
- *     `.vscode/settings.json` points `debuggen.serviceUrl` at an unbindable
- *     loopback port and turns `debuggen.autoStartService` off, which is what
- *     keeps a run away from a developer's service on the default port 43117.
- *     VS Code reads a setting whose manifest `scope` is `machine` or
- *     `application` from user settings only and silently drops it from a
- *     workspace's settings — `debuggen.serviceUrl` is `machine`-scoped — so
- *     every such fixture entry is also written to the throwaway profile's
- *     `user-data/User/settings.json` (see {@link userOnlyFixtureSettings});
- *     the fixture file stays the one place those values are authored;
- *   - only the extension under development loads (`--disable-extensions`,
- *     extension dependencies skipped, nothing installed from a marketplace),
- *     and editor telemetry is off. The one exception is deliberate and lives
- *     outside this editor: the packaged-vsix suite starts a second window,
- *     without `--disable-extensions`, on its own throwaway profile inside its
- *     scratch directory, because the VSIX it installed there is what that
- *     window must load.
- *
- * ENVIRONMENT KNOBS, each optional, each validated:
- *   - `VSCODE_TEST_VERSION`  editor to download: `stable` (default),
- *     `insiders`, a commit, or `X.Y.Z`, which must satisfy
- *     `engines.vscode` in package.json. CI pins `1.139.0` on the `verify`
- *     job's "Extension-host tests" step in `.github/workflows/ci.yml`; a local
- *     run that sets neither this nor `VSCODE_TEST_PATH` tests `stable`.
- *   - `VSCODE_TEST_PATH`     the absolute path of an already-installed editor
- *     executable to use instead of downloading one; wins over
- *     `VSCODE_TEST_VERSION`.
- *   - `DEBUGGEN_VSCODE_TEST_TIMEOUT_MS`  default mocha timeout per test and
- *     hook; `0` disables it (debugging). Default 600000.
- *   - `DEBUGGEN_VSCODE_TEST_KEEP_STATE=1`  keep the throwaway directory for
- *     inspection (logs live under `user-data/logs/`); its path is printed.
- *   - `DEBUGGEN_TEST_NODE`   Node executable `resolveNodeExecutable()` in
- *     `test/helpers.ts` hands a suite that runs a Node program itself;
- *     defaults to the Node running this CLI (the repository's pinned runtime
- *     when invoked through pnpm), never Electron. The embedded service is not
- *     started that way: the packaged-vsix suite has the installed extension
- *     start it, on the runtime `src/service/process.ts` chooses.
- * These are read here and are not forwarded as-is: the editor receives only
- * the environment assembled in {@link extensionHostEnvironment}.
- *
- * Plain Node ESM: linted (`eslint.config.js`, JavaScript rules) and
- * format-checked, never compiled. Imports are limited to `node:` built-ins and
- * `defineConfig`, which `@vscode/test-cli` resolves for us.
+ * Environment knobs, each optional and validated; the `DEBUGGEN_*` ones reach the editor only
+ * through {@link extensionHostEnvironment}:
+ *   - `VSCODE_TEST_VERSION`: `stable` (default), `insiders`, a commit, or an `X.Y.Z` satisfying
+ *     `engines.vscode`;
+ *   - `VSCODE_TEST_PATH`: absolute path of an installed editor; wins over `VSCODE_TEST_VERSION`;
+ *   - `DEBUGGEN_VSCODE_TEST_TIMEOUT_MS`: mocha timeout, default 600000; `0` disables it;
+ *   - `DEBUGGEN_VSCODE_TEST_KEEP_STATE=1` (or `true`): keep and print the throwaway directory;
+ *   - `DEBUGGEN_TEST_NODE`: Node for suites that run Node themselves; defaults to this CLI's Node.
  *
  * @module apps/vscode-extension/.vscode-test
  */
@@ -91,22 +39,13 @@ import { fileURLToPath } from 'node:url';
 
 import { defineConfig } from '@vscode/test-cli';
 
-// ---------------------------------------------------------------------------
-// Layout
-// ---------------------------------------------------------------------------
-
-/**
- * This workspace, from this module's own location: `vscode-test` may be run
- * from the workspace, from the repository root through `pnpm --filter`, or by
- * the editor's test explorer, and every path below must mean the same thing in
- * each case.
- */
+/** From `import.meta.url`, not the cwd, which varies with how `vscode-test` is launched. */
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-/** Where the suites are authored (`esbuild.mjs` LAYOUT.testSuiteSrc). */
+/** Mirrors `esbuild.mjs` LAYOUT.testSuiteSrc. */
 const SUITE_SOURCE_DIR = path.join(EXTENSION_DIR, 'test', 'suite');
 
-/** Where `esbuild.mjs --tests` writes them (LAYOUT.testSuiteOut). */
+/** Mirrors `esbuild.mjs` LAYOUT.testSuiteOut. */
 const SUITE_OUTPUT_DIR = path.join(EXTENSION_DIR, 'dist', 'test', 'suite');
 
 /** The runner's glob, relative to this file; mirrors {@link SUITE_OUTPUT_DIR}. */

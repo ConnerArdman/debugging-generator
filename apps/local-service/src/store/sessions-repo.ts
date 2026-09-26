@@ -15,7 +15,7 @@
  * | `session_progress` | one line of the append-only pipeline progress log the editor replays on reopen |
  * | `plans` | one version of the session's instrumentation plan ladder |
  * | `captures` | one capture window, open while `stopped_at` is `NULL` |
- * | `followups` | one follow-up attempt — rewritten in place when it is retried — in the order it was first asked |
+ * | `followups` | one follow-up attempt — rewritten in place when it is retried or answered — in the order it was first asked |
  * | `bindings` | which inspected browser tab belongs to which session |
  * | `session_keys` | the per-session keyed-hash secret behind duplicate-request grouping |
  *
@@ -96,10 +96,11 @@
  * returned `err` into a module-private throw so the outermost transaction (or
  * the savepoint, when already nested) rolls back **every** write the body's
  * nested repository calls made, and hands the body's `err` back unchanged.
- * The session manager uses it wherever a capture window and the session
- * status must change together — opening a window with the move to
- * `capturing`, closing one with the move out of it — so a failed second write
- * can never leave the first one standing.
+ * The session manager uses it wherever a row and the session record must
+ * change together — opening a capture window with the move to `capturing`,
+ * closing one with the move out of it, a `followups` row with the ladder entry
+ * that mirrors it, the move to `ended` with the removal of the session's
+ * binding — so a failed second write can never leave the first one standing.
  *
  * Project-wide capture exclusivity stays the session manager's decision, made
  * against its in-memory owner index. {@link SessionsRepo.startCapture} adds an
@@ -734,8 +735,21 @@ WHERE session_id = ? AND json_extract(record, '$.attemptId') = ?
 ORDER BY id ASC`;
 
 /**
- * Rewrites one follow-up row in place — the retry of an attempt — keeping its
- * autoincrement id, and with it the position the question was first asked in.
+ * A session's most recently asked follow-up: its row with the highest
+ * autoincrement id — the order {@link SELECT_FOLLOWUPS_SQL} lists them in —
+ * with the `session_id` index bounding the read to one session's follow-ups.
+ * The row an outcome is stamped on when the follow-up it answers carries no
+ * attempt id.
+ */
+const SELECT_LATEST_FOLLOWUP_SQL = `SELECT id, record FROM followups
+WHERE session_id = ?
+ORDER BY id DESC
+LIMIT 1`;
+
+/**
+ * Rewrites one follow-up row in place — the retry of an attempt, or the
+ * outcome links stamped on it once answered — keeping its autoincrement id,
+ * and with it the position the question was first asked in.
  */
 const UPDATE_FOLLOWUP_SQL = `UPDATE followups SET question = ?, asked_at = ?, record = ?
 WHERE id = ? AND session_id = ?`;
@@ -1776,8 +1790,11 @@ export interface SessionsRepo {
    * are its projections. The record carries no session id of its own — it is an
    * element of `SessionRecord.followUps` — so the owning session is named here.
    * The outcome links a follow-up acquires later (the capture, analysis and
-   * panel that answered it) are persisted on the session record through
-   * {@link SessionsRepo.update}.
+   * panel that answered it) are stamped on this row too — through
+   * {@link SessionsRepo.replaceFollowUpAttempt}, or
+   * {@link SessionsRepo.replaceLatestFollowUp} for an entry without an attempt
+   * id — in the transaction that rewrites the session record, so the log and
+   * `SessionRecord.followUps` hold one history.
    *
    * One row per follow-up **attempt**: a record carrying an `attemptId` the
    * session's log already holds is refused (`SESSION_INVALID_STATE`,
@@ -1796,24 +1813,49 @@ export interface SessionsRepo {
 
   /**
    * Rewrites the `followups` row that recorded `record.attemptId` with
-   * `record` — the in-place retry of a follow-up attempt that failed. The row
-   * keeps its id, and therefore its place in the order the questions were
-   * asked; the `question` / `asked_at` projections are recomputed from the new
-   * document in the same statement, so they cannot disagree with it.
+   * `record`: the in-place retry of a follow-up attempt that failed, or the
+   * attempt with the outcome links its answer stamped on it. The row keeps its
+   * id, and therefore its place in the order the questions were asked; the
+   * `question` / `asked_at` projections are recomputed from the new document
+   * in the same statement, so they cannot disagree with it.
    *
    * The row is found by the attempt id inside its JSON document
    * (`json_extract(record, '$.attemptId')`), never by the question's text
    * (AAP §0.5.4).
    *
    * @param sessionId The session the attempt belongs to.
-   * @param record The retried attempt: the same `attemptId`, its new
-   *   `attempt` counter, question and `askedAt`.
+   * @param record The attempt as it is to be stored: the same `attemptId`
+   *   with either its retry's new `attempt` counter, question and `askedAt`,
+   *   or its outcome links.
    * @returns The record as stored, or `err` `STORE_ERROR`: `invalid-follow-up`
    * when it fails the follow-up schema or carries no `attemptId`,
    * `follow-up-attempt-not-found` when the session logs no row for the attempt,
    * `follow-up-attempt-duplicated` when it logs more than one.
    */
   replaceFollowUpAttempt(sessionId: SessionId, record: FollowUpRecord): Result<FollowUpRecord>;
+
+  /**
+   * Rewrites the session's most recently asked `followups` row with `record` —
+   * the outcome links stamped on a follow-up that carries no attempt id, as
+   * one stored before attempts had an identity does. The row keeps its id and
+   * its projections are recomputed from the new document, as in
+   * {@link SessionsRepo.replaceFollowUpAttempt}.
+   *
+   * With no attempt id to find the row by, the newest row is taken, and only
+   * when it can be the same follow-up: it must carry no attempt id either and
+   * the same `askedAt` as `record`. The question's text is never compared
+   * (AAP §0.5.4).
+   *
+   * @param sessionId The session the follow-up belongs to.
+   * @param record The follow-up as it is to be stored, without an `attemptId`.
+   * @returns The record as stored, or `err` `STORE_ERROR`: `invalid-follow-up`
+   * when it fails the follow-up schema or carries an `attemptId` (such a
+   * record goes through {@link SessionsRepo.replaceFollowUpAttempt}),
+   * `follow-up-not-found` when the session logs no follow-up,
+   * `follow-up-log-disagrees` when its newest row carries an attempt id or
+   * another `askedAt`, `corrupt-row` when that row no longer parses.
+   */
+  replaceLatestFollowUp(sessionId: SessionId, record: FollowUpRecord): Result<FollowUpRecord>;
 
   /**
    * Reads a session's follow-ups in the order they were asked.
@@ -5101,7 +5143,7 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
   /**
    * Validates a follow-up offered for storage and prepares its row: the
    * schema-checked record with `askedAt` normalised to what the column holds,
-   * and its JSON document. Shared by the two writers of `followups`, so an
+   * and its JSON document. Shared by every writer of `followups`, so an
    * appended row and a rewritten one are canonicalised identically.
    */
   function prepareFollowUp(
@@ -5323,6 +5365,113 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         ...fields,
         ...(outcome.value.attempt === undefined ? {} : { attempt: outcome.value.attempt }),
       });
+    }
+
+    return outcome;
+  }
+
+  function replaceLatestFollowUp(
+    sessionId: SessionId,
+    record: FollowUpRecord,
+  ): Result<FollowUpRecord> {
+    const operation = 'replaceLatestFollowUp';
+    const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId };
+    const outcome = attempt(
+      operation,
+      (): Result<FollowUpRecord> => {
+        const invalid = sessionIdError(operation, sessionId);
+
+        if (invalid !== undefined) {
+          return err(invalid);
+        }
+
+        const prepared = prepareFollowUp(operation, record, fields);
+
+        if (isErr(prepared)) {
+          return prepared;
+        }
+
+        const { canonical, json } = prepared.value;
+
+        if (canonical.attemptId !== undefined) {
+          return err(
+            invalidArgumentError(
+              operation,
+              'record.attemptId',
+              'absent: an identified attempt is rewritten by its id with replaceFollowUpAttempt()',
+              fields,
+              'invalid-follow-up',
+            ),
+          );
+        }
+
+        // Read and rewrite in one transaction, so the row checked is the row
+        // written even if another writer appends a follow-up meanwhile.
+        return store.transaction((): Result<FollowUpRecord> => {
+          const row = store.statement(SELECT_LATEST_FOLLOWUP_SQL).get(sessionId);
+
+          if (row === undefined) {
+            return err(
+              new DebuggenError(
+                'STORE_ERROR',
+                'The session store logs no follow-up for the session.',
+                {
+                  hint: 'The session record and its follow-up log disagree. Report the operation and identifiers with the service log.',
+                  details: context(operation, { ...fields, reason: 'follow-up-not-found' }),
+                },
+              ),
+            );
+          }
+
+          const rowId = readInteger(row['id']);
+          const latest = toFollowUpRecord(row, operation);
+
+          if (isErr(latest)) {
+            return latest;
+          }
+
+          if (rowId === undefined) {
+            return err(corruptRowError(operation, 'followups', fields));
+          }
+
+          // Identity without the question's text: an unidentified row asked
+          // at the same instant is the entry the record holds.
+          if (latest.value.attemptId !== undefined || latest.value.askedAt !== canonical.askedAt) {
+            return err(
+              new DebuggenError(
+                'STORE_ERROR',
+                "The session's newest logged follow-up is not the one being rewritten.",
+                {
+                  hint: 'The session record and its follow-up log disagree. The session store may have been written by a different build of Debug Generator or altered by hand. Report the operation and identifiers with the service log.',
+                  details: context(operation, {
+                    ...fields,
+                    followUpId: rowId,
+                    reason: 'follow-up-log-disagrees',
+                  }),
+                },
+              ),
+            );
+          }
+
+          store
+            .statement(UPDATE_FOLLOWUP_SQL)
+            .run(canonical.question, canonical.askedAt, json, rowId, sessionId);
+
+          return ok(canonical);
+        });
+      },
+      fields,
+    );
+
+    if (isErr(outcome)) {
+      reportFailure(
+        'the latest follow-up could not be rewritten',
+        operation,
+        outcome.error,
+        fields,
+      );
+    } else {
+      logger.info('latest follow-up rewritten in place', fields);
     }
 
     return outcome;
@@ -5752,6 +5901,7 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     getPanelCapture,
     appendFollowUp,
     replaceFollowUpAttempt,
+    replaceLatestFollowUp,
     listFollowUps,
     upsertBinding,
     getBindingByTab,

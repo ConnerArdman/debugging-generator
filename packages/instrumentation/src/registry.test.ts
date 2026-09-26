@@ -1,8 +1,7 @@
 /**
  * The suite for `./registry.ts` — the one place adapter identity is enumerated,
- * and the extension point that makes AAP §0.4.2's promise literal: *adding an
- * adapter means implementing `InstrumentationAdapter` and registering it, no
- * orchestrator change.*
+ * and the extension point: *adding an adapter means implementing
+ * `InstrumentationAdapter` and registering it, with no orchestrator change.*
  *
  * Every other suite in this package satisfies `PlanAdapterResolver` with an
  * object literal, which is right for them and is also why the production
@@ -32,9 +31,9 @@
  *    second mode is logged and the first kept, and a capability probe that
  *    throws is treated as "not applicable here" — logged, never propagated.
  * 5. **Consumers.** `normalizePlan` and the feasibility gate take the registry
- *    as their `resolver` unchanged, AAP §0.1.2's plan normalises to an exact
- *    expected object through it, and a seventh adapter reaches normalisation
- *    through `registerAdapter` alone.
+ *    as their `resolver` unchanged, the canonical authoring example plan
+ *    normalises to an exact expected object through it, and a seventh adapter
+ *    reaches normalisation through `registerAdapter` alone.
  *
  * ## How the contexts are built
  *
@@ -53,10 +52,10 @@
  * after every case that no fake was ever asked to plan, install, remove or
  * report readiness.
  *
- * AAP §0.1.2's example carries identifiers that also exist in the demo
- * application. `scripts/check-no-hardcoding.mjs` scans product source excluding
- * test suites, which is what makes them acceptable here; they appear once, in
- * {@link AUTHORING_EXAMPLE}.
+ * The canonical authoring example carries identifiers that also exist in the
+ * demo application. `scripts/check-no-hardcoding.mjs` scans product source
+ * excluding test suites, which is what makes them acceptable here; they appear
+ * once, in {@link AUTHORING_EXAMPLE}.
  */
 
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -156,7 +155,8 @@ const EXPECTED_CLAIMANTS: Readonly<Record<InstrumentationActionType, readonly st
 };
 
 /**
- * AAP §0.1.2's authoring example, exactly as the plan states it.
+ * The canonical authoring example plan, verbatim: an objective, the capture
+ * list, and one `function-timing` and one `server-span` target.
  *
  * Typed `unknown`: the authoring schema is what must accept it, not the
  * compiler. The one place in this suite a demo-overlapping identifier appears.
@@ -1985,7 +1985,7 @@ describe('the extension point: a seventh adapter', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('consumers: normalizePlan and the feasibility gate take the registry as resolver', () => {
-  it('normalises AAP §0.1.2’s plan to the exact expected plan through the built-ins', () => {
+  it('normalises the authoring example to the exact expected plan through the built-ins', () => {
     const resolver: PlanAdapterResolver = createAdapterRegistry();
     const normalized = normalizePlan(AUTHORING_EXAMPLE, {
       sessionId: SESSION_ID,

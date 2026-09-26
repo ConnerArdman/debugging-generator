@@ -200,7 +200,12 @@ export type EventDetailsStatus = 'idle' | 'loading' | 'error';
  *
  * Structural, so a `DebuggenError` from `@debuggen/shared` and the protocol's
  * `error` payload are both assignable as they stand; `hint` and `code` are
- * shown when present.
+ * shown when present, exactly as given.
+ *
+ * Every field is rendered verbatim, so the composition root supplies only
+ * presentable copy: a typed product error's own message and hint, or fixed
+ * wording of its own — never an unexpected exception's text, which could carry
+ * a file path, a query or a credential.
  */
 export interface EventDetailsError {
   /** One complete sentence describing what failed. */

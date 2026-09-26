@@ -1386,10 +1386,11 @@ const RUNTIME_ACTION_TYPES: readonly ActionTypeId[] = [
  * Mirrors `CAPTURE_SIGNALS` of `@debuggen/instrumentation` (`schema/readiness.ts`):
  * the closed vocabulary `ProblemUnderstanding.signalsNeeded` is validated
  * against, the adapters' readiness catalog is keyed by, and the readiness gate
- * reports one row per member of. The package layering of AAP §0.2.2 keeps this
- * package below instrumentation, so the names are restated rather than
- * imported; an understanding built in any other vocabulary is one the product's
- * own schema rejects, which is a defect of this module, not of the caller.
+ * reports one row per member of. The package layering (docs/ARCHITECTURE.md,
+ * "Workspace layout and dependency layering") keeps this package below
+ * instrumentation, so the names are restated rather than imported; an
+ * understanding built in any other vocabulary is one the product's own schema
+ * rejects, which is a defect of this module, not of the caller.
  */
 const CAPTURE_SIGNAL_NAMES: readonly string[] = Object.freeze([
   'interactions',
@@ -2997,11 +2998,12 @@ function readFlowSteps(value: JsonValue | undefined): readonly string[] {
  * chain's components are traced along their calls to the API route a call site
  * reaches, and each route reached is traced on to its data-layer call — the
  * "found the component, traced the handler, found the route, found the
- * database dependency" walk of AAP §0.1.2 Step 8. The queries are derived from
- * the structured context alone (the owner chain, the candidates the log holds,
- * the requests already run), never from the question's wording, and a query
- * already in the log is never proposed again, so the conversation converges on
- * the final investigation within the stage's budget.
+ * database dependency" walk the session's progress view reports
+ * (docs/ARCHITECTURE.md, "Progress from real findings"). The queries are
+ * derived from the structured context alone (the owner chain, the candidates
+ * the log holds, the requests already run), never from the question's
+ * wording, and a query already in the log is never proposed again, so the
+ * conversation converges on the final investigation within the stage's budget.
  * ---------------------------------------------------------------------------------------------- */
 
 /** The context field holding the executed query log, and the field a query batch answers in. */
@@ -4263,12 +4265,12 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
  *
  * An entry is emitted only when its *primary* declared source belongs to the
  * active lens, so a latency capture and a rendering capture compose disjoint
- * visualization bodies (AAP §0.6.5) and share only the metric cards and the
- * source link, whose content is lens-specific too. A detected pattern may
- * admit one further source into the timing lens: duplicated requests bring in
- * the render statistics of the components that issued them. None of this
- * reads a question: the lens is a function of the capture's source counts and
- * detected patterns.
+ * visualization bodies and share only the metric cards and the source link,
+ * whose content is lens-specific too. A detected pattern may admit one further
+ * source into the timing lens: duplicated requests bring in the render
+ * statistics of the components that issued them. None of this reads a
+ * question: the lens is a function of the capture's source counts and detected
+ * patterns.
  * ---------------------------------------------------------------------------------------------- */
 
 /** One node catalog entry, as the context declared it. */
@@ -4423,7 +4425,7 @@ const SOURCE_LENS: Readonly<Record<string, PanelLens>> = Object.freeze({
 /**
  * The lens each computed metric belongs to, so the cards of a timing panel
  * measure time and traffic and the cards of a component panel measure
- * rendering and main-thread work (AAP §0.6.5: the four duration cards against
+ * rendering and main-thread work (the four duration cards against
  * `render_count`, `unchanged_render_count`, `render_trigger_unknown_count` and
  * `blocking_time`). Keyed by {@link ComputedMetricId} and therefore total: a
  * metric added to the computed tuple without a lens is a compile error.
@@ -4448,9 +4450,9 @@ const METRIC_LENS: Readonly<Record<ComputedMetricId, PanelLens>> = Object.freeze
 /**
  * Sources a detected pattern admits into the lens it is read through, beyond
  * the lens's own. Duplicated requests are issued by components, so their panel
- * also shows the render statistics of the initiators (AAP §0.6.5, third case).
- * Keyed by {@link EvidencePattern}, so a new pattern without an entry is a
- * compile error.
+ * also shows the render statistics of the initiators. Keyed by
+ * {@link EvidencePattern}, so a new pattern without an entry is a compile
+ * error.
  */
 const PATTERN_ADMITTED_SOURCES: Readonly<Record<EvidencePattern, readonly string[]>> =
   Object.freeze({

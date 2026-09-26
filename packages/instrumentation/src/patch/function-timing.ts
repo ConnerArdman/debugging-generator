@@ -4,9 +4,9 @@
  * position a resulting span will carry back to source.
  *
  * This is the one signal the product cannot obtain from a runtime hook. Every
- * other signal AAP §0.5.1 enumerates — interactions, React commits and state,
- * fetch and XHR, performance entries, incoming HTTP, route handlers, Prisma and
- * `pg` queries — arrives through an observer or an OpenTelemetry
+ * other signal it captures — interactions, React commits and state, fetch and
+ * XHR, performance entries, incoming HTTP, route handlers, Prisma and `pg`
+ * queries — arrives through an observer or an OpenTelemetry
  * instrumentation that touches nothing on disk. Timing *an arbitrary function
  * the plan named* has no such hook, so a plan whose `mode` is `'patch'` reaches
  * here, and what this module emits is the only code the product ever writes
@@ -19,15 +19,16 @@
  * of it, and returns a *string* plus metadata. It never opens, writes, renames
  * or deletes a file, and it never calls ts-morph's `save`/`saveSync`.
  *
- * That boundary is not tidiness, it is the reversibility guarantee. AAP §0.5.1
- * fixes the order in which a patch is committed: read the original and hash it,
- * **produce the patched content in memory and hash that**, copy the original to
- * the backup store and `fsync`, journal a `pending` record carrying *both*
- * hashes, then write atomically and mark the record `applied`. `./patcher.ts`
- * owns that sequence, and `../cleanup.ts` reconciles against the
- * `instrumentedHash` the journal recorded *before* the write. A transform that
- * wrote its own output would skip the backup and the journal entry, and the
- * file it left behind would be one reconciliation could not classify.
+ * That boundary is not tidiness, it is the reversibility guarantee. A patch is
+ * committed in this order (docs/ARCHITECTURE.md, "The crash-safe write
+ * sequence"): read the original and hash it, **produce the patched content in
+ * memory and hash that**, copy the original to the backup store and `fsync`,
+ * journal a `pending` record carrying *both* hashes, then write atomically and
+ * mark the record `applied`. `./patcher.ts` owns that sequence, and
+ * `../cleanup.ts` reconciles against the `instrumentedHash` the journal
+ * recorded *before* the write. A transform that wrote its own output would skip
+ * the backup and the journal entry, and the file it left behind would be one
+ * reconciliation could not classify.
  *
  * Two consequences follow for callers, and both are contractual:
  *
@@ -67,10 +68,9 @@
  *   async function __orig(): Promise<Response> {
  *   return respond(await load(request));
  * }
- *   // Debug Generator: temporary instrumentation, removed when the session ends.
- *   // The guard tests helper availability, never its result, so the body runs exactly once.
+ *   // Debug Generator instrumentation: the guard tests helper availability, so the body runs exactly once.
  *   const __dbg = (globalThis as { __DEBUGGEN__?: __DebuggenSpanHelper }).__DEBUGGEN__;
- *   if (__dbg && typeof __dbg.span === "function") return __dbg.span("handle", { file: "app/handler.ts", line: 4, column: 22, symbol: "handle" }, () => __orig.apply(undefined, arguments as never));
+ *   if (__dbg && typeof __dbg.span === "function") return __dbg.span("handle", { file: "app/handler.ts", line: 4, column: 23, symbol: "handle" }, () => __orig.apply(undefined, arguments as never));
  *   return __orig.apply(undefined, arguments as never);
  * }
  * ```
@@ -87,18 +87,17 @@
  *
  * ## The patched file must still type-check
  *
- * AAP §0.5.1 requires a strict target project to keep type-checking with no
- * new dependency, and a strict project reads more than a function's runtime
- * behaviour: its **signature** — what callers and every type derived from the
- * function see — and the **contextual types** its `return` statements and
- * parameters were checked against. Moving a body into an inner function keeps
- * the first for free in the `'arguments'` style (the outer keeps its own
- * parameter list and return type) and loses the second unless it is restated:
- * the inner function therefore declares the outer's return type (a type
- * predicate as `boolean`, an assertion signature as `void`), so a literal
- * returned against a declared union does not widen into a `TS2322` the
- * developer's build reports and a single-file check cannot see when the
- * declared type is imported.
+ * A strict target project must keep type-checking with no new dependency, and
+ * a strict project reads more than a function's runtime behaviour: its
+ * **signature** — what callers and every type derived from the function see —
+ * and the **contextual types** its `return` statements and parameters were
+ * checked against. Moving a body into an inner function keeps the first for
+ * free in the `'arguments'` style (the outer keeps its own parameter list and
+ * return type) and loses the second unless it is restated: the inner function
+ * therefore declares the outer's return type (a type predicate as `boolean`, an
+ * assertion signature as `void`), so a literal returned against a declared
+ * union does not widen into a `TS2322` the developer's build reports and a
+ * single-file check cannot see when the declared type is imported.
  *
  * ## Arrow functions take the other template
  *
@@ -126,14 +125,15 @@
  *
  * ## The position is recorded here, before anything moves
  *
- * AAP §0.4.2 gives the patch route its authority from exactly one fact: the
- * file, line and column a function span carries were recorded **when the patch
- * was applied**, by the code that applied it. This module reads them from the
- * pre-rewrite abstract syntax tree and emits them as a literal, so
- * `packages/telemetry`'s span helpers can mint the only `SourceLocation` in the
- * product with `resolvedBy: 'patch'` without resolving anything at run time.
- * Reading them afterwards would yield lines shifted by the wrapper, and nothing
- * anywhere would fail — the developer would simply be sent to the wrong line.
+ * The `'patch'` route of click-to-source takes its authority from exactly one
+ * fact: the file, line and column a function span carries were recorded **when
+ * the patch was applied**, by the code that applied it. This module reads them
+ * from the pre-rewrite abstract syntax tree and emits them as a literal, so
+ * `packages/telemetry`'s span helpers can mint the only `SourceLocation` in
+ * the product with `resolvedBy: 'patch'` without resolving anything at run
+ * time. Reading them afterwards would yield lines shifted by the wrapper, and
+ * nothing anywhere would fail — the developer would simply be sent to the wrong
+ * line.
  *
  * The same holds across patches. A second symbol in a file this session already
  * patched, and a follow-up plan version over such a file, are computed against
@@ -528,10 +528,10 @@ export interface FunctionTimingRequest {
    * The rewrite is always computed against `text`, because those are the bytes
    * being replaced. The recorded position — `meta.line`/`meta.column` in the
    * emitted call and {@link FunctionTimingPatch.location} — is resolved against
-   * this text instead, because it is what the click-to-source route of AAP
-   * §0.4.2 sends the developer to and what the code graph indexed: resolving it
-   * against layered text would shift every symbol below an earlier wrapper by
-   * that wrapper's lines, and the first symbol of a file by the helper alias.
+   * this text instead, because it is what click-to-source sends the developer
+   * to and what the code graph indexed: resolving it against layered text
+   * would shift every symbol below an earlier wrapper by that wrapper's lines,
+   * and the first symbol of a file by the helper alias.
    *
    * `./patcher.ts` supplies it for every chained patch, from the backup at the
    * root of the file's chain. Omitted, or equal to `text`, the position is read
@@ -1818,8 +1818,8 @@ function detectNewline(text: string): string {
  *   where the unpatched file reported none. Hook *order* is preserved at run
  *   time, because the helper invokes the callback synchronously, so nothing
  *   misbehaves; what breaks is the developer's own lint and type-check, which a
- *   temporary patch has no business breaking. AAP §0.5.1 tracks React renders
- *   at run time and reserves patches for named function timing, so this target
+ *   temporary patch has no business breaking. React renders are tracked at run
+ *   time and patches are reserved for named function timing, so this target
  *   belongs to the runtime route rather than to a narrower wrapper. See
  *   {@link reactComponentSite}.
  * - **`super` or `new.target` in a body that would move into an inner
@@ -2031,12 +2031,11 @@ const REACT_HOOK_NAME_PATTERN = /^use[A-Z0-9]/u;
  * The rule is React's own — `isHookName` in `eslint-plugin-react-hooks`, the
  * analysis whose errors a misplaced patch would produce: the bare
  * {@link REACT_USE_API_NAME}, or {@link REACT_HOOK_NAME_PATTERN}. This is the
- * whole rule, and deliberately so. AAP §0.5.4 forbids framework-specific and
- * application-specific name lists in product code, so `useState`,
- * `useTransition`, `use(context)`, a project's own `useCart`, a `use3DScene`
- * and a hook written tomorrow are all recognised by their shape, while `user`,
- * `used` and `useful` — ordinary names that merely begin with the prefix — are
- * not.
+ * whole rule, and deliberately so: product code carries no framework-specific
+ * or application-specific name list, so `useState`, `useTransition`,
+ * `use(context)`, a project's own `useCart`, a `use3DScene` and a hook written
+ * tomorrow are all recognised by their shape, while `user`, `used` and
+ * `useful` — ordinary names that merely begin with the prefix — are not.
  *
  * @param name The final identifier of a call's callee.
  * @returns `true` when React would treat the call as a hook call.
@@ -3298,11 +3297,11 @@ function containsThisType(typeNode: Node): boolean {
  * `return this.total`, `return this.load()`, `return this['key']` — does not
  * escape: what is returned is the property's type, not the receiver's, so the
  * annotation cannot narrow anything a caller can observe. That distinction is
- * what keeps the overwhelmingly common `this`-reading method patchable, which
- * AAP §0.5.1 requires of this transform; every other position (`return this`,
- * `return [this]`, `return { self: this }`, `return () => this`,
- * `return cond ? this : other`) is treated as an escape, erring towards a
- * refusal the developer can read.
+ * what keeps the overwhelmingly common `this`-reading method patchable, and a
+ * `this`-dependent method is one of the shapes this transform exists to wrap.
+ * Every other position (`return this`, `return [this]`, `return { self: this }`,
+ * `return () => this`, `return cond ? this : other`) is treated as an escape,
+ * erring towards a refusal the developer can read.
  *
  * @param body The method's body.
  * @returns `true` when a `return` carries the receiver out of the method.

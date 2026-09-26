@@ -4,7 +4,7 @@
  * This package sits at the bottom of the acyclic workspace graph (AAP 0.2.2):
  * it depends on no other workspace, so `pnpm build`
  * (`pnpm demo:generate && pnpm -r build`) builds it first and every other
- * workspace type-checks and bundles against the artefacts produced here. The
+ * workspace loads or bundles the artefacts produced here. The
  * only job of this file is therefore to emit — deterministically, on a clean
  * clone, without anything else having run first — exactly the four paths that
  * `package.json` `exports` advertises:
@@ -77,8 +77,11 @@ export default defineConfig({
 
   /**
    * Declarations are non-negotiable: `dist/index.d.ts` and
-   * `dist/node/index.d.ts` are what every other workspace type-checks against,
-   * including the single `SourceLocation` Zod schema this package owns.
+   * `dist/node/index.d.ts` are the packed-tarball entries of the `exports`
+   * map's source-first `types` arrays, carrying the single `SourceLocation` Zod
+   * schema this package owns to any consumer outside the repository. Inside
+   * it, every other workspace type-checks against this project's `.tsbuild`
+   * declarations (root tsconfig.json, `"// no-aliases"`).
    *
    * The three overrides below are each required, not defensive. tsup's
    * declaration step builds its own TypeScript program: it reads the

@@ -96,7 +96,7 @@
  * of the product, and a test fixture is no place to start.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   DEBUGGEN_ERROR_CODES,
@@ -113,6 +113,9 @@ import {
 } from '@debuggen/shared';
 import { DEFAULT_PROVIDER_ID, PROVIDER_IDS, type ProviderId } from '@debuggen/model-provider';
 
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -127,13 +130,23 @@ import {
   INDEX_CACHE_DIRECTORY_NAME,
   LOG_LEVEL_SETTINGS,
   MAX_PORT,
+  PATH_UNRESOLVABLE_REASON,
+  PROJECT_ROOT_UNRESOLVABLE_MESSAGE,
+  PROJECT_ROOT_UNRESOLVABLE_REASON,
   PROMPTS_DIRECTORY_NAME,
   PROVIDER_REQUIREMENTS,
   SERVICE_ENV_KEYS,
   SESSIONS_DATABASE_FILE_NAME,
+  STATE_HOME_OVERLAP_HINT,
+  STATE_HOME_OVERLAP_MESSAGE,
+  STATE_HOME_OVERLAP_REASON,
+  canonicalizePath,
   describeServiceConfig,
   isServiceEnvKey,
   loadServiceConfig,
+  pathsOverlap,
+  requireProjectOutsideStateHome,
+  stateHomeOverlap,
   resolvedServiceConfigSchema,
   serviceConfigOverridesSchema,
   serviceConfigSchema,
@@ -2280,5 +2293,229 @@ describe('describeServiceConfig', () => {
 
     expect(Object.keys(described)).not.toContain('anthropicApiKey');
     expect(described.anthropicApiKeyPresent).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The state root stays outside every project (AAP 0.4.2, CWE-200)
+ * ---------------------------------------------------------------------------
+ */
+
+/** Sandboxes the overlap suite created, removed after each test. */
+const overlapSandboxes: string[] = [];
+
+afterEach(() => {
+  for (const sandbox of overlapSandboxes.splice(0)) {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A fresh, canonical temporary directory: `realpath`ed, because the host's
+ * temporary directory may itself be reached through a link.
+ */
+function overlapSandbox(): string {
+  const sandbox = toPosix(realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-config-overlap-'))));
+  overlapSandboxes.push(sandbox);
+  return sandbox;
+}
+
+/** Creates `path` (and its parents) and returns it in POSIX spelling. */
+function directory(path: string): string {
+  mkdirSync(path, { recursive: true });
+  return toPosix(path);
+}
+
+/** Fails the test unless `result` is an `Err`, and returns its error. */
+function refusalOf(result: Result<string, DebuggenError>): DebuggenError {
+  if (!isErr(result)) {
+    return expect.unreachable(`expected a refusal, got ${result.value}`);
+  }
+  return result.error;
+}
+
+/** Every textual surface of an error, for the "names no path" assertions. */
+function surfacesOf(error: DebuggenError): string {
+  return [
+    error.message,
+    error.hint ?? '',
+    JSON.stringify(error.details ?? {}),
+    JSON.stringify(error),
+  ].join('\n');
+}
+
+describe('pathsOverlap and stateHomeOverlap', () => {
+  it('see the same directory and either one inside the other as overlapping', () => {
+    expect(pathsOverlap('/work/shop', '/work/shop')).toBe(true);
+    expect(pathsOverlap('/work/shop', '/work/shop/.debuggen')).toBe(true);
+    expect(pathsOverlap('/home/dev/.debuggen/projects/shop', '/home/dev/.debuggen')).toBe(true);
+
+    expect(stateHomeOverlap('/work/shop', '/work/shop')).toBe('same-directory');
+    expect(stateHomeOverlap('/work/shop/.debuggen', '/work/shop')).toBe('home-inside-project');
+    expect(stateHomeOverlap('/home/dev/.debuggen', '/home/dev/.debuggen/shop')).toBe(
+      'project-inside-home',
+    );
+  });
+
+  it('keep siblings that merely share a prefix apart, segment by segment', () => {
+    expect(pathsOverlap('/work/shop', '/work/shop-state')).toBe(false);
+    expect(pathsOverlap('/work/shop-state', '/work/shop')).toBe(false);
+    expect(stateHomeOverlap('/work/shop-state', '/work/shop')).toBeUndefined();
+    expect(stateHomeOverlap('/home/dev/.debuggen', '/work/shop')).toBeUndefined();
+  });
+});
+
+describe('canonicalizePath', () => {
+  it('resolves an existing directory through every link on the way', async () => {
+    const sandbox = overlapSandbox();
+    const real = directory(join(sandbox, 'real'));
+    symlinkSync(real, join(sandbox, 'link'));
+
+    expect(await canonicalizePath(`${sandbox}/link`)).toStrictEqual({ ok: true, value: real });
+    expect(await canonicalizePath(`${sandbox}/link/./`)).toStrictEqual({ ok: true, value: real });
+  });
+
+  it('resolves a path that does not exist yet through its nearest existing ancestor', async () => {
+    const sandbox = overlapSandbox();
+    const real = directory(join(sandbox, 'real'));
+    symlinkSync(real, join(sandbox, 'link'));
+
+    const resolved = await canonicalizePath(`${sandbox}/link/not/there/yet`);
+
+    expect(resolved).toStrictEqual({ ok: true, value: `${real}/not/there/yet` });
+  });
+
+  it('refuses a relative path and a resolution that fails for another reason than absence', async () => {
+    expect(refusalOf(await canonicalizePath('relative/project')).details?.['reason']).toBe(
+      PATH_UNRESOLVABLE_REASON,
+    );
+
+    const denied = Object.assign(new Error('EACCES: permission denied, realpath /x'), {
+      code: 'EACCES',
+    });
+    const error = refusalOf(
+      await canonicalizePath('/work/shop', { realpath: () => Promise.reject(denied) }),
+    );
+    expect(error.code).toBe('FS_UNSAFE_PATH');
+    expect(error.details).toMatchObject({ reason: PATH_UNRESOLVABLE_REASON, errno: 'EACCES' });
+    expect(surfacesOf(error)).not.toContain('/work/shop');
+  });
+});
+
+describe('requireProjectOutsideStateHome', () => {
+  it('refuses a project that contains the state root', async () => {
+    const sandbox = overlapSandbox();
+    const project = directory(join(sandbox, 'shop'));
+    const home = directory(join(project, 'debuggen-state'));
+
+    const error = refusalOf(await requireProjectOutsideStateHome(home, project));
+
+    expect(error.code).toBe('FS_UNSAFE_PATH');
+    expect(error.message).toBe(STATE_HOME_OVERLAP_MESSAGE);
+    expect(error.message).toContain('set DEBUGGEN_HOME to a directory outside the project');
+    expect(error.hint).toBe(STATE_HOME_OVERLAP_HINT);
+    expect(error.details).toMatchObject({
+      reason: STATE_HOME_OVERLAP_REASON,
+      relation: 'home-inside-project',
+    });
+    // Constant text: no surface of the refusal names either path.
+    expect(surfacesOf(error)).not.toContain(sandbox);
+  });
+
+  it('refuses a project inside the state root, and the state root itself', async () => {
+    const sandbox = overlapSandbox();
+    const home = directory(join(sandbox, 'state'));
+    const project = directory(join(home, 'shop'));
+
+    expect(
+      refusalOf(await requireProjectOutsideStateHome(home, project)).details?.['relation'],
+    ).toBe('project-inside-home');
+    expect(refusalOf(await requireProjectOutsideStateHome(home, home)).details?.['relation']).toBe(
+      'same-directory',
+    );
+  });
+
+  it('accepts a sibling that shares the project name as a prefix', async () => {
+    const sandbox = overlapSandbox();
+    const project = directory(join(sandbox, 'shop'));
+    const home = directory(join(sandbox, 'shop-state'));
+
+    expect(await requireProjectOutsideStateHome(home, project)).toStrictEqual({
+      ok: true,
+      value: project,
+    });
+  });
+
+  it('refuses a project whose path resolves into the state root through a link', async () => {
+    const sandbox = overlapSandbox();
+    const home = directory(join(sandbox, 'state'));
+    const inside = directory(join(home, 'checkouts', 'shop'));
+    symlinkSync(inside, join(sandbox, 'shop'));
+
+    const error = refusalOf(await requireProjectOutsideStateHome(home, `${sandbox}/shop`));
+
+    expect(error.details).toMatchObject({
+      reason: STATE_HOME_OVERLAP_REASON,
+      relation: 'project-inside-home',
+    });
+  });
+
+  it('refuses a linked project that contains the state root', async () => {
+    const sandbox = overlapSandbox();
+    const project = directory(join(sandbox, 'real-shop'));
+    const home = directory(join(project, '.debuggen'));
+    symlinkSync(project, join(sandbox, 'shop'));
+
+    const error = refusalOf(await requireProjectOutsideStateHome(home, `${sandbox}/shop`));
+
+    expect(error.details?.['relation']).toBe('home-inside-project');
+  });
+
+  it('judges a project root that does not exist by its nearest existing ancestor', async () => {
+    const sandbox = overlapSandbox();
+    const home = directory(join(sandbox, 'state'));
+
+    // Apart: a folder about to be created beside the state root.
+    expect(await requireProjectOutsideStateHome(home, `${sandbox}/new/shop`)).toStrictEqual({
+      ok: true,
+      value: `${sandbox}/new/shop`,
+    });
+    // Not apart: a folder that would be created inside it.
+    expect(
+      refusalOf(await requireProjectOutsideStateHome(home, `${home}/later/shop`)).details?.[
+        'relation'
+      ],
+    ).toBe('project-inside-home');
+  });
+
+  it('fails closed on a project root it cannot resolve, naming no path', async () => {
+    const denied = Object.assign(new Error('EACCES: permission denied, realpath /work/shop'), {
+      code: 'EACCES',
+    });
+
+    const error = refusalOf(
+      await requireProjectOutsideStateHome('/home/dev/.debuggen', '/work/shop', {
+        realpath: () => Promise.reject(denied),
+      }),
+    );
+
+    expect(error.code).toBe('FS_UNSAFE_PATH');
+    expect(error.message).toBe(PROJECT_ROOT_UNRESOLVABLE_MESSAGE);
+    expect(error.details).toMatchObject({
+      reason: PROJECT_ROOT_UNRESOLVABLE_REASON,
+      errno: 'EACCES',
+    });
+    expect(surfacesOf(error)).not.toContain('/work/shop');
+  });
+
+  it('never changes what loadServiceConfig resolves: the check is a separate, explicit read', () => {
+    // The loader stays pure; overlap is judged only by the asynchronous check.
+    const config = loadOk({ DEBUGGEN_HOME: '/work/shop/debuggen-state' });
+
+    expect(config.debuggenHome).toBe('/work/shop/debuggen-state');
+    expect(normalizePosix(config.databasePath)).toBe(
+      `/work/shop/debuggen-state/${SESSIONS_DATABASE_FILE_NAME}`,
+    );
   });
 });

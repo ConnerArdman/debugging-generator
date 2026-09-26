@@ -7,11 +7,11 @@
  *
  *  1. CALLER/DEFINER CONTRACT. {@link PROTOCOL_ROUTES} below is the definer
  *     side, transcribed from the specification: the protocol's route table
- *     (AAP 0.4.2 `POST /dev-server/launch` `{ projectRoot, command? }` →
+ *     (`POST /dev-server/launch` `{ projectRoot, command? }` →
  *     `{ devServerUrl, pid }`, `POST /dev-server/stop`, `GET /health`), the
  *     service's own credential route (`POST /dev-server/credential`
  *     `{ projectRoot }` → `{ token, expiresAt }`, defined by
- *     `apps/local-service/src/dev-server/launcher.ts`), and AAP 0.5.6 for who
+ *     `apps/local-service/src/dev-server/launcher.ts`), and `docs/SECURITY.md` §7 for who
  *     must present a credential. It is written from those definitions and
  *     NEVER from the module under test — deriving the accepted routes from the
  *     caller's own exports would make the pair self-consistent and blind to
@@ -24,13 +24,20 @@
  *     the launch route's optional `command`) 400. Every rejection is recorded,
  *     and the end-to-end cases assert the caller provokes none of them.
  *
+ *     `GET /health` answers the service-identity challenge from
+ *     {@link IDENTITY}, transcribed the same way, and impostor listeners —
+ *     no proof, a forged proof, a proof keyed by another credential, a proof
+ *     relayed from a service on another port — assert that no mode sends a
+ *     credential, or any request at all, to a listener that cannot prove it is
+ *     the service.
+ *
  *     `agrees with the definers of those routes` closes the loop against the
  *     real definers: it reads `packages/protocol/src/http.ts` for the three
  *     table routes, and the credential route's path and strict request and
  *     response schemas from whichever of the launcher or the protocol declares
  *     them. An in-process run against the real hono app with its auth
  *     middleware belongs to the service's own integration suite
- *     (`apps/local-service/test/integration/**`, AAP 0.8.3).
+ *     (`apps/local-service/test/integration/**`).
  *
  *  2. ENVIRONMENT CONTRACT. `.env.example` claims to document every variable
  *     the product and its suites read. That claim is re-derived from the tree:
@@ -43,8 +50,9 @@
  * concurrently with any other.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -54,25 +62,37 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   AUTH_FILE_NAME,
+  CHILD_ENV_ALLOWLIST,
   DEFAULT_SERVICE_HOST,
   DEFAULT_SERVICE_PORT,
   INGEST_PATH,
+  RESPONSE_MAX_BYTES,
+  SERVICE_IDENTITY_CHALLENGE_BYTES,
+  SERVICE_IDENTITY_CHALLENGE_HEADER,
+  SERVICE_IDENTITY_ENDPOINT_HEADER,
+  SERVICE_IDENTITY_PROOF_HEADER,
+  SERVICE_IDENTITY_PROOF_LABEL,
   SERVICE_ROUTES,
   awaitShutdownSignal,
   buildChildEnv,
   buildLaunchCommand,
+  checkServiceHealth,
+  computeServiceIdentityProof,
   describeToken,
   escapeCmdArgument,
   escapeCmdCommand,
+  isForwardedToChild,
   isLoopbackHostname,
   launchDevServer,
   main,
   parseArgs,
   requestServerAgentCredential,
+  resolveExtraEnv,
   resolveProject,
   resolveServiceBase,
   stopDevServer,
   usage,
+  verifyServiceIdentity,
   wrapForPlatform,
 } from './dev-instrumented.mjs';
 
@@ -80,7 +100,7 @@ import {
  * The definer's contract, transcribed from the protocol and from the service's
  * launcher rather than imported from the module under test.
  *
- * `authenticated` follows AAP 0.5.6: `GET /health` is one of the two
+ * `authenticated` follows `docs/SECURITY.md` §7: `GET /health` is one of the two
  * unauthenticated routes, and everything else requires a bearer credential —
  * for these three routes the editor credential the service wrote to
  * `$DEBUGGEN_HOME/auth.json`.
@@ -136,6 +156,62 @@ const LAUNCH = PROTOCOL_ROUTES.launch.path;
 const STOP = PROTOCOL_ROUTES.stop.path;
 const CREDENTIAL = PROTOCOL_ROUTES.credential.path;
 
+/**
+ * The service-identity contract of `GET /health`, transcribed from its
+ * specification rather than imported from the module under test, for the same
+ * reason as {@link PROTOCOL_ROUTES}: the stub services below answer with this
+ * transcription, so a caller that drifted from the contract fails against them.
+ *
+ * The probe sends `challengeHeader` (unpadded base64url of `challengeBytes`
+ * random bytes); the service answers with `endpointHeader` — the `host:port`
+ * it is bound to, IPv6 bracketed — and `proofHeader`, the unpadded base64url
+ * HMAC-SHA256 keyed by the UTF-8 editor credential over the UTF-8 message
+ * `${label}\n${challenge}\n${endpoint}` ({@link identityProof}).
+ */
+const IDENTITY = Object.freeze({
+  challengeHeader: 'X-Debuggen-Identity-Challenge',
+  proofHeader: 'X-Debuggen-Identity-Proof',
+  endpointHeader: 'X-Debuggen-Identity-Endpoint',
+  label: 'debuggen-service-identity/v1',
+  challengeBytes: 32,
+});
+
+/** An unpadded base64url string of 32 bytes: the form of a challenge and a proof. */
+const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/u;
+
+/**
+ * The identity proof as the contract defines it.
+ *
+ * @param {string} key editor credential
+ * @param {string} challenge the probe's challenge
+ * @param {string} endpoint `host:port` the answering service names
+ * @returns {string}
+ */
+function identityProof(key, challenge, endpoint) {
+  return createHmac('sha256', Buffer.from(key, 'utf8'))
+    .update(Buffer.from(`${IDENTITY.label}\n${challenge}\n${endpoint}`, 'utf8'))
+    .digest('base64url');
+}
+
+/**
+ * The identity headers a genuine service bound to `127.0.0.1:<port>` answers
+ * a probe with, or none when the request carries no challenge. The port is the
+ * one the request actually arrived on.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {string} [key] editor credential the proof is keyed by
+ * @returns {Record<string, string>}
+ */
+function identityAnswer(req, key = EDITOR_TOKEN) {
+  const challenge = req.headers[IDENTITY.challengeHeader.toLowerCase()];
+  if (typeof challenge !== 'string' || challenge === '') return {};
+  const endpoint = `127.0.0.1:${String(req.socket.localPort)}`;
+  return {
+    [IDENTITY.endpointHeader]: endpoint,
+    [IDENTITY.proofHeader]: identityProof(key, challenge, endpoint),
+  };
+}
+
 /** Repository root, derived from this file's location. */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -157,11 +233,12 @@ const EDITOR_TOKEN = `editor-credential-${randomUUID()}`;
 const SERVER_AGENT_TOKEN = `server-agent-credential-${randomUUID()}`;
 
 /**
- * How far in the future the stub's credential expires: the service's default
- * lifetime for a credential minted through the credential route
- * (`DEFAULT_CLI_CREDENTIAL_TTL_MS`, twelve hours).
+ * How far in the future the stub's credential answer puts `expiresAt`: the
+ * first lease the service grants a credential minted through the credential
+ * route (`DEFAULT_CLI_CREDENTIAL_LEASE_MS`, five minutes), which it renews
+ * while the dev server's preload stays connected.
  */
-const CREDENTIAL_LIFETIME_MS = 12 * 60 * 60 * 1000;
+const CREDENTIAL_LIFETIME_MS = 5 * 60 * 1000;
 
 /** What the stub service reports for a successful launch. */
 const LAUNCHED = Object.freeze({ devServerUrl: 'http://localhost:3000', pid: 4242 });
@@ -191,6 +268,7 @@ function captureStream() {
  * @property {string} method
  * @property {string} path
  * @property {string | undefined} authorization
+ * @property {string | undefined} challenge the identity challenge it carried
  * @property {unknown} body
  */
 
@@ -221,10 +299,16 @@ function captureStream() {
  *   `{ code, message }` error otherwise
  * @param {string} [options.credentialText] a raw `text/plain` body for the
  *   credential route instead of JSON
+ * @param {number} [options.identityProbes] how many health probes are answered
+ *   with the identity proof ({@link identityAnswer}) before later ones are
+ *   answered without it, as when another process has taken the port over;
+ *   default every probe
  * @returns {Promise<StubService>}
  */
 async function startStubService(options = {}) {
   const implemented = options.implemented ?? ALL_PROTOCOL_ROUTES;
+  const identityProbes = options.identityProbes ?? Number.POSITIVE_INFINITY;
+  let healthProbes = 0;
   const launchStatus = options.launchStatus ?? 200;
   const stopStatus = options.stopStatus ?? 200;
   const launchBody = options.launchBody ?? LAUNCHED;
@@ -258,10 +342,12 @@ async function startStubService(options = {}) {
 
       const requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
       const method = req.method ?? 'GET';
+      const challenge = req.headers[IDENTITY.challengeHeader.toLowerCase()];
       requests.push({
         method,
         path: requestPath,
         authorization: req.headers.authorization,
+        challenge: typeof challenge === 'string' ? challenge : undefined,
         body: parsed,
       });
 
@@ -328,7 +414,12 @@ async function startStubService(options = {}) {
       }
 
       if (requestPath === HEALTH) {
-        answer(200, { status: 'ok', version: '0.1.0', pairing: true });
+        healthProbes += 1;
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          ...(healthProbes <= identityProbes ? identityAnswer(req) : {}),
+        });
+        res.end(JSON.stringify({ status: 'ok', version: '0.1.0', pairing: true }));
         return;
       }
       if (requestPath === LAUNCH) {
@@ -423,10 +514,24 @@ async function createFixture(options = {}) {
 /**
  * @typedef {object} FakeDevServer
  * @property {string} binDir directory to put first on the child's `PATH`
- * @property {Record<string, string>} env variables the fake reads
+ * @property {Record<string, string>} env what the run's environment needs for
+ *   the fake to be found: a `PATH` with {@link FakeDevServer.binDir} first
  * @property {() => Record<string, string>} read what the fake recorded
+ * @property {() => Record<string, string>} readEnv the fake's whole
+ *   environment, as `env` printed it
  * @property {() => boolean} ran whether the fake was executed at all
  */
+
+/**
+ * Quote a value for a POSIX shell script: single quotes, each embedded `'`
+ * closed, escaped and reopened.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function shellQuote(value) {
+  return `'${value.replace(/'/gu, "'\\''")}'`;
+}
 
 /**
  * Put a fake package manager on a `PATH` of our own, so the local spawn mode
@@ -435,9 +540,12 @@ async function createFixture(options = {}) {
  *
  * It stands in for `pnpm`, which is what {@link buildLaunchCommand} looks up,
  * and it records the argv, working directory and the four injected variables
- * to a file rather than to stdout: `runDevServer` spawns with
- * `stdio: 'inherit'`, so anything it printed would land in the test runner's
- * own output.
+ * to one file, and the whole environment it received to another, rather than
+ * to stdout: `runDevServer` spawns with `stdio: 'inherit'`, so anything it
+ * printed would land in the test runner's own output. The dump paths and the
+ * exit status are written into the script itself, because the child inherits
+ * only the allowlisted part of the run's environment — a variable naming them
+ * would never reach it.
  *
  * @param {Fixture} fixture
  * @param {object} [options]
@@ -449,6 +557,8 @@ async function createFakeDevServer(fixture, options = {}) {
   await fs.promises.mkdir(binDir, { recursive: true });
 
   const dump = path.join(fixture.base, `dev-server-${randomUUID()}.txt`);
+  const envDump = `${dump}.env`;
+  const exitCode = options.exitCode ?? 0;
   const executable = path.join(binDir, 'pnpm');
   await fs.promises.writeFile(
     executable,
@@ -461,32 +571,35 @@ async function createFakeDevServer(fixture, options = {}) {
       '  echo "DEBUGGEN_INGEST_URL=$DEBUGGEN_INGEST_URL"',
       '  echo "DEBUGGEN_PROJECT_ROOT=$DEBUGGEN_PROJECT_ROOT"',
       '  echo "DEBUGGEN_TOKEN=${DEBUGGEN_TOKEN-<unset>}"',
-      '} > "$DEV_INSTRUMENTED_DUMP"',
-      'exit "${DEV_INSTRUMENTED_EXIT:-0}"',
+      `} > ${shellQuote(dump)}`,
+      `env > ${shellQuote(envDump)}`,
+      `exit ${String(exitCode)}`,
       '',
     ].join('\n'),
     'utf8',
   );
   await fs.promises.chmod(executable, 0o755);
 
+  /**
+   * @param {string} file
+   * @returns {Record<string, string>}
+   */
+  const parse = (file) => {
+    /** @type {Record<string, string>} */
+    const record = {};
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      const separator = line.indexOf('=');
+      if (separator > 0) record[line.slice(0, separator)] = line.slice(separator + 1);
+    }
+    return record;
+  };
+
   return {
     binDir,
-    env: {
-      PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
-      DEV_INSTRUMENTED_DUMP: dump,
-      DEV_INSTRUMENTED_EXIT: String(options.exitCode ?? 0),
-    },
+    env: { PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}` },
     ran: () => fs.existsSync(dump),
-    read: () => {
-      const text = fs.readFileSync(dump, 'utf8');
-      /** @type {Record<string, string>} */
-      const record = {};
-      for (const line of text.split('\n')) {
-        const separator = line.indexOf('=');
-        if (separator > 0) record[line.slice(0, separator)] = line.slice(separator + 1);
-      }
-      return record;
-    },
+    read: () => parse(dump),
+    readEnv: () => parse(envDump),
   };
 }
 
@@ -642,7 +755,7 @@ function strictObjectKeys(source, name) {
 describe('the route contract the caller is held to', () => {
   it('matches the service, route for route', () => {
     // Left side: the caller's exported list. Right side: the contract
-    // transcribed at the top of this file from the protocol (AAP 0.4.2) and the
+    // transcribed at the top of this file from the protocol's route table and the
     // service's launcher. A rename on either side fails here.
     expect([...SERVICE_ROUTES]).toEqual([HEALTH, LAUNCH, STOP, CREDENTIAL]);
     expect([HEALTH, LAUNCH, STOP, CREDENTIAL]).toEqual([
@@ -796,10 +909,41 @@ describe('launching through the service', () => {
     process.emit('SIGINT');
 
     await expect(run).resolves.toBe(0);
-    expect(started.routes()).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`, `POST ${STOP}`]);
-    expect(started.requests[2]?.body).toEqual({ projectRoot: fixture.projectDir });
+    // The service proves itself again before the stop carries the credential.
+    expect(started.routes()).toEqual([
+      `GET ${HEALTH}`,
+      `POST ${LAUNCH}`,
+      `GET ${HEALTH}`,
+      `POST ${STOP}`,
+    ]);
+    expect(started.requests[3]?.body).toEqual({ projectRoot: fixture.projectDir });
     expect(started.rejections).toEqual([]);
     expect(stdout.text()).toContain('stopped the dev server');
+  });
+
+  it('sends no stop to a listener that no longer proves it is the service', async () => {
+    // One proof, for the launch pre-flight; the port answers without one when
+    // the foreground run is interrupted, as after another process took it over.
+    service = await startStubService({ identityProbes: 1 });
+    const fixture = await createFixture();
+    const { context, stderr } = contextFor(fixture);
+    const started = service;
+
+    const run = main(['--service', started.base], context);
+    await waitFor(
+      () => started.requests.some((request) => request.path === LAUNCH),
+      'the launch request',
+    );
+    process.emit('SIGINT');
+
+    await expect(run).resolves.toBe(2);
+    expect(started.routes()).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`, `GET ${HEALTH}`]);
+    expect(started.requests[2]?.authorization).toBeUndefined();
+    const errors = squash(stderr.text());
+    expect(errors).toContain('did not prove it is the Debug Generator service');
+    expect(errors).toContain('the editor credential was not sent');
+    expect(errors).toContain('The stop request was not sent, so the dev server the service');
+    expect(stderr.text()).not.toContain(EDITOR_TOKEN);
   });
 
   it('reports a launch route the service does not implement, without trying another path', async () => {
@@ -1136,6 +1280,589 @@ describe('the service address trust boundary', () => {
   });
 });
 
+describe('the service identity proof', () => {
+  it('exports the contract the stub services answer with', () => {
+    expect(SERVICE_IDENTITY_CHALLENGE_HEADER).toBe(IDENTITY.challengeHeader);
+    expect(SERVICE_IDENTITY_PROOF_HEADER).toBe(IDENTITY.proofHeader);
+    expect(SERVICE_IDENTITY_ENDPOINT_HEADER).toBe(IDENTITY.endpointHeader);
+    expect(SERVICE_IDENTITY_PROOF_LABEL).toBe(IDENTITY.label);
+    expect(SERVICE_IDENTITY_CHALLENGE_BYTES).toBe(IDENTITY.challengeBytes);
+
+    const key = `editor-credential-${randomUUID()}`;
+    const challenge = randomBytes(IDENTITY.challengeBytes).toString('base64url');
+    for (const endpoint of ['127.0.0.1:43117', '[::1]:43117', 'localhost:20000']) {
+      const proof = computeServiceIdentityProof({ key, challenge, endpoint });
+      expect(proof).toBe(identityProof(key, challenge, endpoint));
+      expect(proof).toMatch(BASE64URL_32_BYTES);
+    }
+    // Every input is bound into the proof.
+    const reference = computeServiceIdentityProof({ key, challenge, endpoint: '127.0.0.1:1' });
+    expect(
+      computeServiceIdentityProof({ key: `${key}x`, challenge, endpoint: '127.0.0.1:1' }),
+    ).not.toBe(reference);
+    expect(
+      computeServiceIdentityProof({ key, challenge: `${challenge}x`, endpoint: '127.0.0.1:1' }),
+    ).not.toBe(reference);
+    expect(computeServiceIdentityProof({ key, challenge, endpoint: '127.0.0.1:2' })).not.toBe(
+      reference,
+    );
+    expect(() => computeServiceIdentityProof({ key: '', challenge, endpoint: 'a:1' })).toThrow(
+      TypeError,
+    );
+  });
+
+  it("agrees with the service's definition of the identity contract", async () => {
+    // Read the definer itself: the service's health route declares the header
+    // names and the label, and computes the proof as an unpadded base64url
+    // HMAC-SHA256. A rename on either side fails here rather than as a refused
+    // service. On this side the proven message is held to the IDENTITY
+    // transcription by the test above and by every stub answer.
+    const healthFile = 'apps/local-service/src/server/routes/health.ts';
+    const health = await fs.promises.readFile(path.join(REPO_ROOT, healthFile), 'utf8');
+    for (const [name, value] of [
+      ['SERVICE_IDENTITY_CHALLENGE_HEADER', IDENTITY.challengeHeader],
+      ['SERVICE_IDENTITY_PROOF_HEADER', IDENTITY.proofHeader],
+      ['SERVICE_IDENTITY_ENDPOINT_HEADER', IDENTITY.endpointHeader],
+      ['SERVICE_IDENTITY_PROOF_LABEL', IDENTITY.label],
+    ]) {
+      expect(health, `${healthFile} must declare ${name} = '${value}'`).toMatch(
+        new RegExp(`export const ${name}\\s*=\\s*'${escapeRegExp(value)}'`, 'u'),
+      );
+    }
+    expect(health, `${healthFile} must key an HMAC-SHA256 with the editor credential`).toMatch(
+      /createHmac\(\s*'sha256'/u,
+    );
+    expect(health, `${healthFile} must answer unpadded base64url`).toContain(
+      ".digest('base64url')",
+    );
+  });
+
+  it('sends a fresh challenge and no credential with every probe', async () => {
+    service = await startStubService();
+
+    await checkServiceHealth(service.base, EDITOR_TOKEN);
+    await checkServiceHealth(service.base, EDITOR_TOKEN);
+
+    expect(service.routes()).toEqual([`GET ${HEALTH}`, `GET ${HEALTH}`]);
+    const [first, second] = service.requests;
+    expect(first?.challenge).toMatch(BASE64URL_32_BYTES);
+    expect(second?.challenge).toMatch(BASE64URL_32_BYTES);
+    expect(first?.challenge).not.toBe(second?.challenge);
+    expect(service.requests.map((request) => request.authorization)).toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it('accepts a proof bound to the address dialled, in any spelling of that address', () => {
+    const key = `editor-credential-${randomUUID()}`;
+    const challenge = randomBytes(IDENTITY.challengeBytes).toString('base64url');
+    /** @type {Array<[string, string]>} base URL, then the endpoint the service names */
+    const accepted = [
+      ['http://127.0.0.1:43117', '127.0.0.1:43117'],
+      ['http://127.0.0.2:43117', '127.0.0.2:43117'],
+      ['http://[::1]:43117', '[::1]:43117'],
+      ['http://[::1]:43117', '[0:0:0:0:0:0:0:1]:43117'],
+      ['http://[::ffff:127.0.0.1]:43117', '[::FFFF:127.0.0.1]:43117'],
+      ['http://127.0.0.1', '127.0.0.1:80'],
+      ['https://127.0.0.1', '127.0.0.1:443'],
+      ['http://127.0.0.1:43117/debuggen', '127.0.0.1:43117'],
+    ];
+    for (const [base, endpoint] of accepted) {
+      const proof = identityProof(key, challenge, endpoint);
+      expect(verifyServiceIdentity({ key, challenge, base, proof, endpoint }), endpoint).toEqual({
+        ok: true,
+      });
+    }
+  });
+
+  it('refuses a genuine proof bound to another address, which a relay on the other address family would present', () => {
+    const key = `editor-credential-${randomUUID()}`;
+    const challenge = randomBytes(IDENTITY.challengeBytes).toString('base64url');
+    // A listener holding [::1]:P while the service holds 127.0.0.1:P can
+    // forward the challenge and return the service's real proof, which names
+    // 127.0.0.1:P. Only an exact match of the address the command dialled
+    // defeats that relay.
+    /** @type {Array<[string, string]>} base URL, then the endpoint the proof is bound to */
+    const relayed = [
+      ['http://127.0.0.1:43117', '[::1]:43117'],
+      ['http://[::1]:43117', '127.0.0.1:43117'],
+      ['http://127.0.0.2:43117', '127.0.0.1:43117'],
+      ['http://[::ffff:127.0.0.1]:43117', '127.0.0.1:43117'],
+    ];
+    for (const [base, endpoint] of relayed) {
+      const verdict = verifyServiceIdentity({
+        key,
+        challenge,
+        base,
+        proof: identityProof(key, challenge, endpoint),
+        endpoint,
+      });
+      expect(verdict.ok, `${base} ← ${endpoint}`).toBe(false);
+      expect(verdict.reason).toContain(`bound to "${endpoint}", not to`);
+    }
+  });
+
+  it('refuses a genuine proof bound to a host name, whichever host was dialled', () => {
+    const key = `editor-credential-${randomUUID()}`;
+    const challenge = randomBytes(IDENTITY.challengeBytes).toString('base64url');
+    // A name can stand for more than one listener: a proof bound to
+    // localhost:P would authenticate whichever of 127.0.0.1:P and [::1]:P
+    // answered, a relay included.
+    /** @type {Array<[string, string]>} base URL, then the endpoint the proof is bound to */
+    const named = [
+      ['http://127.0.0.1:43117', 'localhost:43117'],
+      ['http://[::1]:43117', 'localhost:43117'],
+      ['http://localhost:43117', 'localhost:43117'],
+      ['http://LOCALHOST:43117', 'LocalHost:43117'],
+      ['http://127.0.0.1:43117', 'app.localhost:43117'],
+    ];
+    for (const [base, endpoint] of named) {
+      const verdict = verifyServiceIdentity({
+        key,
+        challenge,
+        base,
+        proof: identityProof(key, challenge, endpoint),
+        endpoint,
+      });
+      expect(verdict.ok, `${base} ← ${endpoint}`).toBe(false);
+      expect(verdict.reason).toContain(
+        `bound to "${endpoint}", a host name rather than an address`,
+      );
+    }
+  });
+
+  it('refuses a proof that is missing, malformed, forged or bound elsewhere', () => {
+    const key = `editor-credential-${randomUUID()}`;
+    const challenge = randomBytes(IDENTITY.challengeBytes).toString('base64url');
+    const base = 'http://127.0.0.1:43117';
+    const endpoint = '127.0.0.1:43117';
+    const proof = identityProof(key, challenge, endpoint);
+
+    /** @type {Array<[Partial<{ proof: string | null, endpoint: string | null }>, string]>} */
+    const refusals = [
+      [{ proof: null }, `carries no ${IDENTITY.proofHeader} header`],
+      [{ endpoint: null }, `carries no ${IDENTITY.endpointHeader} header`],
+      [{ proof: null, endpoint: null }, `no ${IDENTITY.proofHeader} and no`],
+      [{ proof: '' }, `carries no ${IDENTITY.proofHeader}`],
+      [{ proof: 'short' }, 'not made with the editor credential'],
+      [{ proof: randomBytes(32).toString('base64url') }, 'not made with the editor credential'],
+      [
+        { proof: identityProof(`other-${randomUUID()}`, challenge, endpoint) },
+        'not made with the editor credential',
+      ],
+      [
+        { proof: identityProof(key, `${challenge}x`, endpoint) },
+        'not made with the editor credential',
+      ],
+      [{ proof: `${proof}=` }, 'not made with the editor credential'],
+    ];
+    for (const [override, reason] of refusals) {
+      const verdict = verifyServiceIdentity({ key, challenge, base, proof, endpoint, ...override });
+      expect(verdict.ok, reason).toBe(false);
+      expect(verdict.reason).toContain(reason);
+      expect(verdict.reason).not.toContain(key);
+      expect(verdict.reason).not.toContain(proof);
+    }
+
+    // Well-formed and correctly proved, but bound to an address this command
+    // does not target: a relayed proof.
+    for (const elsewhere of ['127.0.0.1:43118', '127.0.0.2:43117', '[::1]:43117']) {
+      const verdict = verifyServiceIdentity({
+        key,
+        challenge,
+        base,
+        proof: identityProof(key, challenge, elsewhere),
+        endpoint: elsewhere,
+      });
+      expect(verdict.ok, elsewhere).toBe(false);
+      expect(verdict.reason).toContain(`bound to "${elsewhere}", not to 127.0.0.1:43117`);
+    }
+
+    // Correctly proved over a value that is not a host:port.
+    for (const malformed of [
+      '127.0.0.1',
+      ':43117',
+      '::1:43117',
+      '[::1]',
+      '[::1]43117',
+      '[127.0.0.1]:43117',
+      '[]:43117',
+      '127.0.0.1:0',
+      '127.0.0.1:65536',
+      '127.0.0.1:12a',
+      '127.0.0.1:+80',
+      '127.0.0.1 :43117',
+      '127.0.0.1:43117\u202e',
+    ]) {
+      const verdict = verifyServiceIdentity({
+        key,
+        challenge,
+        base,
+        proof: identityProof(key, challenge, malformed),
+        endpoint: malformed,
+      });
+      expect(verdict.ok, malformed).toBe(false);
+      expect(verdict.reason).toContain('is not a host:port');
+      expect(verdict.reason).not.toContain('\u202e');
+    }
+  });
+
+  /**
+   * @typedef {'no-proof' | 'wrong-proof' | 'other-token' | 'relayed'} ImpostorKind
+   */
+
+  /**
+   * Start a listener that is not the service: it answers `GET /health` with a
+   * 200 and the identity headers `kind` calls for, answers every other request
+   * with a 200 and a body the caller would accept — so a caller that went on
+   * would visibly get further — and records every request.
+   *
+   * - `no-proof`: no identity headers at all;
+   * - `wrong-proof`: its real endpoint and a random proof of the right length;
+   * - `other-token`: its real endpoint and a proof keyed by another credential;
+   * - `relayed`: the challenge forwarded to a genuine stub service on another
+   *   port, and that service's proof and endpoint copied into the answer.
+   *
+   * @param {ImpostorKind} kind
+   * @returns {Promise<{ base: string, requests: Array<{ method: string, path: string, authorization: string | undefined }>, upstream: StubService | undefined, close: () => Promise<void> }>}
+   */
+  async function startImpostor(kind) {
+    const upstream = kind === 'relayed' ? await startStubService() : undefined;
+    /** @type {Array<{ method: string, path: string, authorization: string | undefined }>} */
+    const requests = [];
+    const otherKey = `editor-credential-${randomUUID()}`;
+
+    const server = http.createServer((req, res) => {
+      const requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+      requests.push({
+        method: req.method ?? 'GET',
+        path: requestPath,
+        authorization: req.headers.authorization,
+      });
+      req.resume();
+      req.on('end', () => {
+        if (requestPath !== HEALTH) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              ...LAUNCHED,
+              token: SERVER_AGENT_TOKEN,
+              expiresAt: Date.now() + CREDENTIAL_LIFETIME_MS,
+            }),
+          );
+          return;
+        }
+        const challenge = String(req.headers[IDENTITY.challengeHeader.toLowerCase()] ?? '');
+        const endpoint = `127.0.0.1:${String(req.socket.localPort)}`;
+
+        /** @type {Promise<Record<string, string>>} */
+        let headers;
+        if (kind === 'no-proof') {
+          headers = Promise.resolve({});
+        } else if (kind === 'wrong-proof') {
+          headers = Promise.resolve({
+            [IDENTITY.endpointHeader]: endpoint,
+            [IDENTITY.proofHeader]: randomBytes(32).toString('base64url'),
+          });
+        } else if (kind === 'other-token') {
+          headers = Promise.resolve({
+            [IDENTITY.endpointHeader]: endpoint,
+            [IDENTITY.proofHeader]: identityProof(otherKey, challenge, endpoint),
+          });
+        } else {
+          headers = globalThis
+            .fetch(`${upstream?.base ?? ''}${HEALTH}`, {
+              headers: { [IDENTITY.challengeHeader]: challenge },
+            })
+            .then(async (relayed) => {
+              await relayed.body?.cancel();
+              return {
+                [IDENTITY.endpointHeader]: relayed.headers.get(IDENTITY.endpointHeader) ?? '',
+                [IDENTITY.proofHeader]: relayed.headers.get(IDENTITY.proofHeader) ?? '',
+              };
+            });
+        }
+        // A relay whose upstream failed answers without identity headers,
+        // which the caller must refuse like any other unproved answer.
+        void headers
+          .catch(() => ({}))
+          .then((identity) => {
+            res.writeHead(200, { 'content-type': 'application/json', ...identity });
+            res.end(JSON.stringify({ status: 'ok' }));
+          });
+      });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+    return {
+      base: `http://127.0.0.1:${port}`,
+      requests,
+      upstream,
+      close: async () => {
+        await new Promise((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve(undefined));
+        });
+        await upstream?.close();
+      },
+    };
+  }
+
+  /** @type {Array<[string, ImpostorKind]>} */
+  const impostors = [
+    ['answers 200 without any proof', 'no-proof'],
+    ['answers with a proof that is not an HMAC of the challenge', 'wrong-proof'],
+    ['answers with a proof made with a different editor credential', 'other-token'],
+    ['relays the proof of the real service on another port', 'relayed'],
+  ];
+
+  /** @type {Array<[string, string[]]>} */
+  const modes = [
+    ['the default launch', ['--detach']],
+    ['--stop', ['--stop']],
+    ['--spawn-local', ['--spawn-local']],
+  ];
+
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  for (const [mode, flags] of modes) {
+    const test = flags.includes('--spawn-local') ? spawns : it;
+    for (const [what, kind] of impostors) {
+      test(`${mode} sends nothing to a listener that ${what}`, async () => {
+        const impostor = await startImpostor(kind);
+        const fixture = await createFixture();
+        const dev = await createFakeDevServer(fixture);
+        const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+        try {
+          const code = await main([...flags, '--service', impostor.base], context);
+
+          expect(code).toBe(2);
+          // One unauthenticated probe, and nothing after it: no POST and no
+          // request carrying the bearer credential.
+          expect(impostor.requests.map((entry) => `${entry.method} ${entry.path}`)).toEqual([
+            `GET ${HEALTH}`,
+          ]);
+          expect(impostor.requests.filter((entry) => entry.authorization !== undefined)).toEqual(
+            [],
+          );
+          if (impostor.upstream !== undefined) {
+            // The genuine service behind the relay was asked for its proof and
+            // for nothing else.
+            expect(impostor.upstream.routes()).toEqual([`GET ${HEALTH}`]);
+            expect(impostor.upstream.requests[0]?.authorization).toBeUndefined();
+          }
+
+          expect(stdout.text()).toBe('');
+          expect(dev.ran()).toBe(false);
+          const errors = squash(stderr.text());
+          expect(errors).toContain(
+            `the listener at ${impostor.base}${HEALTH} did not prove it is the Debug Generator service holding the editor credential in $DEBUGGEN_HOME/${AUTH_FILE_NAME}`,
+          );
+          expect(errors).toContain('the editor credential was not sent');
+          expect(errors).toContain('another process holds the port');
+          expect(errors).toContain('pnpm --filter @debuggen/local-service build');
+          expect(errors).toContain('different DEBUGGEN_HOME');
+          const reason = {
+            'no-proof': `carries no ${IDENTITY.proofHeader} and no ${IDENTITY.endpointHeader} header`,
+            'wrong-proof': 'not made with the editor credential',
+            'other-token': 'not made with the editor credential',
+            relayed: `bound to "127.0.0.1:${new URL(impostor.upstream?.base ?? 'http://x:1').port}"`,
+          }[kind];
+          expect(errors).toContain(reason);
+          if (flags.includes('--spawn-local')) expect(errors).toContain('Nothing was spawned');
+          expect(`${stdout.text()}${stderr.text()}`).not.toContain(EDITOR_TOKEN);
+        } finally {
+          await impostor.close();
+        }
+      });
+    }
+  }
+});
+
+describe('dialling the address that proves the service', () => {
+  /** @type {Array<() => Promise<void>>} */
+  const cleanups = [];
+  afterEach(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  });
+
+  /**
+   * A listener on another loopback address that shares the service's port —
+   * `[::1]:P` beside a service on `127.0.0.1:P` on a dual-stack machine,
+   * played here by `127.0.0.2:P` — and relays every challenge to the service,
+   * copying its genuine proof and endpoint into its own answer. It records
+   * what it receives.
+   *
+   * @param {string} host the relay's address
+   * @param {StubService} upstream the genuine service
+   * @returns {Promise<{ requests: Array<{ method: string, path: string, authorization: string | undefined }> }>}
+   */
+  async function startAddressRelay(host, upstream) {
+    const port = Number.parseInt(new URL(upstream.base).port, 10);
+    /** @type {Array<{ method: string, path: string, authorization: string | undefined }>} */
+    const requests = [];
+    const server = http.createServer((req, res) => {
+      requests.push({
+        method: req.method ?? 'GET',
+        path: new URL(req.url ?? '/', 'http://127.0.0.1').pathname,
+        authorization: req.headers.authorization,
+      });
+      req.resume();
+      const challenge = String(req.headers[IDENTITY.challengeHeader.toLowerCase()] ?? '');
+      void globalThis
+        .fetch(`${upstream.base}${HEALTH}`, { headers: { [IDENTITY.challengeHeader]: challenge } })
+        .then(async (relayed) => {
+          await relayed.body?.cancel();
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            [IDENTITY.endpointHeader]: relayed.headers.get(IDENTITY.endpointHeader) ?? '',
+            [IDENTITY.proofHeader]: relayed.headers.get(IDENTITY.proofHeader) ?? '',
+          });
+          res.end(JSON.stringify({ status: 'ok' }));
+        });
+    });
+    await new Promise((resolve) => server.listen(port, host, () => resolve(undefined)));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve(undefined));
+        }),
+    );
+    return { requests };
+  }
+
+  /**
+   * A stand-in for `node:dns/promises` `lookup` that answers `addresses` for
+   * `localhost` and records every call.
+   *
+   * @param {string[]} addresses
+   */
+  function lookupOf(addresses) {
+    /** @type {Array<[string, unknown]>} */
+    const calls = [];
+    /** @type {(hostname: string, options: { all: true, order: 'verbatim' }) => Promise<Array<{ address: string, family: number }>>} */
+    const lookup = async (hostname, options) => {
+      calls.push([hostname, options]);
+      return addresses.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+    };
+    return { lookup, calls };
+  }
+
+  it('probes an address as it is, without resolving anything', async () => {
+    const service = await startStubService();
+    cleanups.push(() => service.close());
+    const { lookup, calls } = lookupOf([]);
+
+    await expect(checkServiceHealth(service.base, EDITOR_TOKEN, { lookup })).resolves.toBe(
+      service.base,
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it('resolves a host name and pins the address that proves the service, past a relay on another address', async () => {
+    const service = await startStubService();
+    cleanups.push(() => service.close());
+    const relay = await startAddressRelay('127.0.0.2', service);
+    const port = new URL(service.base).port;
+    const { lookup, calls } = lookupOf(['127.0.0.2', '127.0.0.1']);
+
+    const pinned = await checkServiceHealth(`http://localhost:${port}/`, EDITOR_TOKEN, {
+      lookup,
+    });
+
+    expect(pinned).toBe(`http://127.0.0.1:${port}`);
+    expect(calls).toEqual([['localhost', { all: true, order: 'verbatim' }]]);
+    // The relay got one unauthenticated probe and was refused: its answer
+    // names 127.0.0.1, not the 127.0.0.2 it was dialled on.
+    expect(relay.requests).toEqual([{ method: 'GET', path: HEALTH, authorization: undefined }]);
+    // The service answered the relayed challenge and the direct one, and was
+    // sent no credential by either.
+    expect(service.routes()).toEqual([`GET ${HEALTH}`, `GET ${HEALTH}`]);
+    expect(service.requests.map((request) => request.authorization)).toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it('refuses, sending nothing else, when the only address of the name is a relay', async () => {
+    const service = await startStubService();
+    cleanups.push(() => service.close());
+    const relay = await startAddressRelay('127.0.0.2', service);
+    const port = new URL(service.base).port;
+    const { lookup } = lookupOf(['127.0.0.2']);
+
+    const refusal = checkServiceHealth(`http://localhost:${port}`, EDITOR_TOKEN, { lookup });
+
+    await expect(refusal).rejects.toThrow(
+      `the listener at http://127.0.0.2:${port}${HEALTH} did not prove it is the Debug Generator service`,
+    );
+    await expect(refusal).rejects.toThrow(`bound to "127.0.0.1:${port}", not to 127.0.0.2:${port}`);
+    expect(relay.requests.filter((request) => request.authorization !== undefined)).toEqual([]);
+  });
+
+  it('probes each loopback address of the name once, and no other address', async () => {
+    const service = await startStubService();
+    cleanups.push(() => service.close());
+    const port = new URL(service.base).port;
+    const { lookup } = lookupOf(['192.0.2.10', '127.0.0.1', '127.0.0.1']);
+
+    await expect(
+      checkServiceHealth(`http://localhost:${port}`, EDITOR_TOKEN, { lookup }),
+    ).resolves.toBe(`http://127.0.0.1:${port}`);
+    expect(service.routes()).toEqual([`GET ${HEALTH}`]);
+  });
+
+  it('refuses a name that resolves to no loopback address, or cannot be resolved', async () => {
+    await expect(
+      checkServiceHealth('http://localhost:43117', EDITOR_TOKEN, {
+        lookup: lookupOf(['192.0.2.10']).lookup,
+      }),
+    ).rejects.toThrow('the service host localhost resolves to no loopback address');
+    await expect(
+      checkServiceHealth('http://localhost:43117', EDITOR_TOKEN, {
+        lookup: async () => {
+          throw Object.assign(new Error('getaddrinfo ENOTFOUND localhost'), { code: 'ENOTFOUND' });
+        },
+      }),
+    ).rejects.toThrow('the service host localhost could not be resolved');
+  });
+
+  it('names every address it tried when none of them proves the service', async () => {
+    const closed = await startStubService();
+    const port = new URL(closed.base).port;
+    await closed.close();
+    const { lookup } = lookupOf(['127.0.0.2', '127.0.0.3']);
+
+    await expect(
+      checkServiceHealth(`http://localhost:${port}`, EDITOR_TOKEN, { lookup }),
+    ).rejects.toThrow(
+      new RegExp(
+        `none of the 2 loopback addresses localhost resolves to proved it is the Debug Generator service, so the editor credential was not sent: the local service is not answering http://127\\.0\\.0\\.2:${port}${HEALTH}: .*; the local service is not answering http://127\\.0\\.0\\.3:${port}${HEALTH}`,
+        'u',
+      ),
+    );
+  });
+
+  it('launches through the address that proved the service when --service names localhost', async () => {
+    const service = await startStubService();
+    cleanups.push(() => service.close());
+    const port = new URL(service.base).port;
+    const fixture = await createFixture();
+    const { context } = contextFor(fixture);
+
+    const code = await main(['--detach', '--service', `http://localhost:${port}`], context);
+
+    expect(code).toBe(0);
+    const launch = service.requests.find((request) => request.path === LAUNCH);
+    expect(launch?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
+  });
+});
+
 describe('the local spawn mode', () => {
   it('drops an inherited credential when the caller supplies none', () => {
     const childEnv = buildChildEnv({
@@ -1173,6 +1900,265 @@ describe('the local spawn mode', () => {
     // Neutral: the description of an absent credential claims nothing about
     // any mode.
     expect(describeToken(undefined)).toBe('<not set>');
+  });
+
+  /**
+   * Parent variables that must never reach a target project, each with a
+   * per-run value so its absence can be asserted by value as well as by name.
+   *
+   * @returns {Record<string, string>}
+   */
+  const parentSecrets = () => ({
+    ANTHROPIC_API_KEY: `sentinel-${randomUUID()}`,
+    GITHUB_TOKEN: `sentinel-${randomUUID()}`,
+    AWS_SECRET_ACCESS_KEY: `sentinel-${randomUUID()}`,
+    FOO_SECRET: `sentinel-${randomUUID()}`,
+    DEBUGGEN_PROVIDER: `sentinel-${randomUUID()}`,
+    VSCODE_IPC_HOOK: `sentinel-${randomUUID()}`,
+    npm_config_registry: `sentinel-${randomUUID()}`,
+  });
+
+  /** Parent variables on the allowlist, with the values the child must see. */
+  const ALLOWLISTED = Object.freeze({
+    HOME: '/home/developer',
+    DATABASE_URL: 'postgresql://localhost/debuggen_test',
+    NEXT_TELEMETRY_DISABLED: '1',
+    LC_ALL: 'C',
+    http_proxy: 'http://127.0.0.1:9',
+    DEBUGGEN_LOG_LEVEL: 'debug',
+  });
+
+  it('keeps every variable off the allowlist out of the child environment', () => {
+    const secrets = parentSecrets();
+    const childEnv = buildChildEnv({
+      preloadUrl: 'file:///tmp/register.mjs',
+      base: 'http://127.0.0.1:43117',
+      projectRoot: '/tmp/target',
+      token: 'server-agent-credential',
+      env: {
+        PATH: '/usr/bin',
+        ...ALLOWLISTED,
+        ...secrets,
+        DEBUGGEN_HOME: '/tmp/home',
+        // Differently cased spellings are other variables on POSIX.
+        Path: '/elsewhere',
+        node_options: '--require ./steal.js',
+      },
+      platform: 'linux',
+    });
+
+    expect(childEnv).toEqual({
+      PATH: '/usr/bin',
+      ...ALLOWLISTED,
+      NODE_OPTIONS: '--import file:///tmp/register.mjs',
+      DEBUGGEN_INGEST_URL: `http://127.0.0.1:43117${INGEST_PATH}`,
+      DEBUGGEN_PROJECT_ROOT: '/tmp/target',
+      DEBUGGEN_TOKEN: 'server-agent-credential',
+    });
+    for (const value of Object.values(secrets)) {
+      expect(JSON.stringify(childEnv)).not.toContain(value);
+    }
+  });
+
+  it('forwards the explicit extras, replacing a same-named parent variable', () => {
+    const childEnv = buildChildEnv({
+      preloadUrl: 'file:///tmp/register.mjs',
+      base: 'http://127.0.0.1:43117',
+      projectRoot: '/tmp/target',
+      token: 'server-agent-credential',
+      env: { PATH: '/usr/bin', FEATURE_FLAGS: 'inherited-only' },
+      extraEnv: { FEATURE_FLAGS: 'a,b', PORT: '3200', EMPTY: '' },
+      platform: 'linux',
+    });
+
+    expect(childEnv.FEATURE_FLAGS).toBe('a,b');
+    expect(childEnv.PORT).toBe('3200');
+    expect(childEnv.EMPTY).toBe('');
+    expect(childEnv.PATH).toBe('/usr/bin');
+
+    // The builder refuses the names only this command sets, whoever calls it.
+    for (const name of ['NODE_OPTIONS', 'DEBUGGEN_TOKEN', 'debuggen_ingest_url']) {
+      expect(() =>
+        buildChildEnv({
+          preloadUrl: 'file:///tmp/register.mjs',
+          base: 'http://127.0.0.1:43117',
+          projectRoot: '/tmp/target',
+          token: 'server-agent-credential',
+          env: {},
+          extraEnv: { [name]: 'x' },
+        }),
+      ).toThrow(/^--env "/u);
+    }
+  });
+
+  it('compares names case-insensitively on Windows and folds their spellings', () => {
+    const childEnv = buildChildEnv({
+      preloadUrl: 'file:///C:/repo/register.mjs',
+      base: 'http://127.0.0.1:43117',
+      projectRoot: 'C:\\target',
+      token: 'server-agent-credential',
+      env: {
+        Path: 'C:\\bin',
+        SystemRoot: 'C:\\Windows',
+        ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+        http_proxy: 'http://127.0.0.1:9',
+        Lc_All: 'C',
+        Node_Options: '--trace-warnings',
+        debuggen_token: 'stale-credential',
+        Anthropic_Api_Key: 'sentinel',
+        DEBUGGEN_HOME: 'C:\\home',
+      },
+      extraEnv: { PATH: 'C:\\override' },
+      platform: 'win32',
+    });
+
+    expect(childEnv).toEqual({
+      PATH: 'C:\\override',
+      SystemRoot: 'C:\\Windows',
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      http_proxy: 'http://127.0.0.1:9',
+      Lc_All: 'C',
+      NODE_OPTIONS: '--trace-warnings --import file:///C:/repo/register.mjs',
+      DEBUGGEN_INGEST_URL: `http://127.0.0.1:43117${INGEST_PATH}`,
+      DEBUGGEN_PROJECT_ROOT: 'C:\\target',
+      DEBUGGEN_TOKEN: 'server-agent-credential',
+    });
+
+    expect(isForwardedToChild('SystemRoot', 'win32')).toBe(true);
+    expect(isForwardedToChild('SystemRoot', 'linux')).toBe(false);
+    expect(isForwardedToChild('http_proxy', 'linux')).toBe(true);
+    expect(isForwardedToChild('Http_Proxy', 'linux')).toBe(false);
+    expect(isForwardedToChild('next_public_api', 'win32')).toBe(true);
+    expect(isForwardedToChild('Node_Options', 'win32')).toBe(false);
+    expect(isForwardedToChild('', 'linux')).toBe(false);
+  });
+
+  it('resolves --env against this terminal, and refuses an unset or repeated name', () => {
+    expect(
+      resolveExtraEnv(
+        [
+          { name: 'FORWARDED', value: undefined },
+          { name: 'GIVEN', value: 'a=b' },
+          { name: 'BLANK', value: '' },
+        ],
+        { FORWARDED: 'from-terminal' },
+        'linux',
+      ),
+    ).toEqual({ FORWARDED: 'from-terminal', GIVEN: 'a=b', BLANK: '' });
+
+    // Windows finds a bare name whatever its spelling in the environment.
+    expect(
+      resolveExtraEnv([{ name: 'path', value: undefined }], { Path: 'C:\\bin' }, 'win32'),
+    ).toEqual({ path: 'C:\\bin' });
+    // A name that is an own data property, never the prototype.
+    const proto = resolveExtraEnv([{ name: '__proto__', value: 'x' }], {}, 'linux');
+    expect(Object.getOwnPropertyDescriptor(proto, '__proto__')?.value).toBe('x');
+
+    expect(() => resolveExtraEnv([{ name: 'MISSING', value: undefined }], {}, 'linux')).toThrow(
+      '--env MISSING names a variable this terminal does not set',
+    );
+    expect(() =>
+      resolveExtraEnv([{ name: 'path', value: undefined }], { Path: '/usr/bin' }, 'linux'),
+    ).toThrow(/does not set/u);
+    expect(() =>
+      resolveExtraEnv(
+        [
+          { name: 'Foo', value: '1' },
+          { name: 'FOO', value: '2' },
+        ],
+        {},
+        'win32',
+      ),
+    ).toThrow(/given more than once/u);
+    expect(
+      resolveExtraEnv(
+        [
+          { name: 'Foo', value: '1' },
+          { name: 'FOO', value: '2' },
+        ],
+        {},
+        'linux',
+      ),
+    ).toEqual({ Foo: '1', FOO: '2' });
+  });
+
+  it("mirrors the service launcher's dev-server environment allowlist exactly", async () => {
+    // The script cannot import the TypeScript launcher, so it carries a copy of
+    // its allowlist. Read the launcher's own declarations and hold the copy to
+    // them: a name added to or removed from either side fails here.
+    const launcherFile = 'apps/local-service/src/dev-server/launcher.ts';
+    const launcher = await fs.promises.readFile(path.join(REPO_ROOT, launcherFile), 'utf8');
+    const drift = (/** @type {string} */ what) =>
+      `${launcherFile} ${what}; update CHILD_ENV_ALLOWLIST in scripts/dev-instrumented.mjs to match it`;
+
+    /** Every `const X_NAMES = [ ... ] as const;` body, by name. */
+    const arrays = new Map(
+      [
+        ...launcher.matchAll(/\bconst\s+([A-Z_]+_NAMES)\s*=\s*\[([\s\S]*?)\]\s*as\s+const\s*;/gu),
+      ].map((match) => [match[1] ?? '', match[2] ?? '']),
+    );
+    /**
+     * The names an array declares, its spreads of other arrays resolved.
+     *
+     * @param {string} name
+     * @returns {string[]}
+     */
+    const resolveNames = (name) => {
+      const body = arrays.get(name);
+      if (body === undefined) throw new Error(drift(`no longer declares ${name}`));
+      return [...body.matchAll(/\.\.\.([A-Z_]+_NAMES)|'([^']*)'/gu)].flatMap((token) =>
+        token[1] === undefined ? [token[2] ?? ''] : resolveNames(token[1]),
+      );
+    };
+
+    const declaration =
+      /export const DEV_SERVER_ENV_ALLOWLIST\b[^=]*=\s*Object\.freeze\(\{([\s\S]*?)\n\}\);/u.exec(
+        launcher,
+      );
+    expect(declaration, drift('no longer declares DEV_SERVER_ENV_ALLOWLIST')).not.toBeNull();
+    const allowlist = declaration?.[1] ?? '';
+
+    const namesBody = /names:\s*Object\.freeze\(\[([\s\S]*?)\]\)/u.exec(allowlist)?.[1];
+    expect(namesBody, drift('declares its names differently')).toBeDefined();
+    const spreads = [...(namesBody ?? '').matchAll(/\.\.\.([A-Z_]+_NAMES)/gu)].map(
+      (match) => match[1] ?? '',
+    );
+    expect(spreads.length, drift('lists its names without *_NAMES spreads')).toBeGreaterThan(0);
+    const launcherNames = spreads.flatMap((name) => resolveNames(name));
+
+    const prefixesBody = /prefixes:\s*Object\.freeze\(\[([^\]]*)\]\)/u.exec(allowlist)?.[1];
+    expect(prefixesBody, drift('declares its prefixes differently')).toBeDefined();
+    const launcherPrefixes = [...(prefixesBody ?? '').matchAll(/'([^']*)'/gu)].map(
+      (match) => match[1] ?? '',
+    );
+
+    const lowerSource =
+      /posixLowercaseNames:\s*Object\.freeze\(\s*([A-Z_]+_NAMES)\.map\(\s*\(name\)\s*=>\s*name\.toLowerCase\(\)\s*\)\s*\)/u.exec(
+        allowlist,
+      )?.[1];
+    expect(lowerSource, drift('derives its POSIX lower-case names differently')).toBeDefined();
+    const launcherLowercase = resolveNames(lowerSource ?? '').map((name) => name.toLowerCase());
+
+    // The matching rule itself: upper-cased on Windows, exact elsewhere.
+    expect(launcher, drift('compares names differently')).toMatch(
+      /const key = platform === 'win32' \? name\.toUpperCase\(\) : name;/u,
+    );
+
+    const sorted = (/** @type {readonly string[]} */ values) => [...values].sort();
+    expect(sorted(CHILD_ENV_ALLOWLIST.names), drift('lists other names')).toEqual(
+      sorted(launcherNames),
+    );
+    expect(sorted(CHILD_ENV_ALLOWLIST.prefixes), drift('lists other prefixes')).toEqual(
+      sorted(launcherPrefixes),
+    );
+    expect(
+      sorted(CHILD_ENV_ALLOWLIST.posixLowercaseNames),
+      drift('lists other POSIX lower-case names'),
+    ).toEqual(sorted(launcherLowercase));
+    // The extraction found the lists it is meant to, not an empty match.
+    expect(launcherNames).toContain('DATABASE_URL');
+    expect(launcherNames).toContain('PROGRAMFILES(X86)');
+    expect(launcherLowercase).toContain('http_proxy');
   });
 
   it('asks the credential route for a scoped credential and returns it verbatim', async () => {
@@ -1260,6 +2246,7 @@ describe('the local spawn mode', () => {
       expect(service.routes()).toEqual([`GET ${HEALTH}`, `POST ${CREDENTIAL}`]);
       expect(service.rejections).toEqual([]);
       expect(service.requests[0]?.authorization).toBeUndefined();
+      expect(service.requests[0]?.challenge).toMatch(BASE64URL_32_BYTES);
       expect(service.requests[1]?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
       expect(service.requests[1]?.body).toEqual({ projectRoot: fixture.projectDir });
 
@@ -1279,20 +2266,82 @@ describe('the local spawn mode', () => {
         expect(stderr.text()).not.toContain(secret);
       }
 
-      // The banner describes the credential by length and expiry only, and says
-      // plainly that nothing revokes it when the child exits.
+      // The banner describes the credential by length and the end of its first
+      // lease only, and says how the service renews and revokes it.
       const banner = squash(stdout.text());
       expect(banner).toContain(`DEBUGGEN_TOKEN <set, ${SERVER_AGENT_TOKEN.length} bytes>`);
-      expect(banner).toContain(`expires ${new Date(service.expiresAt).toISOString()}`);
+      expect(banner).toContain(
+        `lease ends ${new Date(service.expiresAt).toISOString()} (renewed while the dev server runs)`,
+      );
       expect(banner).toContain('This run is AUTHENTICATED');
-      expect(banner).toContain('The service has no revoke route');
-      expect(banner).toContain('the credential is not revoked when the dev server exits');
+      expect(banner).toContain('the service renews it while the dev server');
+      expect(banner).toContain('It is revoked when the dev server disconnects, 20 seconds after');
+      expect(banner).toContain('shortly after the dev server exits, Ctrl-C included');
+      expect(banner).toContain('lapses within 5 minutes');
+      expect(banner).not.toContain('no revoke route');
+      expect(banner).not.toContain('not revoked');
+    },
+  );
+
+  spawns(
+    'starts the dev server with the allowlisted environment and the --env extras, and no other secret',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture);
+      const secrets = parentSecrets();
+      const { context, stdout, stderr } = contextFor(fixture, {
+        ...dev.env,
+        ...ALLOWLISTED,
+        ...secrets,
+        FORWARDED_ONE: 'from-this-terminal',
+        DEBUGGEN_TOKEN: 'stale-credential-from-another-process',
+      });
+
+      const code = await main(
+        [
+          '--spawn-local',
+          '--env',
+          'FORWARDED_ONE',
+          '--env=EXTRA_FLAG=on',
+          '--service',
+          service.base,
+        ],
+        context,
+      );
+
+      expect(stderr.text()).toBe('');
+      expect(code).toBe(0);
+
+      // What the child process really received, as `env` printed it.
+      const received = dev.readEnv();
+      for (const [name, value] of Object.entries(secrets)) {
+        expect(received, `${name} reached the dev server`).not.toHaveProperty(name);
+        expect(Object.values(received)).not.toContain(value);
+      }
+      expect(received).not.toHaveProperty('DEBUGGEN_HOME');
+      for (const [name, value] of Object.entries(ALLOWLISTED)) {
+        expect(received[name], name).toBe(value);
+      }
+      expect(received.PATH).toBe(dev.env.PATH);
+      expect(received.FORWARDED_ONE).toBe('from-this-terminal');
+      expect(received.EXTRA_FLAG).toBe('on');
+      expect(received.DEBUGGEN_TOKEN).toBe(SERVER_AGENT_TOKEN);
+      expect(received.DEBUGGEN_PROJECT_ROOT).toBe(fixture.projectDir);
+      expect(received.NODE_OPTIONS).toBe(`--import ${fixture.preloadUrl}`);
+
+      // The banner names the extras and shows none of their values.
+      const banner = squash(stdout.text());
+      expect(banner).toContain('--env FORWARDED_ONE, EXTRA_FLAG (values not shown)');
+      expect(banner).not.toContain('from-this-terminal');
+      expect(banner).toContain('The dev server inherits only the part of this terminal');
     },
   );
 
   /**
    * @typedef {object} SpawnRefusal
    * @property {string} name what goes wrong, for the test title
+   * @property {string[]} [args] arguments before `--spawn-local`
    * @property {Parameters<typeof startStubService>[0]} [stub] stub service
    *   options; omitted with `down`
    * @property {boolean} [down] run against an address nothing listens on
@@ -1321,6 +2370,14 @@ describe('the local spawn mode', () => {
       withCredential: false,
       stub: {},
       expected: ['no editor credential'],
+      routes: [],
+    },
+    {
+      name: '--env names a variable this terminal does not set',
+      args: ['--env', 'NOT_SET_IN_THIS_TERMINAL'],
+      stub: {},
+      expected: ['--env NOT_SET_IN_THIS_TERMINAL names a variable this terminal does not set'],
+      // Resolved before the service is asked anything, so nothing is minted.
       routes: [],
     },
     {
@@ -1387,7 +2444,10 @@ describe('the local spawn mode', () => {
       const base = started === undefined ? await closedServiceAddress() : started.base;
       const { context, stdout, stderr } = contextFor(fixture, dev.env);
 
-      const code = await main(['--spawn-local', '--service', base], context);
+      const code = await main(
+        [...(refusal.args ?? []), '--spawn-local', '--service', base],
+        context,
+      );
 
       expect(code).toBe(2);
       expect(dev.ran()).toBe(false);
@@ -1408,11 +2468,11 @@ describe('the local spawn mode', () => {
     });
   }
 
-  it('documents the mode it implements: authenticated, service-dependent, expiring, never revoked', () => {
+  it('documents the mode it implements: authenticated, service-dependent, a lease revoked when the dev server disconnects', () => {
     const text = usage();
     const options = text.slice(text.indexOf('\nOptions\n'));
     const start = options.indexOf('  --spawn-local');
-    const paragraph = squash(options.slice(start, options.indexOf('  --stop ', start)));
+    const paragraph = squash(options.slice(start, options.indexOf('  --env ', start)));
 
     // The claim and the behaviour asserted above have to stay the same claim.
     expect(paragraph).toContain(`through POST ${CREDENTIAL}`);
@@ -1420,19 +2480,29 @@ describe('the local spawn mode', () => {
       `AUTHENTICATED: it needs the running service and ${AUTH_FILE_NAME}`,
     );
     expect(paragraph).toContain('when the credential cannot be obtained nothing is spawned');
-    expect(paragraph).toContain('The credential expires at the time the banner shows');
     expect(paragraph).toContain(
-      'the service has no revoke route, so it is not revoked when the child exits',
+      'The credential is a lease the service renews while the dev server runs and revokes when the dev server disconnects; otherwise it lapses within 5 minutes.',
     );
 
     const walkthrough = squash(
       text.slice(text.indexOf('What it does (--spawn-local)'), text.indexOf('\nOptions\n')),
     );
     expect(walkthrough).toContain(`POST {service}${CREDENTIAL} with { projectRoot }`);
+    expect(walkthrough).toContain('expiresAt being the end of the first lease');
     expect(walkthrough).toContain(
       `This is an AUTHENTICATED run: it needs a running service and ${AUTH_FILE_NAME}`,
     );
-    expect(walkthrough).toContain('the credential is not revoked when the child exits');
+    expect(walkthrough).toContain('its first lease ends (5 minutes after minting)');
+    expect(walkthrough).toContain(
+      "the service renews it while the dev server's preload keeps its server-agent control connection open",
+    );
+    expect(walkthrough).toContain(
+      'revokes it when the dev server disconnects — 20 seconds after that connection is gone',
+    );
+    expect(walkthrough).toContain('and when the service shuts down');
+    expect(walkthrough).toContain('A lease nothing renews lapses within 5 minutes');
+    expect(walkthrough).toContain('debuggen.rotateServiceToken revokes it at once');
+    expect(walkthrough).toContain('This command itself renews and revokes nothing');
 
     // The exit-code table agrees that every --spawn-local failure precedes the
     // spawn.
@@ -1441,8 +2511,8 @@ describe('the local spawn mode', () => {
       'in --spawn-local every such failure happens before the spawn, and the message says nothing was spawned',
     );
 
-    // The claims of the unauthenticated mode this replaced are gone everywhere.
-    for (const stale of [
+    // The help text claims no unauthenticated mode.
+    for (const unauthenticated of [
       'WITHOUT a credential',
       'stays inert',
       'runs offline',
@@ -1450,7 +2520,20 @@ describe('the local spawn mode', () => {
       'nor a running service',
       'a note rather than a failure',
     ]) {
-      expect(squash(text)).not.toContain(stale);
+      expect(squash(text)).not.toContain(unauthenticated);
+    }
+    // Neither the help text nor any comment in the script claims a long-lived
+    // credential that nothing revokes.
+    for (const unrevoked of [
+      'no revoke route',
+      'not revoked',
+      'never revoked',
+      'nothing revokes',
+      '12 hours',
+      'twelve hours',
+    ]) {
+      expect(squash(text), unrevoked).not.toContain(unrevoked);
+      expect(squash(SCRIPT_SOURCE), unrevoked).not.toContain(unrevoked);
     }
   });
 });
@@ -1602,9 +2685,9 @@ describe('response and project text that reaches the terminal', () => {
   spawns(
     'reports a credential answer cut off mid-body as a pre-spawn failure, not a stack',
     async () => {
-      const scripted = await startScriptedServer((_req, res, requestPath) => {
+      const scripted = await startScriptedServer((req, res, requestPath) => {
         if (requestPath === HEALTH) {
-          res.writeHead(200, { 'content-type': 'application/json' });
+          res.writeHead(200, { 'content-type': 'application/json', ...identityAnswer(req) });
           res.end('{"status":"ok"}');
           return;
         }
@@ -1635,6 +2718,220 @@ describe('response and project text that reaches the terminal', () => {
       }
     },
   );
+
+  /** One mebibyte: far past the cap, and what an oversized answer carries here. */
+  const ONE_MIB = 1024 * 1024;
+
+  /**
+   * A credential answer the caller would accept, preceded by `padding` bytes of
+   * JSON whitespace: a caller that read the whole body would parse it and go
+   * on, so refusing it is the cap's doing and nothing else's.
+   *
+   * @param {number} padding
+   * @returns {Buffer}
+   */
+  const paddedCredentialAnswer = (padding) =>
+    Buffer.concat([
+      Buffer.alloc(padding, 0x20),
+      Buffer.from(
+        JSON.stringify({
+          token: SERVER_AGENT_TOKEN,
+          expiresAt: Date.now() + CREDENTIAL_LIFETIME_MS,
+        }),
+        'utf8',
+      ),
+    ]);
+
+  /**
+   * Stream a body without a `Content-Length` (chunked), 16 KiB at a time and
+   * honouring backpressure, until `total` bytes are sent — or, with no
+   * `total`, until the client goes away.
+   *
+   * @param {import('node:http').ServerResponse} res
+   * @param {Buffer | undefined} total the whole body, or `undefined` for an
+   *   endless one
+   * @returns {void}
+   */
+  const streamChunked = (res, total) => {
+    res.on('error', () => undefined);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    const chunkSize = 16 * 1024;
+    let offset = 0;
+    const pump = () => {
+      if (res.destroyed || res.writableEnded) return;
+      if (total !== undefined && offset >= total.length) {
+        res.end();
+        return;
+      }
+      const chunk =
+        total === undefined
+          ? Buffer.alloc(chunkSize, 0x20)
+          : total.subarray(offset, offset + chunkSize);
+      offset += chunk.length;
+      if (res.write(chunk)) setImmediate(pump);
+      else res.once('drain', pump);
+    };
+    pump();
+  };
+
+  it('caps every answer at 64 KiB', () => {
+    expect(RESPONSE_MAX_BYTES).toBe(64 * 1024);
+  });
+
+  spawns(
+    'refuses a credential answer that streams 1 MiB without a Content-Length, spawning nothing',
+    async () => {
+      const scripted = await startScriptedServer((req, res, requestPath) => {
+        if (requestPath === HEALTH) {
+          res.writeHead(200, { 'content-type': 'application/json', ...identityAnswer(req) });
+          res.end('{"status":"ok"}');
+          return;
+        }
+        streamChunked(res, paddedCredentialAnswer(ONE_MIB));
+      });
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture);
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+      try {
+        const code = await main(['--spawn-local', '--service', scripted.base], context);
+
+        expect(code).toBe(2);
+        expect(dev.ran()).toBe(false);
+        expect(stdout.text()).toBe('');
+        expect(scripted.routes).toEqual([`GET ${HEALTH}`, `POST ${CREDENTIAL}`]);
+        const errors = squash(stderr.text());
+        expect(errors).toContain(
+          `${scripted.base}${CREDENTIAL} answered more than 64 KiB (status 200); the reply was discarded unread`,
+        );
+        expect(errors).toContain('It was neither parsed nor shown');
+        expect(errors).toContain('the service revokes it at the end of its first lease');
+        expect(errors).toContain('Nothing was spawned');
+        expect(errors).not.toContain('unexpected failure');
+        expect(stderr.text()).not.toContain(SERVER_AGENT_TOKEN);
+        expect(stderr.text()).not.toContain(EDITOR_TOKEN);
+      } finally {
+        await scripted.close();
+      }
+    },
+  );
+
+  it('cancels an endless answer as soon as it passes the cap, instead of waiting it out', async () => {
+    const scripted = await startScriptedServer((_req, res) => streamChunked(res, undefined));
+
+    try {
+      const started = Date.now();
+      const failure = await requestServerAgentCredential({
+        base: scripted.base,
+        editorToken: EDITOR_TOKEN,
+        projectRoot: path.join(os.tmpdir(), 'some-project'),
+      }).then(
+        () => undefined,
+        (/** @type {unknown} */ error) => error,
+      );
+
+      // Read to the end, the body would have run into the 5 s request timeout
+      // ("no answer within"); the cap stops the read long before that.
+      expect(failure).toBeInstanceOf(Error);
+      expect(/** @type {Error} */ (failure).message).toContain(
+        'answered more than 64 KiB (status 200); the reply was discarded unread',
+      );
+      expect(Date.now() - started).toBeLessThan(4_000);
+    } finally {
+      await scripted.close();
+    }
+  });
+
+  it('refuses a launch answer whose Content-Length is over the cap, before reading it', async () => {
+    const scripted = await startScriptedServer((req, res, requestPath) => {
+      if (requestPath === HEALTH) {
+        res.writeHead(200, { 'content-type': 'application/json', ...identityAnswer(req) });
+        res.end('{"status":"ok"}');
+        return;
+      }
+      // Declares 1 MiB, sends a complete launch answer, then holds the rest
+      // back: a caller that started reading would wait for bytes that never
+      // come and fail on its timeout instead.
+      res.on('error', () => undefined);
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': String(ONE_MIB),
+      });
+      res.write(JSON.stringify(LAUNCHED));
+    });
+    const fixture = await createFixture();
+    const { context, stdout, stderr } = contextFor(fixture);
+
+    try {
+      const started = Date.now();
+      const code = await main(['--service', scripted.base, '--detach'], context);
+
+      expect(code).toBe(2);
+      expect(Date.now() - started).toBeLessThan(4_000);
+      // No launch report: the answer that would have named the dev server was
+      // never read.
+      expect(stdout.text()).toBe('');
+      expect(scripted.routes).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`]);
+      const errors = squash(stderr.text());
+      expect(errors).toContain(
+        `${scripted.base}${LAUNCH} answered more than 64 KiB (status 200); the reply was discarded unread`,
+      );
+      expect(errors).toContain('The service may have started a dev server before it answered');
+      expect(errors).toContain('--stop --project');
+      expect(errors).not.toContain(LAUNCHED.devServerUrl);
+    } finally {
+      await scripted.close();
+    }
+  });
+
+  it('parses an answer of exactly 64 KiB and refuses one byte more, declared or streamed', async () => {
+    const credentialLength = paddedCredentialAnswer(0).length;
+    const atCap = paddedCredentialAnswer(RESPONSE_MAX_BYTES - credentialLength);
+    const overCap = paddedCredentialAnswer(RESPONSE_MAX_BYTES - credentialLength + 1);
+    expect(atCap.length).toBe(RESPONSE_MAX_BYTES);
+    expect(overCap.length).toBe(RESPONSE_MAX_BYTES + 1);
+
+    /** @type {Array<[string, Buffer, boolean]>} */
+    const cases = [
+      ['declared', atCap, false],
+      ['declared', overCap, false],
+      ['streamed', atCap, true],
+      ['streamed', overCap, true],
+    ];
+    for (const [how, body, chunked] of cases) {
+      const scripted = await startScriptedServer((_req, res) => {
+        if (chunked) {
+          streamChunked(res, body);
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        });
+        res.end(body);
+      });
+      try {
+        const outcome = await requestServerAgentCredential({
+          base: scripted.base,
+          editorToken: EDITOR_TOKEN,
+          projectRoot: path.join(os.tmpdir(), 'some-project'),
+        }).then(
+          (credential) => credential,
+          (/** @type {unknown} */ error) => error,
+        );
+
+        const label = `${how} ${String(body.length)} bytes`;
+        if (body.length <= RESPONSE_MAX_BYTES) {
+          expect(outcome, label).toMatchObject({ token: SERVER_AGENT_TOKEN });
+        } else {
+          expect(outcome, label).toBeInstanceOf(Error);
+          expect(/** @type {Error} */ (outcome).message, label).toContain('more than 64 KiB');
+        }
+      } finally {
+        await scripted.close();
+      }
+    }
+  });
 
   it('shows bidirectional and other invisible characters of a package name as escapes', async () => {
     const fixture = await createFixture();
@@ -2113,9 +3410,10 @@ describe('the command as a process', () => {
       () => started.requests.some((request) => request.path === LAUNCH),
       'the launch request from the child process',
     );
-    // The regression this guards: Node's signal watchers do not hold the event
-    // loop open, so a foreground wait with nothing else pending used to exit
-    // with status 13 the instant the launch was reported.
+    // The foreground command must stay alive until a shutdown signal arrives.
+    // Node's signal watchers do not hold the event loop open, so the wait keeps
+    // its own timer; the process must therefore still be running a quarter
+    // second after the launch was reported, with no stop request sent.
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(child.exitCode).toBeNull();
     expect(started.requests.some((request) => request.path === STOP)).toBe(false);
@@ -2124,7 +3422,12 @@ describe('the command as a process', () => {
     const result = await exited;
 
     expect(result).toEqual({ code: 0, signal: null });
-    expect(started.routes()).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`, `POST ${STOP}`]);
+    expect(started.routes()).toEqual([
+      `GET ${HEALTH}`,
+      `POST ${LAUNCH}`,
+      `GET ${HEALTH}`,
+      `POST ${STOP}`,
+    ]);
     expect(started.rejections).toEqual([]);
     expect(output).toContain('stopped the dev server');
     expect(output).not.toContain(EDITOR_TOKEN);
@@ -2169,6 +3472,50 @@ describe('argument parsing', () => {
     expect(parseArgs(['--detach']).detach).toBe(true);
     expect(parseArgs(['--stop']).stop).toBe(true);
     expect(parseArgs(['--project=../elsewhere']).project).toBe('../elsewhere');
+  });
+
+  it('collects repeatable --env extras for --spawn-local, in order', () => {
+    expect(parseArgs(['--spawn-local']).extraEnv).toEqual([]);
+    expect(
+      parseArgs([
+        '--spawn-local',
+        '--env',
+        'FORWARDED',
+        '--env=GIVEN=a=b',
+        '--env',
+        'BLANK=',
+        '--env',
+        '_under_score1',
+      ]).extraEnv,
+    ).toEqual([
+      { name: 'FORWARDED', value: undefined },
+      { name: 'GIVEN', value: 'a=b' },
+      { name: 'BLANK', value: '' },
+      { name: '_under_score1', value: undefined },
+    ]);
+  });
+
+  it('refuses an --env that is malformed, reserved, repeated or outside --spawn-local', () => {
+    /** @type {Array<[string[], RegExp]>} */
+    const refusals = [
+      [['--spawn-local', '--env', '1ST'], /--env "1ST" is not a variable name/u],
+      [['--spawn-local', '--env', 'A-B=1'], /--env "A-B" is not a variable name/u],
+      [['--spawn-local', '--env', '=value'], /--env "" is not a variable name/u],
+      [['--spawn-local', '--env', 'NODE_OPTIONS=--inspect'], /is set by this command/u],
+      [['--spawn-local', '--env', 'node_options'], /is set by this command/u],
+      [['--spawn-local', '--env', 'DEBUGGEN_TOKEN=x'], /DEBUGGEN_ namespace/u],
+      [['--spawn-local', '--env', 'DEBUGGEN_LOG_LEVEL=debug'], /DEBUGGEN_ namespace/u],
+      [['--spawn-local', '--env', 'debuggen_home'], /DEBUGGEN_ namespace/u],
+      [['--spawn-local', '--env', 'A=1\0'], /cannot contain a NUL/u],
+      [['--spawn-local', '--env', 'A=1', '--env', 'A=2'], /--env A is given more than once/u],
+      [['--spawn-local', '--env'], /--env needs a value/u],
+      [['--env', 'A=1'], /--env applies only to --spawn-local/u],
+      [['--detach', '--env', 'A=1'], /--env applies only to --spawn-local/u],
+      [['--stop', '--env', 'A'], /--env applies only to --spawn-local/u],
+    ];
+    for (const [argv, message] of refusals) {
+      expect(() => parseArgs(argv), argv.join(' ')).toThrow(message);
+    }
   });
 });
 

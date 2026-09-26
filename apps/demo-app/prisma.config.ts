@@ -115,9 +115,10 @@ function loadLocalEnvFile(): void {
  * yields Prisma's actionable "the datasource.url property is required" message
  * instead of a parse error.
  *
- * This is a presence probe only. The value handed to Prisma always comes from
- * `env()`, which is the accessor the CLI expects, and is never read, defaulted or
- * logged here.
+ * This is a presence probe only: the value is inspected here solely to see
+ * whether it is non-blank. The connection value handed to Prisma always comes
+ * from `env()`, which is the accessor the CLI expects, and it is never defaulted
+ * or logged here.
  *
  * @returns `true` when `DATABASE_URL` holds a non-blank value.
  */
@@ -127,35 +128,24 @@ function hasDatabaseUrl(): boolean {
 }
 
 /**
- * The connection URL handed to a fully offline `prisma migrate diff` when
- * `DATABASE_URL` is absent.
+ * The connection URL handed to a fully offline `prisma migrate diff`: supplied
+ * only when `DATABASE_URL` is absent (unset or blank) and neither
+ * `--from-config-datasource` nor `--to-config-datasource` is named.
  *
  * `migrate diff` is a schema-engine command, and the engine needs a datasource
  * *dialect* even for a diff whose two endpoints are both offline — an empty
  * datamodel, a `.prisma` file, a migrations directory. Without one it renders
  * nothing: `prisma migrate diff --from-empty --to-schema prisma/schema.prisma
- * --script` exits 0 and writes zero bytes, so the documented way of
- * regenerating a migration (redirecting that output into
- * `prisma/migrations/0001_init/migration.sql`) truncates the migration to
- * nothing and still reports success. Measured on prisma 7.10.0: 0 bytes with no
- * datasource, 9192 bytes of DDL with one. Contributing this URL is what turns
- * that silent truncation into the complete script.
+ * --script` exits 0 and writes zero bytes, so redirecting that output into a
+ * migration file silently truncates the file. This URL supplies the dialect,
+ * and the complete DDL script is rendered.
  *
- * It is dialled by nothing. Those endpoints open no connection — `migrate diff`
- * is read-only and reads a live database only through
- * `--from-config-datasource` / `--to-config-datasource`, which are excluded
- * below — and the URL could not connect if it were: port 1 (`tcpmux`) is not
- * where PostgreSQL listens, and 127.0.0.1 leaves the machine's loopback.
- *
- * It carries no credential, which is the point of the shape chosen: no user, no
- * password, no real host, no real database. This file's authoring checklist says
- * "grep for `postgresql://` -> zero matches" for the stated reason "never inline
- * a credential"; that reason is honoured here even though the grep now answers
- * once, and `pnpm check:secrets` agrees — its `connection-string` rule requires
- * an embedded `user:password@` and its entropy rule requires a key-like name.
- * The CI workflow of AAP 0.7.1 Group 0 puts a credential-free
- * `postgresql://localhost:5432/placeholder` in the `verify` job environment for
- * exactly the same purpose.
+ * It is never dialled: offline endpoints open no connection, and `migrate diff`
+ * reads a live database only through the config-datasource endpoints, which are
+ * never given it. Nor could it connect if it were: port 1 on the loopback
+ * address is not where PostgreSQL listens, and loopback traffic never leaves
+ * the machine. It carries no credential — no user, no password — and names only
+ * a placeholder database.
  */
 const OFFLINE_DIFF_DATASOURCE_URL = 'postgresql://127.0.0.1:1/lumen_supply_schema_diff_placeholder';
 
@@ -251,8 +241,9 @@ function namesConfigDatasource(): boolean {
  *
  *  1. `DATABASE_URL` is set — every command gets
  *     `{ url: env('DATABASE_URL') }`, the shape AAP 0.3.4 and 0.7.1 Group 5
- *     prescribe. The value is always read through `env()`, the accessor the CLI
- *     expects, and never through `process.env`.
+ *     prescribe. The URL handed to Prisma is always read through `env()`, the
+ *     accessor the CLI expects; `process.env` is consulted only by
+ *     {@link hasDatabaseUrl}'s presence probe.
  *  2. No `DATABASE_URL`, and the command is `prisma migrate diff`:
  *     - naming a config datasource (`--from-config-datasource` /
  *       `--to-config-datasource`) means a live database is required, so

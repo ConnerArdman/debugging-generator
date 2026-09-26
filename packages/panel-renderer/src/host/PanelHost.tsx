@@ -17,12 +17,12 @@
  *    specification belongs to, and the action contract — around the whole
  *    subtree, so that every view beneath it reaches its evidence and reports its
  *    interactions without any of them being threaded through each intervening
- *    layer (AAP 0.6.2). The session is `spec.sessionId`, the document's own
- *    statement of which capture it describes; every query a view makes is
- *    addressed to it (`POST /sessions/:id/panel-data`, AAP 0.4.2). Beside them
- *    it provides the panel's one shared selection — the event every view marks
- *    as selected — which it records from every selection a view or evidence
- *    chip reports, or takes from the surface when the surface drives it.
+ *    layer. The session is `spec.sessionId`, the document's own statement of
+ *    which capture it describes; every query a view makes is addressed to it
+ *    (`POST /sessions/:id/panel-data`). Beside them it provides the panel's one
+ *    shared selection — the event every view marks as selected — which it
+ *    records from every selection a view or evidence chip reports, or takes
+ *    from the surface when the surface drives it.
  * 3. Renders the head (`../layout/SummaryHeader`), which is where the
  *    observed/inferred separation lives.
  * 4. Renders the layout, node by node, through `./NodeRenderer`.
@@ -49,14 +49,13 @@
  * **It does not fetch.** No socket, no request, no host API. Data arrives
  * through the injected provider and interactions leave through the injected
  * actions, which is what lets one panel render identically in an inspected page
- * and in an editor, and what keeps this tier testable without a transport
- * (AAP 0.1.2, 0.4.2).
+ * and in an editor, and what keeps this tier testable without a transport.
  *
  * **It does not present a failure as an answer.** A fallback panel carries
  * `meta.fallback`, and this component draws it under a visible banner that says
  * so, above the summary, in words rather than as a colour — while still
  * rendering every view beneath it, because a deterministic summary of a real
- * capture is worth reading (AAP 0.5.5).
+ * capture is worth reading.
  *
  * **It does not re-render what did not change.** A host surface re-renders this
  * component for reasons that have nothing to do with the panel — a selection in
@@ -87,7 +86,7 @@
  * `dg-panel__summary` composed onto the head and `dg-panel__body` around the
  * layout. The rules behind those names live in `../styles/components.css`
  * against `--dg-*` tokens; this file names classes and never carries a visual
- * value of its own (AAP 0.6.4).
+ * value of its own.
  *
  * Relative specifiers are extensionless: this workspace resolves with
  * `moduleResolution: "bundler"`, unlike the `.js`-suffixed convention of the
@@ -155,12 +154,12 @@ const FALLBACK_BANNER_CLASS = 'dg-panel__banner dg-panel__banner--fallback';
 /**
  * The global icon utility of `../styles/base.css`: a `1em` square in
  * `currentColor`, so a glyph scales with the type role around it instead of
- * carrying a size of its own (AAP 0.6.4 permits no hardcoded dimension).
+ * carrying a size of its own: the renderer hardcodes no dimension.
  */
 const ICON_CLASS = 'dg-icon';
 
 /**
- * The developer-facing wording of AAP 0.5.5, verbatim.
+ * The fixed, developer-facing wording of the fallback notice.
  *
  * It states two things a shorter notice would drop, and both are the point: the
  * generated panel *failed validation* (so the views below are not an answer to
@@ -180,7 +179,7 @@ const FALLBACK_BANNER_MESSAGE =
  * that yielded little it is the honest document — so this states the fact
  * plainly and leaves the reader with the summary that *is* there. Generic
  * product vocabulary only; nothing read out of an inspected project ever
- * reaches a string in this package (AAP 0.5.4).
+ * reaches a string in this package.
  */
 const EMPTY_LAYOUT_MESSAGE = 'This panel specifies no views, so the summary above is all of it.';
 
@@ -234,7 +233,7 @@ const LAYOUT_HEADING_LEVEL: HeadingLevel = 3;
  *
  * The glyph is hidden from assistive technology and the whole meaning is in the
  * sentence beside it, because colour and iconography are never the sole
- * carriers of a state in this design system (AAP 0.6.4).
+ * carriers of a state in this design system.
  *
  * @returns The notice, as one banner element.
  */
@@ -510,7 +509,7 @@ function withSelectionRecording(
  * own session), the data contract and the action contract are the whole of what
  * a panel needs: the provider and the actions are *injected* rather than
  * constructed here, which is the boundary that keeps this tier free of any
- * transport (AAP 0.1.2).
+ * transport.
  *
  * Every optional member spells `| undefined` explicitly, because
  * `exactOptionalPropertyTypes` is in force repository-wide and a host
@@ -565,7 +564,7 @@ export interface PanelHostProps {
   /**
    * The event the host surface has selected, when the surface drives the
    * panel's selection itself — typically from the event its details drawer is
-   * showing (AAP 0.7.3).
+   * showing.
    *
    * Three readings, so a surface can say each thing it may mean:
    *
@@ -625,10 +624,10 @@ export interface PanelHostProps {
  *   draws captured events reads it from the selection context and marks the
  *   items that stand for it, so a timeline bar, a flame cell, a table row, a
  *   log line and an evidence chip for one span are selected together, and
- *   selecting one elsewhere moves every mark (AAP 0.7.3: evidence chips
- *   "select the underlying events"). A report from any view or chip is
- *   recorded before the surface's own `selectEvent` runs; a surface that
- *   drives the selection from its drawer passes `selectedEventId` instead (see
+ *   selecting one elsewhere moves every mark — an evidence chip selects the
+ *   events it cites. A report from any view or chip is recorded before the
+ *   surface's own `selectEvent` runs; a surface that drives the selection from
+ *   its drawer passes `selectedEventId` instead (see
  *   {@link PanelHostProps.selectedEventId}). A recorded selection belongs to
  *   the panel it was made in and is dropped with it.
  *
@@ -649,7 +648,7 @@ export interface PanelHostProps {
  *   adapter's, whose `openSource` is the surface's `onOpenSource` itself.
  *   Either way the guarantee that matters at the far end of the click-to-source
  *   chain holds: what a hypothesis suggested is what the host receives, the
- *   same object (AAP 0.4.2).
+ *   same object.
  * - **The views read the view form.** The action context carries
  *   `onSelectEvent`/`onOpenSource` — the names the components call — adapted
  *   from the host form when that is what the surface supplied, so no component
@@ -664,7 +663,7 @@ export interface PanelHostProps {
  *   neutral sentence — never a blank area, and never an error, which is what a
  *   failed *validation* looks like and this is not.
  *
- * @param props - See {@link PanelHostProps}.
+ * @param props See {@link PanelHostProps}.
  * @returns The whole panel: theme root, contexts, notice, head and layout.
  *
  * @example A host surface mounting one session's current panel.
@@ -738,7 +737,7 @@ export function PanelHost(props: PanelHostProps): ReactElement {
   // reads, and a host that genuinely swaps a callback still reaches every
   // consumer. The supplied form keeps its callbacks as they are and the other
   // is its adaptation, so what a view or the head reports is what the host
-  // receives, location by reference (AAP 0.4.2).
+  // receives, location by reference.
   //
   // Each form's selection member records the report as the panel's shared
   // selection before the surface's own callback runs (see

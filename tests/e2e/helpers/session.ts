@@ -7,8 +7,8 @@
  *
  * ## The three rules this module never bends
  *
- * 1. **It installs nothing and fakes nothing** (AAP §0.5.1, §0.5.4). The
- *    product plans and installs the instrumentation; this module observes
+ * 1. **It installs nothing and fakes nothing.** The product plans and
+ *    installs the instrumentation; this module observes
  *    `instrumentation.plan` / `instrumentation.ready` and reports what
  *    happened. It never sends a protocol frame itself — the panel's DevTools
  *    page sends `session.bind`, the service worker sends `target.selected` —
@@ -19,7 +19,7 @@
  *    budget from {@link SessionTimeouts}) or by `expect.poll`. The only
  *    wall-clock time spent on the caller's behalf is the `interact` callback,
  *    which the spec owns.
- * 3. **A failure always names the stage** (AAP §0.5.5). Every failure is a
+ * 3. **A failure always names the stage.** Every failure is a
  *    {@link SessionWorkflowError} whose message carries the phase, the elapsed
  *    time, the session status last seen, the last three `session.progress`
  *    rows, the message TYPES received since the phase began and every `error`
@@ -65,8 +65,9 @@
  *   make, so the driver fails at once unless the caller opted into
  *   `allowMissingServerAgent`.
  *
- * Any other `unavailable` entry is a legitimate degraded capture (AAP §0.5.5):
- * it is kept in the outcome and the spec decides whether it is acceptable.
+ * Any other `unavailable` entry is a legitimate degraded capture, in which the
+ * product proceeds with the signals it could enable. It is kept in the outcome
+ * and the spec decides whether it is acceptable.
  *
  * This file declares no `test(...)`, `describe(...)` or fixture:
  * `tests/e2e/helpers/fixtures.ts` wires {@link createSessionTracker} into
@@ -241,8 +242,8 @@ const BINDING_LOSS_REASONS: ReadonlySet<string> = new Set([
 
 /**
  * One `session.progress` row, recorded verbatim in arrival order. The prose is
- * the service's (AAP §0.7.1 Group 2, composed from real findings); nothing here
- * re-authors a stage name or a message.
+ * the service's, composed from real findings (`docs/ARCHITECTURE.md`, "Progress
+ * from real findings"); nothing here re-authors a stage name or a message.
  */
 export interface SessionStageRecord {
   /** The reporting stage, protocol's vocabulary. */
@@ -279,7 +280,7 @@ export interface InstrumentationSnapshot {
   readonly applied: readonly ModificationRecord[];
   /** The runtime hooks that came up. */
   readonly runtimeHooks: readonly string[];
-  /** The signals that did not: a degraded capture when non-empty (AAP §0.5.5). */
+  /** The signals that did not: a degraded capture when non-empty. */
   readonly unavailable: readonly UnavailableSignalPayload[];
 }
 
@@ -297,7 +298,10 @@ export interface InstrumentationSnapshot {
  */
 export type ReadinessRoute = 'direct' | 'reload-consented' | 'reload-page-fallback';
 
-/** Which AAP §0.4.2 follow-up path the service took, as observed from its status choreography. */
+/**
+ * Which follow-up path the service took (`docs/ARCHITECTURE.md`, "Follow-ups"),
+ * as observed from its status choreography.
+ */
 export type FollowUpPath = 'existing-evidence' | 'new-capture';
 
 /** The phases a workflow moves through; every failure names one. */
@@ -414,7 +418,7 @@ export interface RunDebugSessionOptions {
   readonly selectTargetVia?: TargetSelectionRoute | undefined;
   /**
    * Point at a `{ selector }` target *before* asking, as a developer who
-   * selects an element and then asks about it does (AAP §0.1.1). The DevTools
+   * selects an element and then asks about it does. The DevTools
    * page describes `$0` through the product (`./chrome`'s `describeSelection`)
    * while no session exists, until the descriptor carries the element's React
    * owner chain; `session.create` carries that descriptor — the editor's
@@ -1748,7 +1752,7 @@ async function startCaptureStep(driver: WorkflowDriver, phase: PhaseClock): Prom
       throw driver.fail(
         phase,
         'capture-conflict',
-        `capture.start was refused: session ${error.owningSessionId} already holds the capture for this project (one capture per project, AAP §0.4.2) — end it; the session tracker ends every session it registered in teardown`,
+        `capture.start was refused: session ${error.owningSessionId} already holds the capture for this project (one capture per project) — end it; the session tracker ends every session it registered in teardown`,
         { owningSessionId: error.owningSessionId, cause: error },
       );
     }
@@ -1826,7 +1830,7 @@ async function interactStep(
 /**
  * Step 8 — `capture.stop`, `capture.stopped`, then where the window sent the
  * session: `analyzing` with evidence, or back to `ready` when the capture
- * yielded nothing (AAP §0.5.5) — reported with the service's own sentence and
+ * yielded nothing — reported with the service's own sentence and
  * the capture's counts, never as a generic timeout.
  */
 async function stopCaptureStep(
@@ -2231,8 +2235,7 @@ function concatStatuses(
 
 /**
  * Ask a follow-up question on a generated session and drive whichever path
- * the service takes (AAP §0.4.2), detected from the observed statuses rather
- * than assumed:
+ * the service takes, detected from the observed statuses rather than assumed:
  *
  * - **existing evidence** — `generated → analyzing → generated`: a new analysis
  *   and a new panel version from the stored capture; no capture may start.
@@ -2338,7 +2341,7 @@ export async function askFollowUp(options: AskFollowUpOptions): Promise<DebugSes
         throw driver.fail(
           askPhase,
           'unexpected-state',
-          `after the follow-up the session moved from "generated" to "${leaving.status}", which neither AAP §0.4.2 path takes`,
+          `after the follow-up the session moved from "generated" to "${leaving.status}", which neither follow-up path (existing-evidence or new-capture) takes`,
         );
       },
     );
@@ -2771,7 +2774,8 @@ export interface PanelNodeTypesResult {
  * `nodeTypesOf` / `visualizationNodeTypesOf`.
  *
  * It exists so `demo-excessive-renders.spec.ts` derives the slow-interaction
- * baseline IN ITS OWN FILE for AAP §0.6.5's "materially different" comparison,
+ * baseline IN ITS OWN FILE for the "materially different" comparison of the
+ * two panels' node-type sets (`docs/DEMO.md`, "How the three panels differ"),
  * instead of depending on the order sibling specs run in. The baseline session
  * is a session like any other: pass the spec's tracker so teardown ends it,
  * and end it (`tracker.end(outcome.sessionId)`) before asking the next

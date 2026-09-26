@@ -14,6 +14,13 @@
  * - **Installs a plan** ({@link InstrumentationService.install}) through the
  *   injected `installPlan`, bracketed by the conflict watcher's
  *   suspend → refresh → resume contract, and serialised per session.
+ * - **Keeps the state root out of the project at the patch sink** (AAP §0.4.2):
+ *   every install first re-checks, with `../config.ts`'s
+ *   `requireProjectOutsideStateHome`, that its project root neither is,
+ *   contains nor lies inside the canonical state root, and is refused
+ *   `FS_UNSAFE_PATH` — reported as `instrumentation.failed` — before any backup
+ *   or patch is written. The routes' checks run earlier; this one runs where
+ *   the bytes are written, however late the pipeline gets there.
  * - **Applies only the delta of a follow-up** (AAP §0.4.2): plan version
  *   *n + 1* is the previous plan plus additive actions; the additive ids are
  *   computed with the upstream `actionIdentityKey`, installed actions are never
@@ -181,7 +188,7 @@ import {
   type Result,
 } from '@debuggen/shared';
 
-import type { ServiceConfig } from '../config.js';
+import { canonicalizePath, requireProjectOutsideStateHome, type ServiceConfig } from '../config.js';
 import { PRELOAD_DEPENDENT_SIGNALS } from '../dev-server/detect.js';
 import {
   LOG_BINDING_KEYS,
@@ -380,6 +387,18 @@ export interface CodeAnalysisHandles {
 export interface InstrumentationServiceDeps {
   /** The resolved service configuration: the state directory and the service address. */
   readonly config: ServiceConfig;
+  /**
+   * The state root as the filesystem resolves it — every symbolic link
+   * followed — which every install's project root is kept apart from before a
+   * backup or a patch is written (AAP §0.4.2; see "The state root stays outside
+   * every project" in `../config.ts`). `src/main.ts` passes the value it
+   * resolved once at start-up, so every check of the running service compares
+   * against one root. When absent, `config.debuggenHome` is canonicalised on the
+   * first install and kept once resolved; a failure is not kept, so the next
+   * install tries again, and the install it fails is refused. A value given
+   * must be absolute, or every install is refused.
+   */
+  readonly canonicalStateHome?: string | undefined;
   /** The service logger; this module binds `subsystem` and `sessionId` on it. */
   readonly logger: Logger;
   /**
@@ -1697,6 +1716,81 @@ export function createInstrumentationService(
    */
   const serverArmedAt = new Map<string, number>();
 
+  /**
+   * The canonical state root, or the one canonicalisation of
+   * `config.debuggenHome` in flight or resolved; see
+   * {@link InstrumentationServiceDeps.canonicalStateHome}. Reset when that
+   * canonicalisation fails, so a later install tries again.
+   */
+  let stateHome: Promise<Result<string, DebuggenError>> | undefined =
+    deps.canonicalStateHome === undefined
+      ? undefined
+      : Promise.resolve(ok(deps.canonicalStateHome));
+
+  /** Resolves the canonical state root, canonicalising the configured one at most once. */
+  function canonicalStateHome(): Promise<Result<string, DebuggenError>> {
+    if (stateHome === undefined) {
+      const resolving = canonicalizePath(deps.config.debuggenHome).then((resolved) => {
+        if (isErr(resolved) && stateHome === resolving) {
+          stateHome = undefined;
+        }
+        return resolved;
+      });
+      stateHome = resolving;
+    }
+    return stateHome;
+  }
+
+  /**
+   * Refuses to install into a project root that is, contains or lies inside
+   * the state root (AAP §0.4.2; CWE-200), re-checked on every install at the
+   * sink itself: the session and dev-server routes check before a session
+   * exists, but the pipeline installs later and asynchronously, and a folder
+   * can be replaced by a link into the state root in between. Runs before
+   * anything is read for the install, so a refused install writes no backup,
+   * no journal record and no patch.
+   *
+   * The refusal is `requireProjectOutsideStateHome`'s own `FS_UNSAFE_PATH`
+   * error — or `canonicalizePath`'s, when the configured state root cannot be
+   * resolved — whose message and hint are constant sentences of `../config.ts`
+   * that name no path. Its hint is registered as product text, so the
+   * `instrumentation.failed` frame shows the recovery step itself.
+   */
+  async function requireStateHomeApart(projectRoot: string): Promise<Result<void, DebuggenError>> {
+    const home = await canonicalStateHome();
+    let refusal: DebuggenError;
+
+    if (isErr(home)) {
+      refusal = home.error;
+    } else {
+      const posixHome = toPosix(home.value);
+
+      if (!isAbsolutePosix(posixHome) && !isWindowsAbsolute(posixHome)) {
+        return err(
+          wiringError(
+            'The instrumentation service was given a state root that is not an absolute path.',
+            'Pass the canonical absolute state root the service resolved at start-up.',
+            'canonicalStateHome',
+          ),
+        );
+      }
+
+      const apart = await requireProjectOutsideStateHome(home.value, projectRoot);
+
+      if (!isErr(apart)) {
+        return ok(undefined);
+      }
+
+      refusal = apart.error;
+    }
+
+    if (refusal.hint !== undefined) {
+      authorProductText(refusal.hint);
+    }
+
+    return err(refusal);
+  }
+
   /** The logger of one session's work: `subsystem` and `sessionId` bound in one call. */
   function sessionLog(sessionId: string): Logger {
     return deps.logger.child({
@@ -2244,8 +2338,10 @@ export function createInstrumentationService(
   }
 
   /**
-   * The preparation half of an install: the readiness facts, the context, the
-   * delta, and — unless the delta is empty — the installer's call.
+   * The preparation half of an install: the state-root separation check, the
+   * readiness facts, the context, the delta, and — unless the delta is empty —
+   * the installer's call. A refused separation check ends the install here,
+   * through {@link failInstall} like every other preparation failure.
    */
   async function prepareInstall(
     request: InstallRequest,
@@ -2254,6 +2350,14 @@ export function createInstrumentationService(
     log: Logger,
   ): Promise<Result<PreparedInstall, DebuggenError>> {
     const { sessionId, projectRoot, plan } = checked;
+    // Logged by `failInstall`, whose record carries the error's closed shape
+    // (its code and constant details) and never a path.
+    const apart = await requireStateHomeApart(projectRoot);
+
+    if (isErr(apart)) {
+      return apart;
+    }
+
     const evidence = await collectReadinessEvidence(
       {
         serverAgents: deps.serverAgents,

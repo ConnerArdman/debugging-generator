@@ -51,12 +51,9 @@
  * at their cart rather than told it is unchanged. The tile keeps nothing of its own for the press:
  * the button reports the cart's saving status and the count beside it is the cart's own line.
  *
- * MEMOIZED, AND NAMED FOR THE TOOLS THAT REPORT ON IT
- * A catalog page mounts a full grid of these tiles, so the component is wrapped in `memo`: a tile
- * is a function of its props, and a page that can skip the ones whose props are unchanged is the
- * reason the grid hands each tile a product and two callbacks rather than a slice of shared
- * state. The inner function keeps the wrapper's name in `displayName`, and the wrapper states it
- * too, so React and its developer tools report this component as `ProductCard` either way.
+ * ONE DISPLAY NAME
+ * The inner function and the exported component both carry the `displayName` `ProductCard`, so
+ * the component is reported under that one name.
  */
 
 import clsx from 'clsx';
@@ -275,17 +272,14 @@ function ProductCardBody({
         </Button>
 
         {/*
-         * The committing action, asked for the `lg` step that `../product/AddToCartControl` asks
-         * for on the product page. "Add to cart" means one thing in this storefront and is
-         * therefore one control at one size: the tile used to offer it at the `sm` step, so the
-         * same intent stood a third of the height on a listing that it stood on the page the
-         * listing leads to, and the smaller of the two was also the one a finger had least to aim
-         * at. The size is the whole of the appearance decision - `Button.module.css` owns what
-         * that step measures - and `styles.add` only places the result.
+         * The committing action, asked for the same `lg` step as `../product/AddToCartControl` on
+         * the product page, so "Add to cart" is one control at one size across the storefront.
+         * `Button.module.css` owns what that step measures; `styles.add` places the control and
+         * narrows only its inline padding so the label fits the narrowest column.
          *
-         * It stays second in the DOM, after the specifications toggle, so the tab order a keyboard
-         * reader walks is unchanged: `.actions` gives it a row of its own by spanning both of the
-         * row's columns, which moves nothing in the document.
+         * It stays second in the DOM, after the specifications toggle, so the tab order follows
+         * the markup: `.actions` gives it a row of its own by spanning both of the row's columns,
+         * which moves nothing in the document.
          */}
         <Button
           variant="primary"
@@ -321,20 +315,7 @@ function ProductCardBody({
 
 ProductCardBody.displayName = 'ProductCard';
 
-/**
- * Render one product tile.
- *
- * @example
- * ```tsx
- * <ProductCard
- *   product={product}
- *   selected={product.id === openProductId}
- *   categoryActive={product.categorySlug === activeSlug}
- *   onSelect={() => onOpen(product.id)}
- *   onCategorySelect={() => onFilterCategory(product.categorySlug)}
- * />
- * ```
- */
+/** Render one product tile. */
 export const ProductCard = memo(ProductCardBody);
 
 ProductCard.displayName = 'ProductCard';

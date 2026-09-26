@@ -100,8 +100,10 @@
  * - **Idempotent.** `redactEvent(redactEvent(e))` deep-equals
  *   `redactEvent(e)`, and likewise for {@link redactAttributes}: the marker is
  *   not re-marked, a `?`-masked query does not become `??`, an
- *   already-truncated preview does not shrink again, and the `redacted` path
- *   list is merged rather than recomputed.
+ *   already-truncated preview does not shrink again, a preview cut inside a
+ *   masked query is re-masked so the truncation suffix never stands as a
+ *   query value, and the `redacted` path list is merged rather than
+ *   recomputed.
  * - **Deterministic and cheap.** No clock, no randomness, no I/O, no logging,
  *   no module state. Work is linear in total input size, and the unchanged
  *   path — which is almost every attribute of almost every event — does no
@@ -138,7 +140,6 @@ import {
 import {
   headerNameFromAttributeKey,
   isDeniedHeaderName,
-  isHeaderAttributeKey,
   isHeaderObjectAttributeKey,
   redactHeaderValue,
   redactHeaders,
@@ -163,7 +164,8 @@ import {
   URL_ATTRIBUTE_KEYS,
   isUrlAttributeKey,
   redactQueryString,
-  redactStackUrls,
+  redactStackText,
+  redactTextUrls,
   redactUrl,
 } from './url.js';
 
@@ -304,7 +306,8 @@ export const UNTRUNCATED_ATTRIBUTE_KEYS = Object.freeze([
  * The declared keys come from the catalog tuples. {@link isStackAttributeKey}
  * additionally accepts the conventional `*.stack` and `*Stack` spellings, so a
  * producer's own `componentStack` or `cause.stack` is covered by shape rather
- * than by enumeration.
+ * than by enumeration. A stack's first line is the thrown error's message, so
+ * every URL quoted there is masked as free text too ({@link urlMaskerFor}).
  */
 export const STACK_ATTRIBUTE_KEYS = Object.freeze([FETCH_INITIATOR_KEY, ERROR_STACK_KEY] as const);
 
@@ -815,6 +818,84 @@ function isStackAttributeKey(key: string): boolean {
   return key.endsWith('.stack') || key.endsWith('Stack');
 }
 
+/**
+ * The header name an attribute key carries a single value of, or `undefined`
+ * when the key is not a header key.
+ *
+ * Two spellings are header keys. A dotted header attribute
+ * (`http.request.header.cookie`) is the declared one, and its name is the
+ * segment after the prefix. A key that is itself one of the six denied header
+ * names, in any letter case (`cookie`, `Set-Cookie`, `authorization`), is the
+ * other: a producer that summarised an object with a `cookie` field — a log
+ * line's attributes, a React state value holding `document.cookie` — wrote the
+ * header's value under the header's name, and nothing else in the dispatch
+ * recognises it, because `cookie` is not a key-like name and a cookie pair
+ * matches no content pattern. Any other bare key is left to the generic
+ * rules, so an ordinary field that happens to share a header's spelling with
+ * a suffix (`cookieBanner`) keeps its value.
+ *
+ * @param key Attribute key, exactly as captured.
+ */
+function headerNameForKey(key: string): string | undefined {
+  return headerNameFromAttributeKey(key) ?? (isDeniedHeaderName(key) ? key : undefined);
+}
+
+/**
+ * A `./url.ts` masker for URLs embedded in text: total, idempotent and
+ * bounded to `MAX_SCAN_LENGTH`.
+ */
+type TextUrlMasker = (value: unknown) => string;
+
+/**
+ * Which embedded-URL masker a string attribute takes.
+ *
+ * - **Stack text** ({@link isStackAttributeKey}) takes `redactStackText`.
+ *   Every absolute frame URL is masked with the frame's `:line:col` position
+ *   kept, which source-map resolution reads, and every line that is not a
+ *   frame — the thrown error's own message, `Error: failed '/reset?code=…'`,
+ *   and its continuations — is masked as free text, quoted and
+ *   bare-relative references included; without that, the message masked
+ *   under `error.message` would travel unmasked inside `error.stack`.
+ *   `redactTextUrls` is not used over the whole stack, because its query-run
+ *   pass reads a frame's position as part of the query value and would mask
+ *   it.
+ * - **Every other string** takes `redactTextUrls`, the widest of the text
+ *   maskers: absolute URLs, origin-relative and bare-relative references and
+ *   quoted paths all lose their query values and fragment. A captured string
+ *   is page or runtime text, never source code the model is asked to read, so
+ *   the over-matching that masker accepts (`a?b=c` in prose reads `a?b=?`)
+ *   costs nothing a debugging session needs.
+ */
+function urlMaskerFor(key: string): TextUrlMasker {
+  return isStackAttributeKey(key) ? redactStackText : redactTextUrls;
+}
+
+/**
+ * Bounds URL-masked text to `maxLength` code points, re-masking the result
+ * when the bound cut it.
+ *
+ * {@link truncate} ends a cut with its suffix, and a cut that lands inside a
+ * masked query leaves that suffix standing as (part of) a value —
+ * `/reset?code=…` or `/reset?code=?…`. Emitted as it is, the text would not be
+ * a fixed point: a second pass masks the suffix to `?` and the event changes,
+ * which breaks the idempotence ingest relies on when it re-redacts what the
+ * browser agent already redacted. Masking the cut text once more with the same
+ * masker absorbs the suffix into the value it interrupted
+ * (`/reset?code=?`), and masking never lengthens text that is already masked,
+ * so the result stays inside the bound; the final `truncate` states the
+ * bound rather than relying on that argument.
+ *
+ * Text the bound did not cut is returned as it is, without a second scan.
+ *
+ * @param masked Text already scrubbed and URL-masked by `maskUrls`.
+ * @param maxLength Preview bound, in code points.
+ * @param maskUrls The masker `masked` went through.
+ */
+function boundMaskedText(masked: string, maxLength: number, maskUrls: TextUrlMasker): string {
+  const cut = truncate(masked, maxLength);
+  return cut === masked ? masked : truncate(maskUrls(cut), maxLength);
+}
+
 /** The rule list reported for a key name caught by the entropy test alone. */
 const ENTROPY_ONLY_RULES: readonly RedactionRuleId[] = Object.freeze<RedactionRuleId[]>([
   'entropy',
@@ -862,7 +943,7 @@ const ENTROPY_ONLY_RULES: readonly RedactionRuleId[] = Object.freeze<RedactionRu
  * report's `droppedKeys` count, in the matched rule ids, and as a path whose
  * last segment is the marker.
  *
- * @param key - Attribute key, exactly as captured.
+ * @param name Attribute key or header-map member name, exactly as captured.
  * @returns The matched rule ids, or `undefined` when the name is safe.
  */
 function deniedNameRules(name: string): readonly RedactionRuleId[] | undefined {
@@ -899,8 +980,8 @@ function deniedKeyNameRules(key: string): readonly RedactionRuleId[] | undefined
  * own name is a credential is dropped whole. Such a name is not a header any
  * client meaningfully sent, so its presence carries nothing worth the leak.
  *
- * @param masked - The output of `redactHeaders`, already value-masked.
- * @param state - Walk state; matched rule ids and the dropped count go here.
+ * @param masked The output of `redactHeaders`, already value-masked.
+ * @param state Walk state; matched rule ids and the dropped count go here.
  * @returns A new record, or `masked` itself when no member was denied.
  */
 function filterDeniedHeaderNames(
@@ -1170,8 +1251,8 @@ function readComponentTreeSource(value: unknown): unknown {
  * and in that order, because cutting first can split a credential so that no
  * pattern matches it.
  *
- * @param raw - The label as it arrived.
- * @param name - The name findings are classified under: the field for a
+ * @param raw The label as it arrived.
+ * @param name The name findings are classified under: the field for a
  * component name, and none for a React key, whose field name would otherwise
  * report a name-driven finding for every key in the tree.
  * @returns The bounded label, or `undefined` when nothing survived.
@@ -1262,8 +1343,8 @@ function readTreeNodeKey(
  *
  * A router may key an element by its URL: Next.js keys a page segment
  * `/__PAGE__?{"q":"…"}`, the page's search parameters serialised as JSON after
- * the `?`. That is a query in all but syntax, and AAP 0.5.2 lets no query
- * parameter value travel, so it is masked as one: the text before the first
+ * the `?`. That is a query in all but syntax, and no query parameter value
+ * may travel, so it is masked as one: the text before the first
  * `?` is kept, a JSON object after it keeps its parameter names with every
  * value replaced by `?`, and any other text after it is masked as a query
  * string (`id=42` becomes `id=?`). A key without a `?` — nearly every key — is
@@ -1456,8 +1537,8 @@ function serializeComponentForest(forest: unknown): string | undefined {
  * its other construction routes, whereas unparseable text would cost it the
  * snapshot silently.
  *
- * @param value - The attribute value as captured.
- * @param state - The event's walk, whose counters and matched rules this
+ * @param value The attribute value as captured.
+ * @param state The event's walk, whose counters and matched rules this
  * contributes to.
  * @returns The bounded JSON text, or {@link OMITTED}.
  */
@@ -1535,7 +1616,13 @@ function emitted(value: unknown, changed: boolean): ValueResult {
  * 1. **Dropped by policy** — a body, a row set or a parameter bag never
  *    travels ({@link DROPPED_ATTRIBUTE_KEYS}).
  * 2. **Header value** — masked positionally by `./headers.ts`, with the
- *    header's presence and multi-value count retained.
+ *    header's presence and multi-value count retained. A key is a header key
+ *    when it is a dotted header attribute (`http.request.header.cookie`) or
+ *    when it *is* one of the six denied header names in any letter case
+ *    ({@link headerNameForKey}): a log attribute or a React state summary
+ *    named `cookie` holds what `document.cookie` returned, which the key-name
+ *    rule does not recognise and which is exactly the value a `Cookie` header
+ *    loses.
  * 3. **Header map** — masked field by field, then filtered by member name
  *    ({@link filterDeniedHeaderNames}), because `./headers.ts` keeps every
  *    member key by design and a page can name a request header anything;
@@ -1557,16 +1644,26 @@ function emitted(value: unknown, changed: boolean): ValueResult {
  * 7. **Preview subtree** — a React prop or hook-state summary, walked with
  *    the structural-field exemption of {@link CHANGED_PROP_NAME_FIELD}.
  * 8. **Stack text** — a string under a stack key is scrubbed and then has
- *    every URL embedded in its frames masked by `./url.ts`
- *    ({@link isStackAttributeKey}), which is the only way a query parameter
- *    inside a frame can be removed: masking a query is positional, and the
- *    content rules are not.
- * 9. **Generic** — a string is scrubbed then truncated (never the reverse:
- *    cutting first can split a credential so that no pattern matches it);
- *    a number or boolean under a key-like name is masked, because a short
- *    numeric secret is still a secret; `null` passes through; a value that
- *    cannot be transported is omitted; a container is walked within the
- *    bounds.
+ *    every URL embedded in its frames and its message line masked by
+ *    `./url.ts` ({@link isStackAttributeKey}, {@link urlMaskerFor}), which is
+ *    the only way a query parameter inside a frame can be removed: masking a
+ *    query is positional, and the content rules are not.
+ * 9. **Generic** — a string is scrubbed, then has every URL embedded in it
+ *    masked by `./url.ts`'s `redactTextUrls`, then is truncated (never
+ *    cutting first: a cut can split a credential so that no pattern matches
+ *    it, or split a query so that its value no longer reads as one). A log
+ *    message, an error string, a selector or a React preview that quotes
+ *    `/reset?code=…` is page-controlled text under an ordinary key, and is
+ *    persisted and tailed like any other value, so its query values go the
+ *    way a request URL's do. A number or boolean under a key-like name is
+ *    masked, because a short numeric secret is still a secret; `null` passes
+ *    through; a value that cannot be transported is omitted; a container is
+ *    walked within the bounds.
+ *
+ * A string that steps 8 or 9 cut to the preview bound is URL-masked once
+ * more ({@link boundMaskedText}), so a cut inside a masked query cannot leave
+ * the truncation suffix standing as a value (`code=…`, `code=?…`) that a
+ * second pass would mask.
  *
  * Total by construction: every step runs inside one `try`, and a throwing
  * getter, an exotic host object or a hostile `Proxy` yields
@@ -1587,8 +1684,8 @@ function redactValue(
       return OMITTED;
     }
 
-    if (isHeaderAttributeKey(key)) {
-      const name = headerNameFromAttributeKey(key) ?? key;
+    const name = headerNameForKey(key);
+    if (name !== undefined) {
       if (isDeniedHeaderName(name)) {
         state.matched.add('sensitive-header');
       }
@@ -1669,22 +1766,24 @@ function redactValue(
 
     if (typeof value === 'string') {
       const scrubbed = applyNameRule ? scrubNamedValue(key, value) : scrub(value);
-      // Stack text embeds URLs inside other text, and a query parameter can
-      // only be masked positionally, which `scrub` cannot do. Masking runs
-      // after scrubbing (a cut before scrubbing can split a credential) and
-      // before the preview bound, so a truncated stack is truncated after its
-      // URLs are already safe.
-      const masked = isStackAttributeKey(key) ? redactStackUrls(scrubbed) : scrubbed;
+      // Stack text and free text both embed URLs inside other text, and a
+      // query parameter can only be masked positionally, which `scrub`
+      // cannot do. Masking runs after scrubbing (a cut before scrubbing can
+      // split a credential) and before the preview bound, so a truncated
+      // string is truncated after its URLs are already safe.
+      const maskUrls = urlMaskerFor(key);
+      const masked = maskUrls(scrubbed);
       const bounded = UNTRUNCATED_KEYS.has(key)
         ? masked
-        : truncate(masked, limits.maxPreviewLength);
+        : boundMaskedText(masked, limits.maxPreviewLength, maskUrls);
       if (masked !== value) {
         state.maskedValues += 1;
         classify(state, value, key);
       }
       if (masked !== scrubbed && value.includes('?')) {
         // Positional, so `findDeniedRules` cannot report it — the same
-        // reasoning as the URL arm above, for a URL found inside a frame.
+        // reasoning as the URL arm above, for a URL found inside a frame or
+        // inside free text.
         state.matched.add('url-query-value');
       }
       if (bounded !== masked) {
@@ -2044,9 +2143,9 @@ function walkAttributes(
  *   silently; there is no synthetic key announcing it. The counts in the
  *   report say how much went, and the event's `redacted` paths say which.
  *
- * @param attributes - Attribute bag as captured. Never modified.
- * @param context - What is known about the owning event; only `kind` is read.
- * @param options - Bound overrides; every default is the declared one.
+ * @param attributes Attribute bag as captured. Never modified.
+ * @param context What is known about the owning event; only `kind` is read.
+ * @param options Bound overrides; every default is the declared one.
  */
 export function redactAttributesWithFindings(
   attributes: Readonly<Record<string, unknown>>,
@@ -2064,9 +2163,9 @@ export function redactAttributesWithFindings(
  * only need the bag — the aggregate and panel-data paths, and every test that
  * asserts on the emitted values rather than on the counts.
  *
- * @param attributes - Attribute bag as captured. Never modified.
- * @param context - What is known about the owning event; only `kind` is read.
- * @param options - Bound overrides; every default is the declared one.
+ * @param attributes Attribute bag as captured. Never modified.
+ * @param context What is known about the owning event; only `kind` is read.
+ * @param options Bound overrides; every default is the declared one.
  */
 export function redactAttributes(
   attributes: Readonly<Record<string, unknown>>,
@@ -2093,9 +2192,15 @@ const AUTHORITY_MARKER = '://';
  *   a literal) or when the name carries a `scheme://authority` marker, which
  *   is how an outgoing server-side request span names its target. Query
  *   parameter values and userinfo therefore go while the scheme, host and
- *   path stay. A name with no such marker — a statement-shaped database span
- *   name, say — is left to the content rules, so `?` placeholders in it are
- *   not reinterpreted as a query string.
+ *   path stay.
+ * - **Left to the content rules** when the event is a database query
+ *   (`QUERY_KINDS`) and carries no such marker: a statement-shaped name's `?`
+ *   placeholders are not reinterpreted as a query string.
+ * - **URL-masked as free text** otherwise, through `./url.ts`'s
+ *   `redactTextUrls`: a log line, an error message, a route label or a
+ *   navigation name that quotes `/reset?code=…` keeps its wording while every
+ *   embedded query value becomes `?` — the same treatment a string attribute
+ *   gets (`error at /p?id=7` becomes `error at /p?id=?`).
  *
  * **Never longer than what arrived.** Scrubbing can lengthen a value — a
  * database URL's short userinfo becomes the marker, which is longer than the
@@ -2108,17 +2213,17 @@ const AUTHORITY_MARKER = '://';
  * subset of the input's.
  *
  * **Idempotent**, and never empty: a name that scrubs away entirely becomes
- * the marker, since the schema requires a non-empty name.
+ * the marker, since the schema requires a non-empty name. A cut made by the
+ * length bound is URL-masked once more with the same masker, so it cannot
+ * leave the truncation suffix standing as a query value.
  *
- * @param kind - The event's kind, which decides whether URL masking applies.
- * @param name - The span name as captured.
+ * @param kind The event's kind, which decides whether URL masking applies.
+ * @param name The span name as captured.
  */
 export function redactEventName(kind: TelemetryKind, name: string): string {
   const scrubbed = scrub(name);
-  const masked =
-    REQUEST_KINDS.includes(kind) || scrubbed.includes(AUTHORITY_MARKER)
-      ? redactUrl(scrubbed)
-      : scrubbed;
+  const maskUrls = eventNameMasker(kind, scrubbed);
+  const masked = maskUrls === undefined ? scrubbed : maskUrls(scrubbed);
 
   if (masked === name) {
     // The common case by far, and the one that must cost nothing: no
@@ -2126,8 +2231,28 @@ export function redactEventName(kind: TelemetryKind, name: string): string {
     return name;
   }
 
-  const bounded = truncate(masked, Math.max(countCodePoints(name), REDACTION_MARKER.length));
+  const limit = Math.max(countCodePoints(name), REDACTION_MARKER.length);
+  const bounded =
+    maskUrls === undefined ? truncate(masked, limit) : boundMaskedText(masked, limit, maskUrls);
   return bounded.length > 0 ? bounded : REDACTION_MARKER;
+}
+
+/**
+ * The URL masker a span name of `kind` takes, or `undefined` for a name left
+ * to the content rules — the three cases {@link redactEventName} documents.
+ *
+ * @param kind The event's kind.
+ * @param scrubbed The name after content scrubbing, which is what the
+ * authority marker is looked for in.
+ */
+function eventNameMasker(kind: TelemetryKind, scrubbed: string): TextUrlMasker | undefined {
+  if (REQUEST_KINDS.includes(kind) || scrubbed.includes(AUTHORITY_MARKER)) {
+    return redactUrl;
+  }
+  if (QUERY_KINDS.includes(kind)) {
+    return undefined;
+  }
+  return redactTextUrls;
 }
 
 /**
@@ -2193,9 +2318,9 @@ function mergeRedactedPaths(
  * and cannot be: that schema's check is deliberately shallow and cycle-safe,
  * which is precisely why the walk here is defensive at every step.
  *
- * @param event - Event as its producer sent it, or as the store holds it.
+ * @param event Event as its producer sent it, or as the store holds it.
  * Never modified.
- * @param options - Bound overrides; every default is the declared one.
+ * @param options Bound overrides; every default is the declared one.
  * @returns The redacted event, and the loggable report of what was removed.
  */
 export function redactEventWithFindings<T extends TelemetryEventIngress | TelemetryEvent>(
@@ -2237,9 +2362,9 @@ export function redactEventWithFindings<T extends TelemetryEventIngress | Teleme
  * {@link redactValue} for the dispatch order; the module documentation states
  * the guarantees.
  *
- * @param event - Event as its producer sent it, or as the store holds it.
+ * @param event Event as its producer sent it, or as the store holds it.
  * Never modified.
- * @param options - Bound overrides; every default is the declared one.
+ * @param options Bound overrides; every default is the declared one.
  * @returns A new event of the same shape, safe to store, broadcast and
  * summarise.
  */

@@ -127,25 +127,22 @@ function idFragment(value: string): string {
 }
 
 /**
- * Props of `QuantityStepper`, intentionally local and unexported: `packages/panel-renderer`
- * publishes its own component catalog and this repository's hardcoding guard harvests this
- * workspace's multi-token identifiers into a policy no product file may then contain, so this
- * workspace puts exactly one new name - `QuantityStepper` - into circulation. A caller that needs
- * this shape reads it back with `React.ComponentProps<typeof QuantityStepper>`.
+ * Props of `QuantityStepper`, local to this file. A caller that needs this shape reads it back
+ * with `React.ComponentProps<typeof QuantityStepper>`.
  */
 interface Props {
   /**
    * Identity of the cart line this control edits. It is one half of the field's DOM id, and it is
-   * there to make that id legible - in the elements panel, in an accessibility audit and in
-   * telemetry, `cart-qty-<lineId>-<fragment>` says which line a control belongs to at a glance.
+   * there to make that id legible - in the elements panel and in an accessibility audit,
+   * `cart-qty-<lineId>-<fragment>` says which line a control belongs to at a glance.
    *
    * It is NOT the whole id and the id is NOT reconstructable from it. The same line is rendered by
    * more than one surface at a time - the drawer opens over `/cart` and over the checkout review,
-   * both of which already list that line - so an id derived from the line alone appeared twice in
-   * one document, `getElementById` answered whichever copy came first, and the other copy's
-   * `<label for>` bound to nothing and left its field with no accessible name at all. The second
-   * half of the id is therefore this instance's own `useId()` fragment, which makes both ids in
-   * this component unique by construction rather than by convention.
+   * both of which already list that line - so an id derived from the line alone would appear twice
+   * in one document, `getElementById` would answer whichever copy came first, and the other copy's
+   * `<label for>` would bind to nothing and leave its field with no accessible name at all. The
+   * second half of the id is therefore this instance's own `useId()` fragment, which makes both
+   * ids in this component unique by construction rather than by convention.
    *
    * A caller that needs the field - to move focus into it, or to point its own element at it -
    * reads the id off the DOM (the `<label>` inside this component, or `.querySelector('input')`
@@ -227,8 +224,8 @@ export function QuantityStepper({
 
   // Prop -> state reconciliation, during render rather than in an effect (see the header). React
   // re-runs this component immediately and discards this pass without touching the DOM, so the
-  // field never paints a stale value, and the guard makes it a no-op on the ~4 renders a second
-  // this control takes from its provider while the quantity itself is unchanged.
+  // field never paints a stale value, and the guard makes it a no-op on any render where the
+  // quantity is unchanged.
   if (syncedQuantity !== quantity) {
     setSyncedQuantity(quantity);
     setDraft(String(quantity));

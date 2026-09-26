@@ -54,6 +54,9 @@
  *   unclaimed one goes back to the front, in order, marks the bridge away and
  *   is delivered after the next `bridge.ready` with the same `batchSeq`, the
  *   same `droppedCount` and no duplicate — halves included;
+ * - *terminal loss* — a flush that leaves loss no batch can carry posts it as
+ *   one event-less batch under the capture's next `batchSeq`, under the same
+ *   custody rules, and a capture that lost nothing never sees an empty batch;
  * - *re-entrancy* — a `bridge.gone`, a `bridge.ready`, a flush, a capture change
  *   or a reset handed back from inside the agent's own dispatch;
  * - *the captured primitives* — replacing `dispatchEvent`, `addEventListener`,
@@ -1121,11 +1124,14 @@ describe('failing and partial sends', () => {
 
       transport.flush();
 
-      // One attempt, not nine: a frame the platform refused to construct would
-      // fail the same way in halves, so halving it would only multiply the
-      // cost. And it is dropped, not requeued: a refusal is not a bridge that
-      // might come back.
-      expect(refusing.attempts()).toBe(1);
+      // One attempt at the batch, not nine: a frame the platform refused to
+      // construct would fail the same way in halves, so halving it would only
+      // multiply the cost. And it is dropped, not requeued: a refusal is not a
+      // bridge that might come back. The one attempt after it is the flush's
+      // loss-only report of the batch it just lost — no batch is left to carry
+      // that count — which this platform refuses too, so the count stays
+      // pending and nothing further is tried.
+      expect(refusing.attempts()).toBe(2);
       expect(refusing.bridge.frames).toHaveLength(0);
       expect(transport.getTransportStats()).toMatchObject({
         buffered: 0,
@@ -1846,6 +1852,344 @@ describe('a capture change', () => {
       seq: 0,
       bridgeReady: false,
     });
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Terminal loss reports
+ *
+ * Loss rides out on the next claimed batch's `droppedCount`, and a terminal
+ * flush — `pagehide`, a hidden document, a capture that stops or changes — may
+ * have no next batch. These cases pin the event-less report that closes that
+ * gap: posted once, only with loss to report, under the custody rules a batch
+ * of events follows.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the terminal loss report', () => {
+  /** Payload keys every batch carries under a capture with a session. */
+  const BATCH_KEYS = [
+    'batchSeq',
+    'captureId',
+    'documentId',
+    'droppedCount',
+    'events',
+    'producerId',
+    'sessionId',
+  ];
+
+  /**
+   * Emit one draft no frame can carry, so delivery drops it alone.
+   *
+   * @param index The emission index.
+   */
+  function emitUnpostable(index: number): void {
+    emit(
+      renderDraft(index, { attributes: { [FILLER_ATTRIBUTE]: 'x'.repeat(MAX_MESSAGE_BYTES + 1) } }),
+    );
+  }
+
+  /**
+   * Whether a dispatched frame is a loss-only `telemetry.batch`.
+   *
+   * @param frame The frame, as the claim policy or the record sees it.
+   * @returns Whether it carries no events.
+   */
+  function isLossReport(frame: Pick<RecordedAgentFrame, 'type' | 'payload'>): boolean {
+    const events = frame.payload.events;
+    return frame.type === 'telemetry.batch' && Array.isArray(events) && events.length === 0;
+  }
+
+  /** Every dispatched loss-only batch, claimed or not, in dispatch order. */
+  function lossReports(): BatchView[] {
+    return dispatchedBatchViews().filter((batch) => batch.events.length === 0);
+  }
+
+  /**
+   * One dispatched batch as the four fields these cases compare.
+   *
+   * @param batch The batch.
+   * @returns `[batchSeq, claimed, event count, droppedCount]`.
+   */
+  function positionOf(batch: BatchView): unknown[] {
+    return [batch.batchSeq, batch.claimed, batch.events.length, batch.droppedCount];
+  }
+
+  /**
+   * Subscribe the way `./agent.ts` does: flush on every `bridge.ready`.
+   *
+   * @returns The unsubscribe function.
+   */
+  function flushOnBridgeReady(): () => void {
+    return subscribe((message) => {
+      if (message.type === 'bridge.ready') {
+        flush();
+      }
+    });
+  }
+
+  it('posts a flush\u2019s final loss as one event-less batch under the next batchSeq', () => {
+    bridge.send('bridge.ready');
+    emit(renderDraft(0));
+    emitUnpostable(1);
+
+    flush();
+
+    // The dropped event was the last one queued, so no batch is left to carry
+    // the loss: the flush posts it on its own, after the diagnostic naming the
+    // event, and under the position the next batch would have taken.
+    expect(bridge.frames.map((frame) => frame.type)).toEqual([
+      'telemetry.batch',
+      'agent.error',
+      'telemetry.batch',
+    ]);
+    const batches = dispatchedBatchViews();
+    expect(batches.map((batch) => positionOf(batch))).toEqual([
+      [0, true, 1, 0],
+      [1, true, 0, 1],
+    ]);
+    const report = at(batches, 1, 'the dispatched batches');
+    expect(report.keys).toEqual(BATCH_KEYS);
+    expect(report).toMatchObject({
+      captureId: CAPTURE_A,
+      sessionId: SESSION_ID,
+      producerId: getProducerId(),
+    });
+    // A claimed `telemetry.batch`, so it counts in `batches`; it carried no
+    // event, so `sent` does not move.
+    expect(getTransportStats()).toMatchObject({
+      buffered: 0,
+      sent: 1,
+      batches: 2,
+      dropped: 1,
+      serializationFailures: 1,
+    });
+
+    // Reported once: a second flush has nothing to say, and the next batch
+    // continues the sequence with nothing lost.
+    flush();
+    expect(bridge.frames).toHaveLength(3);
+    emit(renderDraft(2));
+    flush();
+    expect(
+      dispatchedBatchViews()
+        .slice(2)
+        .map((batch) => positionOf(batch)),
+    ).toEqual([[2, true, 1, 0]]);
+  });
+
+  it('never posts an empty batch for a capture that lost nothing', () => {
+    bridge.send('bridge.ready');
+
+    // An empty queue, a flush after a flush, a capture change and a stop: every
+    // terminal route, and none of them has a loss to report.
+    flush();
+    expect(bridge.frames).toHaveLength(0);
+    emitRange(3);
+    flush();
+    flush();
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+    emitRange(2, 3);
+    flush();
+    configureTransport({ sessionId: undefined, captureId: undefined, enabled: false });
+    flush();
+
+    expect(dispatchedBatchViews().map((batch) => [batch.captureId, ...positionOf(batch)])).toEqual([
+      [CAPTURE_A, 0, true, 3, 0],
+      [CAPTURE_B, 0, true, 2, 0],
+    ]);
+    expect(lossReports()).toHaveLength(0);
+    expect(getTransportStats()).toMatchObject({ batches: 2, dropped: 0 });
+  });
+
+  it('keeps an unclaimed report and re-sends it once, under the same batchSeq, on bridge.ready', () => {
+    const stop = flushOnBridgeReady();
+    try {
+      bridge.send('bridge.ready');
+      emit(renderDraft(0));
+      emitUnpostable(1);
+      // The bridge's port dies between the last batch and the report.
+      bridge.claim = (frame) => !isLossReport(frame);
+
+      flush();
+
+      expect(dispatchedBatchViews().map((batch) => positionOf(batch))).toEqual([
+        [0, true, 1, 0],
+        [1, false, 0, 1],
+      ]);
+      // Custody: nothing moved but the bridge's presence.
+      expect(getTransportStats()).toMatchObject({
+        buffered: 0,
+        sent: 1,
+        batches: 1,
+        dropped: 1,
+        bridgeReady: false,
+      });
+
+      // With the bridge away a flush keeps the count and dispatches nothing.
+      flush();
+      expect(dispatchedBatchViews()).toHaveLength(2);
+
+      bridge.claim = true;
+      expect(bridge.send('bridge.ready')).toBe(true);
+
+      expect(dispatchedBatchViews().map((batch) => positionOf(batch))).toEqual([
+        [0, true, 1, 0],
+        [1, false, 0, 1],
+        [1, true, 0, 1],
+      ]);
+      expect(getTransportStats()).toMatchObject({ batches: 2, dropped: 1, bridgeReady: true });
+
+      // Cleared once claimed: another `bridge.ready` repeats nothing, and the
+      // next batch takes the position after the report.
+      bridge.send('bridge.ready');
+      emit(renderDraft(2));
+      flush();
+      expect(
+        dispatchedBatchViews()
+          .slice(3)
+          .map((batch) => positionOf(batch)),
+      ).toEqual([[2, true, 1, 0]]);
+      expect(lossReports().filter((batch) => batch.claimed)).toHaveLength(1);
+    } finally {
+      stop();
+    }
+  });
+
+  it('labels the report with the ending capture and starts the next capture clean', () => {
+    bridge.send('bridge.ready');
+    emit(renderDraft(0));
+    emitUnpostable(1);
+
+    // Nothing flushed yet: the capture change is the terminal moment, and its
+    // flush is the last chance to say the ending capture lost an event.
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+
+    expect(dispatchedBatchViews().map((batch) => [batch.captureId, ...positionOf(batch)])).toEqual([
+      [CAPTURE_A, 0, true, 1, 0],
+      [CAPTURE_A, 1, true, 0, 1],
+    ]);
+    expect(getTransportStats()).toMatchObject({ buffered: 0, seq: 0, dropped: 1 });
+
+    emitRange(2, 2);
+    flush();
+
+    expect(
+      dispatchedBatchViews()
+        .slice(2)
+        .map((batch) => [batch.captureId, ...positionOf(batch)]),
+    ).toEqual([[CAPTURE_B, 0, true, 2, 0]]);
+    expect(deliveredSeqs().slice(-2)).toEqual([0, 1]);
+    expect(lossReports()).toHaveLength(1);
+  });
+
+  it('reports the loss of a capture that stops under that capture', () => {
+    bridge.send('bridge.ready');
+    emit(renderDraft(0));
+    emitUnpostable(1);
+
+    // `./agent.ts`'s disarm, reduced to the transport's part of it.
+    configureTransport({ sessionId: undefined, captureId: undefined, enabled: false });
+
+    const reports = lossReports();
+    expect(reports.map((batch) => positionOf(batch))).toEqual([[1, true, 0, 1]]);
+    expect(at(reports, 0, 'the loss reports')).toMatchObject({
+      captureId: CAPTURE_A,
+      sessionId: SESSION_ID,
+    });
+  });
+
+  it('lets a later batch carry the loss instead of posting a separate report', () => {
+    const stop = flushOnBridgeReady();
+    try {
+      const overflow = 3;
+      emitRange(MAX_BUFFERED_EVENTS + overflow);
+      expect(getTransportStats()).toMatchObject({ dropped: overflow, bridgeReady: false });
+
+      bridge.send('bridge.ready');
+
+      // The recovery drain and the flush `./agent.ts` runs on `bridge.ready`
+      // empty the queue, and the first batch already carried the eviction: no
+      // report follows, because nothing is left for one to say.
+      const expectedBatches = MAX_BUFFERED_EVENTS / MAX_EVENTS_PER_BATCH;
+      const batches = dispatchedBatchViews();
+      expect(batches).toHaveLength(expectedBatches);
+      expect(batches.every((batch) => batch.claimed && batch.events.length > 0)).toBe(true);
+      expect(batches.map((batch) => batch.droppedCount)).toEqual([
+        overflow,
+        ...Array.from({ length: expectedBatches - 1 }, () => 0),
+      ]);
+      expect(batches.map((batch) => batch.batchSeq)).toEqual(indexRange(0, expectedBatches));
+      expect(lossReports()).toHaveLength(0);
+      expect(getTransportStats()).toMatchObject({
+        buffered: 0,
+        batches: expectedBatches,
+        dropped: overflow,
+      });
+
+      flush();
+      expect(dispatchedBatchViews()).toHaveLength(expectedBatches);
+    } finally {
+      stop();
+    }
+  });
+
+  it('posts one report when a bridge.ready and a flush come back from inside it', () => {
+    bridge.send('bridge.ready');
+    emit(renderDraft(0));
+    emitUnpostable(1);
+    let handedBack = false;
+    bridge.claim = (frame) => {
+      if (!handedBack && isLossReport(frame)) {
+        handedBack = true;
+        // What `./agent.ts` does on `bridge.ready`, from inside the report's own
+        // dispatch: a second report here would repeat the same batchSeq.
+        bridge.send('bridge.ready');
+        flush();
+      }
+      return true;
+    };
+
+    flush();
+
+    expect(lossReports().map((batch) => positionOf(batch))).toEqual([[1, true, 0, 1]]);
+    expect(getTransportStats()).toMatchObject({ batches: 2, bridgeReady: true });
+
+    emit(renderDraft(2));
+    flush();
+    expect(dispatchedBatchViews().map((batch) => batch.batchSeq)).toEqual([0, 1, 2]);
+  });
+
+  it('settles a report to its own capture when the capture changes under it', () => {
+    bridge.send('bridge.ready');
+    emit(renderDraft(0));
+    emitUnpostable(1);
+    let changed = false;
+    bridge.claim = (frame) => {
+      if (!changed && isLossReport(frame)) {
+        changed = true;
+        configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+      }
+      return true;
+    };
+
+    flush();
+
+    // Claimed under the capture it was built for; the capture that replaced it
+    // keeps its own fresh position and count.
+    expect(lossReports().map((batch) => [batch.captureId, ...positionOf(batch)])).toEqual([
+      [CAPTURE_A, 1, true, 0, 1],
+    ]);
+    expect(getTransportStats()).toMatchObject({ batches: 2, dropped: 1, seq: 0 });
+
+    emitRange(1, 2);
+    flush();
+    expect(
+      dispatchedBatchViews()
+        .slice(2)
+        .map((batch) => [batch.captureId, ...positionOf(batch)]),
+    ).toEqual([[CAPTURE_B, 0, true, 1, 0]]);
   });
 });
 

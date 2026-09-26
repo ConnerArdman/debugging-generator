@@ -969,7 +969,8 @@ describe('normalizePanel query lifting', () => {
   it('never receives a parsed node without a source: step 1 refuses it, naming the sources', () => {
     // The authoring schema requires a source of every query-backed node type
     // without a catalog default, so the omission is the model's to repair at
-    // step 1 rather than a product bug found at step 3 (AAP 0.5.3).
+    // step 1 rather than a product bug found at step 3, which is never
+    // retried.
     const parsed = parsePanelSpecInput({
       title: 'Interaction latency',
       summary: 'One step of the interaction held most of the recorded time.',
@@ -1030,13 +1031,14 @@ describe('normalizePanel query lifting', () => {
  * ---------------------------------------------------------------------------
  * The step-1 → step-3 joint over every node type, source and spelling
  *
- * AAP §0.5.3 separates a step-1 failure — repaired by re-prompting — from a
- * step-2 or step-3 failure, which is a product bug and never retried. So the
- * authoring schema must accept nothing the normaliser would turn into a
- * document the internal schema refuses. This sweep states that as a property
- * over every node type, every declared source and each way a source can be
- * written — flat on the node, inside `query`, or not at all — and checks, for
- * each combination, three things:
+ * The pipeline separates a step-1 failure — repaired by re-prompting — from a
+ * step-2 or step-3 failure, which is a product bug and never retried
+ * (`docs/ARCHITECTURE.md`, "Boundary rules"). So the authoring schema must
+ * accept nothing the normaliser would turn into a document the internal
+ * schema refuses. This sweep states that as a property over every node type,
+ * every declared source and each way a source can be written — flat on the
+ * node, inside `query`, or not at all — and checks, for each combination,
+ * three things:
  *
  * - the authoring schema's own `safeParse`, which the model provider's repair
  *   loop runs, and `parsePanelSpecInput` reach the same verdict;
@@ -1492,10 +1494,10 @@ describe('normalizePanel on layouts no parse produces', () => {
   });
 
   it('throws a readable INTERNAL DebuggenError for a node type the vocabulary lacks', () => {
-    // The QA reproduction: step 1 rejects such a node as
-    // `panel_node_type_unknown`, so reaching here is a defect in whatever
-    // assembled the input, and the error must say which node, what it declared
-    // and which types exist — not "object Object { type }".
+    // Step 1 rejects such a node as `panel_node_type_unknown`, so reaching
+    // here is a defect in whatever assembled the input, and the error must say
+    // which node, what it declared and which types exist — not
+    // "object Object { type }".
     const handAssembled: unknown = {
       ...inputWith([]),
       layout: [{ type: 'table', source: 'spans' }, { type: 'gauge' }],

@@ -92,10 +92,11 @@
  * the moment it exists, and for the instrumentations *before* the first
  * instance is constructed, because `InstrumentationBase` enables one in its
  * constructor. The failure path gives every one of the six back in reverse
- * order, and the shutdown sequence gives back the same six. AAP §0.5.1 requires
- * that what remains loaded is an inert module with "no active patches, no
- * provider and no file changes", and that has to hold for an installation that
- * *failed part-way* exactly as it does for one that was torn down.
+ * order, and the shutdown sequence gives back the same six. What remains
+ * loaded must be an inert module with no active patches, no provider and no
+ * file changes (`docs/ARCHITECTURE.md` §7.6), and that has to hold for an
+ * installation that *failed part-way* exactly as it does for one that was
+ * torn down.
  *
  * Because {@link installPreload} returns synchronously, the ledger separates
  * what has to be *revoked* from what merely has to be *closed*: the global
@@ -136,9 +137,9 @@
  * does no work of its own: it only carries the context values callers set
  * through `context.with()`, and once the span helper and the instrumentations
  * are gone this module sets none. It is neither a patch nor a provider nor a
- * file change, so AAP §0.5.1's "no active patches, no provider and no file
- * changes" still describes the process. It goes away when the dev server is
- * restarted without the preload.
+ * file change, so "no active patches, no provider and no file changes" still
+ * describes the process. It goes away when the dev server is restarted
+ * without the preload.
  *
  * ## Instrumentations deliberately NOT installed
  *
@@ -1049,8 +1050,8 @@ function createShutdownSequence(
  *
  * After it, the process holds none of the six process-global effects this
  * module gives back — the same state the failure path of
- * {@link installPreload} leaves, which is what AAP §0.5.1's "no active
- * patches, no provider" requires of a preload that has been torn down.
+ * {@link installPreload} leaves, which is what "no active patches, no
+ * provider" requires of a preload that has been torn down.
  *
  * One global effect of the installation does remain: the `AsyncLocalStorage`
  * context manager `register()` installed, if no context manager was registered
@@ -1368,8 +1369,8 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
 
     // Give back everything this attempt ledgered, newest first: no registered
     // provider, no wrapped `pg`, no Prisma hook, no span helper, no live
-    // exporter, no open socket (AAP §0.5.1). The one thing not given back is
-    // the `AsyncLocalStorage` context manager, if `register()` got as far as
+    // exporter, no open socket. The one thing not given back is the
+    // `AsyncLocalStorage` context manager, if `register()` got as far as
     // installing it — left on purpose and inert (see the overview).
     //
     // The global half first, and *to completion*: this function returns

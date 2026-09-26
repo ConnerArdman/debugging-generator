@@ -1,7 +1,8 @@
 /**
  * A real VS Code window for the `e2e` suite: the Extension Development Host
- * the source-open path ends in (AAP §0.2.3, §0.8.4 acceptance test 1 — "clicking
- * the SQL row opens VS Code at the `pool.query` call site").
+ * the source-open path ends in (`docs/ARCHITECTURE.md`, "A click, end to end"),
+ * so a spec can prove that clicking the SQL row opens VS Code at the
+ * `pool.query` call site.
  *
  * The recording editor connection of `./service` proves that the service
  * forwarded a `source.open`; it cannot prove that an editor acted on it. This
@@ -55,7 +56,7 @@
  *
  * {@link EditorHostHandle.start} resolves once the probe reports the extension
  * activated. Activation does not wait for the service connection (the
- * extension connects in the background, AAP §0.5.5), so
+ * extension connects in the background), so
  * {@link EditorHostHandle.warmUp} proves the window is connected for a live
  * session before a spec relies on it: it sends `source.open` for a harmless
  * position — line 1, column 1 of a file of the session's project — from an

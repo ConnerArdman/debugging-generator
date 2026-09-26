@@ -1,61 +1,16 @@
 /**
- * The browser entry point of the "Debug Generator" DevTools panel — the module
- * `./panel.html` loads with `<script type="module" src="./main.tsx">`.
+ * Entry module of the DevTools panel document (`./panel.html`). Start-up, in order:
  *
- * ## What this module owns
- *
- * Exactly three start-up acts, in this order, and nothing else:
- *
- *   1. **The design system's stylesheet.** `@debuggen/panel-renderer` ships its
- *      CSS as a separate `./styles.css` export (AAP 0.6.1): the JavaScript
- *      barrel never imports it, so the panel is unstyled unless an entry point
- *      does. It is this module's first import, which makes Vite emit it as the
- *      panel document's stylesheet and guarantees the `--dg-*` custom
- *      properties and the component classes exist before React mounts. It is
- *      also the panel's only styling act: no component, and nothing here, ships
- *      inline styles, a `<style>` block or a hand-written class (AAP 0.6.4).
- *   2. **The theme, before first paint.** `getPanelThemeSnapshot()` resolves
- *      the DevTools theme through the panel document's theme store and
- *      `applyPanelTheme()` writes the renderer's theme attribute on the
- *      document root, synchronously, before the React root is created. That is
- *      what prevents a flash of the wrong token set when the tab opens, and
- *      what lets the panel chrome outside the generated panel's own theme root
- *      (header, connection status, drawer, live tail) resolve its tokens. Dark
- *      is the default token set (AAP 0.6.3), and it is also what resolution
- *      falls back to when `chrome.devtools` is absent — the browser suite opens
- *      this page directly as an extension page (AAP 0.8.3), so this module
- *      adds no `chrome.*` access of its own.
- *   3. **The React root.** React 19's `createRoot` mounts {@link ThemedApp}
- *      into the element `./panel.html` declares, inside `<StrictMode>`.
- *      `ThemedApp` keeps the theme live after mount: it reads the store with
- *      `useSyncExternalStore(subscribePanelTheme, getPanelThemeSnapshot)`, so
- *      a DevTools theme switch (pushed through `setThemeChangeHandler`, or
- *      found when the panel is shown again) re-renders `App` — and through
- *      `PanelView`, `PanelHost` — with the new theme, and a layout effect
- *      applies the same value to the document root in that commit, before the
- *      browser paints it. StrictMode is kept on deliberately: the connection
- *      lifecycle `App` owns is reference-counted (`state/connection.ts`) and
- *      the theme store's host registration follows its subscriber count, so
- *      the development-only double effect leaves exactly one runtime port and
- *      one theme-change handler, and StrictMode is what keeps every panel
- *      effect honest about that idempotence.
- *
- * ## Failures are visible, never blank
- *
- * The mount element's id is a contract with `./panel.html`. When it is
- * missing, this module throws an `Error` naming the id it expected instead of
- * mounting nowhere: a DevTools tab that stays silently empty is the one failure
- * a developer cannot diagnose (AAP 0.5.5), whereas a thrown error surfaces in
- * the panel's console and in the browser suite's page-error listener.
- *
- * ## Boundaries
- *
- * No state of its own, no runtime port, no message handling, no socket, no
- * `fetch`, no storage, no layout and no error boundary: `./theme` owns the
- * theme store `ThemedApp` reads, `App` owns composition and `state/*` owns the
- * connection and every piece of session state. The imports
- * are the renderer stylesheet, `react`, `react-dom/client`, `./App` and
- * `./theme`; nothing Node-only, nothing from another process's workspace.
+ * 1. The renderer stylesheet is the first import: the `@debuggen/panel-renderer` JS
+ *    barrel never imports its CSS. It is the panel's only styling act — no inline
+ *    styles and no `<style>` block, because every value resolves to a renderer token.
+ * 2. The theme store's resolved theme is applied to the document root before
+ *    `createRoot`, so the first paint uses the right token set; the extension CSP
+ *    rules out doing this with an inline script in the page. Resolution falls back
+ *    to dark when `chrome.devtools` is absent, as when the page opens directly as an
+ *    extension page, so this module adds no `chrome.*` access.
+ * 3. {@link ThemedApp} mounts into `#root` inside `StrictMode`; a missing mount
+ *    element throws an `Error` naming the id rather than leaving a blank DevTools tab.
  *
  * @module apps/chrome-extension/src/panel/main
  */
@@ -95,14 +50,10 @@ function findMountElement(): HTMLElement {
 }
 
 /**
- * The panel's root component: {@link App}, rendered in the live DevTools theme.
- *
- * The theme comes from the panel document's theme store, so a DevTools theme
- * change after mount re-renders `App` (and, through `PanelView`, `PanelHost`)
- * with the new value. The layout effect writes that same value to the document
- * root during the commit that renders it, so the panel chrome outside
- * `PanelHost` and the generated panel inside it never paint in different token
- * sets. `App`'s contract is unchanged: it receives one `theme` prop.
+ * Renders {@link App} in the live DevTools theme read from the panel theme store.
+ * The layout effect writes the same theme to the document root in the commit that
+ * renders it, so the panel chrome and the generated panel never paint in different
+ * token sets.
  */
 function ThemedApp(): ReactElement {
   const theme = useSyncExternalStore(subscribePanelTheme, getPanelThemeSnapshot);
@@ -112,9 +63,7 @@ function ThemedApp(): ReactElement {
   return <App theme={theme} />;
 }
 
-// Theme first — resolved through the store and applied to the document root
-// before the React root exists, so the first paint already uses the requested
-// token set. `ThemedApp` starts from this same snapshot and follows it.
+// Theme before the React root; `ThemedApp` renders from this same snapshot.
 applyPanelTheme(getPanelThemeSnapshot());
 
 createRoot(findMountElement()).render(

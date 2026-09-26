@@ -4,10 +4,12 @@
  * This is the command behind every click-to-source affordance that starts in
  * the editor itself: the `RelevantFiles`, `ModificationsList` and
  * `AnalysisSummary` rows of the Debug Generator view (their `openFile` message
- * reaches here through `src/views/session-view-provider.ts`), and any
- * programmatic `vscode.commands.executeCommand('debuggen.openSource', …)`. The
- * DevTools panel's source chips travel the same contract over WebSocket
- * `source.open` and end in the same opener (AAP §0.2.3, §0.4.2).
+ * reaches here through `src/views/session-view-provider.ts`, which forwards the
+ * location unresolved and opens nothing itself), and any programmatic
+ * `vscode.commands.executeCommand('debuggen.openSource', …)`. Both reach the
+ * editor only through the canonical gate of step 3. The DevTools panel's
+ * source chips travel the same contract over WebSocket `source.open` and end in
+ * the same opener (AAP §0.2.3, §0.4.2).
  *
  * ## What it does — and deliberately nothing more
  *
@@ -21,11 +23,15 @@
  *    guard resolves. The root is never taken from the argument: a caller that
  *    could nominate its own root would defeat the containment check.
  * 3. **Delegates once** to the injected `OpenSourcePort`, whose production
- *    implementation is `openSourceLocation` in `src/source/open-location.ts`.
- *    That function re-validates the location against the root it is given,
- *    refuses anything outside it, and owns every editor mechanic — the
- *    document, the 1-based → 0-based conversion, the selection, the reveal and
- *    the transient line highlight.
+ *    implementation is `openSourceLocation` in `src/source/open-location.ts`:
+ *    the canonical gate. It re-validates the location, resolves the root and
+ *    the target with `realpath`, requires a regular file with a pinned device
+ *    and inode inside the root — so `src/link/passwd` under `src/link → /etc`
+ *    is refused, however safe the text — probes it without following links
+ *    and re-checks that identity and the loaded text after the load, then
+ *    reveals that verified document at the canonical path. It also
+ *    owns every editor mechanic: the document, the 1-based → 0-based
+ *    conversion, the selection, the reveal and the transient line highlight.
  *
  * This module never calls `showTextDocument`, `openTextDocument` or
  * `revealRange`, and never touches `revealLocationInEditor`: that primitive

@@ -812,10 +812,10 @@ export function deriveControlUrl(ingestUrl: string | URL): string | undefined {
  * loadPreloadConfig({
  *   DEBUGGEN_INGEST_URL: 'http://127.0.0.1:43117/telemetry/ingest',
  *   DEBUGGEN_TOKEN: token,
- *   DEBUGGEN_PROJECT_ROOT: '/home/dev/lumen-supply',
+ *   DEBUGGEN_PROJECT_ROOT: '/home/dev/my-app',
  * });
  * // → { mode: 'active', config: { controlUrl: 'ws://127.0.0.1:43117/ws',
- * //      serviceName: 'lumen-supply', … } }
+ * //      serviceName: 'my-app', … } }
  * ```
  *
  * @example A dev server with the module attached and no session

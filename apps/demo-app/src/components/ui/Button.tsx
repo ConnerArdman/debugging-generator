@@ -46,9 +46,7 @@
  * as `string | undefined` and which hides a typo until the control renders unstyled in a browser.
  * An attribute is constrained by the unions below, is legible in the elements tree beside the class
  * it qualifies, and keeps every colour, space and type size in the stylesheet's `--ls-*` tokens
- * rather than in this file. Note that the stylesheet carries a BLITZY [A11Y] flag of its own: the
- * `sm` and `md` steps render below the 44x44px touch-target guideline, implemented as the shared
- * size contract specifies rather than silently enlarged here.
+ * rather than in this file.
  *
  * DELIBERATELY NOT HERE
  * No `loading` alias for `busy`, no `as`/polymorphic prop, no icon prop and no link mode: an action
@@ -81,10 +79,7 @@ import { Spinner } from './Spinner';
  * the module's `.root`, which means a caller adds to the control's appearance instead of replacing
  * it, and the merge has exactly one meaning.
  *
- * Kept local and unexported on purpose. `packages/panel-renderer` publishes a `Button` primitive of
- * its own, and this repository's hardcoding guard harvests this workspace's multi-token identifiers
- * into a policy that no product file may then contain - so this workspace must not put a second,
- * exported name for this shape into circulation. A consumer that needs the type writes
+ * Kept local and unexported on purpose: a consumer that needs the type writes
  * `React.ComponentProps<typeof Button>` and stays correct no matter what is added here.
  */
 interface Props extends Omit<ComponentPropsWithRef<'button'>, 'className'> {

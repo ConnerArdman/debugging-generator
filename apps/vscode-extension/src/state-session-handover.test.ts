@@ -16,6 +16,10 @@
  *   from the service supersedes it.
  * - **`pendingTarget`.** Only an element selected while no session was active
  *   is the next question's target.
+ * - **`applyModificationJournal`.** The journal read over HTTP merges without
+ *   regressing a status, and its counted `total` is kept for the active
+ *   session beside a list later pushes may extend, until another session
+ *   becomes active.
  *
  * ## The `vscode` substitute
  *
@@ -996,6 +1000,111 @@ describe('applyModificationJournal', () => {
 
     expect(state.applyModificationJournal('S1', [appliedPatch('S1')])).toBe(false);
     expect(state.modifications).toEqual([]);
+    expect(state.modificationsTotal).toBeUndefined();
+  });
+
+  it('keeps the total the read counted, in the snapshot too, across pushes that extend the list', async () => {
+    const events: WebviewState[] = [];
+    state.onDidChange((snapshot) => events.push(snapshot));
+    state.adoptSession(sessionRecord('S1', { status: 'capturing' }), ENDPOINT);
+    expect(state.modificationsTotal).toBeUndefined();
+    expect(Object.hasOwn(state.toWebviewState(), 'modificationsTotal')).toBe(false);
+
+    expect(state.applyModificationJournal('S1', [appliedPatch('S1', 'S1-mod-1')], 3)).toBe(true);
+    await flushed();
+
+    expect(state.modificationsTotal).toBe(3);
+    expect(state.toWebviewState().modificationsTotal).toBe(3);
+    expect(events.at(-1)?.modificationsTotal).toBe(3);
+
+    // A push delivers a record the read did not: the list grows, the counted
+    // total stays, so a reader compares the two.
+    state.applyInstrumentationReady({
+      sessionId: 'S1',
+      applied: [appliedPatch('S1', 'S1-mod-2')],
+      runtimeHooks: [],
+      unavailable: [],
+    });
+    state.applySessionRecord(
+      sessionRecord('S1', {
+        status: 'capturing',
+        updatedAt: T0 + 30,
+        modifications: [appliedPatch('S1', 'S1-mod-1'), appliedPatch('S1', 'S1-mod-2')],
+      }),
+    );
+    expect(state.modifications.map((record) => record.id)).toEqual(['S1-mod-1', 'S1-mod-2']);
+    expect(state.modificationsTotal).toBe(3);
+
+    // A read that reports no total keeps the one held.
+    state.applyModificationJournal('S1', [appliedPatch('S1', 'S1-mod-1')]);
+    expect(state.modificationsTotal).toBe(3);
+  });
+
+  it('never lowers the total: an older read that finishes after a newer one keeps the larger count', async () => {
+    state.adoptSession(sessionRecord('S1', { status: 'ended' }), ENDPOINT);
+
+    // The newer read counted 3 records and loaded 2 before a page failed.
+    state.applyModificationJournal(
+      'S1',
+      [appliedPatch('S1', 'S1-mod-1'), appliedPatch('S1', 'S1-mod-2')],
+      3,
+    );
+    // The older read, answered last, counted the journal before its third record.
+    state.applyModificationJournal(
+      'S1',
+      [appliedPatch('S1', 'S1-mod-1'), appliedPatch('S1', 'S1-mod-2')],
+      2,
+    );
+    await flushed();
+
+    expect(state.modificationsTotal).toBe(3);
+    const snapshot = state.toWebviewState();
+    expect(snapshot.modificationsTotal).toBe(3);
+    expect(snapshot.modifications).toHaveLength(2);
+
+    // A later, larger count raises it.
+    state.applyModificationJournal('S1', [], 4);
+    expect(state.modificationsTotal).toBe(4);
+  });
+
+  it('ignores a total that is not a count, and a total for any session but the active one', () => {
+    state.adoptSession(sessionRecord('S1'), ENDPOINT);
+    state.applyModificationJournal('S1', [], 4);
+
+    for (const invalid of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(state.applyModificationJournal('S1', [], invalid), String(invalid)).toBe(true);
+      expect(state.modificationsTotal, String(invalid)).toBe(4);
+    }
+    expect(state.applyModificationJournal('S2', [appliedPatch('S2')], 9)).toBe(false);
+    expect(state.modificationsTotal).toBe(4);
+
+    state.applyModificationJournal('S1', [], 0);
+    expect(state.modificationsTotal).toBe(4);
+  });
+
+  it('records a zero count, in the snapshot too', () => {
+    state.adoptSession(sessionRecord('S1'), ENDPOINT);
+    state.applyModificationJournal('S1', [], 0);
+    expect(state.modificationsTotal).toBe(0);
+    expect(state.toWebviewState().modificationsTotal).toBe(0);
+  });
+
+  it('forgets the total when another session is adopted or the session is reset, and keeps it on a merge', () => {
+    state.adoptSession(sessionRecord('S1'), ENDPOINT);
+    state.applyModificationJournal('S1', [appliedPatch('S1')], 2);
+
+    state.adoptSession(sessionRecord('S1', { updatedAt: T0 + 5 }), ENDPOINT);
+    expect(state.modificationsTotal).toBe(2);
+
+    state.adoptSession(sessionRecord('S2'), OTHER_ENDPOINT);
+    expect(state.modificationsTotal).toBeUndefined();
+    expect(Object.hasOwn(state.toWebviewState(), 'modificationsTotal')).toBe(false);
+
+    state.applyModificationJournal('S2', [appliedPatch('S2')], 5);
+    expect(state.modificationsTotal).toBe(5);
+    state.resetSession();
+    expect(state.modificationsTotal).toBeUndefined();
+    expect(Object.hasOwn(state.toWebviewState(), 'modificationsTotal')).toBe(false);
   });
 });
 

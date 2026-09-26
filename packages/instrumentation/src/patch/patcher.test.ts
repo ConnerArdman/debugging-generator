@@ -3,10 +3,10 @@
  * into a developer's working tree.
  *
  * Everything else in the monorepo observes. This module writes, and the promise
- * attached to that (AAP §0.5.1) is absolute: whatever happens, the file either
- * comes back byte-for-byte or is left untouched and reported. Two of the ways
- * that promise can be broken are not crashes at all, and they are what most of
- * this file is about.
+ * attached to that is absolute: whatever happens, the file either comes back
+ * byte-for-byte or is left untouched and reported. Two of the ways that
+ * promise can be broken are not crashes at all, and they are what most of this
+ * file is about.
  *
  * 1. **A path that leaves the project (CWE-22).** `resolveWithinProject` is
  *    pure string work and cannot see a symbolic link; `O_NOFOLLOW` constrains a
@@ -49,7 +49,7 @@
  *
  * ## The fresh-process matrix
  *
- * AAP §0.5.1 asks for more than an in-process boundary: a **child killed at
+ * The guarantee needs more than an in-process boundary: a **child killed at
  * each boundary**, then the real reconciliation from `../cleanup.ts`, proving
  * the developer's file comes back byte-for-byte.
  * `describe('a process killed mid-sequence')` is that matrix, and the kill is
@@ -79,12 +79,12 @@
  *   `os.tmpdir()` has no `package.json` above it and would be transformed as
  *   CommonJS, where top-level `await` is an error.
  *
- * Each crash case then asserts what the reconciliation table of AAP §0.5.1
- * promises for that boundary — which record status is on file, whether the
- * digest equals `originalHash`, `instrumentedHash` or neither, and that the
- * backup is deleted only *after* the restored bytes were verified against
- * `originalHash`, observed through a recording backup store rather than
- * inferred from the end state.
+ * Each crash case then asserts what the reconciliation table in
+ * `../cleanup.ts` promises for that boundary — which record status is on
+ * file, whether the digest equals `originalHash`, `instrumentedHash` or
+ * neither, and that the backup is deleted only *after* the restored bytes were
+ * verified against `originalHash`, observed through a recording backup store
+ * rather than inferred from the end state.
  */
 
 import { Buffer } from 'node:buffer';
@@ -906,7 +906,8 @@ function openFileJournal(path: string): FileJournal {
  */
 
 /**
- * The five boundaries of AAP §0.5.1's failure-injection matrix, each mapped to
+ * The five boundaries of the failure-injection matrix — after the backup, after
+ * the journal, mid-replace, after the rename, after the mark — each mapped to
  * the stage whose completion is the kill signal.
  *
  * One table rather than a list beside a map, so a boundary cannot be named in
@@ -1174,12 +1175,12 @@ interface BackupEvent {
  * Wraps a backup store so the order of "restore, verify, then delete" is
  * observable.
  *
- * AAP §0.5.1 requires the backup to be deleted only *after* the restored
- * content has been verified against `originalHash`. An implementation that
- * deleted first and restored second would leave the same end state, so the end
- * state cannot prove the ordering: this records what the target file held at
- * the instant `remove` was called, and `remove`'s own
- * `restoredContentHash` argument, which is the verification being demanded.
+ * A backup may be deleted only *after* the restored content has been verified
+ * against `originalHash`. An implementation that deleted first and restored
+ * second would leave the same end state, so the end state cannot prove the
+ * ordering: this records what the target file held at the instant `remove`
+ * was called, and `remove`'s own `restoredContentHash` argument, which is the
+ * verification being demanded.
  * The record-path operations (`readRecorded`, `removeRecorded`) — the route
  * cleanup takes, since it reads and deletes the backup the journal names —
  * record the same events as their digest-keyed counterparts.
@@ -1380,10 +1381,10 @@ describe('the write sequence', () => {
       await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
     );
 
-    // The linchpoint of AAP §0.5.1: the row exists, with both hashes, while the
-    // file still holds its original bytes. Reordering these two steps is what
-    // turns a crash after the rename from decidable into ambiguous, and no
-    // assertion about the end state would notice.
+    // The linchpoint of the write sequence: the row exists, with both hashes,
+    // while the file still holds its original bytes. Reordering these two
+    // steps is what turns a crash after the rename from decidable into
+    // ambiguous, and no assertion about the end state would notice.
     const journaled = observed.find((entry) => entry.stage === 'journal-pending');
 
     expect(journaled?.rows).toBe(1);
@@ -2195,9 +2196,10 @@ describe('the journaled record and its backup', () => {
       await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
     );
 
-    // The path AAP §0.2.3 specifies, composed rather than reported: filed under
-    // the digest, so two records that saw identical content share one copy and
-    // the write is idempotent.
+    // The backup path, composed rather than reported:
+    // `<debuggenHome>/backups/<sessionId>/<originalHash>`. Filed under the
+    // digest, so two records that saw identical content share one copy and the
+    // write is idempotent.
     const expectedPath = join(
       sandbox.debuggenHome,
       'backups',
@@ -2311,8 +2313,8 @@ describe('the journaled record and its backup', () => {
  * A process killed mid-sequence
  * ---------------------------------------------------------------------------
  *
- * AAP §0.5.1's failure-injection matrix, in full. Five boundaries, each in its
- * own process, each killed with `SIGKILL` so nothing in that process could have
+ * The failure-injection matrix, in full. Five boundaries, each in its own
+ * process, each killed with `SIGKILL` so nothing in that process could have
  * tidied up after it, and each followed by the real `reconcileModifications`
  * from `../cleanup.ts` over the journal the dead process left on disk.
  *
@@ -2386,9 +2388,9 @@ describe('a process killed mid-sequence', () => {
       const before = openFileJournal(journalPathFor(sandbox));
       const pending = onlyRow(before);
 
-      // The row that makes every later crash decidable, exactly as AAP §0.5.1
-      // requires it: both hashes, the backup path and the diff, written while
-      // the file still holds the developer's bytes.
+      // The row that makes every later crash decidable, exactly as the write
+      // sequence requires it: both hashes, the backup path and the diff,
+      // written while the file still holds the developer's bytes.
       expect(before.crashPoint()).toBe('after-journal');
       expect(pending.status).toBe('pending');
       expect(pending.originalHash).toBe(pristine.hash);
@@ -2532,8 +2534,8 @@ describe('a process killed mid-sequence', () => {
       const applied = onlyRow(before);
 
       // The ordinary end of a session that never got to end: the record says
-      // what the disk says, and the session died anyway. AAP §0.5.1 requires
-      // the next service start to act on it whatever state the session is in.
+      // what the disk says, and the session died anyway. Reconciliation on the
+      // next service start acts on it whatever state the session is in.
       expect(before.crashPoint()).toBe('after-mark');
       expect(applied.status).toBe('applied');
       expect(applied.appliedAt).toBeGreaterThan(0);
@@ -2594,7 +2596,7 @@ describe('a process killed mid-sequence', () => {
   it(
     'reports a conflict and preserves the developer bytes when the file was edited after the crash',
     async () => {
-      // The interleaving AAP §0.5.5 promises an answer for: the patch landed,
+      // The interleaving the conflict path exists to answer: the patch landed,
       // the process died, and the developer then edited the instrumented file
       // before anything reconciled it. The bytes on disk are theirs and
       // nothing may overwrite them — not even a restore that believes it is
@@ -2660,12 +2662,12 @@ describe('a process killed mid-sequence', () => {
  * ---------------------------------------------------------------------------
  *
  * A follow-up question produces plan version n + 1 as the previous plan plus
- * additive actions (AAP §0.4.2), and a delta action can land on a file an
- * earlier version already patched. The later record's baseline is then the
- * earlier record's *output*, its backup holds already-instrumented bytes, and
- * only an unwind in strict reverse order lands on the developer's original —
- * with each step verified against that record's own `instrumentedHash` before
- * anything is written.
+ * additive actions, and a delta action can land on a file an earlier version
+ * already patched. The later record's baseline is then the earlier record's
+ * *output*, its backup holds already-instrumented bytes, and only an unwind in
+ * strict reverse order lands on the developer's original — with each step
+ * verified against that record's own `instrumentedHash` before anything is
+ * written.
  */
 
 describe('a chain of plan versions over one file', () => {
@@ -2828,11 +2830,10 @@ describe('a chain of plan versions over one file', () => {
   });
 
   it("records every layered record's position in the developer's own text", async () => {
-    // A1-F01. Each later patch of a file is computed against bytes that already
-    // carry the alias and the earlier wrappers, so a position read from them
-    // lands below the line the developer — and the code graph — sees. The
-    // position must be the one in the chain root's backup: the developer's
-    // original.
+    // Each later patch of a file is computed against bytes that already carry
+    // the alias and the earlier wrappers, so a position read from them lands
+    // below the line the developer — and the code graph — sees. The position
+    // must be the one in the chain root's backup: the developer's original.
     const sandbox = makeSandbox();
     const pristine = pristineFile(sandbox, TARGET_FILE);
     const developerText = pristine.bytes.toString('utf8');
@@ -3153,9 +3154,9 @@ async function expectRootWalkRefusal(
 
 describe('journal reads along a chain of plan versions', () => {
   it('lists the journal once per patch, however many links the chain already has', async () => {
-    // The first patch has no parent, the second's parent is the root itself,
-    // and the third walks one link — over the listing its parent came from,
-    // where it used to list the session a second time.
+    // Each patch lists the journal exactly once, whatever the chain's depth:
+    // the first has no parent, the second's parent is the root itself, and the
+    // third walks one link over the same listing its parent came from.
     const world = chainWorld();
     const probe = probeListings(world.journal);
     const symbols = [TARGET_SYMBOL, 'findConeProfile', OTHER_SYMBOL] as const;
@@ -3178,8 +3179,8 @@ describe('journal reads along a chain of plan versions', () => {
       outcomes[1]?.record.id,
     ]);
 
-    // Reading fewer listings changed nothing about what was recorded: the chain
-    // still unwinds to the developer's file exactly.
+    // Sharing one listing between the parent lookup and the root walk leaves
+    // the recorded chain intact: it unwinds to the developer's file exactly.
     const pass = await reconcileSandbox(world.sandbox, world.pristine.path);
 
     expect(pass.outcome.status).toBe('clean');

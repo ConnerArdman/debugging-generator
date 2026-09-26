@@ -1,6 +1,6 @@
 /**
- * The two messages of element selection: `target.request` and `target.selected`
- * (AAP §0.4.2).
+ * The two messages of element selection: `target.request` and
+ * `target.selected`.
  *
  * A debugging question is usually about a *thing on the screen* — a button that
  * feels slow, a card that repaints while nothing is happening — and the fastest
@@ -20,7 +20,7 @@
  * costs the session nothing, because a target is an *input* to the first
  * pipeline stage and never a precondition for it — when no element was
  * selected, problem understanding reads the bound tab's current URL instead, so
- * a session is never blocked waiting for a click (AAP §0.4.2).
+ * a session is never blocked waiting for a click.
  *
  * ## Who asks: the editor's request, never a client's frame
  *
@@ -31,8 +31,8 @@
  * `telemetry.event`: the HTTP operation is the editor→service leg of the same
  * instruction and the WebSocket message is the service→panel leg, so the
  * editor, which has no DevTools connection, reaches the panel through the one
- * process that knows which tab is bound (AAP §0.2.3: conventional requests use
- * HTTP; the WebSocket vocabulary stays at its twenty-six types). Only the
+ * process that knows which tab is bound (conventional requests use HTTP; the
+ * WebSocket vocabulary stays at its twenty-six types). Only the
  * editor credential may call the route. It answers `{ sessionId, tabId }` once
  * the frame has been handed to the bound tab's live connection, or an error the
  * editor can act on — `TAB_NOT_BOUND` when the session has no bound tab,
@@ -49,8 +49,8 @@
  * established it, and that binding is the deterministic recipient for every
  * frame the service addresses to "the panel of this session" — the agent
  * configuration, the live tail, a generated panel and this request alike
- * (AAP §0.2.3, and `./binding.ts`, which owns the four messages that maintain
- * it). A payload that restated the destination would be a second, weaker
+ * (see `./binding.ts`, which owns the four messages that maintain it). A
+ * payload that restated the destination would be a second, weaker
  * routing rule that could disagree with the first.
  *
  * ## Picker mode is a user-interface state, not a protocol state
@@ -69,8 +69,7 @@
  * ## Where a descriptor comes from
  *
  * The answer is produced page-side and marshalled through a chain of
- * boundaries, each of which can carry only JSON-compliant values
- * (AAP §0.2.3, §0.7.1):
+ * boundaries, each of which can carry only JSON-compliant values:
  *
  * ```text
  * the element the developer clicked, or DevTools' $0
@@ -99,7 +98,7 @@
  * ## The descriptor is imported, never restated
  *
  * `selectedTargetSchema` from `@debuggen/instrumentation` is the single
- * definition of that shape (AAP §0.9.1), and this module embeds it as a field
+ * definition of that shape, and this module embeds it as a field
  * with no wrapper and no second pass over its members. Zod 4 keeps refinements
  * inside the schema, so nesting it here runs the owner's own rules — the
  * single-line rules, the length bounds, the absolute-URL rule, the cap on the
@@ -108,8 +107,8 @@
  * producer needs to fix its side. Three places hold that one descriptor and all
  * three reach for the same import: this payload, the optional `target` of the
  * HTTP `session.create` body in `./session.ts`, and `SessionRecord.target?`
- * in `../session-record.ts`. A second spelling of it in any of them is the
- * defect AAP §0.4.2 calls out by name.
+ * in `../session-record.ts`. A second spelling of it in any of them is a
+ * defect: a duplicate definition of one shape, free to drift from the first.
  *
  * Two properties of the imported shape are worth knowing at this boundary,
  * because a consumer that assumes otherwise will misread a valid descriptor:
@@ -137,8 +136,8 @@
  *   (`./error.ts`) whose `ref` is the refused frame's envelope `id`, so the
  *   sender correlates the refusal with the selection it made. `TAB_NOT_BOUND`
  *   is the answer both when the sending connection's tab is not the one bound
- *   to that session (AAP §0.5.6: a panel selects targets only for its own
- *   session) and when the descriptor is not of the bound tab's current
+ *   to that session (a panel selects targets only for the session bound to its
+ *   tab) and when the descriptor is not of the bound tab's current
  *   document — {@link compareSelectionDocument} answering anything but
  *   `'same-document'` for the descriptor's `url` against the binding's URL.
  *   The descriptor was assembled in a page, so a stale selection from a
@@ -173,7 +172,7 @@
  * The schemas validate shape, and only shape. The visible text arrives already
  * scrubbed of credential material and truncated by the producer, and the URL
  * may arrive query-redacted, its parameter values replaced while its keys and
- * path remain (AAP §0.5.2) — both forms are legitimate values from legitimate
+ * path remain — both forms are legitimate values from legitimate
  * producers, so the owner's schema accepts both and nothing here second-guesses
  * content policy. Redaction happens where the data is produced and again at
  * ingest; a transport schema that tried to re-derive it would reject a

@@ -63,10 +63,6 @@ import { DebuggenError, isErr } from '@debuggen/shared';
 
 import type { ActiveSessionRef, CommandContext, CommandId } from './index';
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /** This command's id, as it appears in every log line the module writes. */
 const START_CAPTURE_COMMAND = 'debuggen.startCapture' satisfies CommandId;
 
@@ -94,10 +90,6 @@ const MAX_OWNER_EXCERPT_LENGTH = 60;
 
 /** Runs of whitespace and control characters (`Cc`), collapsed to one space. */
 const WHITESPACE_OR_CONTROL = /[\s\p{Cc}]+/gu;
-
-// ---------------------------------------------------------------------------
-// Conflict helpers
-// ---------------------------------------------------------------------------
 
 /**
  * The session that holds the project's capture, when `error` is the
@@ -194,10 +186,6 @@ async function renderConflict(ctx: CommandContext, ownerId: string): Promise<voi
     });
   }
 }
-
-// ---------------------------------------------------------------------------
-// Command
-// ---------------------------------------------------------------------------
 
 /**
  * `debuggen.startCapture`: asks the local service to open a capture window on

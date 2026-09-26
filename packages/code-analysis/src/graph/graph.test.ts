@@ -2973,6 +2973,8 @@ describe('indexing a miniature project — what an extractor records and a query
   /** The diagnostics the index came back with. */
   let diagnostics: readonly IndexDiagnostic[] = [];
 
+  // A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+  // machine can push past the 10 s hook default and so fail every case below.
   beforeAll(async () => {
     root = mkdtempSync(join(tmpdir(), 'debuggen-code-analysis-graph-'));
 
@@ -2992,7 +2994,7 @@ describe('indexing a miniature project — what an extractor records and a query
     graph = indexed.value.graph;
     queries = createCodeQueries(graph);
     diagnostics = indexed.value.index.diagnostics ?? [];
-  });
+  }, 30_000);
 
   afterAll(() => {
     if (root !== '') {
@@ -3315,6 +3317,8 @@ describe('indexing the committed corpus — the memoised specimen it carries', (
   /** The corpus graph, and the queries over it. */
   let corpus: { readonly graph: CodeGraph; readonly queries: CodeQueries } | undefined;
 
+  // A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+  // machine can push past the 10 s hook default and so fail every case below.
   beforeAll(async () => {
     const indexed = await indexProject({ projectRoot: CORPUS_ROOT, cache: false });
 
@@ -3323,7 +3327,7 @@ describe('indexing the committed corpus — the memoised specimen it carries', (
     }
 
     corpus = { graph: indexed.value.graph, queries: createCodeQueries(indexed.value.graph) };
-  });
+  }, 30_000);
 
   /**
    * The corpus graph, or a failure naming the missing `beforeAll`.

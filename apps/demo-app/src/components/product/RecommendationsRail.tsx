@@ -3,46 +3,47 @@
 /**
  * Lumen Supply - the strip of suggested products shown beside a product.
  *
- * WHERE IT APPEARS
- * Twice on a product page: full size in the detail body, under the specifications, and as a short
- * row in the site header, so a buyer who has scrolled past the detail still has somewhere else to
- * go. Both places render this same component and differ only in the `variant` they ask for; the
- * measurements that variant selects live in `RecommendationsRail.module.css`, and the tiles' own
- * geometry in `RecommendationTile.module.css`.
+ * TWO VARIANTS
+ * The strip comes in two measures, chosen by the `variant` its caller asks for. `detail` is the
+ * full-size strip: its title is an `h2`, and an empty answer is met with a blank slate. `compact`
+ * is a short row: it renders only the first `COMPACT_TILE_COUNT` suggestions, states its title as
+ * a paragraph, reports a failed read at the smaller measure, and renders nothing for an empty
+ * answer. The measurements each variant selects live in `RecommendationsRail.module.css`, and the
+ * tiles' own geometry in `RecommendationTile.module.css`.
  *
  * WHAT IT OWNS
  * The labelled region, its heading, the horizontal scroll container, the list of tiles, and the
- * wording of its three quiet states - waiting, nothing to suggest, and the endpoint not answering.
- * It owns no data: `@/hooks/useRecommendations` reads `/api/recommendations` and hands back the
- * suggestions, whether the first read has settled, and customer-facing wording for a read that
- * failed. It owns no money and no link either - a tile is `./RecommendationTile`, which is a link
- * to a product page and nothing else.
+ * wording of its three quiet states - waiting, nothing to suggest, and suggestions that could not
+ * be loaded. It owns no data: `@/hooks/useRecommendations` hands back the suggestions, whether the
+ * first read has settled, and customer-facing wording for a read that failed. It owns no money and
+ * no link either - a tile is `./RecommendationTile`, which is a link to a product page and nothing
+ * else.
  *
  * THE NUMBER OF SUGGESTIONS IS THE HOOK'S TO NAME
- * The strip asks for `RECOMMENDED_ITEM_LIMIT`, the size the storefront's rails are laid out for,
- * and takes no count of its own from its caller. One number for every place the strip appears is
- * what keeps a buyer seeing the same suggestions for a product wherever they meet them on the
- * page, and it leaves `@/hooks/useRecommendations` as the single place that number is stated.
+ * The strip asks for `RECOMMENDED_ITEM_LIMIT`, the size the strip is laid out for, and takes no
+ * count of its own from its caller. One number for both variants keeps the suggestions
+ * for a product the same in either measure, and it leaves `@/hooks/useRecommendations` as the
+ * single place that number is stated.
  *
  * THE VARIANT IS PRESENTATION, AND ONLY PRESENTATION
  * `variant` picks the title and the element that states it, how many of the suggestions are put on
  * screen, and - through the `data-variant` attribute the stylesheet selects on - the type sizes, the
- * gaps, the tile width and how a tile is laid out, which in the header is a short row sized for its
- * fixed 64px bar rather than the page's card.
- * It reaches nothing else: the same suggestions are read either way, and the compact row renders
- * the first few of them rather than asking for fewer.
+ * gaps, the tile width and how a tile is laid out, which in the compact variant is a single short
+ * row rather than a card.
+ * It reaches nothing else: the hook call is identical in both variants, and the compact row renders
+ * the first few of the suggestions rather than asking for fewer.
  *
  * ACCESSIBILITY
- * A `<section>` named by its own title, so both strips are landmarks a reader can move between and
- * neither is an unnamed region. The title is rendered in both variants - smaller in the header,
- * never removed - because the name is what makes the region findable, and only its element differs:
- * an `h2` in the detail body, where the strip is a section of the page under its `h1`, and a
- * paragraph in the header, where a heading would open the document's outline at level 2 above the
- * `h1` it belongs under. The scroll container is a `role="group"` with `tabIndex={0}` carrying that
- * same name: a strip that overflows has to be reachable and scrollable from the keyboard, and the
- * stylesheet draws it a focus ring for exactly that arrival. Each `ui/Skeleton` is `aria-hidden`,
- * so the waiting state states what it is waiting for in `ui/VisuallyHidden` text on the region that
- * owns the busy state.
+ * A `<section>` named by its own title, so the strip is a landmark a reader can move to and never
+ * an unnamed region. The title is rendered in both variants - smaller in the compact one, never
+ * removed - because the name is what makes the region findable, and only its element differs: an
+ * `h2` in the detail variant, which is a section of the page under its `h1`, and a paragraph in the
+ * compact variant, so the row can be placed where a level-2 heading would break the page's heading
+ * outline. The scroll container is a `role="group"` with `tabIndex={0}` carrying that same name: a
+ * strip that overflows has to be reachable and scrollable from the keyboard, and the stylesheet
+ * draws it a focus ring for exactly that arrival. Each `ui/Skeleton` is `aria-hidden`, so the
+ * waiting state states what it is waiting for in `ui/VisuallyHidden` text on the region that owns
+ * the busy state.
  */
 
 import clsx from 'clsx';
@@ -58,12 +59,12 @@ import type { RecommendationItem } from '@/lib/types';
 import { RecommendationTile } from './RecommendationTile';
 import styles from './RecommendationsRail.module.css';
 
-/** The heading of the full-size strip in a product page's detail body. */
+/** The title of the `detail` variant, stated as its `h2`. */
 const DETAIL_HEADING = 'Recommended for you';
 
 /**
- * The heading of the short row in the site header. Shorter wording rather than the same sentence
- * twice, so a reader listing the page's regions can tell the two strips apart by name.
+ * The title of the `compact` variant, stated as a paragraph. One word rather than the detail
+ * title's sentence, because the stylesheet sets it as a label at the smallest type step.
  */
 const COMPACT_HEADING = 'Recommended';
 
@@ -89,10 +90,10 @@ const EMPTY_BODY =
 const EMPTY_ART_ALT = '';
 
 /**
- * How many suggestions the header's row puts on screen. It is a rendering budget, not a request:
- * the strip reads the same suggestions in both variants and shows the first few of them here,
- * because the header has a single row of vertical space to spend and a buyer scanning it wants the
- * strongest suggestions rather than all of them.
+ * How many suggestions the compact variant puts on screen. It is a rendering budget, not a
+ * request: the hook call is identical in both variants and the compact row shows the first few of
+ * the suggestions, because it has a single short row of space to spend and a buyer scanning it
+ * wants the strongest suggestions rather than all of them.
  */
 const COMPACT_TILE_COUNT = 2;
 
@@ -107,13 +108,13 @@ const MAX_PLACEHOLDERS = 4;
 /**
  * The strip's inputs.
  *
- * Local and deliberately not exported, like every other props type in this workspace: the product
- * route and the site header write `<RecommendationsRail …>` and let the compiler check the
- * attributes, and a second exported name for this shape would buy nothing.
+ * Local and deliberately not exported, like every other props type in this workspace: a caller
+ * writes `<RecommendationsRail …>` and lets the compiler check the attributes, and a second
+ * exported name for this shape would buy nothing.
  *
  * The two optional members spell `| undefined` out, because this workspace compiles with
  * `exactOptionalPropertyTypes`, under which a bare `variant?: 'detail' | 'compact'` means "absent
- * or one of the two" and rejects a present-but-undefined value. Both callers have one in hand: a
+ * or one of the two" and rejects a present-but-undefined value. A caller may well be holding one: a
  * CSS Module lookup is `string | undefined` under `noUncheckedIndexedAccess`, and a variant a
  * caller takes from its own optional prop is `undefined` when that prop was omitted.
  *
@@ -121,12 +122,12 @@ const MAX_PLACEHOLDERS = 4;
  * note at the top of this file explains.
  */
 interface Props {
-  /** The product on screen, as `/api/recommendations` identifies one. */
+  /** The id of the product the suggestions are for. */
   productId: string;
 
   /**
-   * Which of the stylesheet's two measures to paint: `detail` for the strip in a product page's
-   * body, `compact` for the short row in the site header.
+   * Which of the stylesheet's two measures to paint: `detail` for the full-size strip, `compact`
+   * for the short row.
    *
    * @default 'detail'
    */
@@ -145,22 +146,17 @@ interface Props {
  *
  * The region is rendered whenever there is something to put in it: tiles once the suggestions have
  * arrived, placeholder boxes while the first read is in flight, an inline notice when the read
- * failed, and - in the detail body, where a page region is expected to account for itself - a
- * blank slate when there is nothing to suggest. The header's row reports a failed read too, in the
- * smaller measure the stylesheet gives it there, because a buyer has to be able to tell "the
- * suggestions could not be loaded" from "there is no strip on this page" - a row that disappeared
- * would say the second while the first is what happened. It stays silent in one case only, when
- * there is nothing to suggest: a buyer who came for the page above it is not helped by an
- * illustration wedged into the site header, and an empty row would only take height from the
- * navigation beside it.
+ * failed, and - in the detail variant, where a page region is expected to account for itself - a
+ * blank slate when there is nothing to suggest. The compact row reports a failed read too, at the
+ * smaller measure the stylesheet gives it, because a buyer has to be able to tell "the suggestions
+ * could not be loaded" from "there is no strip here" - a row that disappeared would say the second
+ * while the first is what happened. It stays silent in one case only, when there is nothing to
+ * suggest: a blank slate's illustration and copy do not fit the compact measure, and an empty row
+ * would only take room from whatever sits beside it.
  *
  * @example
  * ```tsx
- * // In the product page's detail body.
- * <RecommendationsRail productId={product.id} />
- *
- * // In the site header, beside the navigation.
- * <RecommendationsRail productId={activeProductId} variant="compact" className={styles.rail} />
+ * <RecommendationsRail productId={product.id} variant="compact" />
  * ```
  */
 export function RecommendationsRail({
@@ -170,8 +166,8 @@ export function RecommendationsRail({
 }: Props): ReactElement | null {
   // The heading's id, which names both the region and the scroll container inside it. `useId`
   // rather than a counter or a random value: React produces the same id on the server and during
-  // hydration, so `aria-labelledby` is valid in the first frame, and two strips on one page get
-  // two distinct ids without either knowing about the other.
+  // hydration, so `aria-labelledby` is valid in the first frame, and the id is distinct per
+  // instance without any instance knowing about another.
   const railHeadingId = useId();
 
   const { items, isLoading, error } = useRecommendations({
@@ -183,20 +179,20 @@ export function RecommendationsRail({
 
   // What goes on screen, which is the whole of what the variant decides here. `slice` is safe on a
   // shorter list - it simply yields all of it - so a reply carrying fewer suggestions than the
-  // header's budget needs no check of its own.
+  // compact budget needs no check of its own.
   const tiles: readonly RecommendationItem[] = compact ? items.slice(0, COMPACT_TILE_COUNT) : items;
 
   // The region's contents, decided once so that the section, its heading and its name are written
   // once below. `null` means this variant has nothing worth occupying the page with, and it is
-  // reachable in one case only - the header's row with nothing to suggest: a failed read is
-  // reported in both variants, and the detail body always has something to render.
+  // reachable in one case only - the compact variant with nothing to suggest: a failed read is
+  // reported in both variants, and the detail variant always has something to render.
   let body: ReactElement | null;
 
   if (error !== null) {
     // The hook's wording, printed as it stands and in both variants. It is written for a buyer - a
-    // sentence about what is missing, at most carrying the status the endpoint answered with, and
+    // sentence about what is missing, at most carrying the status the server answered with, and
     // never a URL, a stack or anything out of the reply - so there is nothing here to interpret,
-    // shorten, hide or restate per variant. The header's row says the same sentence at the smaller
+    // shorten, hide or restate per variant. The compact row says the same sentence at the smaller
     // measure the stylesheet gives it, because a row that vanished on a failed read would tell a
     // buyer there is no strip here rather than that its suggestions could not be fetched.
     // `warning` rather than `danger`: suggestions are an aside, and `ui/Alert` derives
@@ -270,14 +266,12 @@ export function RecommendationsRail({
       <div className={styles.head}>
         {/*
           The title, and the one place the variant decides an element rather than a measurement.
-          The detail body's strip is a section of the page, so its title is a real `h2` under the
-          product's `h1`. The header's row is mounted inside the site banner, which precedes that
-          `h1` in the document: a heading there would open the page's outline at level 2 before its
-          level 1, and at a position - clipped into the banner - where nothing is painted for a
-          sighted reader to match it to. So the compact row states its title as a paragraph. It
-          keeps the same id and the same class, and `aria-labelledby` takes a name from the
-          referenced element's text whatever that element is, so both regions stay named exactly as
-          they were and only the heading outline changes.
+          The detail strip is a section of the page, so its title is a real `h2` under the page's
+          `h1`. The compact row states its title as a paragraph, so it can be placed where a
+          level-2 heading would break the page's heading outline. It keeps the same id and the
+          same class, and `aria-labelledby` takes a name from the referenced element's text
+          whatever that element is, so the region is named the same way in either variant and only
+          the heading outline differs.
         */}
         {compact ? (
           <p id={railHeadingId} className={styles.heading}>

@@ -3,7 +3,7 @@
  * response body, which routes may be called without a credential, and the
  * `DataResult` union that answers a panel-data query.
  *
- * This module is the **only** definition of that surface (AAP §0.9.1). The
+ * This module is the **only** definition of that surface. The
  * service registers its routes from the table below, the VS Code extension host
  * and the Chrome service worker call them through it, and a second copy of any
  * shape here — in an app, a test helper or a fetch wrapper — is a defect rather
@@ -12,11 +12,11 @@
  *
  * ## Twenty-one routes, and where their names come from
  *
- * Six of the operation keys are the user's own names for these operations
- * (prompt §16), preserved character for character: `session.create`,
- * `session.question`, `session.end`, `capture.start`, `capture.stop` and
- * `telemetry.event`. They are **HTTP operations, not WebSocket message types**.
- * Nothing in this file may enter the envelope's discriminated union, and the
+ * Six of the operation keys are the documented operation names, preserved
+ * character for character: `session.create`, `session.question`,
+ * `session.end`, `capture.start`, `capture.stop` and `telemetry.event`. They
+ * are **HTTP operations, not WebSocket message types**. Nothing in this file
+ * may enter the envelope's discriminated union, and the
  * twenty-six WebSocket message types — `client.hello`, `session.created`,
  * `session.updated`, `session.progress`, `session.bind`, `session.bound`,
  * `tab.navigated`, `session.unbind`, `target.request`, `target.selected`,
@@ -36,21 +36,18 @@
  *   the same instruction over the WebSocket to the session's bound DevTools
  *   tab, and to it alone. The editor holds no connection to that tab, and the
  *   service is the one process that knows which tab is bound, so the request is
- *   a conventional HTTP call (AAP §0.2.3) and the push stays the service-only
- *   message `./messages/target.ts` defines — the vocabulary keeps its
- *   twenty-six types.
+ *   a conventional HTTP call and the push stays the service-only message
+ *   `./messages/target.ts` defines — the vocabulary keeps its twenty-six types.
  *
- * Three of the twenty are administrative operations whose behaviour the AAP
- * mandates without naming a path, and they are declared here so that no
- * process has to define a route of its own to reach them:
+ * Three routes serve administrative operations, and they are declared here so
+ * that no process has to define a route of its own to reach them:
  * `devServer.credential` (`POST /dev-server/credential`, the server-agent
  * credential `scripts/dev-instrumented.mjs` requests with the editor
- * credential, AAP §0.5.6), `credentials.rotate` (`POST /credentials/rotate`,
- * the revocation `debuggen.rotateServiceToken` performs, AAP §0.5.6) and
- * `session.purge` (`POST /sessions/purge`, the retention sweep
- * `debuggen.purgeSessions` runs on demand, AAP §0.4.2). A route the service
- * registered outside this table would be a route no client could discover and
- * no test could enumerate, so none may exist.
+ * credential), `credentials.rotate` (`POST /credentials/rotate`, the
+ * revocation `debuggen.rotateServiceToken` performs) and `session.purge`
+ * (`POST /sessions/purge`, the retention sweep `debuggen.purgeSessions` runs on
+ * demand). A route the service registered outside this table would be a route
+ * no client could discover and no test could enumerate, so none may exist.
  *
  * The bodies those operations already own are **imported, never restated**:
  * `./messages/session.ts` owns the three session request bodies,
@@ -70,10 +67,10 @@
  * builders beside it substitute each parameter and `encodeURIComponent` it, so a
  * session id that ever contains a path character cannot escape its segment.
  *
- * No base URL, host or port appears here, on purpose. AAP §0.3.4 puts
- * `DEBUGGEN_HOST` (`127.0.0.1`) and `DEBUGGEN_PORT` (`43117`) in the
- * environment; the service reads them at start-up and each client resolves its
- * base URL from configuration (`apps/vscode-extension/src/service/discovery.ts`,
+ * No base URL, host or port appears here, on purpose. The environment supplies
+ * `DEBUGGEN_HOST` (default `127.0.0.1`) and `DEBUGGEN_PORT` (default `43117`):
+ * the service reads them at start-up and each client resolves its base URL from
+ * configuration (`apps/vscode-extension/src/service/discovery.ts`,
  * `apps/chrome-extension/src/background/ws-bridge.ts`), which is what lets a
  * second service instance run on another port without a code change. The paths
  * below are relative, and {@link WS_PATH} is here for the same reason: so that
@@ -81,8 +78,8 @@
  *
  * ## Two routes are unauthenticated, and only two
  *
- * {@link AUTH_EXEMPT_OPERATIONS} contains exactly `health` and `pair.complete`
- * (AAP §0.5.6). `GET /health` has to answer before a client holds any
+ * {@link AUTH_EXEMPT_OPERATIONS} contains exactly `health` and `pair.complete`.
+ * `GET /health` has to answer before a client holds any
  * credential — it is how the extension host decides whether to spawn the
  * service — so it reports the build version, the protocol version and whether
  * pairing is available, and nothing else: no session, no project, no path.
@@ -207,10 +204,15 @@ import {
 // PAIRING. `POST /pair/complete` is unauthenticated because the one-time code it
 // presents *is* the capability: eight characters from a CSPRNG, valid for five
 // minutes, single use, and rate-limited (five failures then a sixty-second
-// lockout). The code's alphabet and lifetime are the service's generator detail
-// and are deliberately not encoded in `pairCompleteRequestSchema` — a schema
-// that pinned them would have to change in lockstep with the generator, and a
-// stale code is answered by the pairing store, not by a parser.
+// lockout, counted once for the whole service rather than per `Origin`, which
+// the caller controls). The code's alphabet and lifetime are the service's
+// generator detail and are deliberately not encoded in
+// `pairCompleteRequestSchema` — a schema that pinned them would have to change
+// in lockstep with the generator, and a stale code is answered by the pairing
+// store, not by a parser. The service
+// compares the submitted code exactly as sent, with no trimming and no case
+// folding: a client that accepts what the developer typed tidies it before it
+// submits, and any other spelling is a counted wrong guess.
 //
 // ROLES ARE NEVER SELF-DECLARED. The service resolves a request's role and
 // scope from the presented credential, never from anything the client says
@@ -224,6 +226,14 @@ import {
 // `Access-Control-Allow-Origin` header is ever set, so a browser page cannot
 // read a response even if it managed to provoke one; that, together with the
 // bearer requirement on every state-changing route, is what closes CSRF.
+//
+// A DevTools credential's writes and socket must come from the origin of the
+// extension it was issued to. Chrome omits `Origin` on the `GET`s an extension's service
+// worker sends, so those four reads (`session.get`, `panel.get`,
+// `panel.getById`, `modifications.list`) also carry `READ_PROOF_HEADER`: a
+// second secret the service issued with the credential when the pairing code
+// was redeemed. A DevTools read without the proof issued with its credential
+// is refused, whether or not it claims the extension's origin.
 // ---------------------------------------------------------------------------
 
 /**
@@ -260,9 +270,9 @@ export function formatBearer(token: string): string {
  *
  * One pairing issues one DevTools credential, and the Chrome service worker
  * presents it for every tab the developer inspects. The credential therefore
- * cannot say *which* tab a request comes from, and AAP §0.5.6 allows a DevTools
- * principal to bind, capture and query panel data only for the session bound to
- * its tab. The service worker fills this header from Chrome's own metadata for
+ * cannot say *which* tab a request comes from, and a DevTools principal may
+ * bind, capture and query panel data only for the session bound to its tab. The
+ * service worker fills this header from Chrome's own metadata for
  * the panel or page that asked — never from anything a page supplied — and the
  * service checks it against its live tab-to-session binding table:
  *
@@ -300,13 +310,12 @@ const ACTING_TAB_HEADER_PATTERN = /^(0|[1-9][0-9]{0,15})$/;
 /**
  * What {@link parseActingTabHeader} reports for a value that is not one tab id.
  *
- * Constant: the refused value is never interpolated (AAP §0.5.2), because a
- * header this service did not expect is unvalidated data from another process.
+ * Constant: the refused value is never interpolated, because a header this
+ * service did not expect is unvalidated data from another process.
  */
 const ACTING_TAB_HEADER_INVALID_MESSAGE =
   'Invalid x-debuggen-tab header: expected the decimal id of exactly one Chrome tab';
 
-/** The constant next step for {@link ACTING_TAB_HEADER_INVALID_MESSAGE}. */
 const ACTING_TAB_HEADER_INVALID_HINT =
   'Send x-debuggen-tab once, as the inspected tab’s non-negative integer id in canonical decimal (no sign, no leading zero, no whitespace), or omit it on a request that acts for no tab.';
 
@@ -318,7 +327,6 @@ const ACTING_TAB_HEADER_INVALID_HINT =
 const ACTING_TAB_FORMAT_INVALID_MESSAGE =
   'Cannot send the x-debuggen-tab header: the value is not a non-negative safe-integer Chrome tab id';
 
-/** The constant next step for {@link ACTING_TAB_FORMAT_INVALID_MESSAGE}. */
 const ACTING_TAB_FORMAT_INVALID_HINT =
   'Pass the inspected tab’s id as Chrome reports it (a port sender’s tab.id, or chrome.devtools.inspectedWindow.tabId); -1 is chrome.tabs.TAB_ID_NONE, not a tab.';
 
@@ -377,7 +385,7 @@ export function formatActingTabHeader(tabId: number): Result<string, DebuggenErr
  *   its neighbour.
  *
  * The rejection is `PROTOCOL_INVALID_MESSAGE` with a constant message and hint
- * and `details: { header }`; the value is never quoted (AAP §0.5.2).
+ * and `details: { header }`; the value is never quoted.
  *
  * @param value The raw header value, or `null` / `undefined` when absent.
  * @returns `ok(tabId)`, `ok(undefined)` when absent, or `err(error)`.
@@ -416,6 +424,104 @@ export function parseActingTabHeader(
       details: { header: ACTING_TAB_HEADER },
     }),
   );
+}
+
+/**
+ * The DevTools read-proof request header's name, lowercase: the second secret
+ * a DevTools credential's reads carry, issued with the credential when the
+ * pairing code was redeemed.
+ *
+ * ## Why a read carries a proof
+ *
+ * The service binds a DevTools credential to the extension it was issued to by
+ * the `Origin` header, and Chrome sends that header on the extension's `POST`s
+ * and on its WebSocket upgrade — but not on a `GET` its service worker sends to
+ * a host the extension holds a permission for (`http://127.0.0.1/*`). And an
+ * `Origin` header is only a claim: any local process holding the credential can
+ * write the extension's origin itself. So the four DevTools reads —
+ * `session.get`, `panel.get`, `panel.getById` and `modifications.list` — are
+ * not admitted on the credential and a claimed origin alone.
+ *
+ * `POST /pair/complete` answers with the credential *and* a read proof
+ * ({@link readProofSchema}): 32 CSPRNG bytes the service draws at the moment
+ * the one-time code is redeemed, returned exactly once to the extension that
+ * redeemed it, and kept by the service only as a SHA-256 digest in the
+ * credential's own record. The extension stores the proof beside its
+ * credential and sends it in this header on each of those reads; no hello, no
+ * connection and no origin can register or replace it.
+ *
+ * - **required** on every DevTools read, whether or not it claims the issuing
+ *   extension's origin: a read without it, with a malformed or repeated one, or
+ *   with one other than the proof issued with its credential (including a
+ *   credential issued before proofs existed) is refused as `UNAUTHORIZED`
+ *   (401), which the extension answers by dropping its pairing so the developer
+ *   pairs again;
+ * - **refused** on every other request: a write (bound to the extension by its
+ *   `Origin`), an auth-exempt operation, or any credential other than a DevTools
+ *   one. `./client/http-client.ts` refuses such a request, and a malformed
+ *   proof, locally as `PROTOCOL_INVALID_MESSAGE` before anything is sent.
+ *
+ * ⚠️ The value is a secret of the same class as the credential: never logged,
+ * echoed or reported, and deleted with the credential on rotation. Lowercase
+ * for the reason {@link AUTHORIZATION_HEADER} is.
+ */
+export const READ_PROOF_HEADER = 'x-debuggen-read-proof';
+
+/**
+ * How many CSPRNG bytes a DevTools read proof carries: 256 bits, the strength
+ * of the credential it accompanies.
+ */
+export const READ_PROOF_BYTES = 32;
+
+/**
+ * The wire length of a read proof: {@link READ_PROOF_BYTES} bytes as unpadded
+ * base64url, `ceil(32 * 4 / 3)` = 43 characters.
+ */
+export const READ_PROOF_LENGTH = 43;
+
+/** Exactly {@link READ_PROOF_LENGTH} base64url characters, nothing else. */
+const READ_PROOF_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * A DevTools read proof as it travels: in `POST /pair/complete`'s response
+ * ({@link pairCompleteResponseSchema}) and in {@link READ_PROOF_HEADER}.
+ *
+ * ## Shape
+ *
+ * Exactly {@link READ_PROOF_LENGTH} base64url characters (`A–Z`, `a–z`, `0–9`,
+ * `-`, `_`), no padding and no whitespace: the unpadded encoding of
+ * {@link READ_PROOF_BYTES} random bytes. The service mints it; a client only
+ * stores and repeats it, so one spelling is the whole contract.
+ *
+ * ⚠️ A secret: a refusal names the rule it broke, never the value.
+ *
+ * @example
+ * ```ts
+ * readProofSchema.safeParse('x'.repeat(READ_PROOF_LENGTH)).success; // true
+ * readProofSchema.safeParse(' padded ').success; // false
+ * ```
+ */
+export const readProofSchema = z.string().regex(READ_PROOF_PATTERN, {
+  error: `expected a read proof of exactly ${String(READ_PROOF_LENGTH)} base64url characters`,
+});
+
+/**
+ * Whether a value is a well-formed read proof — exactly
+ * {@link READ_PROOF_LENGTH} base64url characters, as {@link readProofSchema}
+ * requires. A type guard that never throws and never reports the value.
+ *
+ * @param value Anything; typically a header value or a stored proof.
+ * @returns `true` for a well-formed proof.
+ *
+ * @example
+ * ```ts
+ * if (!isReadProof(headers.get(READ_PROOF_HEADER))) {
+ *   // refuse, with a constant message
+ * }
+ * ```
+ */
+export function isReadProof(value: unknown): value is string {
+  return readProofSchema.safeParse(value).success;
 }
 
 /**
@@ -561,7 +667,7 @@ function urlSchema(): z.ZodType<string> {
  * Used for the tallies of the two administrative reports (`credentials.rotate`
  * and `session.purge`). The field's own name goes into the refusal so a
  * producer that sent `-1` learns which tally was wrong; no value is ever
- * echoed (AAP §0.5.2).
+ * echoed.
  *
  * @param field The body field the count is declared under.
  * @returns An integer schema refusing a negative, fractional or unsafe value.
@@ -767,8 +873,8 @@ export type {
 // modification journal holds up to 256 records whose diffs may each reach
 // 2 MiB. Each listing therefore answers one **page**, echoes the window it
 // applied in the same four fields the panel-data results carry (`total`,
-// `limit`, `offset`, `nextOffset`, AAP §0.4.2), and reads its window from the
-// store with one indexed query instead of hydrating whole documents.
+// `limit`, `offset`, `nextOffset`), and reads its window from the store with
+// one indexed query instead of hydrating whole documents.
 //
 // The page window is requested with two query-string parameters, `limit` and
 // `offset`, parsed by {@link parseListPageQuery}. A `GET` carries no body, so
@@ -850,7 +956,7 @@ export interface ListPageBounds {
  * `GET /sessions` and `GET /sessions/:id/modifications` handlers pass hono's
  * `c.req.query()` record here, and a refusal is the same `400`-mapped
  * `PROTOCOL_INVALID_MESSAGE` a malformed body produces. The error carries issue
- * paths and codes only (AAP §0.5.2), never the rejected text.
+ * paths and codes only, never the rejected text.
  *
  * @param query The request's query parameters, one value per name.
  * @param bounds The listing's `limit` ceiling —
@@ -961,7 +1067,7 @@ const LIST_PAGE_EARLY_END_RULE =
 
 /**
  * Records one breach of a listing's paging rule on `payload`, with no input
- * attached (AAP §0.5.2).
+ * attached.
  */
 function reportListPageIssue(
   payload: z.core.ParsePayload<unknown>,
@@ -1079,9 +1185,9 @@ export type SessionListCleanup = z.infer<typeof sessionListCleanupSchema>;
  * and nothing it would have to hydrate a whole record for.
  *
  * Picked from the imported {@link sessionRecordSchema} — the single definition of
- * the record (AAP §0.9.1) — rather than restated, so a member's constraints are
- * the record's own, and `.pick()`/`.extend()` keep the record's strictness: a row
- * carrying any other member (a plan, a diff, an analysis) is refused. `cleanup`
+ * the record — rather than restated, so a member's constraints are the record's
+ * own, and `.pick()`/`.extend()` keep the record's strictness: a row carrying
+ * any other member (a plan, a diff, an analysis) is refused. `cleanup`
  * is the diff-free {@link sessionListCleanupSchema} summary.
  *
  * Consumed by `apps/vscode-extension/src/views/sessions-tree.ts`, the editor's
@@ -1324,9 +1430,10 @@ export const SESSION_PURGE_MAX_REPORTED_SESSIONS = 100;
 /**
  * The `POST /sessions/purge` request body: `{}`, and strictly that.
  *
- * The retention window is the service's configuration — `DEBUGGEN_RETENTION_DAYS`
- * (AAP §0.3.4) — and never a caller's choice: a body that could shorten the
- * window would let one call delete sessions the developer's own setting keeps.
+ * The retention window is the service's configuration —
+ * `DEBUGGEN_RETENTION_DAYS` — and never a caller's choice: a body that could
+ * shorten the window would let one call delete sessions the developer's own
+ * setting keeps.
  * Strict over an empty shape for the reason {@link pairStartRequestSchema} is,
  * so a body carrying a key is refused rather than silently ignored.
  */
@@ -1337,7 +1444,7 @@ export type SessionPurgeRequest = z.infer<typeof sessionPurgeRequestSchema>;
 
 /**
  * The refusal a purge report whose conflict list disagrees with its total
- * carries. Names fields and the bound, never a value (AAP §0.5.2).
+ * carries. Names fields and the bound, never a value.
  */
 const SESSION_PURGE_TRUNCATION_RULE = `sessionsRetainedForConflicts must list exactly min(sessionsRetainedForConflictsTotal, ${String(
   SESSION_PURGE_MAX_REPORTED_SESSIONS,
@@ -1364,7 +1471,7 @@ function reportSessionPurgeIssue(
     path,
     message,
     // Left empty for the reason `reportMetricsPageIssue` states: a failure here
-    // never carries the value that caused it (AAP §0.5.2).
+    // never carries the value that caused it.
     input: undefined,
   });
 }
@@ -1416,8 +1523,8 @@ function checkSessionPurgeReport(
  * The `POST /sessions/purge` response: what one retention sweep removed, and
  * what it kept.
  *
- * The retention sweep of AAP §0.4.2 runs at service start and, through this
- * operation, on demand from the editor command `debuggen.purgeSessions`. It
+ * The retention sweep runs at service start and, through this operation, on
+ * demand from the editor command `debuggen.purgeSessions`. It
  * deletes the sessions last updated before the window `DEBUGGEN_RETENTION_DAYS`
  * sets, together with their telemetry, panels, analyses, modification records
  * and backup directories; code-index caches whose project was not opened
@@ -1615,7 +1722,7 @@ export type CaptureStartConflictResponse = z.infer<typeof captureStartConflictRe
 //
 // `POST /sessions/:id/target/request`.
 //
-// The editor's half of element selection (AAP §0.4.2). The VS Code view's
+// The editor's half of element selection. The VS Code view's
 // element-request control has no DevTools connection of its own, so it asks the
 // service, and the service — the one process that knows which tab is bound to
 // the session — pushes `target.request { sessionId }` to that tab's connection
@@ -1656,7 +1763,7 @@ export type CaptureStartConflictResponse = z.infer<typeof captureStartConflictRe
  * binding, so there is nothing left to say. Strict, like every other empty
  * body here: a caller that sends `{ tabId }` believes it can choose which tab
  * enters picker mode, and silence would let it keep believing that — the
- * binding, not the caller, decides (AAP §0.5.6).
+ * binding, not the caller, decides.
  */
 export const targetRequestRequestSchema = z.strictObject({});
 
@@ -1708,9 +1815,9 @@ export type TargetRequestResponse = z.infer<typeof targetRequestResponseSchema>;
  * (`packages/panel-renderer/src/host/useQuery.ts` →
  * `apps/chrome-extension/src/panel/data-provider.ts`), and the node catalog's
  * per-node source constraints — validated against *that* schema — cannot drift
- * from what this route accepts. Re-declaring a query field here would be the
- * second definition AAP §0.9.1 forbids. The identity is asserted field by field
- * in `./__tests__/http.test.ts` and at compile time in
+ * from what this route accepts. Re-declaring a query field here would give it a
+ * second definition, and two definitions can only drift apart. The identity is
+ * asserted field by field in `./__tests__/http.test.ts` and at compile time in
  * {@link PanelDataRequestIsDataQueryWithPanelId}.
  *
  * ## `panelId` says which evidence the node describes
@@ -1735,7 +1842,7 @@ export type TargetRequestResponse = z.infer<typeof targetRequestResponseSchema>;
  * because the query must stay the node's own, unwrapped, for the identity above
  * to hold.
  *
- * ## Semantics the service implements (AAP §0.4.2)
+ * ## Semantics the service implements
  *
  * Stated here because this schema is the contract: `filter` narrows the source;
  * `sort` orders with a stable secondary key (each source's `id`) so equal keys
@@ -1841,9 +1948,9 @@ export type PanelByIdResponse = z.infer<typeof panelByIdResponseSchema>;
  *
  * `total` is the journal's length, so a caller that only needs the count asks
  * for `limit=0` and receives no diff at all. Records keep the full
- * `modificationRecordSchema` shape — hashes, backup path and diff — because AAP
- * §0.4.2 names this route's answer "modification records", and the
- * reversibility checks and the diff views read exactly those fields.
+ * `modificationRecordSchema` shape — hashes, backup path and diff — because
+ * this route answers with modification records, and the reversibility checks
+ * and the diff views read exactly those fields.
  */
 export const modificationsResponseSchema = z
   .strictObject({
@@ -1990,20 +2097,18 @@ export function formatListPageQuery(
 //
 // `POST /telemetry/ingest`.
 //
-// RECONCILIATION, recorded so a later reader does not "fix" it by deleting the
-// route: this package's folder brief lists the HTTP surface and ends with
-// "Nothing else.", omitting this route — but AAP §0.4.2 mandates it by name
-// ("`telemetry.event` · HTTP `POST /telemetry/ingest` | Node preload
-// (server-agent) → service | `{ projectRoot, events: TelemetryEventIngress[] }`"),
-// its process edge appears in that section's architecture diagram, and
-// `apps/local-service/src/server/routes/telemetry.ts` exists to serve it. The
-// AAP has primary authority, so the table below carries it.
+// A required route, not a stray one: the Node preload posts its server spans
+// here as `telemetry.event`, with its server-agent credential and a
+// `{ projectRoot, events: TelemetryEventIngress[] }` body;
+// `apps/local-service/src/server/routes/telemetry.ts` serves it; and
+// `docs/ARCHITECTURE.md` section 4.3 lists it among the HTTP routes. Deleting
+// it would leave the preload nowhere to post, so the table below carries it.
 //
 // Note which side of the wire reads this definition. `@debuggen/telemetry` sits
-// BELOW this package in the layering (AAP §0.2.2) and may not import it, so the
-// Node preload learns where to post from `DEBUGGEN_INGEST_URL` and validates
-// nothing against this table; the table is the canonical definition for the
-// SERVICE, which registers the route, and for any future client of it.
+// BELOW this package in the layering and may not import it, so the Node preload
+// learns where to post from `DEBUGGEN_INGEST_URL` and validates nothing against
+// this table; the table is the canonical definition for the SERVICE, which
+// registers the route, and for any future client of it.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2089,13 +2194,12 @@ export type TelemetryIngestResponse = z.infer<typeof telemetryIngestResponseSche
  * deriving it is the normal path and naming it is the escape hatch.
  *
  * `sessionId` decides who owns the process the service spawns. A launch that
- * names a session ties the child's lifetime to it (AAP §0.7.1 Group 2, "child
- * lifecycle tied to the session"): the child is stopped and its `server-agent`
- * credential revoked when the last session that launched or joined it ends. A
- * launch that names none is the developer's own dev server — it keeps serving
- * after any session ends, with the inert preload still attached (AAP §0.5.1),
- * until `POST /dev-server/stop`, the editor's deactivation or the service's
- * shutdown stops it.
+ * names a session ties the child's lifetime to it: the child is stopped and its
+ * `server-agent` credential revoked when the last session that launched or
+ * joined it ends. A launch that names none is the developer's own dev server —
+ * it keeps serving after any session ends, with the inert preload still
+ * attached, until `POST /dev-server/stop`, the editor's deactivation or the
+ * service's shutdown stops it.
  */
 export const devServerLaunchRequestSchema = z.strictObject({
   /** The project whose dev server should be running. */
@@ -2119,7 +2223,7 @@ export const devServerLaunchRequestSchema = z.strictObject({
    * started on the port of one already answering there: a dev server the
    * service launched itself is reused, and any other — the service cannot
    * attribute a preload to a process it did not start — is reported with the
-   * exact relaunch command (AAP §0.5.5). A child that prints no address is
+   * exact relaunch command. A child that prints no address is
    * polled at it. The same URL constraints as `session.create`'s.
    */
   devServerUrl: devServerUrlSchema.optional(),
@@ -2200,9 +2304,9 @@ export type DevServerStopResponse = z.infer<typeof devServerStopResponseSchema>;
  * The `POST /dev-server/credential` request: which project the credential will
  * be scoped to.
  *
- * The route mints the server-agent credential of AAP §0.5.6 for a dev server
- * the caller starts itself rather than through `devServer.launch` —
- * `scripts/dev-instrumented.mjs` "requests one with the editor credential" and
+ * The route mints a server-agent credential for a dev server the caller starts
+ * itself rather than through `devServer.launch` —
+ * `scripts/dev-instrumented.mjs` requests one with the editor credential and
  * hands it to the Node preload as `DEBUGGEN_TOKEN`. The body is the same as
  * {@link devServerStopRequestSchema}'s, and checked for the same thing: a
  * non-empty, bounded path. Deliberately no absolute-path refinement: whether
@@ -2220,23 +2324,30 @@ export type DevServerCredentialRequest = z.infer<typeof devServerCredentialReque
 
 /**
  * The `POST /dev-server/credential` response: the server-agent credential,
- * once, and when it stops being accepted.
+ * once, and when its first lease ends.
  *
  * One of exactly two HTTP responses in the product that carry a plaintext
  * credential — {@link pairCompleteResponseSchema} is the other — so the caller
  * treats `token` accordingly: it goes into the child's environment and nowhere
  * else, never into a log line, a message or a file. The credential is scoped
  * to the one `projectRoot` the request named, so `POST /telemetry/ingest` and
- * `client.hello` accept it only for that project, and it expires at
- * `expiresAt` even if the dev server it was minted for is never stopped.
- * Nothing rides along with the token: a role or a scope echoed here would be a
- * client's word for what it was granted.
+ * `client.hello` accept it only for that project. It is a lease, not a
+ * fixed-term credential: the service renews it while a server-agent control
+ * connection authenticated with it is online, revokes it shortly after that
+ * connection is gone (the dev server exited) or when no preload connected
+ * with it before `expiresAt`, and a lease nothing renews stops being accepted
+ * at its end. Nothing rides along with the token: a role or a scope echoed
+ * here would be a client's word for what it was granted.
  */
 export const devServerCredentialResponseSchema = z.strictObject({
   /** The bearer credential for the Node preload, `DEBUGGEN_TOKEN`. */
   token: opaqueTokenSchema(),
 
-  /** When the credential stops being accepted, in Unix epoch milliseconds. */
+  /**
+   * When the credential's first lease ends, in Unix epoch milliseconds: the
+   * instant it stops being accepted unless the service has renewed it for a
+   * connected preload.
+   */
   expiresAt: epochMsSchema,
 });
 
@@ -2331,13 +2442,22 @@ export type PairStartResponse = z.infer<typeof pairStartResponseSchema>;
  *
  * Unauthenticated, because the code **is** the credential being exchanged.
  * Everything that makes that safe is the service's: single use, five-minute
- * validity, a rate limit of five failures then a sixty-second lockout, and the
- * same origin policy every other route applies — the `chrome-extension://<id>`
+ * validity, a service-wide rate limit of five failures then a sixty-second
+ * lockout (never keyed by the caller-controlled `Origin`), and the same origin
+ * policy every other route applies — the `chrome-extension://<id>`
  * origin the request arrives from becomes the scope of the credential it
  * returns, so a code observed elsewhere cannot be redeemed into a usable one.
+ *
+ * `code` is compared exactly as sent: the service neither trims it nor folds
+ * its case, so a padded or lower-case submission is refused as a wrong code
+ * and counts toward the lockout. The DevTools pair dialog normalises what the
+ * developer typed before it submits.
  */
 export const pairCompleteRequestSchema = z.strictObject({
-  /** The one-time code the developer copied from the editor. */
+  /**
+   * The one-time code the developer copied from the editor, in the exact
+   * spelling the editor showed.
+   */
   code: opaqueTokenSchema(),
 });
 
@@ -2345,17 +2465,22 @@ export const pairCompleteRequestSchema = z.strictObject({
 export type PairCompleteRequest = z.infer<typeof pairCompleteRequestSchema>;
 
 /**
- * The `POST /pair/complete` response: the DevTools credential.
+ * The `POST /pair/complete` response: the DevTools credential and the read
+ * proof issued with it.
  *
- * Stored by `apps/chrome-extension/src/background/auth.ts` in
- * `chrome.storage.local` and sent on every subsequent request as
- * {@link formatBearer}'s output and in the socket's `client.hello`. It is scoped
+ * Both are stored by `apps/chrome-extension/src/background/auth.ts` in
+ * `chrome.storage.local`. The token is sent on every subsequent request as
+ * {@link formatBearer}'s output and in the socket's `client.hello`; it is scoped
  * to the extension id that redeemed the code and is refused from any other
- * origin.
+ * origin. The read proof is sent only as {@link READ_PROOF_HEADER} on the four
+ * DevTools reads, which are refused without it. The service returns both
+ * exactly once and keeps only their digests.
  */
 export const pairCompleteResponseSchema = z.strictObject({
   /** The bearer credential for the paired DevTools client. */
   token: opaqueTokenSchema(),
+  /** The read proof issued with {@link token}; see {@link READ_PROOF_HEADER}. */
+  readProof: readProofSchema,
 });
 
 /** The validated `POST /pair/complete` response body. */
@@ -2393,9 +2518,9 @@ export type HttpErrorResponse = z.infer<typeof httpErrorResponseSchema>;
 /**
  * The `POST /credentials/rotate` request body: `{}`, and strictly that.
  *
- * Rotation is all or nothing (AAP §0.5.6): a body that could name one
- * credential to keep would be a way to survive the revocation the command
- * exists to perform. Which credential may call it — the editor's alone — is
+ * Rotation is all or nothing: a body that could name one credential to keep
+ * would be a way to survive the revocation the command exists to perform.
+ * Which credential may call it — the editor's alone — is
  * the service's role table (Section A: no permission is expressed here), not
  * anything this body could say. Strict over an empty shape for the reason
  * {@link pairStartRequestSchema} is.
@@ -2409,11 +2534,11 @@ export type CredentialsRotateRequest = z.infer<typeof credentialsRotateRequestSc
  * The `POST /credentials/rotate` response: how much the rotation revoked.
  *
  * The route is what `debuggen.rotateServiceToken` calls, and it performs the
- * whole of AAP §0.5.6's rotation: it deletes every row of the `credentials`
- * table — the DevTools credentials of paired extensions and the server-agent
- * credentials of launched dev servers among them — regenerates
- * `$DEBUGGEN_HOME/auth.json` with a new editor credential, and closes every
- * open socket with `WS_CLOSE_UNAUTHORIZED` (4401, `./messages/agent.ts`).
+ * whole rotation: it deletes every row of the `credentials` table — the
+ * DevTools credentials of paired extensions and the server-agent credentials of
+ * launched dev servers among them — regenerates `$DEBUGGEN_HOME/auth.json` with
+ * a new editor credential, and closes every open socket with
+ * `WS_CLOSE_UNAUTHORIZED` (4401, `./messages/agent.ts`).
  * Paired Chrome extensions must pair again, and launched dev servers must be
  * relaunched to receive a fresh credential.
  *

@@ -1926,8 +1926,8 @@ describe('property 4: generated panels genuinely differ between two captures', (
  * counts the kind-indifferent span and event sources as the whole event count
  * and the trace source as the trace count, so a capture that only rendered
  * still reports traces, spans, events and a graph; and a page with a ticking
- * provider renders during a checkout too. The panels must still differ as AAP
- * §0.6.5 fixes: disjoint visualization bodies, lens-specific cards and links.
+ * provider renders during a checkout too. The panels must still differ:
+ * disjoint visualization bodies, lens-specific cards and links.
  * ---------------------------------------------------------------------------------------------- */
 
 /** The component whose own state updates publish the changing context value. */
@@ -2172,7 +2172,7 @@ function serviceLatencyPanelInput(options: ServiceLatencyOptions = {}): JsonObje
   };
 }
 
-/** The render-side and duration-side metric ids AAP §0.6.5 assigns to the two panels. */
+/** The render-side and duration-side metric ids the two panels are assigned. */
 const RENDER_CARD_IDS: readonly string[] = [
   'render_count',
   'unchanged_render_count',

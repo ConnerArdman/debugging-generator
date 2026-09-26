@@ -1,34 +1,12 @@
 /**
  * `GET /api/products/[slug]` - one product of the Lumen Supply catalog, addressed by its slug.
  *
- * The handler does what a route handler in this workspace does and nothing else: it parses the
- * matched route segment with the schema that declares it, hands the segment to the service that
- * answers it, and serializes that answer as it stands. The product is already stated in
- * `ProductDetail` from `@/lib/types` - prices are integer cents, `updatedAt` is an ISO-8601 UTC
- * string, stock is a state and a count per location - so nothing is renamed, rounded, re-ordered
- * or re-labelled on the way out, and a caller reads the same fields the product's own page renders.
- *
- * Three boundaries meet here, and each belongs to exactly one module:
- *
- * 1. **What a request may say** is `productSlugParamsSchema`'s. The slug's shape and its length
- *    ceiling are declared there, so this file restates neither and cannot drift from the schema
- *    the product's own page parses with. The parse is the throwing `parse`: a segment this
- *    endpoint does not accept is a failure to report rather than a lookup to attempt, and the
- *    resulting `ZodError` carries the field path a caller needs.
- * 2. **What the answer is** is `readProductBySlug`'s. It owns the lookup, the per-location stock
- *    ordering and the specification rows, and it raises the not-found failure itself when no
- *    product owns the slug - which is why nothing here pre-checks existence, branches on an absent
- *    value or assembles a 404 of its own.
- * 3. **How a failure reads** is `@/server/errors`'s. Whatever is thrown - a rejected segment, an
- *    unknown product, a database that could not be reached - is handed to
- *    `storefrontErrorResponse`, the one mapper every endpoint in this application answers through,
- *    so the status and the envelope are chosen in one place and no field path, statement or
- *    connection string can leak from this one.
- *
- * The answer is never stored. A product states a price and a stock level as they are at the moment
- * it is read, and both change while the application runs, so the response asks every layer between
- * here and the reader to come back for the next one, and two identical requests each reach the
- * database.
+ * `productSlugParamsSchema` in `@/server/validation/products` owns the slug's shape and length
+ * ceiling, shared with the product's own page. `readProductBySlug` raises the not-found failure
+ * itself, so nothing here checks existence. Every failure - a rejected segment, an unknown product,
+ * an unreachable database - is answered by `storefrontErrorResponse`, so no input value, SQL
+ * statement or connection string reaches the caller. Price and stock change while the application
+ * runs, so the segment is dynamic and the `ProductDetail` is returned as it stands with `no-store`.
  */
 
 import type { ProductDetail } from '@/lib/types';
@@ -51,8 +29,9 @@ export const dynamic = 'force-dynamic';
  *
  * @param _request The incoming request. Unread: this endpoint takes no query, header or body.
  * @param context The matched route segment, as Next.js hands it over.
- * @returns `200` with the product as JSON, or the shared failure envelope with the status the
- *   mapper chose - `400` for a segment the schema rejected, `404` for a slug no product owns.
+ * @returns `200` with the product as JSON, or the shared failure envelope with the status
+ *   `storefrontErrorResponse` chose - `400` for a segment the schema rejected, `404` for a slug no
+ *   product owns.
  */
 export async function GET(
   _request: Request,

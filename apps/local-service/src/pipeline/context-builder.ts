@@ -57,13 +57,35 @@
  * ## The developer's question travels in the prompt only
  *
  * AAP §0.5.4 requires two questions that differ only in wording to produce the
- * same structured input. So the raw question — and a follow-up question — is
- * rendered into the prompt text (capped) and **never** placed in
+ * same structured input. So the question — and a follow-up question — is
+ * rendered into the prompt text and **never** placed in
  * {@link ModelRequest.input}. What the structured input may carry instead is a
  * wording-invariant projection: the sorted, de-duplicated lexical hints the
- * generic tokenizer of `stages/understand.ts` produces. This module never
- * compares, searches or switches on question text; it only measures and cuts
- * it.
+ * generic tokenizer of `stages/understand.ts` produces.
+ *
+ * The question is free text the developer typed, so it can quote what the page
+ * showed — `Why is /reset?code=… slow?` — or paste a header line —
+ * `Authorization: Bearer …`, `Cookie: session=…`. Only the redaction layer's
+ * output may leave the machine, so every builder renders it
+ * through {@link redactQuestionText} (`scrub`, then `redactTextUrls`, then the
+ * cap), and the tokenizer reads the same redacted text. This module never
+ * compares, searches or switches on question text; it only redacts, measures
+ * and cuts it.
+ *
+ * ## Embedded URLs in the structured input
+ *
+ * The outbound guard refuses a URL run in prose or code that still carries a
+ * query value. Every string of a stage's structured input — tool requests,
+ * code excerpts, model-authored understanding, investigation, plan, analysis
+ * and panel text — is therefore passed through `redactEmbeddedUrls` by
+ * {@link redactEmbeddedUrlsDeep} before the budget runs, and every prompt
+ * placeholder is derived from the result. That masker is the code-safe one: it
+ * masks absolute `http(s)` URLs and origin-relative `/path?…` runs at the start
+ * of the text or after whitespace (or its written escape, `\n`) or `(`, and
+ * leaves quoted paths, optional
+ * chaining, ternaries and regular-expression literals as they are. It never
+ * scrubs credentials, so a secret inside a source excerpt still makes the
+ * guard refuse the stage.
  *
  * ## Import direction
  *
@@ -126,8 +148,10 @@ import {
 } from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
 import {
+  MAX_SCAN_LENGTH,
   formatUrlParts,
   parseUrlParts,
+  redactEmbeddedUrls,
   redactQueryString,
   redactTextUrls,
   redactUrl,
@@ -238,9 +262,15 @@ export interface PipelineStageContext {
   readonly session: SessionRecord;
   /** The project root: absolute, POSIX separators, normalised. */
   readonly projectRoot: string;
-  /** The developer's question, verbatim. Rendered into prompts only, never into structured input. */
+  /**
+   * The developer's question, verbatim as stored. Rendered into prompts only,
+   * never into structured input, and only after {@link redactQuestionText}.
+   */
   readonly question: string;
-  /** The follow-up question being answered, on the follow-up path. Prompt-only, like the question. */
+  /**
+   * The follow-up question being answered, on the follow-up path. Prompt-only
+   * and redacted before rendering, like the question.
+   */
   readonly followUpQuestion?: string | undefined;
   /** The element the developer selected, when there is one. */
   readonly target?: SelectedTarget | undefined;
@@ -538,11 +568,13 @@ function isGuardParsedUrl(token: string): boolean {
  *
  * `capped` is {@link capText}'s cut of text whose query values are already the
  * mask `?`. A cut that lands in a masked value turns `sort=?` into `sort=…` or
- * `sort=?…`, a value that is neither empty nor the mask, and the guard's
- * `url-query-value` rule would refuse the whole request for it. So when the
- * cut falls inside a value, the pair it split is dropped back to the preceding
- * `&` (or the `?`) and the marker becomes a bare trailing segment — the same
- * shape `redactUrl` itself gives a query it had to cut. A cut inside the
+ * `sort=?…`: a half pair. The guard counts both values as a mask cut short, so
+ * neither refuses the request, but a half pair tells the model a value was
+ * there without saying it was masked. So when the cut falls inside a value,
+ * the pair it split is dropped back to the preceding `&` (or the `?`) and the
+ * marker becomes a bare trailing segment — the same shape `redactUrl` itself
+ * gives a query it had to cut, and a shape that stays masked for any reader
+ * that accepts only `?` and the empty value. A cut inside the
  * authority or path leaves no query; a cut inside a parameter name leaves a
  * bare name; a cut inside the fragment leaves every pair whole. Each of those,
  * and text that was not cut, is returned as {@link capText} produced it.
@@ -578,12 +610,12 @@ function keepCutQueryMasked(capped: CappedText): CappedText {
  * Re-masks the query of a single token the outbound guard parses as a URL, as
  * the guard's parser delimits it; any other text is returned unchanged.
  *
- * `redactTextUrls` ends an embedded URL at a quote or an angle bracket and
- * leaves trailing sentence punctuation outside it, which is right for a URL
- * inside a label or a selector but not for a token the guard reads whole: to
- * the WHATWG parser, `/reset?coupon=?.` carries the value `?.` and
- * `/a[@href="/p?id=?"]` the value `?"]`, and either would refuse the request.
- * So every pair of such a token's query is masked again with
+ * `redactTextUrls` masks every query run whole, trailing punctuation included
+ * (`/reset?coupon=SPRING.` becomes `/reset?coupon=?`), but it ends a run at a
+ * quote, an angle bracket or a backtick. That is right for a URL inside a
+ * label or a selector, and not for a token the guard reads whole: to the
+ * WHATWG parser, `/a[@href="/p?id=?"]` carries the value `?"]`, which would
+ * refuse the request. So every pair of such a token's query is masked again with
  * `redactQueryString` — idempotent on a value that is already `?`, so the
  * common case comes back byte-identical — and the trailing characters the
  * parser would have read as part of the last value go with it. A masked value
@@ -616,11 +648,15 @@ function maskGuardParsedQuery(text: string): string {
  * Used for every string of a selected element — tag name, selector, visible
  * text, component names — because the element is described by the browser,
  * not by the ingest checkpoint, and nothing upstream of this builder has run
- * the rules of AAP §0.5.2 over it. Two passes run over the whole value:
+ * the rules of AAP §0.5.2 over it; and, through {@link redactQuestionText}, for
+ * the developer's question, which is free text of the same exposure. Two
+ * passes run over the whole value:
  *
  * 1. `scrub`: provider keys, bearer credentials, JWT-shaped strings,
  *    private-key blocks and credentialed connection strings become
- *    `[redacted]` wherever they sit in the text.
+ *    `[redacted]` wherever they sit in the text, and the value of a pasted
+ *    header line of a denied header (`Authorization: Bearer …`,
+ *    `Cookie: session=…`) becomes `[redacted]` whatever its length.
  * 2. `redactTextUrls`: every URL embedded in the text — a link whose visible
  *    text is its own address, an attribute selector such as
  *    `a[href="/p?id=…"]`, a sentence quoting `/reset?coupon=…`, a component
@@ -637,8 +673,9 @@ function maskGuardParsedQuery(text: string): string {
  * bound to key-like field names, and a selector or a label is not one.
  *
  * The cut is then made with {@link capText}. Prose — text with whitespace
- * inside it — keeps that plain cut: the guard does not examine prose, and its
- * values were masked before the cut. A result that is a single token is held
+ * inside it — keeps that plain cut: its values were masked before the cut, and
+ * a cut that lands inside a masked value leaves `?…` or `…`, which the guard's
+ * embedded-URL check counts as masked. A result that is a single token is held
  * to the guard's reading of it: a cut inside a masked pair drops that pair and
  * ends with {@link TRUNCATION_MARKER}, as {@link redactAndCapUrl} does, and when
  * the guard parses the token as a URL, its query is masked in the parser's own
@@ -671,6 +708,47 @@ export function redactAndCapText(value: string, max: number): CappedText {
 }
 
 /**
+ * Redacts a developer question — the session's question or a follow-up — and
+ * caps the redacted form: the one form in which a question may reach a prompt,
+ * and the text the understand stage's tokenizer reads.
+ *
+ * The question is typed by the developer, but it is typed *about* the page, so
+ * it carries what the page showed and what the developer pasted: a queried
+ * route (`Why is /reset?code=… slow?`), a link, a copied request header
+ * (`Authorization: Bearer …`, `Cookie: session=…`). Only the redaction layer's
+ * output may leave the machine, so the question gets exactly
+ * the treatment of page-derived free text, {@link redactAndCapText}: `scrub`
+ * (credential shapes, and the whole value of a denied header line, become
+ * `[redacted]`), then `redactTextUrls` (every query value and a non-empty
+ * fragment of every embedded URL becomes `?`, trailing punctuation included),
+ * then the cut. Both passes see the whole question before anything is cut, so
+ * no credential or value is split out of reach of the rule that identifies it.
+ *
+ * Wording invariance is unaffected: the redaction is a pure,
+ * deterministic function of the text that looks for shapes, never for words,
+ * and the structured input still carries only the tokenizer's projection of
+ * the redacted text. The question is handed over as data; nothing here
+ * compares, searches or switches on it.
+ *
+ * @example
+ * ```ts
+ * redactQuestionText('Why is /reset?code=ZIP42 slow?', 2_000).text;
+ * // 'Why is /reset?code=? slow?'
+ * redactQuestionText('Authorization: Bearer S3CRET', 2_000).text;
+ * // 'Authorization: [redacted]'
+ * ```
+ *
+ * @param value The question, verbatim as stored.
+ * @param max The greatest length of the result, as {@link capText} counts it; a
+ * non-finite `max` redacts without cutting, for a reader that bounds the text
+ * itself.
+ * @returns The redacted, capped question and whether the cap removed characters.
+ */
+export function redactQuestionText(value: string, max: number): CappedText {
+  return redactAndCapText(value, max);
+}
+
+/**
  * Redacts a page address with the telemetry layer's `redactUrl`, then caps the
  * redacted form without ever leaving a query value the outbound guard would
  * read as unmasked.
@@ -684,10 +762,10 @@ export function redactAndCapText(value: string, max: number): CappedText {
  * idempotent, so an address that was masked upstream comes back unchanged.
  *
  * A plain {@link capText} of the redacted form is right everywhere except
- * inside the query, where a cut into a masked value would leave a value the
- * guard's `url-query-value` rule refuses; {@link keepCutQueryMasked} drops the
- * pair such a cut split, back to the preceding `&` (or the `?`), and ends the
- * query with the marker as a bare trailing segment.
+ * inside the query, where a cut into a masked value would leave a half pair
+ * (`sort=…`); {@link keepCutQueryMasked} drops the pair such a cut split, back
+ * to the preceding `&` (or the `?`), and ends the query with the marker as a
+ * bare trailing segment.
  *
  * @example
  * ```ts
@@ -1059,6 +1137,95 @@ export function toBoundedJson(value: unknown, options: BoundedJsonOptions): Boun
   } catch {
     return { value: undefined, truncated: true };
   }
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Embedded-URL masking of structured sections
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Mutable state of one {@link maskEmbeddedUrls} walk. */
+interface EmbeddedUrlWalk {
+  /** Whether a string was longer than `MAX_SCAN_LENGTH`, and so cut by the masker. */
+  bounded: boolean;
+}
+
+/** One step of {@link redactEmbeddedUrlsDeep}: masks strings, copies containers, keeps the rest. */
+function maskEmbeddedUrls(value: JsonValue, walk: EmbeddedUrlWalk): JsonValue {
+  if (typeof value === 'string') {
+    if (value.length > MAX_SCAN_LENGTH) {
+      walk.bounded = true;
+    }
+    return redactEmbeddedUrls(value);
+  }
+  if (Array.isArray(value)) {
+    const list: readonly JsonValue[] = value;
+    return list.map((item) => maskEmbeddedUrls(item, walk));
+  }
+  if (isObjectRecord(value)) {
+    const source: JsonObject = value;
+    const out: Record<string, JsonValue> = {};
+    for (const key of Object.keys(source)) {
+      const entry = source[key];
+      if (entry !== undefined && key !== PROTO_KEY) {
+        out[key] = maskEmbeddedUrls(entry, walk);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Masks the query values of every URL embedded in every string of a
+ * structured section, with the telemetry layer's code-safe
+ * `redactEmbeddedUrls`, and returns a fresh copy: the caller's value is never
+ * modified, keys and their order are kept, and numbers, booleans and `null`
+ * pass through.
+ *
+ * This is what lets a stage input that *legitimately* mentions a URL reach the
+ * model: a code-tool request (`routeForUrl` with a queried address), a source
+ * excerpt whose comment reads `// GET /api/items?page=2`, a documentation link
+ * in a string literal, a model-authored understanding, investigation, plan,
+ * analysis or panel that quotes a route. The outbound guard refuses any such
+ * URL that still carries a value, and would otherwise refuse the whole stage.
+ * What is masked is exactly what that guard checks — an absolute `http(s)` URL
+ * anywhere (its userinfo replaced and its path scrubbed, as `redactUrl` does),
+ * and an origin-relative `/path?…` run at the start of the text or after
+ * whitespace (or its written escape, `\n`) or `(`, trailing punctuation
+ * included — while code the guard
+ * never reads as a URL is left alone: a quoted path (`'/api/x?a=1'`), a
+ * template literal, optional chaining (`a?.b`), a ternary, a regular-expression
+ * literal. Page text is not this function's business: it has already been
+ * through the wider `redactTextUrls`, on which this is idempotent.
+ *
+ * Credentials are **not** scrubbed. A secret in a source excerpt is a finding
+ * the guard must still refuse the stage for, not something to
+ * hide from the developer by rewriting their code.
+ *
+ * Every string cap of {@link CONTEXT_LIMITS} is below the masker's own
+ * `MAX_SCAN_LENGTH`, so no bounded section is cut here. A longer string from an
+ * upstream module is cut at that bound with a `[redacted]` line, never passed
+ * through unexamined; the builder reports its section as truncated.
+ *
+ * Pure, total and deterministic; linear in the size of the value. A JSON value
+ * holds no cycles, and every section reaching this function is already depth-
+ * bounded by {@link toBoundedJson} or by its producer.
+ *
+ * @example
+ * ```ts
+ * redactEmbeddedUrlsDeep({ request: { tool: 'routeForUrl', url: 'http://127.0.0.1:3000/p?id=7' } });
+ * // { request: { tool: 'routeForUrl', url: 'http://127.0.0.1:3000/p?id=?' } }
+ * redactEmbeddedUrlsDeep({ text: "fetch('/api/x?a=1'); // GET /api/x?a=1" });
+ * // { text: "fetch('/api/x?a=1'); // GET /api/x?a=?" }
+ * ```
+ *
+ * @param value The structured section.
+ * @returns A copy with every embedded URL's query values and fragment masked.
+ */
+export function redactEmbeddedUrlsDeep(value: JsonObject): JsonObject;
+export function redactEmbeddedUrlsDeep(value: JsonValue): JsonValue;
+export function redactEmbeddedUrlsDeep(value: JsonValue): JsonValue {
+  return maskEmbeddedUrls(value, { bounded: false });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2081,13 +2248,39 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
     readonly values: (input: JsonObject, outputSchema: string) => Readonly<Record<string, string>>;
   }
 
-  /** Budgets a drafted input, renders its schema and values, and runs the fixed build sequence. */
+  /**
+   * The drafted input with every embedded URL masked, section by section (see
+   * {@link redactEmbeddedUrlsDeep}); a section holding a string the masker had
+   * to bound is recorded as truncated. The draft itself is never modified.
+   */
+  const maskInputSections = (input: JsonObject, truncated: Set<string>): JsonObject => {
+    const masked: Record<string, JsonValue> = {};
+    for (const section of Object.keys(input)) {
+      const entry = input[section];
+      if (entry === undefined || section === PROTO_KEY) {
+        continue;
+      }
+      const walk: EmbeddedUrlWalk = { bounded: false };
+      masked[section] = maskEmbeddedUrls(entry, walk);
+      if (walk.bounded) {
+        truncated.add(section);
+      }
+    }
+    return masked;
+  };
+
+  /**
+   * Masks a drafted input's embedded URLs, budgets it, renders its schema and
+   * values, and runs the fixed build sequence. Every placeholder value is
+   * derived from the masked, budgeted input, so the prompt and the structured
+   * input carry the same text.
+   */
   const finishStage = (draft: StageDraft): Result<StageRequestBuild, DebuggenError> => {
     const { stage, request, truncated } = draft;
     const { context } = request;
     const log = subsystemLogger(context.logger, CONTEXT_BUILDER_SUBSYSTEM);
 
-    const budget = applyPayloadBudget(draft.input, limits, {
+    const budget = applyPayloadBudget(maskInputSections(draft.input, truncated), limits, {
       protectedSections: draft.protectedSections,
     });
     if (!budget.fits) {
@@ -2128,6 +2321,23 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
     truncated: Set<string>,
   ): string => {
     const capped = redactAndCapText(value, max);
+    if (capped.truncated) {
+      truncated.add(section);
+    }
+    return capped.text;
+  };
+
+  /**
+   * The prompt-only text of a developer question — `question` or
+   * `followUpQuestion` — redacted by {@link redactQuestionText} and capped at
+   * `maxQuestionChars`, recording `section` when the cap removed characters.
+   */
+  const questionSectionText = (
+    value: string,
+    section: 'question' | 'followUpQuestion',
+    truncated: Set<string>,
+  ): string => {
+    const capped = redactQuestionText(value, limits.maxQuestionChars);
     if (capped.truncated) {
       truncated.add(section);
     }
@@ -2310,12 +2520,7 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       upstreamBounded,
       truncated,
     );
-    const question = capSectionText(
-      context.question,
-      limits.maxQuestionChars,
-      'question',
-      truncated,
-    );
+    const question = questionSectionText(context.question, 'question', truncated);
 
     const input: JsonObject = {
       ...hints.value,
@@ -2367,12 +2572,7 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       [];
     const candidates = candidatesFrom(queryResults);
     const remainingQueries = toCount(request.remainingQueries);
-    const question = capSectionText(
-      context.question,
-      limits.maxQuestionChars,
-      'question',
-      truncated,
-    );
+    const question = questionSectionText(context.question, 'question', truncated);
 
     const input: JsonObject = {
       ...(understanding !== undefined ? { understanding } : {}),
@@ -2494,9 +2694,8 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       codeExcerpts = canonicalJson(request.stageInput.excerpts, new Set<object>()) ?? [];
     }
 
-    const question = capSectionText(
+    const question = questionSectionText(
       context.followUpQuestion ?? context.question,
-      limits.maxQuestionChars,
       'question',
       truncated,
     );
@@ -2556,9 +2755,8 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       request.panel !== undefined
         ? boundSection(request.panel, 'panel', fullyCapped, truncated)
         : undefined;
-    const followUpQuestion = capSectionText(
+    const followUpQuestion = questionSectionText(
       request.followUpQuestion,
-      limits.maxQuestionChars,
       'followUpQuestion',
       truncated,
     );

@@ -211,10 +211,10 @@ model Order {
   placedAt      DateTime    @default(now()) @map("placed_at")
 
   /// Who placed this order, as the checkout collected it. The account the order
-  /// is written against is the session's, and may have been opened for an
-  /// earlier order by somebody else at the same company, so the contact on the
-  /// order is kept with the order. Written as a set or not at all; `NULL`
-  /// throughout on an order placed before the store recorded them.
+  /// is written against may be shared by several people at the same company, so
+  /// the contact is kept on the order itself. Written as a set or not at all;
+  /// `NULL` throughout on an order written without a collected contact, which
+  /// is then described by its customer account.
   contactName    String? @map("contact_name")
   contactEmail   String? @map("contact_email")
   contactCompany String? @map("contact_company")

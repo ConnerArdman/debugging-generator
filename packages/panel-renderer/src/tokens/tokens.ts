@@ -1,17 +1,17 @@
 /**
  * Design tokens — the single source of truth for every visual value in this
- * design system (AAP 0.6.1, 0.6.3).
+ * design system, in three complete value sets: dark, light and high contrast
+ * (see "The renderer contract" in docs/ARCHITECTURE.md).
  *
  * No third-party component library or design system is used, so this module
  * *is* the value layer: every colour, space, font, weight, radius, glyph and
  * control size, shadow, focus ring, motion duration, easing function and
  * stacking level that either host surface renders resolves to a `--dg-*`
  * custom property whose value originates here, once. Nothing downstream may
- * define a colour, a metric or a motion constant of its own: AAP 0.6.4 permits
- * only the literals `0`, `none`, `auto`, `inherit`, `currentColor` and
- * `transparent` in a component, so a value that is missing here has no legal
- * way to be expressed — the fix is to add it here, never to inline it in a
- * component.
+ * define a colour, a metric or a motion constant of its own: a component may
+ * write only the literals `0`, `none`, `auto`, `inherit`, `currentColor` and
+ * `transparent`, so a value that is missing here has no legal way to be
+ * expressed — the fix is to add it here, never to inline it in a component.
  *
  * There is likewise no second namespace and no "internal constant" escape
  * hatch. A value declared beside these — under any other prefix, in any other
@@ -153,12 +153,12 @@ const darkTokens = {
   kindFunction: '#f97316',
   kindDb: '#f472b6',
   kindError: '#ef4444',
-  // Two families the seven AAP 0.6.3 values leave unrepresented, so the
+  // Two families the seven core kinds above leave unrepresented, so the
   // dependency graph's six participant classes can each own a colour and
   // agree with the span views: server-side work behind a request boundary
   // (the route handler) and a request the server makes onwards to another
   // system. Supplementary members of the same scale, under the same 3:1 fill
-  // bar; the seven AAP values above are untouched.
+  // bar; they add colours without changing any of the seven core values.
   /** Server-side work behind a request boundary (a route handler). */
   kindService: '#22d3ee',
   /** A request the server makes onwards to another system. */
@@ -244,9 +244,9 @@ const darkTokens = {
    * RESETS weight — so a rule that wants a role's size and line-height but a
    * heavier face has to restate the weight in a declaration of its own. That
    * declaration needs a token, because a numeral written in a stylesheet is a
-   * visual value outside this table and AAP 0.6.4 admits none. This is that
-   * token, and it is the same weight the `textLg` role carries; the token test
-   * pins the two together so they cannot drift apart.
+   * visual value outside this table and the design system admits none. This is
+   * that token, and it is the same weight the `textLg` role carries; the token
+   * test pins the two together so they cannot drift apart.
    */
   fontWeightMedium: '500',
   // Type roles are complete `font` shorthands, so a rule can set a role with
@@ -761,7 +761,7 @@ export function cssVarName(key: TokenKey): string {
  *
  * This is how inline geometry computed in TypeScript — a scale, a lane offset,
  * a severity colour — reaches the stylesheet's values without any component
- * restating one (AAP 0.6.4).
+ * restating one.
  */
 export function cssVar(key: TokenKey): string {
   return `var(${cssVarName(key)})`;

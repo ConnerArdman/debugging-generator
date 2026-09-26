@@ -1,80 +1,28 @@
 'use client';
 
 /**
- * Lumen Supply - ToastViewport: the visible corner region the notification queue is shown in.
+ * Lumen Supply - ToastViewport: the corner region that shows the notification queue.
  *
- * `@/providers/ToastProvider` owns the queue and renders `children` and nothing else - no DOM, no
- * stylesheet, no stacking tier - so without this component every notice the storefront raises
- * ("Added to cart", "Order placed", "That line is out of stock") exists in state and is never seen.
- * This file is the other half of that split: the root layout mounts it exactly once inside the
- * provider, it reads the queue from context, and it paints it. That is the whole of its job.
+ * `@/providers/ToastProvider` owns the queue and its whole lifecycle, so there is no timer, clock
+ * read or queue logic here - a second lifecycle would race the first. This component reads the
+ * queue from context and paints it in the order received, oldest first.
  *
- * WHAT IT DELIBERATELY DOES NOT DO
- * Lifecycle belongs to the provider, all of it. A notice retires on the provider's own schedule,
- * through a single timer armed for the earliest `expiresAt` in the queue, so there is no timer, no
- * `Date.now()` reading, no remaining-time calculation, no queueing, no pause-on-hover and no
- * maximum-count truncation anywhere in here - a second lifecycle would race the first and produce
- * notices that vanish early or linger, for reasons no reader of either file could explain. The
- * component holds no state, runs no effect, keeps no ref and touches no browser global while
- * rendering, which is also what makes it hydration-safe: the server renders the region with an
- * empty list, the browser's first render produces the same markup, and the queue only ever grows
- * afterwards from an interaction. `toasts` is `readonly` and is rendered in the order it arrives -
- * oldest first, as the provider documents - never copied, sorted or sliced.
+ * The region renders even when the queue is empty: a live region has to be in the accessibility
+ * tree before its first message, or that message is announced late or not at all. `role="status"`
+ * with `aria-live="polite"` waits for the reader rather than interrupting, and
+ * `aria-relevant="additions"` keeps an expiry or a dismissal from being announced. `aria-atomic`
+ * is stated as `"false"` because `role="status"` implies `"true"`, which would re-read every
+ * visible notice each time one is added. Focus is never moved: a notice can arrive while the buyer
+ * is typing into the checkout form.
  *
- * THE REGION IS RENDERED EVEN WHEN THE QUEUE IS EMPTY, AND THAT IS THE POINT
- * A live region has to be in the accessibility tree *before* the text it should announce is put
- * into it; a container inserted into the document in the same frame as its first message is
- * frequently announced late or not at all. So the region is unconditional and only the list items
- * come and go. `role="status"` with `aria-live="polite"` queues each new notice behind whatever the
- * reader is doing rather than interrupting them, and `aria-relevant="additions"` keeps a removal -
- * an expiry, or a dismissal the reader performed themselves - from being announced as news.
+ * `data-ls-live-region="true"` is a contract with `@/components/cart/CartDrawer`, whose modal
+ * `inert` sweep skips any body child that is or contains it. Removing it makes this region inert
+ * while the drawer is open and silences every notice raised from inside the drawer.
  *
- * `aria-atomic="false"` is stated explicitly because `role="status"` implies `aria-atomic="true"`:
- * left implicit, adding a third notice would re-announce the two already on screen, so a buyer who
- * adds three lines to a cart hears the first line's confirmation three times. Only the addition is
- * announced, and the title is the first text in each item, so that announcement leads with the
- * headline rather than with a dismiss control.
- *
- * Focus is never moved here. A notice appears while the buyer is typing into the checkout form,
- * and stealing focus would empty the field they were in the middle of. The dismiss control is
- * reachable in document order like any other button, which is the correct trade for a message that
- * retires by itself anyway.
- *
- * THE REGION IDENTIFIES ITSELF, SO A MODAL SURFACE CAN LEAVE IT ALONE
- * `data-ls-live-region="true"` on the root is a contract with exactly one reader:
- * `@/components/cart/CartDrawer`, which - while its `aria-modal="true"` sheet is open - puts the
- * `inert` attribute on every other child of `document.body` so no focus move, find-in-page hit or
- * assistive-technology cursor can land behind the dialog. This region must survive that sweep: the
- * drawer's own rows raise notices while it is open ("Quantity updated", "Removed from cart"), and
- * an inert live region is out of the accessibility tree, so it announces nothing. The drawer skips
- * any body child that is, or contains, `[data-ls-live-region]`, which is this attribute and nothing
- * else in the document. It is a data attribute rather than an id or a class because the marker
- * states a role for other code to read, carries no styling, and must not be renamed by a CSS Module
- * hash. Removing it would silence every notice raised from inside the cart drawer.
- *
- * STRUCTURE, AND WHY IT IS FLAT
- * `ToastViewport.module.css` lays a notice out as a two-column grid - the message, then the
- * dismiss control - with `.title` and `.body` placed in column 1 and `.dismiss` in column 2 of row
- * 1, and the rows created by whichever children are actually present. Those three classes are
- * therefore rendered as DIRECT children of `.toast`: grouping the two paragraphs inside a wrapper
- * element would make the stylesheet's column placement inert and, more visibly, would drop the
- * `row-gap` between the headline and the detail line, because a wrapper declares no gap of its
- * own. A notice with no detail line simply contributes no second row.
- *
- * The region is transparent to the pointer (`.root { pointer-events: none }`) while each notice
- * takes interaction back (`.toast { pointer-events: auto }`), which is what stops a 360px
- * rectangle parked over the checkout summary's action column from swallowing presses meant for the
- * storefront. That pair lives in the stylesheet and nothing here may undo it: no `style` prop, no
- * inline CSS and no portal - the region is `position: fixed` and is already mounted at the layout
- * root, so a portal would only add a node the server tree has to reconcile.
- *
- * `data-tone` carries the notice's tone to the stylesheet, which selects the accent and title
- * colour from the attribute. The four values are exactly the `ToastTone` union the provider
- * exports, passed through untouched, so the two files cannot drift into a tone that renders
- * unstyled; an unknown value would fall back to the neutral accent rather than break the layout.
- *
- * No props, and no exported props type: the component is mounted once, at a known place, with
- * nothing to configure. Its only hook is the context read that hands it the queue.
+ * `.title`, `.body` and `.dismiss` must stay direct children of `.toast`: the stylesheet places
+ * them on a two-column grid, and a wrapper would break the placement and the row gap. The region
+ * ignores the pointer while each notice takes it back; that pair lives in the stylesheet, so this
+ * file adds no `style` prop and no portal.
  */
 
 import { useToastCenter } from '@/providers/ToastProvider';

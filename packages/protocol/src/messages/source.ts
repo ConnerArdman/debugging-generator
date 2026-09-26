@@ -14,9 +14,9 @@
  * ## The hop sequence
  *
  * A source chip in a rendered panel becomes an editor selection through a fixed
- * chain (AAP §0.2.3, §0.4.2). Every hop passes the same object through
- * unchanged; this module defines what that object looks like on the hops that
- * cross a process boundary, in both directions:
+ * chain. Every hop passes the same object through unchanged; this module
+ * defines what that object looks like on the hops that cross a process
+ * boundary, in both directions:
  *
  * ```text
  * a SourceLink node in the rendered panel
@@ -38,7 +38,7 @@
  * The direction matters for who may send what: the DevTools panel is the origin
  * of `source.open` and the editor its destination, so the service forwards
  * rather than opens, and it accepts the message only from the connection bound
- * to the session named in the payload (AAP §0.5.6). The answer runs the other
+ * to the session named in the payload. The answer runs the other
  * way, and it is correlated by `ref` alone — the `id` of the `source.open`
  * envelope it answers — because that is the one value both ends of each hop
  * already hold: the sender minted it, and the receiver read it off the frame.
@@ -63,7 +63,7 @@
  *   or no editor answered within {@link SOURCE_OPEN_EDITOR_TIMEOUT_MS}. The
  *   payload carries the failure as `{ code, message, hint? }`, the shape
  *   `DebuggenError.toPayload()` returns, so a user interface renders it with the
- *   renderer it already has for every other failure (AAP §0.5.5).
+ *   renderer it already has for every other failure.
  *
  * A request that receives no `source.result` at all — a dropped socket, a
  * suspended worker — is closed by the sender's own deadline,
@@ -80,8 +80,10 @@
  *
  * 1. the service, which has the session's `projectRoot` and the filesystem, and
  *    refuses a location that resolves outside it;
- * 2. the editor's URI handler, which re-derives the same answer from the
- *    workspace folders without trusting the service.
+ * 2. the editor, which re-derives the same answer without trusting the
+ *    service: against the session's `projectRoot` for a forwarded frame, whose
+ *    `pinned` file and identity must match what it resolves itself, and
+ *    against the workspace folders for the fallback URI.
  *
  * Containment cannot be decided here: this package has no project root, no
  * filesystem and no environment — `packages/protocol/tsconfig.json` declares
@@ -89,7 +91,7 @@
  * loaded by a Node service, an MV3 service worker, a DevTools panel page and a
  * VS Code webview alike. Adding a third, weaker copy of the path rules would put
  * a contract this package does not own in a place that cannot enforce it, and
- * AAP §0.9.1 allows the shape exactly one definition. What this module does is
+ * the location shape has exactly one definition. What this module does is
  * check that each payload *is* what it claims — a session id and a location, a
  * correlation reference and an outcome — and reject everything else before it
  * can reach a handler. {@link buildEditorOpenUri} follows the same rule: it
@@ -214,6 +216,53 @@ const MAX_HINT_LENGTH = 2000;
 const sessionIdSchema = z.string().min(1).max(MAX_ID_LENGTH);
 
 /**
+ * The most digits a device or inode number is written with. 2^128 − 1 has 39
+ * digits, so every 64-bit `st_dev` and `st_ino` fits with room to spare.
+ */
+const MAX_FILE_ID_DIGITS = 39;
+
+/**
+ * A device or inode number in canonical decimal: digits only, no sign and no
+ * leading zero.
+ *
+ * A string, because JSON has no `bigint` and a `number` rounds an inode above
+ * 2^53 — and a rounded inode can make two different files compare equal, the
+ * one outcome the pin exists to refuse. The canonical form is what makes
+ * string equality the same test as numeric equality, so `String(stats.ino)` of
+ * a `bigint` `lstat` is compared as written.
+ */
+const fileIdNumberSchema = z
+  .string({ error: 'expected a decimal string' })
+  .regex(new RegExp(`^(?:0|[1-9][0-9]{0,${String(MAX_FILE_ID_DIGITS - 1)}})$`), {
+    error: `expected a canonical decimal of at most ${String(MAX_FILE_ID_DIGITS)} digits`,
+  });
+
+/**
+ * The file the service proved a forwarded `source.open` names.
+ *
+ * - `file` — the target's path relative to the canonical project root with
+ *   every symbolic link resolved, final component included. It differs from
+ *   `location.file` when the location reaches the file through a link that
+ *   stays inside the project.
+ * - `dev`, `ino` — the device and inode a non-following `lstat` of that
+ *   canonical path reported, as {@link fileIdNumberSchema} writes them.
+ *
+ * Set by the service on the frame it forwards to the editor and by no other
+ * sender: the service refuses an inbound `source.open` that carries it, so a
+ * page can never nominate the file it wants trusted. A canonical path is true
+ * only at the instant it was computed, and this frame crosses a socket before
+ * the editor acts on it, so the editor resolves the location again and opens
+ * nothing unless its own canonical path and identity equal these. A link
+ * re-pointed or a file replaced while the frame was in flight is refused
+ * rather than opened.
+ */
+const sourceOpenPinSchema = z.strictObject({
+  file: sourceLocationSchema.shape.file,
+  dev: fileIdNumberSchema,
+  ino: fileIdNumberSchema,
+});
+
+/**
  * The payload of `source.open`: which session the click came from, and where in
  * the project to go.
  *
@@ -229,6 +278,11 @@ const sessionIdSchema = z.string().min(1).max(MAX_ID_LENGTH);
  * the schema, so nesting it here runs the owner's own checks and reports their
  * issues under the full path (`location.file`, `location.endLine`), which is
  * exactly what a producer needs to fix its side.
+ *
+ * `pinned` is optional because only one hop carries it: absent from the
+ * DevTools panel to the service, present from the service to the editor. The
+ * schema cannot tell the hops apart, so each receiver enforces its own rule —
+ * the service refuses a frame that carries it, the editor one that lacks it.
  */
 export const sourceOpenPayloadSchema = z.strictObject({
   /** The session whose panel the developer clicked in. */
@@ -243,6 +297,12 @@ export const sourceOpenPayloadSchema = z.strictObject({
    * something like this".
    */
   location: sourceLocationSchema,
+
+  /**
+   * The canonical file and identity the service proved for `location`, on the
+   * service-to-editor hop only. See {@link sourceOpenPinSchema}.
+   */
+  pinned: sourceOpenPinSchema.optional(),
 });
 
 /**
@@ -298,7 +358,7 @@ export function parseSourceOpenPayload(value: unknown): Result<SourceOpenPayload
       'PROTOCOL_INVALID_MESSAGE',
       'Invalid source.open payload',
       parsed.error.issues,
-      'A source.open payload carries exactly two fields: the session the click came from, and a location that satisfies the shared source-location schema of @debuggen/shared.',
+      'A source.open payload carries the session the click came from and a location that satisfies the shared source-location schema of @debuggen/shared; the frame the service forwards to the editor also carries pinned: { file, dev, ino }, and nothing else.',
     ),
   );
 }
@@ -414,8 +474,7 @@ const sourceResultErrorSchema = z.strictObject({
    *
    * Never a path the service refused: the service reports a containment
    * refusal by its code and a constant sentence, because the refused value is
-   * attacker-controllable and a user interface is no place to echo it
-   * (AAP §0.5.2).
+   * attacker-controllable and a user interface is no place to echo it.
    */
   message: z
     .string({ error: 'expected an error message string' })
@@ -526,7 +585,7 @@ export type SourceResultPayload = z.infer<typeof sourceResultPayloadSchema>;
  * paths and codes — an unknown `status` is reported at the discriminator, a
  * missing `error` under its own name — and **never** a rejected value: the
  * `message` of a malformed failure is unvalidated text from another process,
- * and it does not travel into this error (AAP §0.5.2).
+ * and it does not travel into this error.
  *
  * @param value Any value believed to be a `source.result` payload.
  * @returns `ok(payload)` with the validated payload, or `err(error)` describing
@@ -628,7 +687,7 @@ export type SourceResultDriftAssertions = [
  * DevTools panel, which opens the URI, and the VS Code extension's URI handler,
  * which receives it.
  *
- * `vscode://debuggen.debug-generator/open?file=…&line=…&col=…` (AAP §0.2.3):
+ * `vscode://debuggen.debug-generator/open?file=…&line=…&col=…`:
  *
  * - `scheme` — the scheme VS Code registers with the operating system;
  * - `authority` — `<publisher>.<name>` of the extension, which is how VS Code
@@ -757,7 +816,7 @@ function encodeEditorQueryValue(value: string | number): string {
  * schema refuses — an absolute path, a `..` traversal, a zero line — or a file
  * that cannot be URI-encoded is answered with a `DebuggenError` of code
  * `'PROTOCOL_INVALID_MESSAGE'` from `protocolParseError`, which names the field
- * and **never** the rejected value (AAP §0.5.2). Passing validation is not
+ * and **never** the rejected value. Passing validation is not
  * permission to open anything: the extension's URI handler resolves the file
  * against the open workspace folders itself, refuses whatever escapes them, and
  * asks the developer to confirm before opening.
@@ -808,9 +867,8 @@ export function buildEditorOpenUri(location: SourceLocation): Result<string, Deb
  *
  * `messages/index.ts` merges this map with the other domain modules' maps into
  * `MESSAGE_PAYLOAD_SCHEMAS`, and `envelope.ts` maps over that to build the
- * discriminated union every frame is validated against. `source.open` is
- * verbatim from AAP §0.4.2 and is one of the message names the product's
- * requirements fix character for character; `source.result` is its answer.
+ * discriminated union every frame is validated against. `source.open` is the
+ * documented message name, spelled exactly; `source.result` is its answer.
  * Both are written once, here, and referenced everywhere else.
  *
  * Frozen because it is a module-level table the envelope reads on every parse: a

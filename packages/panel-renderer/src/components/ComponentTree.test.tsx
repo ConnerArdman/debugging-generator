@@ -6,23 +6,24 @@
  * The `componentTree` node draws a structure the capture could not always
  * observe completely, and that is what most of the cases below are about.
  *
- *   - **Accessibility is the substance, not a garnish.** AAP 0.6.4 names this
- *     component's shape explicitly: ARIA roles on the tree, full keyboard
+ *   - **Accessibility is the substance, not a garnish.** This component's
+ *     accessibility contract is explicit: ARIA roles on the tree, full keyboard
  *     navigation, and a highlight that is never colour alone. So the tree's
- *     roles, its single roving tab stop — with the toggles and source chips kept
- *     out of the Tab order —, each of the seven navigation and selection keys
- *     it owns, the Shift+Enter command that opens a row's source, the words
- *     beside the highlight's icon and the badge a collapsed branch carries for
- *     the marks it hides are all asserted mechanically rather than described in
- *     a comment.
- *   - **A snapshot states its own limits (AAP 0.6.6).** The structure is taken
- *     at the last commit of a capture and cannot always be reconstructed, so
- *     `origin` and `degraded` are part of the answer. Two cases hold that line:
- *     a reconstructed, degraded snapshot must say both things on screen, and an
+ *     roles, its single roving tab stop — with the toggles and source chips
+ *     kept out of the Tab order —, each of the seven navigation and selection
+ *     keys it owns, the Shift+Enter command that opens a row's source, the
+ *     words beside the highlight's icon and the badge a collapsed branch
+ *     carries for the marks it hides are all asserted mechanically rather than
+ *     described in a comment.
+ *   - **A snapshot states its own limits.** The structure is taken at the last
+ *     commit of a capture and cannot always be reconstructed, so `origin` and
+ *     `degraded` are part of the answer. Two cases hold that line: a
+ *     reconstructed, degraded snapshot must say both things on screen, and an
  *     `origin: "flat"` snapshot must render a **list** — no `role="group"`, no
  *     nesting — because a single level of nodes dressed as a tree claims a
  *     hierarchy nobody observed. That is the same class of error as an
- *     unevidenced fact in an analysis, which AAP 0.8.4 rules out structurally.
+ *     unevidenced fact in an analysis, which the product rules out structurally
+ *     by requiring every observed fact to cite evidence the capture holds.
  *   - **Nothing is selected that does not exist.** A node of this datum is an
  *     aggregate; the producer names one real render to stand for it, and
  *     selecting the node reports exactly that reference with only the
@@ -42,22 +43,23 @@
  *   - **Selecting is not disclosing.** A click on a row and Enter/Space select
  *     it and never toggle it; the toggle, ArrowRight/ArrowLeft and the toolbar
  *     disclose, and are asserted to keep doing so.
- *   - **Names and counts only (AAP 0.5.2).** Prop and state values are
- *     structurally absent from the datum. One case renders a payload that
- *     smuggles them in anyway and asserts they never reach the DOM, and another
- *     pins a row's complete text, so a prop or state inspector cannot be added
- *     here without failing this file.
+ *   - **Names and counts only.** Prop and state values are structurally absent
+ *     from the datum. One case renders a payload that smuggles them in anyway
+ *     and asserts they never reach the DOM, and another pins a row's complete
+ *     text, so a prop or state inspector cannot be added here without failing
+ *     this file.
  *   - **A large structure stays bounded.** This source answers with one object
- *     and no paging (AAP 0.4.2), so the default expansion policy is the only
- *     bound available; the last case asserts the rendered rows are a small
- *     fraction of the nodes the snapshot reports.
+ *     and no paging, so the default expansion policy is the only bound
+ *     available; the last case asserts the rendered rows are a small fraction
+ *     of the nodes the snapshot reports.
  *
- * Alongside those, AAP 0.8.3 asks every component suite here for the three
- * states of a query-backed view — loading, empty and error — and for the
- * click-to-source payload. Each state is driven through a stub `DataProvider`
- * that respectively never settles, resolves an empty snapshot and rejects; the
- * payload case asserts what the host actually receives, because every hop after
- * this one acts blind on the object it is handed (AAP 0.4.2, hop 2 of five).
+ * Alongside those, every component suite here covers the three states of a
+ * query-backed view — loading, empty and error — and the click-to-source
+ * payload. Each state is driven through a stub `DataProvider` that respectively
+ * never settles, resolves an empty snapshot and rejects; the payload case
+ * asserts what the host actually receives, because every step after the host's
+ * `openSource` acts blind on the object it is handed (`docs/ARCHITECTURE.md`,
+ * "A click, end to end").
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -76,10 +78,10 @@
  *   - **In-file synthetic builders, no fixture files.** {@link makeTreeNode},
  *     {@link makeSnapshot} and {@link makeNode} take overrides; nothing here is
  *     read from disk or shared with another suite.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): component names, a file
- *     path and a symbol that belong to no application, demonstration or
- *     otherwise. `scripts/check-no-hardcoding.mjs` scans this text with the rest
- *     of `packages/**`.
+ *   - **Generic fixture vocabulary only**: component names, a file path and a
+ *     symbol that belong to no application, demonstration or otherwise.
+ *     `scripts/check-no-hardcoding.mjs` skips test files, so this suite keeps
+ *     the product's neutral vocabulary by convention.
  *   - **Queries by role and accessible name.** The tree, its rows, its child
  *     groups, the toolbar controls and the source chips are all reached that
  *     way; a class is read only off an element already obtained semantically,
@@ -141,10 +143,10 @@ import { ComponentTree } from './ComponentTree';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Every string below is application-neutral (AAP 0.5.4): no component, route,
- * service or symbol of any inspected project appears here, in the fixtures or
- * in the comments. The identifiers are shaped as the capture shapes them — node
- * ids carry the producer's own prefix, the timestamp is epoch milliseconds, the
+ * Every string below is application-neutral: no component, route, service or
+ * symbol of any inspected project appears here, in the fixtures or in the
+ * comments. The identifiers are shaped as the capture shapes them — node ids
+ * carry the producer's own prefix, the timestamp is epoch milliseconds, the
  * source path is project-relative and POSIX — because the component reads those
  * fields and formats them.
  * ---------------------------------------------------------------------------
@@ -202,9 +204,9 @@ const SOURCE_COLUMN = 9;
  * A complete, resolved location for the click-to-source cases.
  *
  * Held as one frozen value so the payload assertions can compare **identity**
- * as well as contents: the component's contract is to forward the object it was
- * given, field for field and without rewriting a path or adjusting a coordinate
- * (AAP 0.4.2, `PanelActions` hop 2).
+ * as well as contents: the component's contract is to hand the host's
+ * `openSource` the object it was given, field for field and without rewriting a
+ * path or adjusting a coordinate.
  */
 const LEAF_SOURCE: SourceLocation = Object.freeze({
   file: SOURCE_FILE,
@@ -327,9 +329,9 @@ const FLAT_ORIGIN_DETAIL =
   'No hierarchy could be rebuilt, so every observed component is listed at a single level.';
 
 /**
- * The shared error-state contract, spelled out rather than imported so a drift
- * in the one place that words it fails here too (B1-F16, B2-F14): the title of
- * a failed view, the generic lead its message opens with, the title of a query
+ * The shared error-state contract, spelled out rather than imported so a
+ * wording drift in the one place that words it fails here too: the title of a
+ * failed view, the generic lead its message opens with, the title of a query
  * this view cannot draw and the focus key its retry control carries.
  */
 const ERROR_TITLE = 'Could not load this view';
@@ -340,7 +342,7 @@ const RETRY_FOCUS_KEY = 'error-state-retry';
 /**
  * A provider's own failure message, which reaches the screen as the cause
  * after the generic lead: the lead alone would hide what failed, and an error
- * state reports what failed without reading like an analysis (AAP 0.5.5).
+ * state reports what failed without reading like an analysis.
  */
 const PROVIDER_FAILURE_MESSAGE = 'The channel to the service is closed.';
 
@@ -361,8 +363,8 @@ const EMPTY_MESSAGE_PATTERN = /no component tree was captured/i;
  *
  * The datum carries names, keys, counts, a duration, a trigger and a location —
  * prop and state **values are structurally absent**, which is the privacy
- * guarantee rather than an omission (AAP 0.5.2). These strings prove the view
- * renders only what its type gave it.
+ * guarantee rather than an omission. These strings prove the view renders only
+ * what its type gave it.
  */
 const SMUGGLED_PROP_VALUE = 'prop-value-that-must-never-render';
 const SMUGGLED_STATE_VALUE = 'state-value-that-must-never-render';
@@ -397,7 +399,7 @@ function counted(count: number, one: string, other: string): string {
  *
  * Built from the snapshot's own counters and the number of rows on screen,
  * because the component states all three rather than implying completeness from
- * whatever happens to be visible (AAP 0.6.6).
+ * whatever happens to be visible.
  *
  * @param snapshot The snapshot being drawn.
  * @param shown How many rows are on screen.
@@ -941,7 +943,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -1157,7 +1159,7 @@ function rowNamed(name: string, role: 'treeitem' | 'listitem' = 'treeitem'): HTM
  *
  * A composite widget has exactly one, whichever row currently holds it, so
  * every keyboard case asserts the length of this rather than the attribute of
- * one row (AAP 0.6.4).
+ * one row.
  *
  * @returns The rows whose `tabIndex` is `0`.
  */
@@ -1363,7 +1365,7 @@ describe('ComponentTree states', () => {
     expect(busy.closest(`.${LOADING_CLASS}`)).not.toBeNull();
 
     // Nothing is drawn yet: no tree, no rows, no toolbar, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryAllByRole('treeitem')).toHaveLength(0);
     expect(screen.queryByRole('spinbutton', { name: THRESHOLD_FIELD_NAME })).toBeNull();
@@ -2239,8 +2241,8 @@ describe('ComponentTree counts', () => {
     );
 
     // The whole row, pinned: a name, a count and a time. There is no prop cell,
-    // no state cell and no value of any kind (AAP 0.5.2), and a threshold this
-    // node does not reach leaves no mark either.
+    // no state cell and no value of any kind, and a threshold this node does
+    // not reach leaves no mark either.
     expect(row.textContent).toBe(
       `ExampleRoot${formatCount(renderCount)} ${RENDERS_UNIT}${formatDurationCompact(
         totalDurationMs,
@@ -2654,7 +2656,7 @@ describe('ComponentTree host reporting', () => {
     const forwarded = spies.onOpenSource.mock.calls[0]?.[0];
 
     // Field for field, with the same key set, and the same object: no path
-    // rewriting, no coordinate arithmetic, no field dropped (AAP 0.4.2).
+    // rewriting, no coordinate arithmetic, no field dropped.
     expect(forwarded).toEqual(LEAF_SOURCE);
     expect(Object.keys(forwarded ?? {}).sort()).toEqual(Object.keys(LEAF_SOURCE).sort());
     expect(forwarded).toBe(LEAF_SOURCE);
@@ -2940,7 +2942,7 @@ describe('ComponentTree bounds and privacy', () => {
     expect(document.body.innerHTML).not.toContain(SMUGGLED_STATE_VALUE);
 
     // And there is no affordance that would ask for them: this view has no prop
-    // or state inspector, by design (AAP 0.5.2).
+    // or state inspector, by design.
     for (const pattern of [/prop/i, /state/i, /inspect/i, /value/i]) {
       expect(screen.queryByRole('button', { name: pattern })).toBeNull();
     }

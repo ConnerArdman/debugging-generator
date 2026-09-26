@@ -1,59 +1,22 @@
 /*
- * Lumen Supply - the busy indicator.
+ * Lumen Supply - the busy indicator: one rotating ring shown while a request the reader started is
+ * still in flight. The element is empty; `Spinner.module.css` paints all of it.
  *
- * One rotating ring, shown while a request the reader started is still in flight: inside a
- * button's label as the cart or the checkout posts, and beside a line of inline "loading" copy on
- * the catalog and dashboard surfaces. It is the whole of this component - the element is empty,
- * and every pixel of it is painted by `Spinner.module.css`.
- *
- * DECORATIVE BY CONTRACT, NOT BY OVERSIGHT
- * The span carries `aria-hidden="true"` and has no `role`, no `aria-label`, no `aria-live` and no
- * text, so it contributes nothing to the accessibility tree. The announcement belongs to the
- * surface that owns the request, which is the only place that knows what is being waited for and
- * how often it changes: a control names its wait with adjacent hidden text, a region marks itself
- * `aria-busy`. This primitive renders in dozens of places, and a `role="status"` in here would
- * turn each of them into an independent live region - a reader would hear the same generic
- * "loading" announced repeatedly, from places it could neither locate nor silence, and the
- * duplicates would be loudest exactly when several requests are in flight at once.
+ * Decorative by contract: `aria-hidden="true"`, with no role, label, live region or text. The
+ * announcement belongs to the control or region that owns the request, the only place that knows
+ * what is being waited for - a control names its wait with adjacent hidden text, a region marks
+ * itself `aria-busy`. A `role="status"` here would make each of its many placements a separate
+ * live region repeating a generic "loading".
  *
  *     <button type="button" aria-busy={submitting} disabled={submitting}>
- *       {submitting ? (
- *         <>
- *           <Spinner />
- *           <VisuallyHidden>Placing order</VisuallyHidden>
- *         </>
- *       ) : (
- *         'Place order'
- *       )}
+ *       {submitting ? <Spinner /> : null}
+ *       {submitting ? <VisuallyHidden>Placing order</VisuallyHidden> : 'Place order'}
  *     </button>
  *
- * Colour is never the sole carrier of meaning here either: the ring says only "something is in
- * flight", and what that something is always reaches the reader as text from the caller.
- *
- * THE SIZE IS AN ATTRIBUTE, NOT A LOOKED-UP CLASS
- * `Spinner.module.css` exports exactly one class, `root`, and selects the two non-default sizes
- * with `.root[data-size='sm']` and `.root[data-size='lg']`, each of which sets a single custom
- * property that the width, the height and nothing else read. So this component forwards its prop
- * straight into an attribute and never indexes the styles object: a variant class would have to be
- * read through a computed key, which this repository's `noUncheckedIndexedAccess` types as
- * `string | undefined`, hiding a typo until the ring renders unstyled in a browser. An attribute
- * is constrained by the prop union below, cannot be applied without the base rule, and is legible
- * in the elements tree beside the class it qualifies.
- *
- * MOTION
- * The rotation and its reduced-motion behaviour are the stylesheet's: under
- * `prefers-reduced-motion: reduce` the ring stops turning and keeps its size, its accent arc and
- * its place in the line, so a reader who asked for less motion still sees that work is in
- * progress. There is no JavaScript motion here to keep in step with that, and deliberately no
- * media-query read during render, which would have to happen in the browser and would make the
- * server's markup and the browser's first markup disagree.
- *
- * RENDER BEHAVIOUR
- * A plain function component: no state, no effects, no `ref` forwarding, and nothing read from
- * `window`, `Date.now()` or `Math.random()` while rendering, so the markup the server sends and
- * the markup the browser first produces always agree. Holding no hooks, and carrying no client
- * directive either, lets a server component and a client component render it equally - which
- * matters, because the surfaces that wait on data are of both kinds.
+ * The size is a `data-size` attribute, not a class looked up in `styles`. Rotation and its
+ * reduced-motion behaviour live in the stylesheet: under `prefers-reduced-motion: reduce` the ring
+ * stops turning but keeps its size and accent arc. No state, effects or client directive, and no
+ * media-query read during render, so it renders on either side and server and client markup agree.
  */
 
 import clsx from 'clsx';
@@ -61,11 +24,10 @@ import clsx from 'clsx';
 import styles from './Spinner.module.css';
 
 /**
- * The indicator's inputs. Local and deliberately not exported: `packages/panel-renderer` declares
- * its own primitives, and a caller that needs this shape reads it back from the component with
- * `React.ComponentProps<typeof Spinner>` rather than importing a second name for it. There is no
- * `children`, no label and no tone prop - text belongs to the caller (see the contract above), and
- * the ring takes its colours from the storefront's `--ls-*` tokens rather than from a prop.
+ * The indicator's inputs. Local and deliberately not exported: a caller that needs this shape reads
+ * it back with `React.ComponentProps<typeof Spinner>`. There is no `children`, no label and no tone
+ * prop - text belongs to the caller (see the contract above), and the ring takes its colours from
+ * the storefront's `--ls-*` tokens rather than from a prop.
  */
 interface Props {
   /**

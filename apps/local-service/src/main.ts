@@ -41,7 +41,9 @@
  *    configuration is logged once through its credential-free view.
  * 3. **The state tree** — `$DEBUGGEN_HOME`, `backups/` and `index/`, created and
  *    verified `0700` and symlink-free by `ensureSecureDir` (mkdir's own mode is
- *    umask-masked, which is why it is not used).
+ *    umask-masked, which is why it is not used) — and its canonical location,
+ *    resolved once with `realpath`: the value every project root is kept apart
+ *    from (AAP 0.4.2).
  * 4. **The session store** — `openStore` from `./store/db.js`: the owner-only
  *    database file, WAL mode, the pragmas and the schema ladder.
  * 5. **The editor credential** — `AuthService.ensureEditorCredential` from
@@ -55,11 +57,21 @@
  *    restored from its backup or marked `conflict` by
  *    `reconcileModificationsOnStartup`. A developer who killed the service
  *    mid-session gets their files back here, before any client can open a new
- *    session.
+ *    session. Then the **state-root overlap check**: a stored session whose
+ *    canonical project root contains the canonical state root, or lies inside
+ *    it, refuses the start (`FS_UNSAFE_PATH`, step `state-home-overlap`), so
+ *    session data, backups and the credential never live in a working tree;
+ *    so does one whose project root cannot be resolved on disk, because
+ *    separation that cannot be shown is not assumed. The same check guards
+ *    every new session, follow-up, dev-server launch and credential through
+ *    the routes, and the instrumentation service repeats it before every
+ *    install writes a backup or a patch.
  * 7. **Retention — before serving** (AAP 0.4.2): `runRetention` purges aged
  *    sessions, stale index caches and orphan backups, conflict backups exempt.
  *    The same dependencies back `POST /sessions/purge`, which the editor
- *    command `debuggen.purgeSessions` calls to run the sweep on demand.
+ *    command `debuggen.purgeSessions` calls to run the sweep on demand —
+ *    scoped to that editor's announced workspace folders, while the start-up
+ *    pass is machine-wide.
  * 8. **The model provider** — `createModelProvider` over the validated
  *    selection. An unusable selection is a configuration error and fails the
  *    start; a transport failure is a runtime condition reported per session by
@@ -81,7 +93,16 @@
  *     request listener is the hono application of `./server/http.js` and whose
  *     `upgrade` event is routed to the WebSocket server of `./server/ws.js` at
  *     protocol's `WS_PATH`. The bound port is read back, so `port: 0` yields a
- *     usable {@link ServiceHandle.url}.
+ *     usable {@link ServiceHandle.url}. The server is created with
+ *     {@link HTTP_SERVER_LIMITS} in force — header, request and keep-alive
+ *     deadlines and a connection cap — so no connection holds a socket
+ *     unbounded before the access boundary sees its request (CWE-400); a
+ *     connection it refuses is answered by a raw `Connection: close` response
+ *     carrying `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+ *     New connections are admitted at a bounded rate, and those that have sent
+ *     no complete request — or idle with none in flight — share a bounded
+ *     budget whose oldest member a newcomer evicts, so stalled connections
+ *     cannot hold every slot ({@link createLimitedServer}).
  * 12. **Health** — `GET /health`, auth-exempt, answers from the first accepted
  *     connection.
  *
@@ -193,9 +214,17 @@ import {
 import { ensureSecureDir } from '@debuggen/shared/node';
 
 import { realpathSync } from 'node:fs';
-import { createServer, type RequestListener, type Server } from 'node:http';
+import {
+  STATUS_CODES,
+  createServer,
+  type IncomingMessage,
+  type RequestListener,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { performance } from 'node:perf_hooks';
+import type { Duplex } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -210,11 +239,17 @@ import type {
   StartupReconciliationReport,
 } from './cleanup/cleanup.js';
 import {
+  PROJECT_ROOT_UNRESOLVABLE_REASON,
+  STATE_HOME_OVERLAP_HINT,
+  STATE_HOME_OVERLAP_REASON,
+  canonicalizePath,
   describeServiceConfig,
   loadServiceConfig,
+  stateHomeOverlap,
   toModelProviderOverrides,
   type ServiceConfig,
   type ServiceConfigOverrides,
+  type StateHomeOverlap,
 } from './config.js';
 import { probeDevServer } from './dev-server/detect.js';
 import {
@@ -271,9 +306,13 @@ import type { CodeIndexPort, PipelineOrchestrator } from './pipeline/orchestrato
 import type { CaptureReadinessRequest, CaptureReadinessSource } from './pipeline/stages/capture.js';
 import { createAuthService } from './server/auth.js';
 import type { AuthService, ConnectionRevoker } from './server/auth.js';
-import { WS_CLOSE_GOING_AWAY, createClientRegistry } from './server/clients.js';
+import {
+  DEFAULT_MAX_CLIENTS,
+  WS_CLOSE_GOING_AWAY,
+  createClientRegistry,
+} from './server/clients.js';
 import type { ClientRegistry } from './server/clients.js';
-import { createHttpApp } from './server/http.js';
+import { DEFAULT_REQUEST_BODY_TIMEOUT_MS, createHttpApp } from './server/http.js';
 import type { HttpApp } from './server/http.js';
 import { createBindingRoutes, redactSelectedTarget } from './server/routes/binding.js';
 import type { BindingRoutes } from './server/routes/binding.js';
@@ -375,6 +414,211 @@ export const SERVICE_VERSION = '0.1.0';
  * so it has ended long before {@link SHUTDOWN_BUDGET} does.
  */
 const HTTP_DRAIN_GRACE_MS = 3_000;
+
+/**
+ * The deadlines and the connection cap the HTTP server enforces on every
+ * connection before a route — and so before the access boundary — sees it
+ * (CWE-400). See {@link HTTP_SERVER_LIMITS} for the values and why.
+ */
+export interface HttpServerLimits {
+  /**
+   * How long a request may take to deliver its complete header block, in
+   * milliseconds: counted from the connection's establishment for its first
+   * request and from the first byte of every later one, so a connection that
+   * sends nothing at all is closed at this deadline too. Node's
+   * `server.headersTimeout`; answered `408` and closed.
+   */
+  readonly headersTimeoutMs: number;
+
+  /**
+   * How long a request may take to arrive whole — header block and body — in
+   * milliseconds, counted like {@link headersTimeoutMs}. Node's
+   * `server.requestTimeout`. It ends once the request has arrived: a handler
+   * that takes longer to answer, and a WebSocket upgraded on the connection,
+   * are not bound by it. Never below {@link headersTimeoutMs}.
+   */
+  readonly requestTimeoutMs: number;
+
+  /**
+   * How long a keep-alive connection may sit idle after a response before the
+   * server closes it, in milliseconds. Node's `server.keepAliveTimeout`.
+   */
+  readonly keepAliveTimeoutMs: number;
+
+  /**
+   * How often the server checks the two request deadlines above, in
+   * milliseconds, and so how late past its deadline a stalled request can be
+   * closed. Node's `connectionsCheckingInterval` server option.
+   */
+  readonly connectionsCheckingIntervalMs: number;
+
+  /**
+   * The most connections the server holds open at once — HTTP connections and
+   * upgraded WebSocket sockets alike. A connection accepted past it is closed at
+   * once, before a byte is read. Node's `server.maxConnections`: the hard
+   * backstop behind the admission budget of the three limits below.
+   */
+  readonly maxConnections: number;
+
+  /**
+   * The admission bucket's capacity: how many new TCP connections the server
+   * admits in one burst before {@link connectionsPerSecond} paces them. A
+   * connection that finds the bucket empty is destroyed as it is accepted,
+   * before a byte of it is parsed. See {@link createConnectionAdmission}.
+   */
+  readonly connectionBurst: number;
+
+  /**
+   * How many admissions the bucket regains per second, up to
+   * {@link connectionBurst}: the sustained rate of new connections.
+   */
+  readonly connectionsPerSecond: number;
+
+  /**
+   * The most **unengaged** connections the server holds at once: connections
+   * that have not delivered a complete request head yet, or that sit idle on
+   * keep-alive with no response in flight — sockets that hold no slot a
+   * legitimate client is waiting on. A new connection past it evicts the oldest
+   * unengaged one. A connection with a request in flight is never unengaged, and
+   * neither is one upgraded to WebSocket (`./server/ws.ts` applies its own
+   * admission quotas to those).
+   */
+  readonly maxUnengagedConnections: number;
+
+  /**
+   * How many of {@link maxConnections}' slots the eviction keeps free for new
+   * connections. Once the server holds `maxConnections − reservedConnections`
+   * connections of any kind — the soft cap — a new connection evicts the oldest
+   * unengaged one, and is refused only when none is left to evict. A reserve no
+   * smaller than `maxConnections` leaves no room for a soft cap, so none applies
+   * and the hard cap alone refuses (how a suite observes it with a cap of 2).
+   */
+  readonly reservedConnections: number;
+}
+
+/**
+ * Replacements for members of {@link HTTP_SERVER_LIMITS}; see
+ * {@link StartServiceOptions.httpLimits}. Every member accepts an explicit
+ * `undefined`, which keeps the default.
+ */
+export type HttpServerLimitOverrides = {
+  readonly [Limit in keyof HttpServerLimits]?: number | undefined;
+};
+
+/**
+ * The time a request's header block may take, in milliseconds. Every client of
+ * this service — the editor, the DevTools panel, a dev-server preload, the
+ * guard scripts — sends its header block in one write over loopback, so ten
+ * seconds is generous for them and short for a connection that trickles or
+ * withholds it.
+ */
+const HTTP_HEADERS_TIMEOUT_MS = 10_000;
+
+/**
+ * What the whole-request deadline allows beyond a full header deadline and the
+ * request-body guard's own time ceiling, in milliseconds: the time between the
+ * header block and the route's first body read, and the check interval.
+ */
+const HTTP_REQUEST_TIMEOUT_SLACK_MS = 5_000;
+
+/**
+ * The WebSocket sockets {@link HTTP_SERVER_LIMITS}' connection cap provides
+ * for: twice the client registry's {@link DEFAULT_MAX_CLIENTS} — every
+ * registered client, and as many again for upgrades still awaiting their
+ * `client.hello`, which is more than `./server/ws.ts` admits before a hello —
+ * so the WebSocket surface meets its own cap before this one.
+ */
+const WEBSOCKET_SOCKET_ALLOWANCE = 2 * DEFAULT_MAX_CLIENTS;
+
+/**
+ * The HTTP connections {@link HTTP_SERVER_LIMITS}' connection cap provides for
+ * beyond {@link WEBSOCKET_SOCKET_ALLOWANCE}: one developer's editor, DevTools
+ * panels, dev-server preloads and scripts open a handful each.
+ */
+const HTTP_CONNECTION_HEADROOM = 512;
+
+/**
+ * The admission bucket's capacity: as many new connections at once as
+ * {@link WEBSOCKET_SOCKET_ALLOWANCE} provides for, so every client of a full
+ * registry reconnecting together after a service restart — or an integration
+ * suite opening its connections — is admitted without waiting.
+ */
+const HTTP_CONNECTION_BURST = 512;
+
+/**
+ * The bucket's refill rate, per second: an emptied bucket admits a full
+ * registry again within two seconds, while a flood of new connections is held
+ * to this pace — below what one process can open — whatever it sends.
+ */
+const HTTP_CONNECTIONS_PER_SECOND = 256;
+
+/**
+ * The unengaged connections held at once: a quarter of the cap. Every client
+ * of this service sends its request head in one write as it connects, so a
+ * legitimate connection is unengaged for a moment, or while it idles on
+ * keep-alive for at most {@link HttpServerLimits.keepAliveTimeoutMs}.
+ */
+const HTTP_MAX_UNENGAGED_CONNECTIONS = 256;
+
+/**
+ * The slots below the cap the eviction keeps free (the soft cap is 960): room
+ * for the connections accepted while earlier ones are still being closed.
+ */
+const HTTP_RESERVED_CONNECTIONS = 64;
+
+/**
+ * The limits of the HTTP server {@link startService} listens with (CWE-400).
+ *
+ * The server's authentication runs in the application, after the request has
+ * arrived, so without these a peer that opens connections and never completes
+ * a request would hold a socket, a file descriptor and a parser each for as
+ * long as it liked. With them every connection is bounded in number and in
+ * time before any route reads a byte of it, and connections are admitted at a
+ * bounded rate with a bounded share for those that serve nobody yet:
+ *
+ * | Limit | Value | Why |
+ * | --- | --- | --- |
+ * | `headersTimeoutMs` | 10 s | a stalled or empty connection is closed `408` within 11 s |
+ * | `requestTimeoutMs` | 45 s | above the header deadline plus `../server/http.ts`'s {@link DEFAULT_REQUEST_BODY_TIMEOUT_MS} (30 s), so a trickling body meets that guard's own `408` first |
+ * | `keepAliveTimeoutMs` | 5 s | an idle keep-alive connection is released |
+ * | `connectionsCheckingIntervalMs` | 1 s | how late past a deadline the close comes |
+ * | `maxConnections` | 1 024 | {@link WEBSOCKET_SOCKET_ALLOWANCE} (512) plus {@link HTTP_CONNECTION_HEADROOM} (512) |
+ * | `connectionBurst` | 512 | {@link HTTP_CONNECTION_BURST}: a reconnect storm of a full registry is admitted at once |
+ * | `connectionsPerSecond` | 256 | {@link HTTP_CONNECTIONS_PER_SECOND}: a flood is paced below the speed it can open sockets |
+ * | `maxUnengagedConnections` | 256 | {@link HTTP_MAX_UNENGAGED_CONNECTIONS}: stalled or idle sockets can take a quarter of the cap, never all of it |
+ * | `reservedConnections` | 64 | {@link HTTP_RESERVED_CONNECTIONS}: from 960 held connections on, a newcomer evicts an unengaged one |
+ *
+ * Every peer of this service is on loopback, where a per-address quota cannot
+ * tell one client from another, so the admission budget is global rather than
+ * per peer; see {@link createConnectionAdmission} for how it still keeps a
+ * slot for a legitimate client. A connection refused at the cap, past the
+ * admission rate or with nothing left to evict, and a connection evicted, is
+ * reported at `warn`, at most once per
+ * {@link DROPPED_CONNECTIONS_REPORT_INTERVAL_MS} for each kind, with counts
+ * only. No environment variable changes these (the settings surface is fixed
+ * by AAP 0.3.4); {@link StartServiceOptions.httpLimits} is the suites' seam.
+ */
+export const HTTP_SERVER_LIMITS: HttpServerLimits = Object.freeze({
+  headersTimeoutMs: HTTP_HEADERS_TIMEOUT_MS,
+  requestTimeoutMs:
+    HTTP_HEADERS_TIMEOUT_MS + DEFAULT_REQUEST_BODY_TIMEOUT_MS + HTTP_REQUEST_TIMEOUT_SLACK_MS,
+  keepAliveTimeoutMs: 5_000,
+  connectionsCheckingIntervalMs: 1_000,
+  maxConnections: WEBSOCKET_SOCKET_ALLOWANCE + HTTP_CONNECTION_HEADROOM,
+  connectionBurst: HTTP_CONNECTION_BURST,
+  connectionsPerSecond: HTTP_CONNECTIONS_PER_SECOND,
+  maxUnengagedConnections: HTTP_MAX_UNENGAGED_CONNECTIONS,
+  reservedConnections: HTTP_RESERVED_CONNECTIONS,
+});
+
+/**
+ * The shortest time between two `warn` records about one kind of connection
+ * the server refused or evicted — at {@link HttpServerLimits.maxConnections},
+ * past the admission rate, with nothing left to evict, or evicted — in
+ * milliseconds. Events in between are counted and reported with the next
+ * record of their kind.
+ */
+export const DROPPED_CONNECTIONS_REPORT_INTERVAL_MS = 10_000;
 
 /**
  * How one shutdown spends its time, in milliseconds. See {@link SHUTDOWN_BUDGET}.
@@ -579,6 +823,18 @@ export interface StartServiceOptions {
    * without spawning a process.
    */
   readonly createLauncher?: ((deps: DevServerLauncherDeps) => DevServerLauncher) | undefined;
+
+  /**
+   * Replacements for members of {@link HTTP_SERVER_LIMITS} — how a suite
+   * observes a deadline in milliseconds rather than seconds, or the connection
+   * cap and the admission budget with a handful of sockets rather than
+   * hundreds. Never read from the environment. Every member given must be a
+   * positive safe integer, and the header deadline may not exceed the request
+   * deadline; otherwise the start is refused `CONFIG_INVALID` before the
+   * filesystem is touched. A shortened request deadline is no longer above the
+   * request-body guard's, so the server's own `408` may then answer first.
+   */
+  readonly httpLimits?: HttpServerLimitOverrides | undefined;
 }
 
 /**
@@ -809,6 +1065,7 @@ type StartupStep =
   | 'editor-credential'
   | 'server-agent-leases'
   | 'reconciliation'
+  | 'state-home-overlap'
   | 'model-provider'
   | 'prompts'
   | 'session-hydration'
@@ -940,6 +1197,160 @@ function prepareStateTree(config: ServiceConfig): Result<void, DebuggenError> {
       ),
     );
   }
+}
+
+/**
+ * The state root as the filesystem resolves it — every symbolic link on the
+ * way followed — taken once, right after {@link prepareStateTree} created it.
+ *
+ * Every overlap check of the running service compares a project root against
+ * this one value (see "The state root stays outside every project" in
+ * `./config.ts`): the start-up check of the stored sessions below, and the
+ * checks the session and dev-server routes make before a session is created
+ * or questioned and before a dev server is launched or credentialed.
+ *
+ * @param config The resolved configuration.
+ * @returns The canonical state root, or an `FS_UNSAFE_PATH` refusal naming it.
+ */
+async function resolveCanonicalStateHome(
+  config: ServiceConfig,
+): Promise<Result<string, DebuggenError>> {
+  const canonical = await canonicalizePath(config.debuggenHome);
+  if (isErr(canonical)) {
+    return err(
+      new DebuggenError(
+        'FS_UNSAFE_PATH',
+        'Could not resolve the Debug Generator state directory to its location on disk.',
+        {
+          hint: `Check that ${config.debuggenHome} and every directory above it are readable by this account and that no symbolic link on the way loops; or set DEBUGGEN_HOME to another location and start again.`,
+          details: { subsystem: SUBSYSTEM_SERVICE, debuggenHome: config.debuggenHome },
+          cause: canonical.error,
+        },
+      ),
+    );
+  }
+  return canonical;
+}
+
+/**
+ * The message of a start refused because a stored session's project overlaps
+ * the state root. Constant, and naming no path: it reaches standard error and
+ * the VS Code output channel.
+ */
+const STATE_HOME_OVERLAP_STARTUP_MESSAGE =
+  'The Debug Generator service did not start: the project of a stored session contains DEBUGGEN_HOME or lies inside it, so session data, file backups and the editor credential would sit in that project.';
+
+/**
+ * The message of a start refused because the project folder of a stored
+ * session could not be resolved on disk, so it could not be shown to lie
+ * apart from the state root. Constant, and naming no path, like
+ * {@link STATE_HOME_OVERLAP_STARTUP_MESSAGE}.
+ */
+export const STORED_PROJECT_UNRESOLVABLE_STARTUP_MESSAGE =
+  'The Debug Generator service did not start: the project folder of a stored session could not be resolved on disk, so it cannot be shown to lie outside DEBUGGEN_HOME.';
+
+/**
+ * The recovery instruction of that refusal. Either step ends it: a folder
+ * this account can read again resolves on the next start, and a new state
+ * directory holds no stored session to check.
+ */
+export const STORED_PROJECT_UNRESOLVABLE_STARTUP_HINT =
+  'Restore this account’s access to the project folders of your earlier sessions — every folder above them must be searchable and no symbolic link on the way may loop — or set DEBUGGEN_HOME to a new state directory outside every project, then start the service again.';
+
+/**
+ * Refuses to serve when the state root overlaps the project of any stored
+ * session, or when a stored project cannot be shown to lie apart from it
+ * (AAP 0.4.2: session data and backups live outside the target project, so a
+ * session never pollutes its git status; CWE-200).
+ *
+ * Run after the modification reconciliation, which must still restore every
+ * file a previous process left instrumented, and before anything else writes
+ * into the store. Every distinct stored project root is canonicalised through
+ * `canonicalizePath` of `./config.ts` — a root that no longer exists through
+ * its nearest existing ancestor, so a deleted project still resolves — and
+ * compared with `canonicalStateHome`.
+ *
+ * Fails closed. A root that cannot be canonicalised at all — a folder above it
+ * this account can no longer search, a symbolic-link loop — refuses the start:
+ * two lexically disjoint spellings prove nothing about separation, because the
+ * unresolved part may be a link into the state root. The refusal is constant
+ * text naming no path and tells the developer how to recover (restore access,
+ * or start over in a new state directory); its `details` carry counts only.
+ * An overlap proven for another root is reported in its place, because it is
+ * the definite finding.
+ *
+ * @param sessions The session index, read in pages of its largest size.
+ * @param canonicalStateHome The state root as {@link resolveCanonicalStateHome} resolved it.
+ * @returns `Ok`; or an `FS_UNSAFE_PATH` refusal — `details.reason`
+ *   `state-home-overlaps-project` with the first relation met and how many
+ *   stored projects overlap, or `project-root-unresolvable` with how many
+ *   stored projects could not be resolved of how many were checked; or the
+ *   store failure that prevented reading the index.
+ */
+async function refuseStoredProjectOverlap(
+  sessions: Pick<SessionsRepo, 'list'>,
+  canonicalStateHome: string,
+): Promise<Result<void, DebuggenError>> {
+  const roots = new Set<string>();
+  let offset = 0;
+  for (;;) {
+    const page = sessions.list({ limit: MAX_SESSION_LIST_LIMIT, offset });
+    if (isErr(page)) {
+      return page;
+    }
+    const { items, total } = page.value;
+    for (const item of items) {
+      roots.add(item.projectRoot);
+    }
+    offset += items.length;
+    if (items.length === 0 || offset >= total) {
+      break;
+    }
+  }
+
+  let first: StateHomeOverlap | undefined;
+  let overlapping = 0;
+  let unresolved = 0;
+  for (const root of roots) {
+    const canonical = await canonicalizePath(root);
+    if (isErr(canonical)) {
+      unresolved += 1;
+      continue;
+    }
+    const relation = stateHomeOverlap(canonicalStateHome, canonical.value);
+    if (relation !== undefined) {
+      overlapping += 1;
+      first ??= relation;
+    }
+  }
+
+  if (first !== undefined) {
+    return err(
+      new DebuggenError('FS_UNSAFE_PATH', STATE_HOME_OVERLAP_STARTUP_MESSAGE, {
+        hint: STATE_HOME_OVERLAP_HINT,
+        details: {
+          subsystem: SUBSYSTEM_SERVICE,
+          reason: STATE_HOME_OVERLAP_REASON,
+          relation: first,
+          overlappingProjects: overlapping,
+        },
+      }),
+    );
+  }
+  if (unresolved > 0) {
+    return err(
+      new DebuggenError('FS_UNSAFE_PATH', STORED_PROJECT_UNRESOLVABLE_STARTUP_MESSAGE, {
+        hint: STORED_PROJECT_UNRESOLVABLE_STARTUP_HINT,
+        details: {
+          subsystem: SUBSYSTEM_SERVICE,
+          reason: PROJECT_ROOT_UNRESOLVABLE_REASON,
+          unresolvedProjects: unresolved,
+          storedProjects: roots.size,
+        },
+      }),
+    );
+  }
+  return ok(undefined);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2135,6 +2546,499 @@ function validatePromptTree(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * Resolves the limits the HTTP server is created with: {@link HTTP_SERVER_LIMITS}
+ * with the host's {@link StartServiceOptions.httpLimits} applied.
+ *
+ * Every member — the deadlines, the cap and the admission budget alike — must
+ * be a positive safe integer: a zero burst, rate or unengaged budget would
+ * refuse every connection, and a fractional or infinite one has no meaning as
+ * a count of sockets or milliseconds.
+ *
+ * @param overrides The replacements, if any.
+ * @returns The limits, or `CONFIG_INVALID` naming the offending members when
+ *   one is not a positive safe integer or the header deadline exceeds the
+ *   request deadline (which Node itself would reject with a throw).
+ */
+function resolveHttpServerLimits(
+  overrides: HttpServerLimitOverrides | undefined,
+): Result<HttpServerLimits, DebuggenError> {
+  const limits: HttpServerLimits = {
+    headersTimeoutMs: overrides?.headersTimeoutMs ?? HTTP_SERVER_LIMITS.headersTimeoutMs,
+    requestTimeoutMs: overrides?.requestTimeoutMs ?? HTTP_SERVER_LIMITS.requestTimeoutMs,
+    keepAliveTimeoutMs: overrides?.keepAliveTimeoutMs ?? HTTP_SERVER_LIMITS.keepAliveTimeoutMs,
+    connectionsCheckingIntervalMs:
+      overrides?.connectionsCheckingIntervalMs ?? HTTP_SERVER_LIMITS.connectionsCheckingIntervalMs,
+    maxConnections: overrides?.maxConnections ?? HTTP_SERVER_LIMITS.maxConnections,
+    connectionBurst: overrides?.connectionBurst ?? HTTP_SERVER_LIMITS.connectionBurst,
+    connectionsPerSecond:
+      overrides?.connectionsPerSecond ?? HTTP_SERVER_LIMITS.connectionsPerSecond,
+    maxUnengagedConnections:
+      overrides?.maxUnengagedConnections ?? HTTP_SERVER_LIMITS.maxUnengagedConnections,
+    reservedConnections: overrides?.reservedConnections ?? HTTP_SERVER_LIMITS.reservedConnections,
+  };
+  const invalid = (Object.keys(limits) as (keyof HttpServerLimits)[]).filter(
+    (limit) => !Number.isSafeInteger(limits[limit]) || limits[limit] <= 0,
+  );
+  if (invalid.length > 0) {
+    return err(
+      new DebuggenError(
+        'CONFIG_INVALID',
+        'The HTTP server limits must be positive whole numbers.',
+        {
+          hint: 'Pass positive integers for the HTTP server limits the host overrides, or leave them out to keep the defaults.',
+          details: { subsystem: SUBSYSTEM_SERVER, invalid },
+        },
+      ),
+    );
+  }
+  if (limits.headersTimeoutMs > limits.requestTimeoutMs) {
+    return err(
+      new DebuggenError(
+        'CONFIG_INVALID',
+        'The HTTP header deadline may not exceed the whole-request deadline.',
+        {
+          hint: 'Pass a headersTimeoutMs no greater than requestTimeoutMs.',
+          details: { subsystem: SUBSYSTEM_SERVER, invalid: ['headersTimeoutMs'] },
+        },
+      ),
+    );
+  }
+  return ok(Object.freeze(limits));
+}
+
+/**
+ * The responses of each connection that have not finished yet, keyed by the
+ * connection's socket. Read by {@link createClientErrorHandler} to decide
+ * whether a raw error response can still be written without corrupting one
+ * already under way; an entry goes with its socket.
+ */
+type OpenResponses = WeakMap<object, Set<ServerResponse>>;
+
+/**
+ * Wraps the application's request listener so every response is recorded in
+ * `open` until it closes (finished, or its connection ended), and the
+ * admission control is told when a connection becomes engaged — a request
+ * arrived — and when its last response in flight has closed.
+ *
+ * @param listener The application's request listener.
+ * @param open Where the unfinished responses are recorded.
+ * @param activity The admission control's hooks.
+ * @returns The listener the server's `request` event is routed to.
+ */
+function trackOpenResponses(
+  listener: RequestListener,
+  open: OpenResponses,
+  activity: ConnectionActivity,
+): RequestListener {
+  return (request, response) => {
+    const socket = request.socket;
+    let responses = open.get(socket);
+    if (responses === undefined) {
+      responses = new Set();
+      open.set(socket, responses);
+    }
+    const unfinished = responses;
+    unfinished.add(response);
+    activity.requestStarted(socket);
+    response.once('close', () => {
+      unfinished.delete(response);
+      if (unfinished.size === 0) {
+        activity.responsesSettled(socket);
+      }
+    });
+    listener(request, response);
+  };
+}
+
+/** The statuses a connection the HTTP server refused is answered with. */
+type ClientErrorStatus = 400 | 408 | 413 | 431;
+
+/**
+ * Builds one entry of {@link CLIENT_ERROR_RESPONSES}.
+ *
+ * @param status The status.
+ * @returns The complete response head, with no body.
+ */
+function rawClientErrorResponse(status: ClientErrorStatus): Buffer {
+  return Buffer.from(
+    [
+      `HTTP/1.1 ${String(status)} ${STATUS_CODES[status] ?? 'Error'}`,
+      'Connection: close',
+      'Content-Length: 0',
+      'Cache-Control: no-store',
+      'X-Content-Type-Options: nosniff',
+      '',
+      '',
+    ].join('\r\n'),
+    'latin1',
+  );
+}
+
+/**
+ * The raw response for each {@link ClientErrorStatus}. Written straight to the
+ * socket, below the application, so it carries by hand what the application
+ * sets on every response it sends: no body (`Content-Length: 0`), no caching
+ * and no content sniffing — and `Connection: close`, because the connection
+ * is closed right after it.
+ */
+const CLIENT_ERROR_RESPONSES: Readonly<Record<ClientErrorStatus, Buffer>> = Object.freeze({
+  400: rawClientErrorResponse(400),
+  408: rawClientErrorResponse(408),
+  413: rawClientErrorResponse(413),
+  431: rawClientErrorResponse(431),
+});
+
+/**
+ * The status Node answers a refused connection with, by its error code: an
+ * oversized header block `431`, oversized chunk extensions `413`, a missed
+ * header or request deadline `408`, anything else `400`.
+ *
+ * @param code The error's code, if it has one.
+ * @returns The status.
+ */
+function clientErrorStatusOf(code: string | undefined): ClientErrorStatus {
+  switch (code) {
+    case 'HPE_HEADER_OVERFLOW':
+      return 431;
+    case 'HPE_CHUNK_EXTENSIONS_OVERFLOW':
+      return 413;
+    case 'ERR_HTTP_REQUEST_TIMEOUT':
+      return 408;
+    default:
+      return 400;
+  }
+}
+
+/** The shape of a Node error code: upper-case letters, digits and underscores. */
+const NODE_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]*$/u;
+
+/**
+ * The server's `clientError` listener: what Node itself does — answer a
+ * connection its parser refused or whose request missed a deadline, then
+ * destroy it — with {@link CLIENT_ERROR_RESPONSES} in place of Node's bare
+ * responses.
+ *
+ * The response is written only while the socket is writable and none of its
+ * unfinished responses has sent its head, so a response under way is never
+ * corrupted; a transport error (`ECONNRESET`) leaves nothing to answer. The
+ * `debug` record carries the error's code, the status and whether it was
+ * written — never a byte of what the peer sent.
+ *
+ * @param open The unfinished responses per socket.
+ * @param logger The server logger.
+ * @returns The listener.
+ */
+function createClientErrorHandler(
+  open: OpenResponses,
+  logger: Logger,
+): (error: Error, socket: Duplex) => void {
+  return (error, socket) => {
+    const raw: unknown = (error as { code?: unknown }).code;
+    const code = typeof raw === 'string' && NODE_ERROR_CODE_PATTERN.test(raw) ? raw : undefined;
+    const status = clientErrorStatusOf(code);
+    const underway = [...(open.get(socket) ?? [])].some((response) => response.headersSent);
+    const answered = socket.writable && !underway;
+    if (answered) {
+      socket.write(CLIENT_ERROR_RESPONSES[status]);
+    }
+    socket.destroy();
+    logger.debug('closed a connection the HTTP server could not serve', {
+      errorCode: code ?? 'unknown',
+      status,
+      answered,
+    });
+  };
+}
+
+/**
+ * A `warn` reporter for one kind of connection event: each call counts one
+ * event, and a record is written at most once every
+ * {@link DROPPED_CONNECTIONS_REPORT_INTERVAL_MS} with how many were counted
+ * since the previous record under `countField`, beside the fields `fields`
+ * returns at that moment. Counts and limits only; never an address or a port.
+ *
+ * @param logger The server logger.
+ * @param message The record's constant message.
+ * @param countField The field the event count is reported under.
+ * @param fields The record's other fields, read when a record is written.
+ * @returns The function to call once per event.
+ */
+function throttledConnectionReport(
+  logger: Logger,
+  message: string,
+  countField: string,
+  fields: () => LogFields,
+): () => void {
+  let unreported = 0;
+  let reportedAt = Number.NEGATIVE_INFINITY;
+  return () => {
+    unreported += 1;
+    const at = performance.now();
+    if (at - reportedAt < DROPPED_CONNECTIONS_REPORT_INTERVAL_MS) {
+      return;
+    }
+    logger.warn(message, { ...fields(), [countField]: unreported });
+    unreported = 0;
+    reportedAt = at;
+  };
+}
+
+/**
+ * Reports connections the server refused at {@link HttpServerLimits.maxConnections}
+ * (Node's `drop` event), through {@link throttledConnectionReport}.
+ *
+ * @param server The server.
+ * @param maxConnections The cap in force, for the record.
+ * @param logger The server logger.
+ */
+function reportDroppedConnections(server: Server, maxConnections: number, logger: Logger): void {
+  server.on(
+    'drop',
+    throttledConnectionReport(
+      logger,
+      'refused connections: the HTTP server holds its maximum number of connections',
+      'droppedConnections',
+      () => ({ maxConnections }),
+    ),
+  );
+}
+
+/**
+ * What {@link trackOpenResponses} tells the admission control about a
+ * connection's requests: when one arrives whole, and when the last response in
+ * flight on the connection has closed.
+ */
+interface ConnectionActivity {
+  /** A complete request head arrived on `socket`; its response is now in flight. */
+  requestStarted(socket: Duplex): void;
+  /** No response is in flight on `socket` any more. */
+  responsesSettled(socket: Duplex): void;
+}
+
+/**
+ * The connection admission control of the HTTP server (CWE-400): what stops a
+ * local process from filling every one of {@link HttpServerLimits.maxConnections}'
+ * slots with connections that never complete a request, which the deadlines
+ * alone only bound in time. Two budgets apply to every TCP connection as it is
+ * accepted — before a byte of it is parsed, and so before the access boundary
+ * could tell a client from an attacker:
+ *
+ * 1. **An admission rate** — a token bucket of
+ *    {@link HttpServerLimits.connectionBurst} admissions, regaining
+ *    {@link HttpServerLimits.connectionsPerSecond} per second. A connection
+ *    that finds it empty is destroyed at once: it costs one accept, never a
+ *    parser, a timer or a slot. The burst absorbs every client reconnecting
+ *    together after a restart; the rate is what a flood is held to.
+ * 2. **An unengaged budget** — at most
+ *    {@link HttpServerLimits.maxUnengagedConnections} connections that hold no
+ *    slot a legitimate client is waiting on: those that have not delivered a
+ *    complete request head yet, and those idle on keep-alive with no response
+ *    in flight. When a new connection arrives and that budget is full — or the
+ *    server already holds its soft cap of `maxConnections −`
+ *    {@link HttpServerLimits.reservedConnections} connections of any kind —
+ *    the **oldest** unengaged connection is evicted to make room, and the
+ *    newcomer is refused only if there is none to evict.
+ *
+ * Eviction is what keeps the service answering under a flood: a flood's
+ * sockets are the unengaged ones, so each newcomer displaces the longest
+ * stalled of them, and a legitimate client — which sends its request head in
+ * the same write that follows its connect — is engaged before the next wave
+ * reaches it. A connection with a request in flight, whose handler may be
+ * slow, is never evicted, and neither is one handed to the WebSocket server by
+ * the `upgrade` event: `./server/ws.ts` applies its own pending-handshake and
+ * open-socket quotas to those, and they still count towards the soft cap
+ * because they hold a slot. Node's `maxConnections` stays the hard backstop.
+ *
+ * The budget is global, not per peer. Every peer of this service is a process
+ * on this machine speaking over loopback, where the source address is
+ * 127.0.0.1 for the editor, the DevTools panel, a dev-server preload and an
+ * attacker alike and the source port is chosen by the kernel, so no
+ * per-address or per-port quota can tell them apart; what can be told apart is
+ * whether a connection is doing anything, which is what the budget measures.
+ *
+ * Refusals past the rate, refusals with nothing to evict and evictions are
+ * each reported at `warn` through {@link throttledConnectionReport}.
+ *
+ * @param server The server, before it listens; its `connection` and `upgrade`
+ *   events are observed here.
+ * @param limits The resolved limits.
+ * @param logger The server logger.
+ * @returns The activity hooks {@link trackOpenResponses} reports each request
+ *   and each settled response to.
+ */
+function createConnectionAdmission(
+  server: Server,
+  limits: HttpServerLimits,
+  logger: Logger,
+): ConnectionActivity {
+  // A reserve that leaves no room below the cap sets no soft cap.
+  const softMaxConnections =
+    limits.reservedConnections < limits.maxConnections
+      ? limits.maxConnections - limits.reservedConnections
+      : Number.POSITIVE_INFINITY;
+  /** Every admitted connection still open, and whether it was upgraded. */
+  const admitted = new Map<Duplex, { upgraded: boolean }>();
+  /** The admitted connections that are unengaged, oldest first (insertion order). */
+  const unengaged = new Set<Duplex>();
+  let tokens = limits.connectionBurst;
+  let refilledAt = performance.now();
+
+  const budgetFields = (): LogFields => ({
+    openConnections: admitted.size,
+    unengagedConnections: unengaged.size,
+    maxUnengagedConnections: limits.maxUnengagedConnections,
+    maxConnections: limits.maxConnections,
+    reservedConnections: limits.reservedConnections,
+  });
+  const reportRateRefusal = throttledConnectionReport(
+    logger,
+    'refused connections: new connections arrived faster than the HTTP server admits them',
+    'refusedConnections',
+    () => ({
+      connectionBurst: limits.connectionBurst,
+      connectionsPerSecond: limits.connectionsPerSecond,
+    }),
+  );
+  const reportEviction = throttledConnectionReport(
+    logger,
+    'closed stalled or idle connections to admit new ones',
+    'evictedConnections',
+    budgetFields,
+  );
+  const reportBusyRefusal = throttledConnectionReport(
+    logger,
+    'refused connections: every connection the HTTP server holds is serving a request',
+    'refusedConnections',
+    budgetFields,
+  );
+
+  /** Takes one admission from the bucket, refilled for the time since the last take. */
+  const takeAdmission = (): boolean => {
+    const at = performance.now();
+    tokens = Math.min(
+      limits.connectionBurst,
+      tokens + ((at - refilledAt) * limits.connectionsPerSecond) / 1_000,
+    );
+    refilledAt = at;
+    if (tokens < 1) {
+      return false;
+    }
+    tokens -= 1;
+    return true;
+  };
+
+  const forget = (socket: Duplex): void => {
+    admitted.delete(socket);
+    unengaged.delete(socket);
+  };
+
+  /** Destroys the oldest unengaged connection; `false` when there is none. */
+  const evictOldestUnengaged = (): boolean => {
+    const oldest = unengaged.values().next();
+    if (oldest.done === true) {
+      return false;
+    }
+    forget(oldest.value);
+    oldest.value.destroy();
+    reportEviction();
+    return true;
+  };
+
+  // Registered after Node's own connection listener, and synchronous: the
+  // first byte is read on a later turn, so a socket destroyed here is never
+  // parsed.
+  server.on('connection', (socket: Duplex) => {
+    if (!takeAdmission()) {
+      socket.destroy();
+      reportRateRefusal();
+      return;
+    }
+    while (
+      unengaged.size >= limits.maxUnengagedConnections ||
+      admitted.size >= softMaxConnections
+    ) {
+      if (!evictOldestUnengaged()) {
+        // Only the soft cap leaves nothing to evict: every connection held is
+        // serving a request or is a WebSocket.
+        socket.destroy();
+        reportBusyRefusal();
+        return;
+      }
+    }
+    admitted.set(socket, { upgraded: false });
+    unengaged.add(socket);
+    socket.once('close', () => {
+      forget(socket);
+    });
+  });
+
+  // Prepended, so the socket is excluded before `./server/ws.ts` takes it. An
+  // upgrade this listener alone would receive (the WebSocket server has
+  // detached during a stop) has nobody to answer it and is closed.
+  server.prependListener('upgrade', (_request: IncomingMessage, socket: Duplex) => {
+    const state = admitted.get(socket);
+    if (state !== undefined) {
+      state.upgraded = true;
+      unengaged.delete(socket);
+    }
+    if (server.listenerCount('upgrade') <= 1) {
+      socket.destroy();
+    }
+  });
+
+  return {
+    requestStarted: (socket) => {
+      unengaged.delete(socket);
+    },
+    responsesSettled: (socket) => {
+      const state = admitted.get(socket);
+      if (state === undefined || state.upgraded || socket.destroyed) {
+        return;
+      }
+      // Re-inserted, so an idle connection is as old as its idleness.
+      unengaged.delete(socket);
+      unengaged.add(socket);
+    },
+  };
+}
+
+/**
+ * Creates the one HTTP server with {@link HTTP_SERVER_LIMITS}' deadlines,
+ * connection cap and admission budget in force (CWE-400): the admission
+ * control of {@link createConnectionAdmission}, fed by the response tracking
+ * of {@link trackOpenResponses}, the raw `clientError` answer of
+ * {@link createClientErrorHandler} and the refusal report of
+ * {@link reportDroppedConnections}. Upgrade routing is attached by the caller.
+ *
+ * Exported so `./main.test.ts` can drive the admission budget with a handler
+ * it controls — a slow one — which no route of the composed service offers.
+ *
+ * @param listener The application's request listener.
+ * @param limits The resolved limits.
+ * @param logger The server logger.
+ * @returns The server, not yet listening.
+ */
+export function createLimitedServer(
+  listener: RequestListener,
+  limits: HttpServerLimits,
+  logger: Logger,
+): Server {
+  const open: OpenResponses = new WeakMap();
+  const server = createServer({
+    headersTimeout: limits.headersTimeoutMs,
+    requestTimeout: limits.requestTimeoutMs,
+    keepAliveTimeout: limits.keepAliveTimeoutMs,
+    connectionsCheckingInterval: limits.connectionsCheckingIntervalMs,
+  });
+  server.maxConnections = limits.maxConnections;
+  const admission = createConnectionAdmission(server, limits, logger);
+  server.on('request', trackOpenResponses(listener, open, admission));
+  server.on('clientError', createClientErrorHandler(open, logger));
+  reportDroppedConnections(server, limits.maxConnections, logger);
+  return server;
+}
+
+/**
  * Binds the server and resolves once it is listening, with the bound port.
  *
  * Settles exactly once, on the first of: `listening` (`Ok`, the port read back
@@ -2971,7 +3875,7 @@ export interface ReleasePartsOptions {
  * record, which resolves the service's own defaults.
  * @returns `Ok` with a listening {@link ServiceHandle}, or `Err` with the first
  * failure that prevented the start — `CONFIG_INVALID` from the configuration,
- * the provider selection or the prompt tree, `FS_UNSAFE_PATH` from the state
+ * the HTTP server limits, the provider selection or the prompt tree, `FS_UNSAFE_PATH` from the state
  * tree or the store files, `STORE_ERROR` from the store or the modification
  * journal, `INTERNAL` from wiring or the bind. Everything acquired before the
  * failure has been released by the time it is returned.
@@ -3002,6 +3906,10 @@ export async function startService(
     return loaded;
   }
   const resolved = loaded.value;
+  const httpLimits = resolveHttpServerLimits(options.httpLimits);
+  if (isErr(httpLimits)) {
+    return httpLimits;
+  }
 
   // 2 — logging. The configuration is logged once, through its credential-free
   // view, on the root (its fields carry their own `subsystem`). An injected
@@ -3019,7 +3927,8 @@ export async function startService(
   const bound: { port?: number } = {};
   const config = createEffectiveConfig(resolved, () => bound.port);
 
-  // 3 — the state tree, before anything writes into it.
+  // 3 — the state tree, before anything writes into it, and its canonical
+  // location, which every project root is kept apart from.
   const tree = prepareStateTree(config);
   if (isErr(tree)) {
     loggers.service.error(STARTUP_REFUSED_MESSAGE, {
@@ -3028,6 +3937,15 @@ export async function startService(
     });
     return tree;
   }
+  const canonicalHome = await resolveCanonicalStateHome(config);
+  if (isErr(canonicalHome)) {
+    loggers.service.error(STARTUP_REFUSED_MESSAGE, {
+      step: 'state-tree' satisfies StartupStep,
+      ...errorFields(canonicalHome.error),
+    });
+    return canonicalHome;
+  }
+  const canonicalStateHome = canonicalHome.value;
 
   const parts: ServiceParts = {};
   const refuse = async (
@@ -3123,6 +4041,16 @@ export async function startService(
       unresolved: reconciled.value.unresolved,
       restored: reconciled.value.restored,
     });
+  }
+
+  // The state root stays outside every project (AAP 0.4.2). Checked only now,
+  // so the reconciliation above has already restored every file a previous
+  // process left instrumented; a stored session whose project contains the
+  // state root, lies inside it, or cannot be resolved on disk to show it lies
+  // apart, refuses the start before anything else is written there or served.
+  const apart = await refuseStoredProjectOverlap(repos.sessions, canonicalStateHome);
+  if (isErr(apart)) {
+    return refuse('state-home-overlap', apart.error);
   }
 
   // 7 — retention. Housekeeping, not correctness: a sweep that cannot run is
@@ -3240,6 +4168,8 @@ export async function startService(
   const managerRef: { current?: SessionManager } = {};
   const instrumentation = createInstrumentationService({
     config,
+    // The one canonical state root, re-checked before every install writes.
+    canonicalStateHome,
     logger: root,
     modifications: repos.modifications,
     progress,
@@ -3507,6 +4437,9 @@ export async function startService(
     auth,
     config,
     logger: root,
+    // Every session create and follow-up, and every dev-server launch and
+    // credential, refuses a project root that overlaps the state root.
+    canonicalStateHome,
     manager: sessionManager,
     reopener,
     orchestrator,
@@ -3520,18 +4453,23 @@ export async function startService(
       probe: (url: string) => probeDevServer(url, { logger: root }),
     }),
     // `session.purge` (`debuggen.purgeSessions`): the start-up sweep's own
-    // dependencies, reported the way the start-up sweep is. The sweep logs its
-    // counts itself; a request that joins a running sweep shares its result.
-    // Unlike the start-up pass, this one runs beside a warm trace cache, so
-    // each purged session's cached trees are dropped as its rows are.
+    // dependencies, reported the way the start-up sweep is, but scoped to the
+    // requesting editor's workspace — the start-up pass alone is machine-wide.
+    // The sweep logs its counts itself; a request that joins a running sweep of
+    // its own scope shares its result. Unlike the start-up pass, this one runs
+    // beside a warm trace cache, so each purged session's cached trees are
+    // dropped as its rows are.
     retention: {
-      purge: async () => {
-        const purged = await runRetention({
-          ...retentionDeps,
-          onSessionDeleted: (sessionId) => {
-            correlator.invalidate(sessionId);
+      purge: async (scope) => {
+        const purged = await runRetention(
+          {
+            ...retentionDeps,
+            onSessionDeleted: (sessionId) => {
+              correlator.invalidate(sessionId);
+            },
           },
-        });
+          { scope },
+        );
         if (isErr(purged)) {
           loggers.service.error('the on-demand retention sweep could not run', {
             ...errorFields(purged.error),
@@ -3586,7 +4524,12 @@ export async function startService(
   }
   parts.ws = ws.value;
 
-  const server = createServer(http.value.requestListener satisfies RequestListener);
+  // Every connection is bounded in number and in time before a route sees it.
+  const server = createLimitedServer(
+    http.value.requestListener satisfies RequestListener,
+    httpLimits.value,
+    loggers.server,
+  );
   parts.server = server;
   const attached = ws.value.attach(server);
   if (isErr(attached)) {
@@ -3601,6 +4544,18 @@ export async function startService(
     loggers.server.error('the HTTP server reported an error after start-up', {
       ...describeException(cause),
     });
+  });
+  // Read back from the server, so the record states what is enforced.
+  loggers.server.info('the HTTP server enforces its connection limits', {
+    headersTimeoutMs: server.headersTimeout,
+    requestTimeoutMs: server.requestTimeout,
+    keepAliveTimeoutMs: server.keepAliveTimeout,
+    connectionsCheckingIntervalMs: httpLimits.value.connectionsCheckingIntervalMs,
+    maxConnections: server.maxConnections,
+    connectionBurst: httpLimits.value.connectionBurst,
+    connectionsPerSecond: httpLimits.value.connectionsPerSecond,
+    maxUnengagedConnections: httpLimits.value.maxUnengagedConnections,
+    reservedConnections: httpLimits.value.reservedConnections,
   });
   // Only now does a stop end live sessions: a start refused before this point
   // served no client, so it leaves every session to whoever serves them next.

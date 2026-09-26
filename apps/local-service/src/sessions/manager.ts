@@ -117,6 +117,7 @@ import type {
 } from '@debuggen/instrumentation';
 import {
   CAPTURE_CONFLICT_ERROR_CODE,
+  MESSAGE_TYPE,
   createEnvelope,
   followUpAttemptIdSchema,
   isCleanupStatus,
@@ -677,6 +678,12 @@ export interface SessionManager {
    * recorded by the entry's `attempt` counter growing — never by the ladder's
    * length or a timestamp, which two asks in one millisecond share.
    *
+   * The `followups` row and the record that mirrors it are written in one
+   * store transaction (`SessionsRepo.transaction`): when either write is
+   * refused both are rolled back, nothing is broadcast and the store's error
+   * is returned, so the two durable views never disagree and asking again
+   * retries the whole ask. `session.updated` is sent only after the commit.
+   *
    * @param sessionId The session.
    * @param question The question as the developer asked it this time.
    * @param attemptId The attempt's identity: fresh for a new question, the
@@ -692,6 +699,16 @@ export interface SessionManager {
    * Stamps the outcome links onto the session's most recent follow-up. Only
    * the defined members of `outcome` change; the question and its time never
    * do.
+   *
+   * The links are written to both durable views in one store transaction: the
+   * follow-up's `followups` row — found by its attempt id
+   * (`SessionsRepo.replaceFollowUpAttempt`), or, for an entry stored before
+   * attempts carried one, as the session's newest row once the store has
+   * checked it is the same entry (`SessionsRepo.replaceLatestFollowUp`) — and
+   * the record's ladder. When either write is refused, or the log holds no
+   * row for the entry, both are rolled back, nothing is broadcast and the
+   * store's error is returned. `session.updated` is sent only after the
+   * commit.
    */
   recordFollowUpOutcome(
     sessionId: SessionId,
@@ -762,8 +779,17 @@ export interface SessionManager {
    * ownership, runs cleanup, records its outcome and moves the session to
    * `ended`. When the window cannot be closed the end is refused before
    * cleanup runs, with ownership retained, so ending again retries.
+   *
+   * The move to `ended` and the removal of the session's tab binding (the
+   * `bindings` row and `SessionRecord.boundTab`) are one store transaction,
+   * broadcast only after the commit: when either is refused the session stays
+   * open with its binding and the store's error is returned, so ending again
+   * re-runs the idempotent cleanup and retries both.
+   *
    * Idempotent — ending an ended session returns its stored record and
-   * cleanup without re-running anything — and concurrent calls share one run.
+   * cleanup without re-running cleanup; it only removes a `bindings` row an
+   * earlier build may have left behind, returning the store's error when it
+   * cannot, so ending again retries — and concurrent calls share one run.
    */
   end(sessionId: SessionId): Promise<Result<SessionEndResult, DebuggenError>>;
 
@@ -1209,8 +1235,8 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
 
   /** Broadcasts `session.updated` carrying the record as stored. */
   function announceUpdated(session: SessionRecord): void {
-    send(session.id, 'session.updated', () =>
-      createEnvelope('session.updated', { session }, { ts: stamp() }),
+    send(session.id, MESSAGE_TYPE.SESSION_UPDATED, () =>
+      createEnvelope(MESSAGE_TYPE.SESSION_UPDATED, { session }, { ts: stamp() }),
     );
   }
 
@@ -1829,8 +1855,8 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
 
     const session = stored.value;
     scoped(session.id).info('session created', { status: session.status });
-    send(session.id, 'session.created', () =>
-      createEnvelope('session.created', { session }, { ts: stamp() }),
+    send(session.id, MESSAGE_TYPE.SESSION_CREATED, () =>
+      createEnvelope(MESSAGE_TYPE.SESSION_CREATED, { session }, { ts: stamp() }),
     );
 
     return ok(session);
@@ -2165,47 +2191,69 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return preview;
     }
 
-    // One `followups` row per attempt: a retry rewrites the row the attempt
-    // was first recorded in, so the log never gains a duplicate.
-    const written =
-      retry === undefined
-        ? sessions.appendFollowUp(sessionId, followUp)
-        : sessions.replaceFollowUpAttempt(sessionId, followUp);
-
-    if (isErr(written)) {
-      return written;
-    }
-
-    const storedFollowUp = written.value;
-    const stored = commit(
-      {
-        ...record,
-        followUps:
+    // The `followups` row and the record that mirrors it are one store unit:
+    // a refusal of either write rolls both back, so the log and the ladder can
+    // never hold different histories of this ask. One row per attempt: a
+    // retry rewrites the row the attempt was first recorded in, so the log
+    // never gains a duplicate.
+    const stored = sessions.transaction(
+      (): Result<
+        { readonly session: SessionRecord; readonly followUp: FollowUpRecord },
+        DebuggenError
+      > => {
+        const written =
           retry === undefined
-            ? [...record.followUps, storedFollowUp]
-            : record.followUps.map((entry, index) =>
-                index === retry.index ? storedFollowUp : entry,
-              ),
-        updatedAt: nextStamp(record),
+            ? sessions.appendFollowUp(sessionId, followUp)
+            : sessions.replaceFollowUpAttempt(sessionId, followUp);
+
+        if (isErr(written)) {
+          return written;
+        }
+
+        // The row's canonical record goes onto the ladder, so both views agree.
+        const storedFollowUp = written.value;
+        const mirrored = commit(
+          {
+            ...record,
+            followUps:
+              retry === undefined
+                ? [...record.followUps, storedFollowUp]
+                : record.followUps.map((entry, index) =>
+                    index === retry.index ? storedFollowUp : entry,
+                  ),
+            updatedAt: nextStamp(record),
+          },
+          'appendFollowUp',
+        );
+
+        return isErr(mirrored)
+          ? mirrored
+          : ok({ session: mirrored.value, followUp: storedFollowUp });
       },
-      'appendFollowUp',
     );
 
     if (isErr(stored)) {
-      scoped(sessionId).error('a follow-up was stored but the session record could not mirror it', {
-        code: stored.error.code,
-        retry: retry !== undefined,
-      });
+      const reason = stored.error.details?.['reason'];
+      scoped(sessionId).error(
+        'a follow-up could not be recorded; neither its follow-up row nor the session record was stored',
+        {
+          code: stored.error.code,
+          retry: retry !== undefined,
+          ...(typeof reason === 'string' ? { reason } : {}),
+        },
+      );
       return stored;
     }
 
+    // Logged and announced only once the unit has committed.
+    const { session } = stored.value;
     scoped(sessionId).info(
       retry === undefined ? 'follow-up recorded' : 'follow-up attempt retried in place',
-      { followUps: stored.value.followUps.length, attempt: storedFollowUp.attempt ?? 1 },
+      { followUps: session.followUps.length, attempt: stored.value.followUp.attempt ?? 1 },
     );
-    announceUpdated(stored.value);
+    announceUpdated(session);
 
-    return stored;
+    return ok(session);
   }
 
   function recordFollowUpOutcome(
@@ -2248,21 +2296,45 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       ...(outcome.panelId === undefined ? {} : { panelId: outcome.panelId }),
     };
 
-    const stored = commit(
-      {
-        ...record,
-        followUps: record.followUps.map((followUp, index) =>
-          index === latestIndex ? updated : followUp,
-        ),
-        updatedAt: nextStamp(record),
-      },
-      'recordFollowUpOutcome',
-    );
+    // The follow-up's `followups` row and the record are stamped in one store
+    // unit, so both durable views carry the outcome links or neither does. An
+    // identified entry's row is found by its attempt id; an entry stored
+    // before attempts had one is the session's newest row, which the store
+    // checks is the same entry.
+    const stored = sessions.transaction((): Result<SessionRecord, DebuggenError> => {
+      const logged =
+        updated.attemptId === undefined
+          ? sessions.replaceLatestFollowUp(sessionId, updated)
+          : sessions.replaceFollowUpAttempt(sessionId, updated);
+
+      if (isErr(logged)) {
+        return logged;
+      }
+
+      const storedFollowUp = logged.value;
+
+      return commit(
+        {
+          ...record,
+          followUps: record.followUps.map((entry, index) =>
+            index === latestIndex ? storedFollowUp : entry,
+          ),
+          updatedAt: nextStamp(record),
+        },
+        'recordFollowUpOutcome',
+      );
+    });
 
     if (isErr(stored)) {
+      const reason = stored.error.details?.['reason'];
+      scoped(sessionId).warn(
+        'a follow-up outcome could not be recorded; neither its follow-up row nor the session record changed',
+        { code: stored.error.code, ...(typeof reason === 'string' ? { reason } : {}) },
+      );
       return stored;
     }
 
+    // Announced only once the unit has committed.
     announceUpdated(stored.value);
 
     return stored;
@@ -2498,8 +2570,12 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     announceTransition(moved);
 
     // 5. The announcement, last.
-    send(sessionId, 'capture.started', () =>
-      createEnvelope('capture.started', { sessionId, captureId: capture.id }, { ts: stamp() }),
+    send(sessionId, MESSAGE_TYPE.CAPTURE_STARTED, () =>
+      createEnvelope(
+        MESSAGE_TYPE.CAPTURE_STARTED,
+        { sessionId, captureId: capture.id },
+        { ts: stamp() },
+      ),
     );
     scoped(sessionId, capture.id).info('capture started', { planVersion: capture.planVersion });
 
@@ -2664,9 +2740,9 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     const { capture, moved } = committed.value;
     releaseOwnership(record);
 
-    send(sessionId, 'capture.stopped', () =>
+    send(sessionId, MESSAGE_TYPE.CAPTURE_STOPPED, () =>
       createEnvelope(
-        'capture.stopped',
+        MESSAGE_TYPE.CAPTURE_STOPPED,
         { sessionId, captureId: capture.id, summary: options.summary },
         { ts: stamp() },
       ),
@@ -2791,9 +2867,9 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
 
     const session = stored.value;
     announceUpdated(session);
-    send(sessionId, 'cleanup.completed', () =>
+    send(sessionId, MESSAGE_TYPE.CLEANUP_COMPLETED, () =>
       createEnvelope(
-        'cleanup.completed',
+        MESSAGE_TYPE.CLEANUP_COMPLETED,
         { sessionId, status: session.cleanup.status, conflicts: session.cleanup.conflicts },
         { ts: stamp() },
       ),
@@ -2825,7 +2901,26 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     // 1. Idempotency first. `./state-machine.ts` deliberately has no
     // `ended → ended` edge, so a repeated end is answered here from the stored
     // record — without re-running cleanup and without consulting the machine.
+    // Its one write removes a `bindings` row an ended session can still hold
+    // in a store written by an earlier build, which removed the binding only
+    // after committing `ended`: a refusal is returned, so ending again retries.
     if (record.status === 'ended') {
+      const swept = sessions.deleteBindingsForSession(sessionId);
+
+      if (isErr(swept)) {
+        scoped(sessionId).warn(
+          'the residual tab binding of the ended session could not be removed; ending it again retries',
+          { code: swept.error.code },
+        );
+        return swept;
+      }
+
+      if (swept.value > 0) {
+        scoped(sessionId).info('the residual tab binding of the ended session was removed', {
+          removed: swept.value,
+        });
+      }
+
       return ok({ session: record, cleanup: outcomeOf(record.cleanup, record.updatedAt) });
     }
 
@@ -2896,21 +2991,39 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return recorded;
     }
 
-    // 6. The terminal transition — legal from every non-terminal status. The
-    // tab binding goes with it: an ended session is no recipient.
-    const moved = applyTransition(withoutField(recorded.value, 'boundTab'), 'ended', {}, {}, 'end');
+    // 6. The terminal transition — legal from every non-terminal status — and
+    // the removal of the tab binding, as one store transaction: an ended
+    // session is no recipient, so it is never stored `ended` while a
+    // `bindings` row still names it. When either write is refused both are
+    // rolled back and the session stays open, so ending it again re-runs the
+    // idempotent cleanup and retries the pair. Announced only after the commit.
+    const moved = sessions.transaction((): Result<CommittedTransition, DebuggenError> => {
+      const committed = commitTransition(
+        withoutField(recorded.value, 'boundTab'),
+        'ended',
+        {},
+        {},
+        'end',
+      );
+
+      if (isErr(committed)) {
+        return committed;
+      }
+
+      const unbound = sessions.deleteBindingsForSession(sessionId);
+
+      return isErr(unbound) ? unbound : committed;
+    });
 
     if (isErr(moved)) {
+      scoped(sessionId).warn(
+        'the session was not ended: its status or its tab binding could not be stored; ending it again retries',
+        { code: moved.error.code },
+      );
       return moved;
     }
 
-    const unbound = sessions.deleteBindingsForSession(sessionId);
-
-    if (isErr(unbound)) {
-      scoped(sessionId).warn('the tab binding of the ended session could not be removed', {
-        code: unbound.error.code,
-      });
-    }
+    const ended = announceTransition(moved.value);
 
     if (reported !== outcome.value) {
       completeWhenReleased(sessionId, outcome.value);
@@ -2918,7 +3031,7 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
 
     scoped(sessionId).info('session ended', { cleanup: reported.status });
 
-    return ok({ session: moved.value, cleanup: reported });
+    return ok({ session: ended, cleanup: reported });
   }
 
   /**

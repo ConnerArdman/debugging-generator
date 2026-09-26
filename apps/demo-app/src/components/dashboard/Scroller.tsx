@@ -67,9 +67,7 @@ const EDGE_SLACK = 1;
 /**
  * Props of {@link Scroller}.
  *
- * Local and deliberately not exported: the tables that use it pass their own values through, and
- * this repository's guard script treats an exported demo identifier as vocabulary no product file
- * may then mention, so a second exported name would buy a constraint and nothing else.
+ * Local and deliberately not exported: the tables that use it pass their own values through.
  *
  * Every optional member spells `| undefined` out, because this workspace compiles with
  * `exactOptionalPropertyTypes`: under it a bare `className?: string` rejects a present-but-

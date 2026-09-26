@@ -182,17 +182,37 @@ function identifierSchema(): z.ZodString {
 }
 
 /**
- * What an empty batch is answered with.
+ * What an empty `telemetry.event` batch that reports no loss is answered with.
  *
- * An empty array carries no information and costs a round trip, an envelope, a
- * parse and a log line to say nothing, so it is a producer bug rather than a
- * quiet no-op — and it is worth naming as one, because a transport that flushes
- * on a timer is exactly the code that drifts into posting empty frames. Both
- * producers already avoid it (`packages/telemetry/src/browser/transport.ts` and
- * `../node/exporter.ts` flush only a non-empty buffer); this is the check that
- * keeps them honest.
+ * An empty batch is accepted only as a loss report: a `droppedCount` above zero
+ * is the one thing an event-less frame can say (see
+ * {@link telemetryEventPayloadSchema}). Without one, the frame costs a round
+ * trip, an envelope, a parse and a log line to say nothing, so it is a producer
+ * bug rather than a quiet no-op — worth naming as one, because a transport that
+ * flushes on a timer is exactly the code that drifts into posting empty frames.
  */
-const EVENTS_MIN_EXPECTATION = 'expected at least one telemetry event: an empty batch is a no-op';
+const EVENTS_MIN_EXPECTATION =
+  'expected at least one telemetry event: an empty batch is accepted only as a loss report with droppedCount above zero';
+
+/**
+ * What an empty `telemetry.tail` frame is answered with.
+ *
+ * The tail has no loss report to carry and the service streams only events it
+ * has just ingested, so an empty frame is always a sender bug.
+ */
+const TAIL_EVENTS_MIN_EXPECTATION =
+  'expected at least one telemetry event: an empty batch is a no-op';
+
+/**
+ * The label an empty `telemetry.event` batch without a loss report is refused
+ * under.
+ *
+ * Rendered by `describeZodIssues` as
+ * `events (custom label=empty-batch-reports-loss)`: the rule that failed, and
+ * no received value. It passes the renderer's name gate, so it is shown
+ * verbatim.
+ */
+const LOSS_REPORT_LABEL = 'empty-batch-reports-loss';
 
 /** What an oversized batch is answered with. */
 const EVENTS_MAX_EXPECTATION = `expected at most ${String(
@@ -223,22 +243,73 @@ function droppedCountSchema(): z.ZodInt {
 
 /**
  * The array schema shared by both payloads, over whichever event schema the
- * direction calls for.
+ * direction calls for: at most {@link MAX_EVENTS_PER_BATCH} elements.
  *
  * A factory rather than two literals, so the two payloads cannot drift apart on
- * their bounds or their messages while still differing — as they must — on the
- * element schema.
+ * their bound or its message while still differing — as they must — on the
+ * element schema. The minimum is each payload's own rule: `telemetry.event`
+ * admits an empty array only beside a loss report, a cross-field rule enforced
+ * by {@link requireLossReportForEmptyBatch}, and `telemetry.tail` never admits
+ * one ({@link nonEmptyEventBatchSchema}).
  *
  * @typeParam S The element schema: the ingress schema inbound, the persisted
  * schema outbound. Never a locally written event shape.
  * @param element The event schema imported from `@debuggen/telemetry`.
- * @returns A bounded, non-empty array schema over `element`.
+ * @returns A bounded array schema over `element`.
  */
 function eventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S> {
-  return z
-    .array(element)
-    .min(1, { error: EVENTS_MIN_EXPECTATION })
-    .max(MAX_EVENTS_PER_BATCH, { error: EVENTS_MAX_EXPECTATION });
+  return z.array(element).max(MAX_EVENTS_PER_BATCH, { error: EVENTS_MAX_EXPECTATION });
+}
+
+/**
+ * {@link eventBatchSchema} with at least one element: the live tail's batch.
+ *
+ * @typeParam S The element schema, as for {@link eventBatchSchema}.
+ * @param element The event schema imported from `@debuggen/telemetry`.
+ * @returns A bounded, non-empty array schema over `element`.
+ */
+function nonEmptyEventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S> {
+  return eventBatchSchema(element).min(1, { error: TAIL_EVENTS_MIN_EXPECTATION });
+}
+
+/**
+ * Refuses an empty `telemetry.event` batch unless it reports a loss.
+ *
+ * Whether `events` may be empty depends on `droppedCount`, so this is a check on
+ * the object rather than an array minimum. A check keeps the `ZodObject` type
+ * and its `.shape`, which the service worker and the service's ingest loop read
+ * structurally for the batch bound — the precedent is `envelopeSchemaFor` in
+ * `../envelope.ts`. It runs only on an otherwise valid payload: one with a field
+ * issue is already refused, and a malformed `droppedCount` is reported by its
+ * own issue. The issue leaves `input` empty and its message is constant, so the
+ * rejection names the rule and never a received value.
+ *
+ * @param parsed The payload's parse state, whose `value` is the parsed batch.
+ */
+function requireLossReportForEmptyBatch(
+  parsed: z.core.ParsePayload<{
+    readonly events: readonly unknown[];
+    readonly droppedCount?: number | undefined;
+  }>,
+): void {
+  if (parsed.issues.length > 0) {
+    return;
+  }
+
+  const { events, droppedCount } = parsed.value;
+
+  if (events.length > 0 || (droppedCount !== undefined && droppedCount > 0)) {
+    return;
+  }
+
+  parsed.issues.push({
+    code: 'custom',
+    path: ['events'],
+    message: EVENTS_MIN_EXPECTATION,
+    params: { label: LOSS_REPORT_LABEL },
+    // Left empty on purpose: a rejection never carries what was received.
+    input: undefined,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +327,7 @@ function eventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S> {
  * `POST /telemetry/ingest` instead, under the `{ projectRoot, events }` body
  * `../http.ts` owns — the project root is how a server producer's events are
  * attributed at all, and a credential scoped to one project is what makes that
- * claim trustworthy (AAP §0.4.2, §0.5.6).
+ * claim trustworthy.
  *
  * **This payload has no `sessionId`, and that is deliberate — do not "fix" it.**
  * It is the only payload in this folder without one, for three independent
@@ -266,7 +337,7 @@ function eventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S> {
  *    `sessionId` for the frames that need it, and the service resolves a
  *    telemetry frame to a session from the *connection* — the tab binding for a
  *    browser producer, the credential's scoped `projectRoot` and the active
- *    capture window for a server producer (AAP §0.4.2, §0.5.6).
+ *    capture window for a server producer.
  * 2. **A producer must not self-attribute.** The agent *is* told a session id
  *    when it is armed, and its bridge frame carries that id as context for the
  *    service worker — but a value that originates page-side must never become
@@ -296,27 +367,35 @@ function eventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S> {
  *   evidence out of capture B (`apps/local-service/src/telemetry/attribute.ts`).
  * - `droppedCount` — how many events the producer discarded since the batch
  *   that last reported a loss (the agent's in-memory buffer is bounded at
- *   5 000 events while the bridge is away, AAP §0.5.5). Absent means none were
+ *   5 000 events while the bridge is away). Absent means none were
  *   reported. The service accumulates it per capture so a capture summary can
  *   say its evidence is incomplete instead of looking whole.
+ *
+ * **An event-less frame is a loss-only report.** `events` may be empty only
+ * when `droppedCount` is above zero: that is what a producer sends when no
+ * later batch will carry its loss — at a capture's end, say — so the loss still
+ * reaches the service's ledger. Any other empty batch is refused
+ * ({@link requireLossReportForEmptyBatch}).
  */
-export const telemetryEventPayloadSchema = z.strictObject({
-  /**
-   * The batch, each element validated against the **ingress** schema — never
-   * the persisted one, so an element carrying attribution is rejected here at
-   * the transport boundary rather than reaching the store.
-   */
-  events: eventBatchSchema(telemetryEventIngressSchema),
+export const telemetryEventPayloadSchema = z
+  .strictObject({
+    /**
+     * The batch, each element validated against the **ingress** schema — never
+     * the persisted one, so an element carrying attribution is rejected here at
+     * the transport boundary rather than reaching the store.
+     */
+    events: eventBatchSchema(telemetryEventIngressSchema),
 
-  /**
-   * The capture the producer was armed for when it recorded these events.
-   * Refusal-only context: never used to choose a session or a capture.
-   */
-  armedCaptureId: identifierSchema().optional(),
+    /**
+     * The capture the producer was armed for when it recorded these events.
+     * Refusal-only context: never used to choose a session or a capture.
+     */
+    armedCaptureId: identifierSchema().optional(),
 
-  /** Events the producer discarded before delivery since its previous loss report. */
-  droppedCount: droppedCountSchema().optional(),
-});
+    /** Events the producer discarded before delivery since its previous loss report. */
+    droppedCount: droppedCountSchema().optional(),
+  })
+  .check(requireLossReportForEmptyBatch);
 
 /**
  * A batch of producer events as it crosses the WebSocket boundary inbound.
@@ -352,7 +431,7 @@ export const telemetryTailPayloadSchema = z.strictObject({
    * The events, each validated against the **persisted** schema: already
    * redacted, already attributed, already stamped with `ingestSeq`.
    */
-  events: eventBatchSchema(telemetryEventSchema),
+  events: nonEmptyEventBatchSchema(telemetryEventSchema),
 });
 
 /**
@@ -378,8 +457,9 @@ export type TelemetryTailPayload = z.infer<typeof telemetryTailPayloadSchema>;
 
 /** The hint offered when an inbound producer batch fails validation. */
 const EVENT_HINT =
-  'A telemetry.event payload is { events, armedCaptureId?, droppedCount? }: between 1 and ' +
-  `${String(MAX_EVENTS_PER_BATCH)} producer events, each carrying an id and producerId, a 32-hex ` +
+  'A telemetry.event payload is { events, armedCaptureId?, droppedCount? }: between 0 and ' +
+  `${String(MAX_EVENTS_PER_BATCH)} producer events (an empty events array only with droppedCount ` +
+  'above zero, as a loss-only report), each carrying an id and producerId, a 32-hex ' +
   'traceId, a 16-hex spanId, a kind and tier that agree, a name, a Unix epoch millisecond ' +
   'startTime, a non-negative duration, a status, an attributes object and a zero-based seq; ' +
   'optionally the identifier of the capture the producer was armed for, and a whole-number count ' +

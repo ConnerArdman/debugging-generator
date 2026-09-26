@@ -331,9 +331,9 @@ function documentRootElement(doc: Document): Element | null {
  * This never touches the attribute `PanelShell` sets on its own element inside
  * `PanelHost`; hand the same theme to the React tree to keep the two in step.
  *
- * @param theme - The theme to apply, typically from {@link getPanelThemeSnapshot}
+ * @param theme The theme to apply, typically from {@link getPanelThemeSnapshot}
  *   or {@link resolvePanelTheme}.
- * @param root - Where to apply it: an element, or a document whose root element
+ * @param root Where to apply it: an element, or a document whose root element
  *   receives it. Omitted or `null`, the current document's root element.
  * @returns `theme`, unchanged, so resolution and application chain:
  *   `applyPanelTheme(resolvePanelTheme())`.

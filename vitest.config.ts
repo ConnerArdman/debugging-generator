@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------------------
 // Debug Generator - root Vitest configuration (AAP 0.3.4, 0.7.1 Group 0, 0.8.5).
 //
-// This is the ONLY Vitest configuration that runs tests in the monorepo. It is a
-// container config: because it declares `test.projects`, it never collects tests
-// itself - it only provides the projects declared below. Every entry point goes
-// through it:
+// This is the configuration the root test gates run through. It is a container
+// config: because it declares `test.projects`, it never collects tests itself -
+// it only provides the projects declared below. `pnpm test`,
+// `pnpm test:integration` and every workspace `test` script go through it:
 //
 //   pnpm test              -> vitest run --coverage                (all projects)
 //   pnpm test:integration  -> vitest run --project local-service-integration
@@ -60,9 +60,10 @@
 //     in that project's entry below.
 //   * `reporters` - the TEST-result reporters, not the coverage ones. The
 //     default reporter is used (it switches itself to `github-actions` in CI);
-//     AAP 0.7.1 Group 0 uploads only the Playwright report, so no junit/json
-//     test-result output is required. Coverage has its own `coverage.reporter`
-//     list, which does emit a JSON summary; see the `coverage` block below.
+//     CI (.github/workflows/ci.yml) uploads only the Playwright report, so no
+//     junit/json test-result output is required. Coverage has its own
+//     `coverage.reporter` list, which does emit a JSON summary; see the
+//     `coverage` block below.
 //   * `coverage.thresholds`. AAP 0.8.5 enumerates the quality gates and no
 //     coverage percentage is among them; a threshold here would invent a gate.
 //   * a blanket `passWithNoTests: true`. Measured behaviour of Vitest 5.0.1: a
@@ -712,33 +713,25 @@ export default defineConfig({
     passWithNoTests: passWithNoIntegrationSuites,
 
     // Coverage is a root-only option - Vitest ignores it inside a project - so
-    // one report covers every project of a `pnpm test` run. Each reporter has a
-    // distinct consumer:
+    // one report covers every project of a `pnpm test` run, written under the
+    // git-ignored `coverage/`. Each reporter has a distinct consumer:
     //   * `text` prints the table in the terminal.
     //   * `lcov` writes `coverage/lcov.info` (plus its HTML view) for CI and
     //     editors that annotate source lines.
-    //   * `json-summary` writes `coverage/coverage-summary.json`, the comparison
-    //     baseline each checkpoint keeps so the next one can compute coverage
-    //     deltas. It holds a `total` entry plus one entry per measured file,
-    //     keyed by the file's absolute path, and every entry carries `lines`,
-    //     `statements`, `functions` and `branches` as
-    //     `{ total, covered, skipped, pct }`. Per-package totals are derived
-    //     from it rather than emitted separately: group the file keys by
-    //     workspace (`packages/<name>`, `apps/<name>`, `scripts`) after
-    //     stripping the repository root, sum `total` and `covered` per metric,
-    //     and recompute the percentage from those sums - averaging the per-file
-    //     `pct` values would weight a 3-line file like a 3000-line one.
+    //   * `json-summary` writes `coverage/coverage-summary.json`, the
+    //     machine-readable totals for tooling that compares runs: a `total`
+    //     entry plus one entry per measured file, keyed by absolute path, each
+    //     carrying `lines`, `statements`, `functions` and `branches` as
+    //     `{ total, covered, skipped, pct }`. A per-workspace total is the sum
+    //     of its files' `total` and `covered` per metric, with the percentage
+    //     recomputed from those sums - never an average of `pct`, which would
+    //     weight every file equally.
     //
-    // Both files land under `coverage/`, which is git-ignored and, per AAP
-    // 0.3.4, never committed. The summary is therefore persisted by whoever
-    // keeps the run's output - a QA checkpoint's evidence, a CI artifact - not
-    // by the repository. No `thresholds` accompany it: AAP 0.8.5 defines no
-    // coverage gate, and the summary measures without judging.
+    // No `thresholds`: the quality gates listed in README.md ("Testing and
+    // quality gates") include no coverage percentage.
     //
-    // `reportOnFailure` is on because Vitest's default (false) writes no report
-    // at all when any test fails, so exactly the checkpoint whose coverage most
-    // needs comparing would leave no baseline behind. It changes only what is
-    // written: a failing run still exits non-zero.
+    // `reportOnFailure` makes a run with failing tests still write its report,
+    // which Vitest's default does not; the run still exits non-zero.
     //
     // `include` is what makes the report cover the source trees rather than only
     // the files some suite happened to load: a module no test imports appears at

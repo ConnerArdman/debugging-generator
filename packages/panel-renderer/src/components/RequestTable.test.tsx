@@ -7,9 +7,10 @@
  * Duplicate detection happens **upstream**, on the request as it was actually
  * made: the service computes an HMAC over the method, the path and the sorted
  * query pairs of the *unredacted* URL, and the telemetry aggregate groups by
- * that key (AAP 0.5.2). What reaches this component is the redacted display
- * form, whose query-parameter values have been replaced per key — so two
- * requests that differ only in a parameter arrive with **byte-identical** text.
+ * that key (`docs/SECURITY.md`, "The pre-redaction request key"). What reaches
+ * this component is the redacted display form, whose query-parameter values
+ * have been replaced per key — so two requests that differ only in a parameter
+ * arrive with **byte-identical** text.
  *
  * A client-side grouping or de-duplication pass would therefore merge two
  * genuinely different calls and report a duplicate that never happened. The
@@ -26,20 +27,22 @@
  * ## What else is asserted, and why each one is here
  *
  *   - **The three states of a query-backed view** — loading, empty, error with a
- *     working retry — which AAP 0.8.3 asks of every component suite in this
- *     folder, driven through a stub `DataProvider` that respectively never
- *     settles, resolves an empty page and rejects.
+ *     working retry — which every component suite in this folder must cover,
+ *     because every component declares all three (`docs/ARCHITECTURE.md`, "The
+ *     renderer contract"). They are driven through a stub `DataProvider` that
+ *     respectively never settles, resolves an empty page and rejects.
  *   - **The click-to-source payload**: the object the host receives when an
  *     initiator chip is activated, compared by value *and* by key set, because
- *     every hop after this one acts blind on what it is handed (AAP 0.4.2).
+ *     every hop after this one acts blind on what it is handed.
  *   - **An absent transfer size renders the unavailable label**, never `0`: a
  *     same-origin response is the only kind whose size the browser exposes, so
- *     the absence is the ordinary case and AAP 0.6.6 records it as a known gap.
- *     A zero here would read as a response that carried nothing.
- *   - **The paging contract** (AAP 0.4.2): the footer states how much of the
- *     result is on screen, and "Load more" asks for the `offset` the *service*
- *     reported rather than one derived from the rows in hand — and only when
- *     that offset moves forward from the page it answered.
+ *     the absence is the ordinary case, a known limit of the metric
+ *     (`docs/ARCHITECTURE.md`, "Computed metrics"). A zero here would read as a
+ *     response that carried nothing.
+ *   - **The paging contract**: the footer states how much of the result is on
+ *     screen, and "Load more" asks for the `offset` the *service* reported
+ *     rather than one derived from the rows in hand — and only when that offset
+ *     moves forward from the page it answered.
  *   - **The page size as authored**: an explicit `limit: 0` reaches the
  *     provider as zero and is never paged, an omitted limit stays omitted, and
  *     an over-sized one is held to the contract ceiling.
@@ -76,10 +79,10 @@
  *     built by the code under discussion could not distinguish the renderer's
  *     behaviour from the aggregate's, so the group shapes are written by hand
  *     and only their *types* are imported.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): a resource path, two
- *     component-shaped initiator labels and two file paths that belong to no
- *     application, demonstrated or otherwise. `scripts/check-no-hardcoding.mjs`
- *     scans this text with the rest of `packages/**`.
+ *   - **Generic fixture vocabulary only**: a resource path, two component-shaped
+ *     initiator labels and two file paths that belong to no application,
+ *     demonstrated or otherwise. `scripts/check-no-hardcoding.mjs` skips test
+ *     files, so this suite keeps the product's neutral vocabulary by convention.
  *   - **Queries by role and accessible name**, with a class read only off an
  *     element already obtained semantically, since no `jest-dom` matcher is
  *     available in this repository.
@@ -135,12 +138,12 @@ import { sourceLinkAccessibleName } from './SourceLink';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Every string below is application-neutral (AAP 0.5.4): no route, component,
- * service or symbol of any inspected project appears here, in the fixtures or
- * in the comments. The shapes are the capture's own — a 32-hex trace id, 16-hex
- * span ids, epoch-millisecond start times, millisecond durations, a redacted
- * URL whose parameter VALUE is already replaced — because those are the fields
- * the component reads and formats.
+ * Every string below is application-neutral: no route, component, service or
+ * symbol of any inspected project appears here, in the fixtures or in the
+ * comments. The shapes are the capture's own — a 32-hex trace id, 16-hex span
+ * ids, epoch-millisecond start times, millisecond durations, a redacted URL
+ * whose parameter VALUE is already replaced — because those are the fields the
+ * component reads and formats.
  * ---------------------------------------------------------------------------
  */
 
@@ -164,10 +167,9 @@ const METHOD_WRITE = 'POST';
  * The redacted URL of the repeated request, and its path.
  *
  * The `?` after `parameter=` is not a placeholder in this file's prose: it is
- * what redaction leaves behind, a key whose value was replaced (AAP 0.5.2).
- * Two requests that differed only in that value arrive here looking exactly
- * like each other, which is the condition the re-grouping case turns into a
- * failing assertion.
+ * what redaction leaves behind, a key whose value was replaced. Two requests
+ * that differed only in that value arrive here looking exactly like each other,
+ * which is the condition the re-grouping case turns into a failing assertion.
  */
 const RESOURCE_PATH = '/example/resource';
 const RESOURCE_URL = `${RESOURCE_PATH}?parameter=?`;
@@ -712,7 +714,7 @@ function watchDisabled(element: HTMLElement): () => readonly MutationRecord[] {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -1055,8 +1057,8 @@ const REPEATED_OCCURRENCES: readonly RequestOccurrence[] = [
  * A request issued four times inside one cluster, by two distinct callers.
  *
  * Two callers rather than one on purpose: a duplicate group with two initiators
- * is a different finding from one caller firing twice (AAP 0.8.2), and the
- * initiator cases below are what keep the column from collapsing to the first.
+ * is a different finding from one caller firing twice, and the initiator cases
+ * below are what keep the column from collapsing to the first.
  */
 const REPEATED_GROUP = makeRequestGroup({
   id: 'request-group-example-0001',
@@ -1086,7 +1088,7 @@ const REPEATED_GROUP = makeRequestGroup({
  * A request issued once, with no duplicate evidence and no exposed size.
  *
  * Its transfer size is absent rather than zero, which is the ordinary case for
- * a response whose bytes nothing measured (AAP 0.6.6).
+ * a response whose bytes nothing measured.
  */
 const SINGLE_GROUP = makeRequestGroup({
   id: 'request-group-example-0002',
@@ -1124,9 +1126,9 @@ const SINGLE_GROUP = makeRequestGroup({
  * The page most cases resolve, deliberately **not** in occurrence-count order
  * (1 then 4) while the node asks for `count_desc`.
  *
- * The service applied the ordering it was given (AAP 0.4.2), so a component
- * that re-ranked the page locally would show an order no response ever
- * reported — which is what the ordering case turns into a failure.
+ * The service applied the ordering it was given, so a component that re-ranked
+ * the page locally would show an order no response ever reported — which is
+ * what the ordering case turns into a failure.
  */
 const PROVIDER_ORDER: readonly RequestGroup[] = [SINGLE_GROUP, REPEATED_GROUP];
 
@@ -1160,7 +1162,7 @@ describe('RequestTable states', () => {
     expect(busy.classList.contains('dg-request-table__loading')).toBe(true);
 
     // Nothing is drawn yet: no grid, therefore no rows, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -1184,7 +1186,7 @@ describe('RequestTable states', () => {
 
     // Queried by a generic substring of the product's own copy rather than by a
     // restatement of the sentence, then checked to be exactly that: product
-    // vocabulary, naming no inspected project (AAP 0.5.4).
+    // vocabulary, naming no inspected project.
     const message = await screen.findByText(/no network requests were captured/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
 
@@ -1226,8 +1228,8 @@ describe('RequestTable states', () => {
 
     // The failure is stated in the package's one failure contract — the
     // generic lead, then the provider's own cause — with the provider's code
-    // carried through so the reader can act on it (B2-F14). The cause stays
-    // inside the error box, never where an analysis goes (AAP 0.5.5).
+    // carried through so the reader can act on it. The cause stays inside the
+    // error box, never where an analysis goes.
     expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
     expect(alert.textContent).toContain('The channel to the service is closed.');
     expect(within(alert).getByText('TRANSPORT_DISCONNECTED').classList.contains('dg-badge')).toBe(
@@ -1236,8 +1238,8 @@ describe('RequestTable states', () => {
 
     // The query that failed is shown in full, and compared as a value rather
     // than as a spelling. No `limit`: the node authored none, so none is
-    // invented and the side that resolves the query applies the contract's own
-    // default (AAP 0.4.2).
+    // invented and the side that resolves the query applies the contract's
+    // own default.
     const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
     expect(JSON.parse(shown.textContent ?? '')).toEqual({
       source: 'requests',
@@ -1266,10 +1268,10 @@ describe('RequestTable states', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    // One design for every failed node (B2-F14, B1-F16), in its fixed order:
-    // the default glyph, the view-scope title, the generic lead followed by the
-    // provider's own cause, the provider's hint on a line of its own, the code
-    // as a chip, the query, and a retry.
+    // One design for every failed node, in its fixed order: the default glyph,
+    // the view-scope title, the generic lead followed by the provider's own
+    // cause, the provider's hint on a line of its own, the code as a chip, the
+    // query, and a retry.
     const alert = await screen.findByRole('alert');
     expect(alert.querySelector('.dg-error-state__icon svg')).not.toBeNull();
     expect(
@@ -1363,7 +1365,7 @@ describe('RequestTable rows', () => {
       ).toBe(true);
 
       // No epoch timestamp is rendered anywhere in the row: a group's times are
-      // aggregates and offsets, never wall-clock readings (AAP 0.2.3).
+      // aggregates and offsets, never wall-clock readings.
       expect(row.textContent).not.toContain(String(group.firstStartTime));
       expect(row.textContent).not.toContain(String(group.lastStartTime));
     }
@@ -1394,7 +1396,7 @@ describe('RequestTable rows', () => {
 
   it('keeps two groups apart when only their request keys differ', async () => {
     /*
-     * THE LOAD-BEARING CASE (AAP 0.5.2).
+     * THE LOAD-BEARING CASE.
      *
      * Both groups carry the same method, the same path and the same redacted
      * URL — byte for byte — because redaction replaced the query value that
@@ -1469,7 +1471,7 @@ describe('RequestTable rows', () => {
     expect(screen.getByRole('grid').textContent).not.toContain('request-key-example-0011');
 
     // No affordance offers a body, a payload or a captured result anywhere in
-    // this view: bodies are never captured, so none can be shown (AAP 0.5.2).
+    // this view: bodies are never captured, so none can be shown.
     expect(screen.queryByRole('button', { name: /body|payload/i })).toBeNull();
     expect(document.body.textContent ?? '').not.toMatch(/body|payload/i);
   });
@@ -1689,9 +1691,9 @@ describe('RequestTable duplicate evidence', () => {
  *
  * The third is what proves a label without a location renders as text rather
  * than as a chip that leads nowhere, and the two that resolved are what prove
- * the column never loses a caller (AAP 0.8.2): the first is shown with its chip,
- * the others are counted beside it and named in the count's description, and
- * every one that resolved is a chip in the occurrence list.
+ * the column never loses a caller: the first is shown with its chip, the others
+ * are counted beside it and named in the count's description, and every one
+ * that resolved is a chip in the occurrence list.
  */
 const MIXED_INITIATOR_GROUP = makeRequestGroup({
   id: 'request-group-example-0051',
@@ -2037,7 +2039,7 @@ describe('RequestTable callers and click-to-source', () => {
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2).
+    // this one acts on the object it is handed.
     expect(received).toEqual(PANEL_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(PANEL_SOURCE.file);
@@ -2157,7 +2159,7 @@ describe('RequestTable transfer size', () => {
 
     // The label the whole product uses for an unobservable quantity, imported
     // rather than spelled, so a change to it cannot leave this case asserting
-    // yesterday's text (AAP 0.6.6).
+    // yesterday's text.
     expect(within(cell).getByText(NOT_AVAILABLE_LABEL)).toBeDefined();
     expect(cell.textContent).toContain(NOT_AVAILABLE_LABEL);
 
@@ -2529,7 +2531,7 @@ describe('RequestTable ordering', () => {
 
     // The host is told, so it can remember the reader's choice. It is a report
     // of a selection in the component's own vocabulary and carries no query
-    // shape (AAP 0.4.2).
+    // shape.
     expect(spies.onFilterChange).toHaveBeenCalledTimes(1);
     expect(spies.onFilterChange).toHaveBeenCalledWith(NODE_ID, {
       sort: MOST_OCCURRENCES_FIRST,
@@ -2725,8 +2727,8 @@ describe('RequestTable paging', () => {
   });
 
   it('keeps focus on Load more, busy and never disabled, while the next page is in flight', async () => {
-    // B2-F12: the control used to unmount the moment the page it asked for went
-    // into flight, which hands a keyboard reader's focus to `<body>`.
+    // Load more stays mounted, busy and enabled while the page it asked for is
+    // in flight, so a keyboard reader's focus never falls to `<body>`.
     const stub = heldSecondPageProvider({ data: [REPEATED_GROUP], total: 18, nextOffset: 1 });
     const user = userEvent.setup();
 
@@ -2811,9 +2813,9 @@ describe('RequestTable paging', () => {
   });
 
   it('reports a failed next page below the groups already shown, and retries that page', async () => {
-    // Every paged view reports a failed further page in the page scope, below
-    // the rows it already drew; this one used to replace them with a failure
-    // titled for the whole view (B2-F14).
+    // Like every paged view, this one reports a failed further page in the page
+    // scope, below the rows it already drew, rather than replacing them with a
+    // failure titled for the whole view.
     const stub = recordingProvider((_query, call) => {
       if (call === 2) {
         return Promise.reject(Object.assign(new Error('Service Unavailable'), { status: 503 }));
@@ -2870,7 +2872,7 @@ describe('RequestTable paging', () => {
 
     // A service that reported no total leaves this view unable to know whether
     // more groups exist, so it states the count it has and claims nothing about
-    // the whole capture (AAP 0.4.2).
+    // the whole capture.
     await screen.findByText(`Groups loaded: ${formatCount(1)}.`);
     expect(footerNote()).not.toContain(' of ');
 
@@ -3618,8 +3620,8 @@ function describingTooltip(trigger: HTMLElement): HTMLElement {
 }
 
 /**
- * Whether a tooltip bubble is currently shown: mounted, no longer `hidden`, and
- * in the open state. A closed bubble keeps its place in the document but carries
+ * Whether a tooltip bubble is currently shown: mounted, not `hidden`, and in
+ * the open state. A closed bubble keeps its place in the document but carries
  * the `hidden` attribute, which takes it out of the accessibility tree.
  */
 function isShown(bubble: HTMLElement): boolean {
@@ -3649,8 +3651,8 @@ function expectKeyboardDisclosure(trigger: HTMLElement, expected: string): void 
   expect(isShown(closed)).toBe(false);
   expect(describingTooltips(trigger)).toEqual([]);
 
-  // Focus opens the description at once: the very bubble it was described by,
-  // now the one it shows.
+  // Focus opens the description at once: the very bubble it was described by
+  // is the one it shows.
   act(() => {
     trigger.focus();
   });
@@ -4149,7 +4151,7 @@ const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
  * A reference to one of the column-geometry tokens a role track is built from.
  * Removing every such reference from a track template must leave nothing but
  * the `minmax()` frames and the spaces between tracks: no number and no unit is
- * the component's own (AAP 0.6.4).
+ * the component's own.
  */
 const COLUMN_TOKEN_REFERENCE = /var\(--dg-column-(?:min|share)-[a-z]+\)/gu;
 
@@ -4387,8 +4389,8 @@ describe('RequestTable layout contracts', () => {
       throw new Error('no occurrence row holds the last occurrence');
     }
 
-    // The caller's label is its location. It used to be printed as code AND as
-    // the compact chip beside it; now the one chip carries it, once.
+    // The caller's label is its location, so the one chip prints it, once: the
+    // label is not printed as code beside the chip as well.
     const text = visibleText(occurrenceRow);
     expect(text.split(WIDGET_CHIP_TEXT)).toHaveLength(2);
     expect(within(occurrenceRow).queryByText(LOCATION_LABEL)).toBeNull();

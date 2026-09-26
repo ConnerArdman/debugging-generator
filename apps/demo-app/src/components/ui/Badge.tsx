@@ -44,11 +44,10 @@ import type { ReactNode } from 'react';
 import styles from './Badge.module.css';
 
 /**
- * The label's inputs. Local and deliberately not exported: `packages/panel-renderer` declares a
- * `Badge` primitive of its own, and consumers that need this one's props read them from the
- * component itself with `React.ComponentProps<typeof Badge>` rather than importing a second
- * name. The tone union is likewise spelled out here instead of being shared with the pill, the
- * alert and the toast region: the four unions are identical by intention, and repeating five
+ * The label's inputs. Local and deliberately not exported: consumers that need these props read
+ * them from the component with `React.ComponentProps<typeof Badge>` rather than importing a
+ * second name. The tone union is likewise spelled out here instead of being shared with the pill,
+ * the alert and the toast region: the four unions are identical by intention, and repeating five
  * string literals keeps each primitive readable on its own.
  */
 interface Props {
@@ -107,11 +106,6 @@ interface Props {
 export function Badge({ children, tone = 'neutral', size = 'md', dot = false, className }: Props) {
   return (
     <span className={clsx(styles.root, className)} data-tone={tone} data-size={size}>
-      {/*
-       * An explicit ternary, not `dot && …`: `false` renders as nothing in React, but the
-       * `&&` form would put a stray `0` or an empty string on the page the day this prop is
-       * fed a number or a string by a caller, and `null` says what an absent dot is.
-       */}
       {dot ? <span className={styles.dot} aria-hidden="true" /> : null}
       {children}
     </span>

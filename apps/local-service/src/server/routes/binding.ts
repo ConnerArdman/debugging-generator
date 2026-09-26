@@ -68,7 +68,23 @@
  * durable row, as after a restart. A same-origin navigation
  * is held to the same rule: when the registry or the record refuses the new
  * URL, the row and the registry get the previous URL back and the navigation
- * is neither announced nor re-armed.
+ * is neither announced nor re-armed. So is a drop — an unbind or a
+ * cross-origin navigation: when the record refuses to clear its bound tab,
+ * the live binding and the durable row are put back exactly as they were, the
+ * drop is not announced and the refusal is returned, so the retried unbind or
+ * the next navigation still finds the binding to drop.
+ *
+ * **Restoration is status-aware.** The binding queue does not serialize with
+ * {@link SessionManager.end}, which may commit `ended` — and remove the
+ * session's `bindings` row in the same transaction — while a route awaits a
+ * record mirror. A durable row is therefore only ever written back inside one
+ * store transaction that first finds its session open; a session that has
+ * ended or vanished gets nothing written. A drop whose session ended during
+ * its mirror restores neither the live binding nor the row, announces
+ * nothing and answers as ignored: `session.end` already did what the drop set
+ * out to do. The status read and the writes of a restoration run in one
+ * synchronous turn of the single service process that owns the store, so no
+ * end can commit between them.
  *
  * **Announcements** go to the session's DevTools and VS Code clients (the two
  * receivers AAP §0.4.2 names) through `broadcastToKinds`. The registry keeps a
@@ -436,11 +452,15 @@ export interface BindingRoutesDeps {
   /**
    * The durable `bindings` rows, session records, the indexed origin lookup
    * and open captures. `getBindingByTab` reads a tab's row before a bind
-   * replaces it, so a refused re-bind of the same tab and session can write
-   * that row back.
+   * replaces it or a drop removes it, so a refused re-bind of the same tab and
+   * session, or a drop whose record mirror refuses, can write that row back.
+   * `transaction` makes every such write-back status-aware: the row's session
+   * is read and the row written in one unit, so a session `session.end` closed
+   * while the route awaited its record mirror is never bound again.
    */
   readonly sessions: Pick<
     SessionsRepo,
+    | 'transaction'
     | 'get'
     | 'findLatestByDevServer'
     | 'getBindingByTab'
@@ -892,6 +912,36 @@ function pairOfRow(row: StoredTabBinding): { readonly tabId: number; readonly se
 }
 
 /**
+ * Whether a session can no longer hold a binding: its record is gone
+ * (purged by retention) or its status is terminal by the state machine's rule
+ * (`ended`). AAP §0.2.3: an ended session is no recipient.
+ */
+function isClosedSession(record: SessionRecord | undefined): boolean {
+  return record === undefined || isTerminalSessionStatus(record.status);
+}
+
+/**
+ * What writing one previous durable row back came to.
+ *
+ * - `restored`: the row stands again, with its own URL and bound-at stamp.
+ * - `session-closed`: its session has ended or no longer exists, so nothing was
+ *   written — the state `session.end` (or retention) left stands.
+ * - `failed`: the session could not be read or the row could not be written;
+ *   logged by ids and codes.
+ */
+type RowRestoration = 'restored' | 'session-closed' | 'failed';
+
+/**
+ * What putting back a binding a refused drop removed came to.
+ *
+ * - `restored`: the live binding was re-established and the row written back
+ *   (each failure logged), so the drop is refused and can be retried.
+ * - `session-closed`: the session was confirmed ended or vanished before
+ *   anything was written, so neither store was touched and the drop stands.
+ */
+type DropRestoration = 'restored' | 'session-closed';
+
+/**
  * Builds the binding route over its injected collaborators.
  *
  * Constructing it has no side effect: no timer, no socket, no store access.
@@ -1094,30 +1144,66 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
   /* ---- store restoration ---- */
 
   /**
-   * Writes a previous durable row back — one a bind displaced or replaced, or
-   * the pre-navigation row of a refused navigation — with its own URL and
-   * bound-at stamp, logging (not propagating) a failure.
+   * Writes a previous durable row back — one a bind displaced or replaced, the
+   * pre-navigation row of a refused navigation, or the row a refused drop
+   * removed — with its own URL and bound-at stamp, provided its session is
+   * still open.
+   *
+   * A refused bind's compensation, a refused navigation's revert and a refused
+   * drop's restoration run this after awaiting a record mirror, and in that
+   * window `SessionManager.end` may have committed `ended` together with the
+   * removal of the session's `bindings` row. `upsertBinding` checks no status
+   * and the foreign key admits an ended session, so an unconditional write
+   * would bind an ended session again after `session.end` answered success.
+   * The row's session is therefore read and the row written inside one
+   * `sessions.transaction`: an ended or vanished session gets nothing written,
+   * and no end can commit between the read and the write. Failures are logged
+   * by ids and codes, never propagated.
+   *
+   * @param row The row to write back, exactly as it was read.
+   * @returns Whether the row stands again, was left out because its session
+   * is closed, or could not be written.
    */
-  function restoreRow(row: StoredTabBinding): void {
-    const restored = sessions.upsertBinding({
-      tabId: row.tab.tabId,
-      sessionId: row.sessionId,
-      url: row.tab.url,
-      boundAt: row.boundAt,
+  function restoreRow(row: StoredTabBinding): RowRestoration {
+    const fields = sessionFields(row.sessionId, { tabId: row.tab.tabId });
+    const outcome = sessions.transaction((): Result<RowRestoration, DebuggenError> => {
+      const loaded = sessions.get(row.sessionId);
+      if (isErr(loaded)) {
+        return loaded;
+      }
+      if (isClosedSession(loaded.value)) {
+        return ok('session-closed');
+      }
+      const restored = sessions.upsertBinding({
+        tabId: row.tab.tabId,
+        sessionId: row.sessionId,
+        url: row.tab.url,
+        boundAt: row.boundAt,
+      });
+      return isErr(restored) ? restored : ok('restored');
     });
-    if (isErr(restored)) {
-      log.error(
-        'A previous binding row could not be restored',
-        sessionFields(row.sessionId, { tabId: row.tab.tabId, ...errorFields(restored.error) }),
+    if (isErr(outcome)) {
+      log.error('A previous binding row could not be restored', {
+        ...fields,
+        ...errorFields(outcome.error),
+      });
+      return 'failed';
+    }
+    if (outcome.value === 'session-closed') {
+      log.info(
+        'A previous binding row was not restored: its session has ended or no longer exists',
+        fields,
       );
     }
+    return outcome.value;
   }
 
   /**
    * Undoes one `upsertBinding`: removes the new row, then writes back every
    * row it replaced — the rows it reported displaced and, when the bind
    * re-bound the same tab to the same session, the tab's own previous row,
-   * which the upsert replaced without reporting it.
+   * which the upsert replaced without reporting it. Each goes through
+   * {@link restoreRow}, so a row whose session has ended meanwhile stays gone.
    *
    * @param upsert What the bind's `upsertBinding` answered.
    * @param priorRow The tab's row before the bind, from {@link PriorBinding}.
@@ -1568,16 +1654,95 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
   /* ---- ending a binding ---- */
 
   /**
+   * Puts back a binding {@link dropBinding} removed from both routing stores
+   * once the session record refused to clear its tab (or the write threw) —
+   * unless the session has ended or vanished meanwhile.
+   *
+   * The drop awaited the record mirror, and `SessionManager.end` may have
+   * committed `ended` in that window, removing the session's `bindings` row in
+   * the same transaction (it found none: the drop had already deleted it). The
+   * binding queue and the manager's end do not serialize with each other, so
+   * restoring either store then would leave an ended session durably and
+   * live-bound after `session.end` answered success (AAP §0.2.3: an ended
+   * session is no recipient). The session is therefore read first: ended or
+   * vanished, neither the live binding nor the row is restored and
+   * `session-closed` is answered — the end's outcome stands. Otherwise the
+   * live binding is re-established — under the credential that made it, with
+   * its URL and bound-at stamp — and then the durable row exactly as it was
+   * read before the drop (none is written when the tab had none), through
+   * {@link restoreRow}, whose transaction checks its session again. The status
+   * read and both restorations run in one synchronous turn: the service is
+   * single-threaded and one process owns the store, so no end can commit
+   * between the check and the writes.
+   *
+   * When the status read itself fails, the live binding is still restored —
+   * `session.end` removes only the durable row, never a live binding, so this
+   * keeps the drop retryable — and {@link restoreRow}'s transaction decides
+   * the row. The record was never changed and nothing was announced, so
+   * nothing else is undone. Failures are logged by ids and codes, never
+   * propagated: the caller returns the record's refusal, or — for
+   * `session-closed` — answers the drop as done.
+   *
+   * @param released The live binding the drop released.
+   * @param priorRow The tab's durable row before the drop, if it had one.
+   * @returns `session-closed` when the session was confirmed ended or vanished
+   * before anything was written; `restored` otherwise.
+   */
+  function restoreDroppedBinding(
+    released: TabBindingView,
+    priorRow: StoredTabBinding | undefined,
+  ): DropRestoration {
+    const fields = sessionFields(released.sessionId, { tabId: released.tabId });
+    const loaded = sessions.get(released.sessionId);
+    if (isErr(loaded)) {
+      log.warn(
+        "The session could not be read before restoring its dropped binding; the live binding is restored and the row's own transaction decides",
+        { ...fields, ...errorFields(loaded.error) },
+      );
+    } else if (isClosedSession(loaded.value)) {
+      log.info(
+        'The session ended while its binding was being dropped; neither the live binding nor its row was restored',
+        fields,
+      );
+      return 'session-closed';
+    }
+    restoreLiveBinding(released);
+    if (priorRow !== undefined) {
+      restoreRow(priorRow);
+    }
+    return 'restored';
+  }
+
+  /**
    * Drops a live binding: the durable row first, the live view second (the row
-   * is written back should the registry refuse), then the record mirror and the
-   * announcement. Never touches the session's status, capture or
+   * is written back should the registry refuse), then — when the session still
+   * has a record — the record mirror, and the announcement only once every
+   * write stands. Should the record refuse to clear its bound tab (or the write
+   * throw), both routing stores are put back exactly as they were by
+   * {@link restoreDroppedBinding}, nothing is announced, and the refusal is
+   * returned (a throw is rethrown after the restoration), so the caller answers
+   * with protocol's `error` and a retried `session.unbind`, or the tab's next
+   * navigation, finds the binding and drops it again. A record that has
+   * vanished meanwhile (`SESSION_NOT_FOUND`) has no tab to clear and does not
+   * hold the drop back. Never touches the session's status, capture or
    * instrumentation.
+   *
+   * A `session.end` that committed while the mirror was awaited has already
+   * done what the drop set out to do: its transaction removed the session's
+   * row and stored the record without a bound tab. The restoration then puts
+   * nothing back, and a refused mirror is answered as `ok(undefined)` — the
+   * handlers' `ignored` — with nothing announced: the binding is gone
+   * everywhere and the ended record shows no tab, so there is nothing to retry
+   * and nothing to tell. A throw is still rethrown after that restoration.
    *
    * @param binding The live binding, already authorized for `principal`.
    * @param reason Why it ends.
    * @param announcedUrl The URL the announcement carries: the new document for
    * an origin change, the last known one otherwise.
    * @param clearRecord Whether the session still has a record to clear.
+   * @returns The drop's announcement; `undefined` when there was nothing left
+   * to drop or announce (the tab was no longer live-bound, or its session ended
+   * during the drop); the refusal otherwise.
    */
   async function dropBinding(
     binding: TabBindingView,
@@ -1587,6 +1752,18 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     clearRecord: boolean,
   ): Promise<Result<BindingAnnouncement | undefined, DebuggenError>> {
     const { tabId, sessionId } = binding;
+    // The tab's row as it stands, so a refused record mirror below can have it
+    // back exactly: a redundant re-bind renews the row's bound-at stamp but not
+    // the live view's, and the row may already be gone. A row that cannot be
+    // read would refuse the delete anyway.
+    const priorRow = sessions.getBindingByTab(tabId);
+    if (isErr(priorRow)) {
+      log.error(
+        "The tab's binding row could not be read; the binding was kept",
+        sessionFields(sessionId, { tabId, ...errorFields(priorRow.error) }),
+      );
+      return priorRow;
+    }
     const removed = sessions.deleteBinding(tabId);
     if (isErr(removed)) {
       log.error(
@@ -1597,15 +1774,17 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     }
     const change = clients.unbindTab(tabId, { reason, principal });
     if (isErr(change)) {
-      const restored = sessions.upsertBinding({
-        tabId,
+      // Written back through the status-aware restoration, so a session that
+      // ended before this frame arrived (its live binding outlives the end)
+      // is not given a durable row again.
+      const restored = restoreRow({
         sessionId,
-        url: binding.url,
+        tab: { tabId, url: binding.url },
         boundAt: binding.boundAt,
       });
       log.warn(
-        'The live binding refused the unbind; the binding row was restored',
-        sessionFields(sessionId, { tabId, restored: restored.ok, ...errorFields(change.error) }),
+        'The live binding refused the unbind; the binding row was written back unless its session has closed',
+        sessionFields(sessionId, { tabId, restored, ...errorFields(change.error) }),
       );
       return change;
     }
@@ -1613,7 +1792,30 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       return ok(undefined);
     }
     if (clearRecord) {
-      await mirrorBoundTab(sessionId, undefined);
+      const released = change.value.binding;
+      let mirrored: Result<void, DebuggenError>;
+      try {
+        mirrored = await mirrorBoundTab(sessionId, undefined);
+      } catch (thrown) {
+        restoreDroppedBinding(released, priorRow.value);
+        throw thrown;
+      }
+      if (isErr(mirrored) && mirrored.error.code !== 'SESSION_NOT_FOUND') {
+        if (restoreDroppedBinding(released, priorRow.value) === 'session-closed') {
+          // `session.end` committed during the mirror and already removed the
+          // row and the record's tab: the drop stands, unannounced.
+          return ok(undefined);
+        }
+        log.warn(
+          'The session record refused to clear its bound tab; the binding was restored and nothing was announced',
+          sessionFields(sessionId, {
+            tabId,
+            reason: change.value.reason,
+            ...errorFields(mirrored.error),
+          }),
+        );
+        return mirrored;
+      }
     }
     const announced = announce({
       sessionId,
@@ -1702,7 +1904,11 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       return updated;
     }
     if (!recordShowsTab(record, tabId, url)) {
-      /** Puts the live view, then the row, back on the URL the record still holds. */
+      /**
+       * Puts the live view, then the row, back on the URL the record still
+       * holds; the row through {@link restoreRow}, so only while the session
+       * is open.
+       */
       const revertNavigation = (): void => {
         const reverted = clients.updateTabUrl({ tabId, url: binding.url, principal });
         if (isErr(reverted)) {

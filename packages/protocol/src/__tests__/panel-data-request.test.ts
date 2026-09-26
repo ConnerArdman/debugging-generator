@@ -22,8 +22,7 @@
  *
  * `parseHttpRequest('panel.data', …)` — the entry both the service's route and
  * the protocol's HTTP client validate through — is held to the same verdicts,
- * and a refusal names the offending field without echoing its value (AAP
- * §0.5.2).
+ * and a refusal names the offending field without echoing its value.
  */
 
 import { describe, expect, it, vi } from 'vitest';

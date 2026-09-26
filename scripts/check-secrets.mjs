@@ -2,9 +2,11 @@
 /**
  * check-secrets.mjs
  *
- * Repository gate behind `pnpm check:secrets`, which `pnpm verify` runs (AAP 0.8.5). It reads every
- * file git tracks and fails the build when one of them carries a credential, so "no committed
- * secrets" is an enforced property of the repository rather than a habit.
+ * Repository gate behind `pnpm check:secrets`, which `pnpm verify` runs. It reads the content git
+ * tracks and fails the build when a tracked path or its content matches one of the credential
+ * shapes below. What a pass establishes is exactly that: none of those shapes occurs in the content
+ * the check read. Which content that is - and what it cannot see inside a binary - is set out
+ * under WHAT IS SCANNED, AND WHAT IS NOT.
  *
  * Six rules, each with a stable id that is also used by the runtime redaction layer
  * (`packages/telemetry/src/redaction/rules.ts`) so findings, logs and documentation share one
@@ -44,8 +46,8 @@
  * appears contiguously in its source. The same reason keeps the two allowlisted literals out of it:
  * their allowlist entries do not name this path, and rightly so.
  *
- * `.git/` IS NEVER READ. The repository's `origin` URL embeds an access token (AAP 0.2.1), which
- * lives in `.git/config`. Enumeration goes through `git ls-files`, which never lists anything under
+ * `.git/` IS NEVER READ. The repository's `origin` URL embeds an access token, which lives in
+ * `.git/config`. Enumeration goes through `git ls-files`, which never lists anything under
  * `.git/`, and there is no filesystem-walk fallback that could reach it. Do not add one.
  *
  * IT FAILS CLOSED. Every condition that leaves the check unable to inspect the repository is an
@@ -55,16 +57,37 @@
  * precondition failure raised where enumeration happens, which makes it fail for in-process
  * callers and for the command line alike.
  *
- * The same holds file by file. Every tracked file is scanned: one larger than 2 MiB is streamed
- * in chunks rather than skipped, and a tracked symbolic link is scanned as its target text - the
- * string git stores for it - without ever being followed. Only two kinds of entry are skipped,
- * both because there is no text here to read: a positively identified binary (its extension and
- * its leading bytes agree on a known format) and a submodule (gitlink). A tracked file the check
- * cannot examine - absent from the work tree, replaced by an entry of another type than the index
- * records (a directory, a symbolic link where git tracks a regular file, or a symbolic link in
- * place of one of its directories), or unreadable - is reported as `unscanned` with the command
- * that fixes it, and the run exits 2: a gate that passed over it would be certifying content it
- * never saw.
+ * WHAT IS SCANNED, AND WHAT IS NOT. Each entry git tracks is handled in exactly one of these
+ * ways, and the report accounts for every one:
+ *
+ *   - A text file is scanned against every rule. One larger than 2 MiB is streamed in chunks,
+ *     with the same line and column semantics as a file read whole.
+ *   - A tracked symbolic link is scanned as its target text - the string git stores for it - and
+ *     is never followed.
+ *   - A positively identified binary (its extension and its leading bytes agree on a format in
+ *     {@link BINARY_FORMATS}) is scanned against every content rule twice over: byte for byte,
+ *     streamed when large, and field by field, each plaintext field its format stores - PNG text
+ *     chunks, standalone or in an ICO image; JPEG comment and application segments; GIF extension
+ *     blocks; ZIP (VSIX) entry names, comments and stored entries and the archive comment; the
+ *     WOFF and WOFF2 private data block - read from its own first byte, so a length prefix or a
+ *     name before a value cannot pass for part of it, and GIF sub-blocks joined back into the text
+ *     they split. PDF delimits its values itself, so the byte pass reads each from its start.
+ *     Nothing is decompressed or decoded: a credential one of those fields holds as plain ASCII is
+ *     found, as is one that stands between non-token bytes anywhere else in the file, while one
+ *     inside compressed data - a PNG `zTXt` chunk, compressed `iTXt` or image data, a PDF Flate
+ *     stream, a deflated ZIP or VSIX entry, a compressed WOFF or WOFF2 table - is not, nor is one
+ *     stored as UTF-16 or hexadecimal (see {@link BinaryFile}). Each such file counts as scanned
+ *     and is listed under `binaries`.
+ *   - A submodule (gitlink) is skipped, because its content is another repository's, and is
+ *     listed under `skipped`.
+ *   - A tracked file the check cannot examine - absent from the work tree, replaced by an entry of
+ *     another type than the index records (a directory, a symbolic link where git tracks a regular
+ *     file, or a symbolic link in place of one of its directories), or unreadable - is reported as
+ *     `unscanned` with the command that fixes it, and the run exits 2: a gate that passed over it
+ *     would be certifying content it never saw.
+ *
+ * `env-file` judges the path alone, so it applies to every tracked entry, skipped and unscanned
+ * ones included.
  *
  * Usage:  node scripts/check-secrets.mjs [--json] [--help]
  * Exits:  0 clean | 1 findings | 2 usage or environment error (unknown option, git unavailable,
@@ -142,9 +165,9 @@ export const RULES = Object.freeze([
 export const RULE_IDS = Object.freeze(RULES.map((rule) => rule.id));
 
 /**
- * The only environment files that may be tracked (AAP 0.3.4). These are repository-relative POSIX
- * paths, not basenames: `/.gitignore` re-includes exactly these two paths after ignoring `.env*`,
- * and an example file anywhere else is still a finding.
+ * The only environment files that may be tracked. These are repository-relative POSIX paths, not
+ * basenames: `/.gitignore` re-includes exactly these two paths after ignoring `.env*`, and an
+ * example file anywhere else is still a finding.
  *
  * @type {readonly string[]}
  */
@@ -200,22 +223,27 @@ const PREVIEW_PREFIX_LENGTH = 4;
 /** Suffix marking a truncated preview (U+2026 HORIZONTAL ELLIPSIS). */
 const PREVIEW_SUFFIX = '\u2026';
 
+/** The eight bytes every PNG file begins with, whether it stands alone or inside an ICO file. */
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 /**
- * The binary formats a tracked file may be skipped as: each format's extensions and the magic
- * signatures its files begin with.
+ * The binary formats a tracked file may be identified as: each format's extensions and the magic
+ * signatures its files begin with. An identified file is scanned in binary mode (see
+ * {@link ContentMode}): decoded byte for byte and, for the formats
+ * {@link METADATA_FIELD_READERS} parses, field by field as well, against every content rule.
  *
- * Skipping requires positive identification - the extension names the format AND the leading
- * bytes match one of its signatures. Either signal alone is what a committed credential could hide
- * behind: renaming `credentials.txt` to `credentials.png` changes nothing about its content, and a
- * stray NUL byte in an otherwise textual file does not make the rest of it unreadable. So a file
- * with a binary extension but no matching signature, or with NUL bytes but no known binary
- * extension, is scanned as text like every other file.
+ * Binary mode requires positive identification - the extension names the format AND the leading
+ * bytes match one of its signatures - because it changes how the bytes are decoded, and either
+ * signal alone says nothing about the content: renaming `credentials.txt` to `credentials.png`
+ * leaves it text, and a stray NUL byte in an otherwise textual file does not make the rest of it
+ * anything but text. So a file with a binary extension but no matching signature, or with NUL
+ * bytes but no known binary extension, is decoded as UTF-8 text like every other file.
  *
  * @type {readonly { readonly format: string, readonly extensions: readonly string[],
  *   readonly signatures: readonly Buffer[] }[]}
  */
 const BINARY_FORMATS = Object.freeze([
-  binaryFormat('png', ['.png'], [Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])]),
+  binaryFormat('png', ['.png'], [PNG_SIGNATURE]),
   binaryFormat('ico', ['.ico'], [Buffer.from([0x00, 0x00, 0x01, 0x00])]),
   binaryFormat('jpeg', ['.jpg', '.jpeg'], [Buffer.from([0xff, 0xd8, 0xff])]),
   binaryFormat('gif', ['.gif'], [Buffer.from('GIF87a', 'latin1'), Buffer.from('GIF89a', 'latin1')]),
@@ -228,7 +256,7 @@ const BINARY_FORMATS = Object.freeze([
 /**
  * One frozen entry of {@link BINARY_FORMATS}.
  *
- * @param {string} format Short format name, reported with the skipped file.
+ * @param {string} format Short format name, reported with the binary file.
  * @param {readonly string[]} extensions Lower-case extensions, leading dot included.
  * @param {readonly Buffer[]} signatures Byte sequences a file of this format starts with.
  * @returns {{ readonly format: string, readonly extensions: readonly string[],
@@ -556,7 +584,7 @@ const LITERAL_CLOSING_PUNCTUATION = new Set([')', ']', '}', "'", ';', ',', '.', 
  * at the literal's last character. What follows the literal can. In the first, only closing
  * punctuation runs to the end of the line; in the second, `password=<secret>` continues the value
  * past the `)`, so the literal is a prefix of a longer value rather than the value itself, and
- * AAP 0.3.4 exempts the exact placeholder only.
+ * the allowlist exempts the exact placeholder only.
  *
  * @param {string} line
  * @param {number} end Exclusive index of the literal's end in `line`.
@@ -620,8 +648,8 @@ function allowlistOccurrences(allowlist, relPath, line) {
  * `<url>)password=<secret>` - the occurrence itself is withheld by {@link allowlistOccurrences},
  * because the literal is not the whole value there either.
  *
- * A match that merely *contains* the literal is deliberately not exempt. That direction is what
- * let an allowlisted prefix launder whatever followed it, and AAP 0.3.4 exempts the exact
+ * A match that merely *contains* the literal is deliberately not exempt. That direction would let
+ * an allowlisted prefix launder whatever followed it, and the allowlist exempts the exact
  * placeholder, not every value it is a substring of. A match that shares a line with an
  * allowlisted literal without lying inside it is a finding too.
  *
@@ -1407,8 +1435,8 @@ function matchConnectionStrings(line) {
  * Exclusion (b): the rule is *bound*. A dense value under a neutral name is a hash, a build id or
  * a base64 asset, and reporting those would make the gate too noisy to be trusted.
  *
- * Exclusion (g), second half: a git object name on a `.github/workflows/` line is how actions are
- * pinned (AAP 0.3.2). Hexadecimal cannot exceed the threshold anyway, so this is belt and braces
+ * Exclusion (g), second half: a git object name on a `.github/workflows/` line is how the workflow
+ * pins its actions. Hexadecimal cannot exceed the threshold anyway, so this is belt and braces
  * rather than the load-bearing guard.
  *
  * @param {string} name Name the value is bound to.
@@ -1444,7 +1472,8 @@ function entropyMatch(name, value, start, inWorkflow) {
 }
 
 /**
- * `entropy`: a long, dense value bound to a key-like name (AAP 0.3.4).
+ * `entropy`: a value of at least {@link ENTROPY_MIN_LENGTH} characters, denser than
+ * {@link ENTROPY_MIN_BITS_PER_CHAR} bits per character, bound to a key-like name.
  *
  * TWO CANDIDATE SOURCES, IN THIS ORDER.
  *
@@ -1453,19 +1482,19 @@ function entropyMatch(name, value, start, inWorkflow) {
  *      password of `!@#$%^&*()` and alphanumerics is dense key material, and the dense-run
  *      alphabet below splits it into sub-runs too short to measure.
  *   2. The contiguous dense run ({@link ENTROPY_CANDIDATE_PATTERN}), which is the only pass that
- *      covers a value with no assignment operator at all - the `--auth-token <run>` form this
- *      file's specification requires - and dense runs embedded in a larger value.
+ *      covers a value with no assignment operator at all - the `--auth-token <run>` form - and
+ *      dense runs embedded in a larger value.
  *
  * Complete values are reported first so that when both passes see the same credential,
  * {@link dedupeOverlaps} keeps the fullest extent and the finding's column, preview and
  * `N characters` describe the whole value. The structural rules still win over this one, because
- * {@link scanContentWithSuppressions} lists them before it.
+ * {@link CONTENT_MATCHERS} lists them before it.
  *
  * EXCLUSIONS. Each has a name, because each is a false positive this repository's own tracked
  * content produces, and each is pinned by a test:
  *
- *   (a) too short, or not dense enough - see {@link entropyMatch}. There is no upper bound: AAP
- *       0.3.4 states a minimum of 32 characters and no maximum, so a long value is measured, and
+ *   (a) too short, or not dense enough - see {@link entropyMatch}. There is no upper bound: the
+ *       rule sets a minimum of 32 characters and no maximum, so a long value is measured, and
  *       what keeps a long *line* affordable is {@link NAME_LOOKBEHIND} rather than a size cap.
  *   (b) the name is not key-like - see {@link entropyMatch}.
  *   (c) the value interpolates (`${...}`) or substitutes a command (`$(...)`): what it holds is
@@ -1536,6 +1565,47 @@ function matchEntropy(relPath, line) {
   }
   return matches;
 }
+
+/**
+ * How a file's bytes are read. Both modes apply every content rule; they differ in decoding and
+ * in what is scanned besides the lines of the file.
+ *
+ *   text    UTF-8. A regular file is read this way unless it is a positively identified binary,
+ *           and a symbolic link's target text always is.
+ *   binary  latin1 - one byte to one character, lossless, so a column is a byte offset within its
+ *           line and a chunk boundary never splits a character. Lines end at the same `\n` and
+ *           `\r\n` bytes as in text mode. The plaintext metadata fields of the file's format are
+ *           then scanned as well, each from its own first byte (see
+ *           {@link scanMetadataFieldsInto}).
+ *
+ * @typedef {'text' | 'binary'} ContentMode
+ */
+
+/**
+ * One content rule's per-line matcher.
+ *
+ * @typedef {object} ContentMatcher
+ * @property {string} rule Rule id.
+ * @property {(line: string, relPath: string) => RuleMatch[]} match
+ */
+
+/**
+ * Every content rule's matcher, in precedence order: the structural rules before the `entropy`
+ * heuristic, which is the order {@link scanLineInto} relies on when it resolves overlaps.
+ *
+ * @type {readonly ContentMatcher[]}
+ */
+const CONTENT_MATCHERS = Object.freeze([
+  Object.freeze({ rule: 'provider-key', match: matchProviderKeys }),
+  Object.freeze({ rule: 'jwt', match: matchJwts }),
+  Object.freeze({ rule: 'private-key', match: matchPrivateKeys }),
+  Object.freeze({ rule: 'connection-string', match: matchConnectionStrings }),
+  Object.freeze({
+    rule: 'entropy',
+    match: (/** @type {string} */ line, /** @type {string} */ relPath) =>
+      matchEntropy(relPath, line),
+  }),
+]);
 
 /* ---------------------------------------------------------------------------
  * Findings
@@ -1617,7 +1687,7 @@ function contentFinding(relPath, lineNumber, match) {
  * Apply the rules that depend on the path alone, which is `env-file`.
  *
  * Kept separate from {@link scanContent} so the gate still reports a tracked `.env` file whose
- * content it did not read - a binary, a submodule, or a file it could not examine.
+ * content it did not read - a submodule, or a file it could not examine.
  *
  * @param {string} filePath Repository-relative path.
  * @returns {Finding[]}
@@ -1654,9 +1724,10 @@ export function scanPath(filePath) {
 /**
  * Apply every content rule to one line and append the results to `sink`.
  *
- * This is the only per-line pass. The in-memory path ({@link scanTextInto}) and the streamed path
- * for oversized files ({@link streamScanFile}) both call it, so a file is judged identically
- * whatever its size.
+ * This is the only per-line pass. The in-memory path ({@link scanTextInto}), the streamed path for
+ * oversized files ({@link streamScanFile}) and the metadata-field pass for binaries
+ * ({@link scanMetadataFieldsInto}) all call it, so content is judged identically whatever its
+ * size, its mode or where in a file it was found.
  *
  * SUPPRESS FIRST, THEN DEDUPE. Every rule's matches are collected in precedence order - the
  * structural rules before the entropy heuristic, so a credential inside a URI is reported once, as
@@ -1677,13 +1748,11 @@ function scanLineInto(relPath, allowlist, lineNumber, line, sink) {
   if (line === '') {
     return;
   }
-  const matches = [
-    ...matchProviderKeys(line),
-    ...matchJwts(line),
-    ...matchPrivateKeys(line),
-    ...matchConnectionStrings(line),
-    ...matchEntropy(relPath, line),
-  ];
+  /** @type {RuleMatch[]} */
+  const matches = [];
+  for (const matcher of CONTENT_MATCHERS) {
+    matches.push(...matcher.match(line, relPath));
+  }
   if (matches.length === 0) {
     return;
   }
@@ -1722,7 +1791,7 @@ function scanLineInto(relPath, allowlist, lineNumber, line, sink) {
  *
  * @param {string} relPath Repository-relative POSIX path.
  * @param {Allowlist} allowlist Validated allowlist.
- * @param {string} text File content as text.
+ * @param {string} text File content, decoded as its {@link ContentMode} prescribes.
  * @param {ContentSink} sink
  */
 function scanTextInto(relPath, allowlist, text, sink) {
@@ -1736,6 +1805,9 @@ function scanTextInto(relPath, allowlist, text, sink) {
  * Scan one file's path and content against every rule, separating the findings the allowlist
  * exempted so a caller can report how many exemptions were used.
  *
+ * `content` is judged as text (see {@link ContentMode}); binary mode, and its metadata-field pass,
+ * is chosen only by {@link scanRepository}, from a tracked file's own extension and leading bytes.
+ *
  * @param {string} filePath Repository-relative path, used in every finding.
  * @param {string} content File content as text.
  * @param {unknown} [allowlist] Validated allowlist, the parsed allowlist file, or nothing (in
@@ -1748,7 +1820,8 @@ export function scanContentWithSuppressions(filePath, content, allowlist) {
   const list = resolveAllowlist(allowlist);
   /** @type {ContentSink} */
   const sink = { findings: scanPath(relPath), allowlisted: [] };
-  scanTextInto(relPath, list, typeof content === 'string' ? content : String(content ?? ''), sink);
+  const text = typeof content === 'string' ? content : String(content ?? '');
+  scanTextInto(relPath, list, text, sink);
   return sink;
 }
 
@@ -1775,7 +1848,7 @@ export function scanContent(filePath, content, allowlist) {
 /**
  * Run git synchronously and return its stdout. Spawning the binary is deliberate: the check must
  * never read the contents of `.git/`, which on this repository holds an access token in its
- * `origin` URL (AAP 0.2.1).
+ * `origin` URL.
  *
  * @param {string} cwd Directory to run git in.
  * @param {readonly string[]} args Arguments, already split.
@@ -1860,10 +1933,10 @@ function resolveRepoRoot(hint) {
 /**
  * Every path git tracks, repository-relative, with its index mode.
  *
- * Tracked-only enumeration is the contract (AAP 0.3.4: the check "scans `git ls-files` content").
- * It keeps the gate deterministic - an untracked scratch file in one developer's tree cannot fail
- * the build - and it is the reason nothing under `.git/` is ever opened, because `git ls-files`
- * does not list it. Do not add a filesystem-walk fallback.
+ * Tracked-only enumeration is the contract: the check scans what `git ls-files` lists, and nothing
+ * else. It keeps the gate deterministic - an untracked scratch file in one developer's tree cannot
+ * fail the build - and it is the reason nothing under `.git/` is ever opened, because
+ * `git ls-files` does not list it. Do not add a filesystem-walk fallback.
  *
  * `--stage` is what carries the mode, which is the only way to tell a submodule (whose content is
  * another repository's) from a directory that has replaced a tracked file (which is a work tree
@@ -1903,7 +1976,8 @@ function listTrackedFiles(repoRoot) {
 }
 
 /**
- * The binary format a tracked file positively is, or `null` when it must be scanned as text.
+ * The binary format a tracked file positively is, which selects binary mode (see
+ * {@link ContentMode}), or `null` when it is scanned as text.
  *
  * Both signals have to agree (see {@link BINARY_FORMATS}): the extension selects the format, and
  * the leading bytes must match one of its signatures.
@@ -1960,8 +2034,829 @@ function fileRead(operation) {
 }
 
 /**
+ * How {@link scanRegularFile} read a file: as text, or in binary mode as the format it names.
+ *
+ * @typedef {{ kind: 'scanned' } | { kind: 'binary', format: string }} RegularFileOutcome
+ */
+
+/**
+ * The outcome for a file read in the mode `format` selects.
+ *
+ * @param {string | null} format What {@link identifyBinary} returned.
+ * @returns {RegularFileOutcome}
+ */
+function regularFileOutcome(format) {
+  return format === null ? { kind: 'scanned' } : { kind: 'binary', format };
+}
+
+/* ---------------------------------------------------------------------------
+ * Metadata fields of binary formats
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Longest stretch of one metadata field that is scanned as a field. A field's bytes are read into
+ * memory together, so this bounds that read; bytes past it are still scanned by the byte-for-byte
+ * pass, which reads every byte of the file.
+ */
+export const MAX_FIELD_BYTES = MAX_SCAN_BYTES;
+
+/** Bytes a descriptor-backed {@link ByteSource} reads at once when it walks a file's structure. */
+const SOURCE_WINDOW_BYTES = 64 * 1024;
+
+/**
+ * Random access to one file's bytes, in memory or through an open descriptor.
+ *
+ * @typedef {object} ByteSource
+ * @property {number} size Bytes in the file.
+ * @property {(position: number, length: number) => Buffer} read Up to `length` bytes starting at
+ *   `position`: fewer at the end of the file, none past it.
+ */
+
+/**
+ * A {@link ByteSource} over a file read whole.
+ *
+ * @param {Buffer} buffer
+ * @returns {ByteSource}
+ */
+function bufferSource(buffer) {
+  return {
+    size: buffer.length,
+    read: (position, length) =>
+      buffer.subarray(position, Math.min(buffer.length, position + Math.max(0, length))),
+  };
+}
+
+/**
+ * A {@link ByteSource} over an open descriptor. Walking a format's structure reads a few bytes at
+ * a time - a GIF's sub-block lengths one byte each - so reads are served from a
+ * {@link SOURCE_WINDOW_BYTES} window, replaced (never overwritten) when a read falls outside it,
+ * which keeps every buffer already returned valid.
+ *
+ * @param {number} fd Open descriptor of the file.
+ * @param {number} size Size the work-tree entry reported.
+ * @returns {ByteSource}
+ * @throws {TrackedFileReadError} From `read`, when the operating system refuses the read.
+ */
+function descriptorSource(fd, size) {
+  let windowStart = 0;
+  let window = Buffer.alloc(0);
+  /**
+   * @param {number} position
+   * @param {number} length
+   * @returns {Buffer}
+   */
+  const readAt = (position, length) => {
+    const buffer = Buffer.allocUnsafe(length);
+    const bytesRead = fileRead(() => readSync(fd, buffer, 0, length, position));
+    return buffer.subarray(0, bytesRead);
+  };
+  return {
+    size,
+    read(position, length) {
+      if (length <= 0 || position >= size) {
+        return Buffer.alloc(0);
+      }
+      const wanted = Math.min(length, size - position);
+      if (position >= windowStart && position + wanted <= windowStart + window.length) {
+        return window.subarray(position - windowStart, position - windowStart + wanted);
+      }
+      if (wanted > SOURCE_WINDOW_BYTES) {
+        return readAt(position, wanted);
+      }
+      window = readAt(position, Math.min(SOURCE_WINDOW_BYTES, size - position));
+      windowStart = position;
+      return window.subarray(0, Math.min(wanted, window.length));
+    },
+  };
+}
+
+/**
+ * One contiguous run of a file's bytes.
+ *
+ * @typedef {object} ByteRange
+ * @property {number} offset Position of the first byte in the file.
+ * @property {number} length Bytes in the run.
+ */
+
+/**
+ * One plaintext value a binary format stores: its bytes, in order, as one or more runs of the
+ * file. A GIF sub-block structure splits a value into runs of at most 255 bytes, each after a
+ * length byte; every other field here is a single run.
+ *
+ * @typedef {object} MetadataField
+ * @property {readonly ByteRange[]} segments
+ */
+
+/**
+ * `ranges` as a field, without the empty runs, or `null` when nothing is left.
+ *
+ * @param {readonly ByteRange[]} ranges
+ * @returns {MetadataField | null}
+ */
+function metadataField(ranges) {
+  const segments = ranges.filter((range) => range.length > 0);
+  return segments.length === 0 ? null : { segments };
+}
+
+/**
+ * The `length` bytes of `source` from `base` on, as a source of their own: an image embedded in
+ * another file, read as the file it would be if it stood alone.
+ *
+ * @param {ByteSource} source
+ * @param {number} base Position of the embedded file's first byte in `source`.
+ * @param {number} length Bytes it holds; clamped to what `source` has after `base`.
+ * @returns {ByteSource}
+ */
+function embeddedSource(source, base, length) {
+  const size = Math.max(0, Math.min(length, source.size - base));
+  return {
+    size,
+    read: (position, wanted) =>
+      source.read(base + position, Math.max(0, Math.min(wanted, size - position))),
+  };
+}
+
+/**
+ * `fields`, read from a source embedded at `base`, positioned in the enclosing file instead.
+ *
+ * @param {readonly MetadataField[]} fields
+ * @param {number} base
+ * @returns {MetadataField[]}
+ */
+function shiftFields(fields, base) {
+  return fields.map((field) => ({
+    segments: field.segments.map((segment) => ({ ...segment, offset: base + segment.offset })),
+  }));
+}
+
+/**
+ * The PNG text chunks and the plaintext fields of each, from its data (`base` is the data's
+ * position in the file). Fields are separated by NUL bytes: `tEXt` holds a keyword and its text;
+ * `zTXt` a keyword and compressed text, of which only the keyword is plaintext; `iTXt` a keyword,
+ * a compression flag and method, a language tag, a translated keyword and its text, which is
+ * plaintext when the flag is 0.
+ *
+ * @param {string} type Chunk type.
+ * @param {Buffer} data Chunk data, at most {@link MAX_FIELD_BYTES} of it.
+ * @param {number} base Position of `data` in the file.
+ * @returns {MetadataField[]}
+ */
+function pngTextFields(type, data, base) {
+  /**
+   * @param {number} start
+   * @param {number} end
+   * @returns {ByteRange}
+   */
+  const range = (start, end) => ({ offset: base + start, length: Math.max(0, end - start) });
+  /**
+   * @param {number} from
+   * @returns {number} The next NUL at or after `from`, or the end of the data.
+   */
+  const nulFrom = (from) => {
+    const index = data.indexOf(0, from);
+    return index === -1 ? data.length : index;
+  };
+  const keywordEnd = nulFrom(0);
+  const ranges = [range(0, keywordEnd)];
+  if (type === 'tEXt') {
+    ranges.push(range(keywordEnd + 1, data.length));
+  } else if (type === 'iTXt') {
+    const compressed = data[keywordEnd + 1] !== 0;
+    const languageStart = keywordEnd + 3;
+    const languageEnd = nulFrom(languageStart);
+    const translatedEnd = nulFrom(languageEnd + 1);
+    ranges.push(range(languageStart, languageEnd), range(languageEnd + 1, translatedEnd));
+    if (!compressed) {
+      ranges.push(range(translatedEnd + 1, data.length));
+    }
+  }
+  return ranges.map((one) => metadataField([one])).filter((field) => field !== null);
+}
+
+/** PNG chunk types whose data holds plaintext fields. */
+const PNG_TEXT_CHUNKS = new Set(['tEXt', 'zTXt', 'iTXt']);
+
+/**
+ * The plaintext fields of a PNG: every field of every text chunk, wherever in the chunk sequence
+ * it stands. A chunk is a four-byte big-endian data length, a four-byte type, the data and a
+ * four-byte CRC; the walk stops at `IEND` or at a chunk that runs past the end of the file.
+ *
+ * @param {ByteSource} source
+ * @returns {MetadataField[]}
+ */
+function pngFields(source) {
+  /** @type {MetadataField[]} */
+  const fields = [];
+  let position = PNG_SIGNATURE.length;
+  while (position + 8 <= source.size) {
+    const header = source.read(position, 8);
+    if (header.length < 8) {
+      break;
+    }
+    const length = header.readUInt32BE(0);
+    const type = header.toString('latin1', 4, 8);
+    const dataStart = position + 8;
+    if (PNG_TEXT_CHUNKS.has(type)) {
+      const data = source.read(dataStart, Math.min(length, MAX_FIELD_BYTES));
+      fields.push(...pngTextFields(type, data, dataStart));
+    }
+    if (type === 'IEND') {
+      break;
+    }
+    position = dataStart + length + 4;
+  }
+  return fields;
+}
+
+/** JPEG marker of a comment segment. */
+const JPEG_COMMENT = 0xfe;
+/** JPEG markers of the application segments APP0 to APP15 (JFIF, EXIF, XMP, ICC, ...). */
+const JPEG_APP_FIRST = 0xe0;
+const JPEG_APP_LAST = 0xef;
+/** JPEG markers that end the header segments: start of scan and end of image. */
+const JPEG_HEADER_END = new Set([0xda, 0xd9]);
+
+/**
+ * Whether a JPEG marker stands alone, with no length or payload after it: TEM, RST0 to RST7 and
+ * SOI.
+ *
+ * @param {number} marker
+ * @returns {boolean}
+ */
+function isStandaloneJpegMarker(marker) {
+  return marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8);
+}
+
+/**
+ * The plaintext fields of a JPEG: the payload of every comment and application segment before
+ * the image data. A segment is `FF`, a marker byte and a two-byte big-endian length that counts
+ * itself - which is why its low byte can be a letter or a digit standing right before the text,
+ * and why the payload has to be read from its own first byte. The walk stops at the start of scan,
+ * the end of the image, or anything that is not a marker; the entropy-coded image data after the
+ * scan header holds no segments.
+ *
+ * @param {ByteSource} source
+ * @returns {MetadataField[]}
+ */
+function jpegFields(source) {
+  /** @type {MetadataField[]} */
+  const fields = [];
+  let position = 2;
+  while (position + 2 <= source.size) {
+    const head = source.read(position, 4);
+    const marker = head[1];
+    if (head[0] !== 0xff || marker === undefined || marker === 0x00) {
+      break;
+    }
+    if (marker === 0xff) {
+      position += 1;
+      continue;
+    }
+    if (isStandaloneJpegMarker(marker)) {
+      position += 2;
+      continue;
+    }
+    if (JPEG_HEADER_END.has(marker) || head.length < 4) {
+      break;
+    }
+    const length = head.readUInt16BE(2);
+    if (length < 2) {
+      break;
+    }
+    const payload = position + 4;
+    if (marker === JPEG_COMMENT || (marker >= JPEG_APP_FIRST && marker <= JPEG_APP_LAST)) {
+      const field = metadataField([
+        {
+          offset: payload,
+          length: Math.min(length - 2, MAX_FIELD_BYTES, Math.max(0, source.size - payload)),
+        },
+      ]);
+      if (field !== null) {
+        fields.push(field);
+      }
+    }
+    position = payload + length - 2;
+  }
+  return fields;
+}
+
+/** GIF block introducers: an extension, an image descriptor. */
+const GIF_EXTENSION = 0x21;
+const GIF_IMAGE = 0x2c;
+/** GIF extension labels whose sub-blocks hold text: plain text, application, comment. */
+const GIF_PLAIN_TEXT = 0x01;
+const GIF_APPLICATION = 0xff;
+const GIF_COMMENT = 0xfe;
+
+/**
+ * Bytes of a GIF colour table announced by a packed field, or 0 when the field has no table.
+ *
+ * @param {number} packed The logical screen's or image descriptor's packed byte.
+ * @returns {number}
+ */
+function gifColorTableBytes(packed) {
+  return (packed & 0x80) === 0 ? 0 : 3 * 2 ** ((packed & 0x07) + 1);
+}
+
+/**
+ * Walk a GIF sub-block sequence starting at `start`: runs of up to 255 bytes, each after its length
+ * byte, ended by a zero length. The data runs are collected, up to {@link MAX_FIELD_BYTES} in
+ * total, when `collect` is set.
+ *
+ * @param {ByteSource} source
+ * @param {number} start Position of the first length byte.
+ * @param {boolean} collect
+ * @returns {{ blocks: ByteRange[], end: number }} `end` is the position after the terminator, or
+ *   the end of the file when the sequence is truncated.
+ */
+function gifSubBlocks(source, start, collect) {
+  /** @type {ByteRange[]} */
+  const blocks = [];
+  let collected = 0;
+  let position = start;
+  for (;;) {
+    const length = source.read(position, 1)[0];
+    if (length === undefined) {
+      return { blocks, end: source.size };
+    }
+    position += 1;
+    if (length === 0) {
+      return { blocks, end: position };
+    }
+    if (collect && collected < MAX_FIELD_BYTES) {
+      const taken = Math.max(
+        0,
+        Math.min(length, MAX_FIELD_BYTES - collected, source.size - position),
+      );
+      blocks.push({ offset: position, length: taken });
+      collected += taken;
+    }
+    position += length;
+  }
+}
+
+/**
+ * The plaintext fields of one GIF extension, from its data sub-blocks. A comment is its
+ * sub-blocks joined back together, so text a sub-block boundary split is whole again; a plain-text
+ * extension's first sub-block is twelve bytes of grid geometry and its text follows; an
+ * application extension's first sub-block is its identifier and authentication code, a field of
+ * its own, and its data follows.
+ *
+ * @param {number} label
+ * @param {readonly ByteRange[]} blocks
+ * @returns {MetadataField[]}
+ */
+function gifExtensionFields(label, blocks) {
+  /** @type {(MetadataField | null)[]} */
+  let fields = [];
+  if (label === GIF_COMMENT) {
+    fields = [metadataField(blocks)];
+  } else if (label === GIF_PLAIN_TEXT) {
+    fields = [metadataField(blocks.slice(1))];
+  } else if (label === GIF_APPLICATION) {
+    fields = [metadataField(blocks.slice(0, 1)), metadataField(blocks.slice(1))];
+  }
+  return fields.filter((field) => field !== null);
+}
+
+/**
+ * The plaintext fields of a GIF: every comment, plain-text and application extension. The walk
+ * follows the block structure - header, logical screen descriptor and global colour table, then
+ * extensions and images, each image's colour table and data sub-blocks skipped - and stops at the
+ * trailer or at a byte that introduces no block.
+ *
+ * @param {ByteSource} source
+ * @returns {MetadataField[]}
+ */
+function gifFields(source) {
+  /** @type {MetadataField[]} */
+  const fields = [];
+  const screen = source.read(6, 7);
+  const screenPacked = screen[4];
+  if (screen.length < 7 || screenPacked === undefined) {
+    return fields;
+  }
+  let position = 13 + gifColorTableBytes(screenPacked);
+  while (position < source.size) {
+    const introducer = source.read(position, 1)[0];
+    if (introducer === GIF_EXTENSION) {
+      const label = source.read(position + 1, 1)[0];
+      const collect =
+        label === GIF_COMMENT || label === GIF_PLAIN_TEXT || label === GIF_APPLICATION;
+      const { blocks, end } = gifSubBlocks(source, position + 2, collect);
+      if (label !== undefined && collect) {
+        fields.push(...gifExtensionFields(label, blocks));
+      }
+      position = end;
+    } else if (introducer === GIF_IMAGE) {
+      const descriptorPacked = source.read(position + 9, 1)[0];
+      if (descriptorPacked === undefined) {
+        break;
+      }
+      // Ten descriptor bytes, the local colour table, then the LZW minimum code size.
+      const data = position + 10 + gifColorTableBytes(descriptorPacked) + 1;
+      position = gifSubBlocks(source, data, false).end;
+    } else {
+      break;
+    }
+  }
+  return fields;
+}
+
+/**
+ * The run of `length` bytes at `offset` as a field, cut to {@link MAX_FIELD_BYTES} and to the end
+ * of the file, or `null` when nothing of it is in the file.
+ *
+ * @param {ByteSource} source
+ * @param {number} offset
+ * @param {number} length
+ * @returns {MetadataField | null}
+ */
+function fileRun(source, offset, length) {
+  return metadataField([
+    { offset, length: Math.max(0, Math.min(length, MAX_FIELD_BYTES, source.size - offset)) },
+  ]);
+}
+
+/** Bytes of an ICO file's header and of each entry of its image directory. */
+const ICO_HEADER_BYTES = 6;
+const ICO_ENTRY_BYTES = 16;
+
+/**
+ * The plaintext fields of an ICO file: those of every PNG image it embeds. The file is a six-byte
+ * header whose last two bytes count the images, a sixteen-byte directory entry per image - its
+ * size and offset in the last eight, little-endian - and the images, each a bitmap, which holds no
+ * text, or a complete PNG file, whose text chunks are read as {@link pngFields} reads those of a
+ * PNG standing alone. The images of a real icon are disjoint, so one that starts inside an image
+ * already read is passed over, which keeps the walk linear in the file however its directory is
+ * written.
+ *
+ * @param {ByteSource} source
+ * @returns {MetadataField[]}
+ */
+function icoFields(source) {
+  /** @type {MetadataField[]} */
+  const fields = [];
+  const header = source.read(0, ICO_HEADER_BYTES);
+  if (header.length < ICO_HEADER_BYTES) {
+    return fields;
+  }
+  const directory = source.read(ICO_HEADER_BYTES, header.readUInt16LE(4) * ICO_ENTRY_BYTES);
+  /** @type {ByteRange[]} */
+  const images = [];
+  for (let entry = 0; entry + ICO_ENTRY_BYTES <= directory.length; entry += ICO_ENTRY_BYTES) {
+    images.push({
+      offset: directory.readUInt32LE(entry + 12),
+      length: directory.readUInt32LE(entry + 8),
+    });
+  }
+  images.sort((left, right) => left.offset - right.offset);
+  let free = ICO_HEADER_BYTES + directory.length;
+  for (const image of images) {
+    if (image.offset < free || image.offset >= source.size) {
+      continue;
+    }
+    const embedded = embeddedSource(source, image.offset, image.length);
+    if (embedded.read(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+      fields.push(...shiftFields(pngFields(embedded), image.offset));
+    }
+    free = image.offset + embedded.size;
+  }
+  return fields;
+}
+
+/** ZIP record signatures, read as little-endian 32-bit values. */
+const ZIP_END_SIGNATURE = 0x06054b50;
+const ZIP_ENTRY_SIGNATURE = 0x02014b50;
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+/** Fixed bytes of the end record, a central directory entry and a local header. */
+const ZIP_END_BYTES = 22;
+const ZIP_ENTRY_BYTES = 46;
+const ZIP_LOCAL_BYTES = 30;
+/** Longest archive comment, so the farthest the end record can stand from the end of the file. */
+const ZIP_MAX_COMMENT_BYTES = 0xffff;
+/** Values of a 16-bit and a 32-bit field whose real value is in a ZIP64 record instead. */
+const ZIP64_COUNT = 0xffff;
+const ZIP64_SIZE = 0xffffffff;
+/** Compression method of a stored (uncompressed) entry, and the flag bit of an encrypted one. */
+const ZIP_STORED = 0;
+const ZIP_ENCRYPTED = 0x0001;
+
+/**
+ * The plaintext fields of a ZIP archive, which a VSIX package is: the archive comment; each
+ * entry's name and comment as the central directory records them; each entry's name again in its
+ * local header; and the data of every stored entry that is not encrypted - a file kept
+ * uncompressed, as a writer does when deflating would not shrink it. Each follows a binary length
+ * or offset field, or the name before it, with no separator: the content of a stored file starts
+ * right after the last letter of its name.
+ *
+ * The directory is found from the end record - the last signature whose comment length fits the
+ * bytes after it - and gives every entry's sizes, including those a local header leaves to a
+ * trailing data descriptor. The local records of a real archive are disjoint, so one that starts
+ * inside a record already read is passed over, which keeps the reads linear in the file however
+ * the directory is written. A ZIP64 directory is not walked; that archive is read byte for byte
+ * only, and so is everything a deflated entry holds.
+ *
+ * @param {ByteSource} source
+ * @returns {MetadataField[]}
+ */
+function zipFields(source) {
+  /** @type {(MetadataField | null)[]} */
+  const fields = [];
+  const tailStart = Math.max(0, source.size - ZIP_END_BYTES - ZIP_MAX_COMMENT_BYTES);
+  const tail = source.read(tailStart, source.size - tailStart);
+  let end = tail.length - ZIP_END_BYTES;
+  while (
+    end >= 0 &&
+    (tail.readUInt32LE(end) !== ZIP_END_SIGNATURE ||
+      end + ZIP_END_BYTES + tail.readUInt16LE(end + 20) > tail.length)
+  ) {
+    end -= 1;
+  }
+  if (end < 0) {
+    return [];
+  }
+  const endRecord = tailStart + end;
+  fields.push(fileRun(source, endRecord + ZIP_END_BYTES, tail.readUInt16LE(end + 20)));
+  const entries = tail.readUInt16LE(end + 10);
+  const directorySize = tail.readUInt32LE(end + 12);
+  const directoryStart = tail.readUInt32LE(end + 16);
+  /** @type {{ local: number, size: number, stored: boolean }[]} */
+  const records = [];
+  if (entries !== ZIP64_COUNT && directorySize !== ZIP64_SIZE && directoryStart !== ZIP64_SIZE) {
+    const directoryEnd = Math.min(directoryStart + directorySize, endRecord);
+    let position = directoryStart;
+    for (let count = 0; count < entries && position + ZIP_ENTRY_BYTES <= directoryEnd; count += 1) {
+      const entry = source.read(position, ZIP_ENTRY_BYTES);
+      if (entry.length < ZIP_ENTRY_BYTES || entry.readUInt32LE(0) !== ZIP_ENTRY_SIGNATURE) {
+        break;
+      }
+      const name = position + ZIP_ENTRY_BYTES;
+      const nameLength = entry.readUInt16LE(28);
+      const extraLength = entry.readUInt16LE(30);
+      const commentLength = entry.readUInt16LE(32);
+      fields.push(
+        fileRun(source, name, nameLength),
+        fileRun(source, name + nameLength + extraLength, commentLength),
+      );
+      records.push({
+        local: entry.readUInt32LE(42),
+        size: entry.readUInt32LE(20),
+        stored:
+          entry.readUInt16LE(10) === ZIP_STORED && (entry.readUInt16LE(8) & ZIP_ENCRYPTED) === 0,
+      });
+      position = name + nameLength + extraLength + commentLength;
+    }
+  }
+  records.sort((left, right) => left.local - right.local);
+  let free = 0;
+  for (const record of records) {
+    const header = record.local < free ? null : source.read(record.local, ZIP_LOCAL_BYTES);
+    if (
+      header === null ||
+      header.length < ZIP_LOCAL_BYTES ||
+      header.readUInt32LE(0) !== ZIP_LOCAL_SIGNATURE
+    ) {
+      continue;
+    }
+    const name = record.local + ZIP_LOCAL_BYTES;
+    const nameLength = header.readUInt16LE(26);
+    const data = name + nameLength + header.readUInt16LE(28);
+    const size = record.size === ZIP64_SIZE ? 0 : record.size;
+    fields.push(fileRun(source, name, nameLength));
+    if (record.stored) {
+      fields.push(fileRun(source, data, size));
+    }
+    free = data + size;
+  }
+  return fields.filter((field) => field !== null);
+}
+
+/** Position, in a WOFF and in a WOFF2 header, of the private data block's offset field. */
+const WOFF_PRIVATE_FIELD = 36;
+const WOFF2_PRIVATE_FIELD = 40;
+
+/**
+ * A reader of the plaintext field of a WOFF or WOFF2 font: its private data block, which a font
+ * tool may fill with anything and which is never compressed. The header records its big-endian
+ * offset and, after that, its length; the block follows the table data or the compressed metadata
+ * on a four-byte boundary with no separator of its own. The font tables are compressed - WOFF2's
+ * always, WOFF's when that shrinks them - or, left uncompressed, binary structures whose strings
+ * sit back to back, and are read byte for byte only.
+ *
+ * @param {number} privateField Position of the private block's offset field in the header.
+ * @returns {(source: ByteSource) => MetadataField[]}
+ */
+function fontPrivateDataFields(privateField) {
+  return (source) => {
+    const header = source.read(privateField, 8);
+    if (header.length < 8 || header.readUInt32BE(0) === 0) {
+      return [];
+    }
+    const field = fileRun(source, header.readUInt32BE(0), header.readUInt32BE(4));
+    return field === null ? [] : [field];
+  };
+}
+
+/**
+ * The field reader of each binary format, by format name. PDF has none: its syntax delimits every
+ * value with bytes that end a token - a string between parentheses, a name after a solidus,
+ * stream data after the line break that follows `stream` - so the byte-for-byte pass already
+ * reads each value from its first byte, and a compressed stream is read by neither pass.
+ *
+ * @type {Readonly<Record<string, (source: ByteSource) => MetadataField[]>>}
+ */
+const METADATA_FIELD_READERS = Object.freeze({
+  png: pngFields,
+  ico: icoFields,
+  jpeg: jpegFields,
+  gif: gifFields,
+  woff: fontPrivateDataFields(WOFF_PRIVATE_FIELD),
+  woff2: fontPrivateDataFields(WOFF2_PRIVATE_FIELD),
+  vsix: zipFields,
+});
+
+/**
+ * Line and column of every position in a file, as the byte-for-byte pass numbers them: a line
+ * ends at each 0x0A byte, and a column counts bytes from the line's first. The line-feed positions
+ * are collected once, on first use, which is only ever for a file with a field finding.
+ *
+ * @param {ByteSource} source
+ * @returns {(offset: number) => { line: number, column: number }}
+ */
+function positionLocator(source) {
+  /** @type {number[] | null} */
+  let lineFeeds = null;
+  const collect = () => {
+    /** @type {number[]} */
+    const found = [];
+    for (let start = 0; start < source.size; start += STREAM_CHUNK_BYTES) {
+      const chunk = source.read(start, STREAM_CHUNK_BYTES);
+      let index = chunk.indexOf(0x0a);
+      while (index !== -1) {
+        found.push(start + index);
+        index = chunk.indexOf(0x0a, index + 1);
+      }
+    }
+    return found;
+  };
+  return (offset) => {
+    lineFeeds ??= collect();
+    let low = 0;
+    let high = lineFeeds.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if ((lineFeeds[middle] ?? 0) < offset) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    const lineStart = low === 0 ? 0 : (lineFeeds[low - 1] ?? -1) + 1;
+    return { line: low + 1, column: offset - lineStart + 1 };
+  };
+}
+
+/**
+ * Position in the file of byte `index` of a field's joined text.
+ *
+ * @param {readonly ByteRange[]} segments
+ * @param {number} index
+ * @returns {number}
+ */
+function fieldOffset(segments, index) {
+  let remaining = index;
+  for (const segment of segments) {
+    if (remaining < segment.length) {
+      return segment.offset + remaining;
+    }
+    remaining -= segment.length;
+  }
+  const last = segments.at(-1);
+  return last === undefined ? 0 : last.offset + last.length;
+}
+
+/**
+ * Where each line of `text` starts, by `text.split(/\r?\n/)` numbering: line `n` starts at index
+ * `n - 1` of the result.
+ *
+ * @param {string} text
+ * @returns {number[]}
+ */
+function lineStartsOf(text) {
+  const starts = [0];
+  let index = text.indexOf('\n');
+  while (index !== -1) {
+    starts.push(index + 1);
+    index = text.indexOf('\n', index + 1);
+  }
+  return starts;
+}
+
+/**
+ * The identity of a finding for merging the two binary passes: rule, line and column.
+ *
+ * @param {Finding} finding
+ * @returns {string}
+ */
+function findingKey(finding) {
+  return `${finding.rule}:${String(finding.line)}:${String(finding.column)}`;
+}
+
+/**
+ * Scan the plaintext metadata fields of a positively identified binary, each as text of its own,
+ * and merge what they add into `sink`, which holds the same file's byte-for-byte findings.
+ *
+ * WHY A SECOND PASS. The byte-for-byte pass reads a value where it stands, so whatever byte comes
+ * before it is its left context - and in a binary that byte is often a length field. A JPEG
+ * comment of 67 bytes follows the length `00 45`, and `E` is a token character: the credential
+ * prefix at the start of the comment does not start a token there, and the rules' left boundary,
+ * which keeps prose like `task-...` from reading as a key, rejects it. The content of a file a ZIP
+ * archive stores uncompressed begins right after the last letter of its name, in the same way. A
+ * GIF value longer than 255 bytes is split by length bytes into sub-blocks, so no single run holds
+ * it whole. Reading each field from its own first byte, and a GIF field's sub-blocks joined,
+ * restores the boundaries and the continuity the value has in the format, and every content rule,
+ * `entropy` included, then judges it exactly as it judges a line of text.
+ *
+ * A finding is reported at its position in the file - the line and column the byte-for-byte pass
+ * uses - and once. Where both passes report a rule at the same position, which is the common case,
+ * the field pass's report stands: its boundaries are the format's, so it names the key without a
+ * length byte glued to it and judges the allowlist on the value alone. The file's findings end in
+ * line then column order.
+ *
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {string} format The format {@link identifyBinary} named.
+ * @param {ByteSource} source The file's bytes.
+ * @param {ContentSink} sink This file's findings so far, and only this file's.
+ */
+function scanMetadataFieldsInto(relPath, allowlist, format, source, sink) {
+  const readFields = METADATA_FIELD_READERS[format];
+  if (readFields === undefined) {
+    return;
+  }
+  const locate = positionLocator(source);
+  /** @type {Map<string, Finding>} */
+  const fieldFindings = new Map();
+  /** @type {Map<string, AllowlistedFinding>} */
+  const fieldAllowlisted = new Map();
+  for (const field of readFields(source)) {
+    const bytes = Buffer.concat(
+      field.segments.map((segment) => source.read(segment.offset, segment.length)),
+    );
+    const text = bytes.toString('latin1');
+    /** @type {ContentSink} */
+    const fieldSink = { findings: [], allowlisted: [] };
+    scanTextInto(relPath, allowlist, text, fieldSink);
+    if (fieldSink.findings.length === 0 && fieldSink.allowlisted.length === 0) {
+      continue;
+    }
+    const starts = lineStartsOf(text);
+    /**
+     * @template {Finding} T
+     * @param {T} finding A finding positioned in the field's text.
+     * @returns {T} The same finding positioned in the file.
+     */
+    const place = (finding) => {
+      const index = (starts[finding.line - 1] ?? 0) + finding.column - 1;
+      return { ...finding, ...locate(fieldOffset(field.segments, index)) };
+    };
+    for (const finding of fieldSink.findings.map(place)) {
+      fieldFindings.set(findingKey(finding), finding);
+    }
+    for (const finding of fieldSink.allowlisted.map(place)) {
+      fieldAllowlisted.set(findingKey(finding), finding);
+    }
+  }
+  if (fieldFindings.size === 0 && fieldAllowlisted.size === 0) {
+    return;
+  }
+  /** @param {Finding} finding */
+  const notReplaced = (finding) =>
+    !fieldFindings.has(findingKey(finding)) && !fieldAllowlisted.has(findingKey(finding));
+  const byPosition = (/** @type {Finding} */ left, /** @type {Finding} */ right) =>
+    left.line - right.line || left.column - right.column;
+  const findings = [...sink.findings.filter(notReplaced), ...fieldFindings.values()];
+  const allowlisted = [...sink.allowlisted.filter(notReplaced), ...fieldAllowlisted.values()];
+  sink.findings.splice(0, sink.findings.length, ...findings.sort(byPosition));
+  sink.allowlisted.splice(0, sink.allowlisted.length, ...allowlisted.sort(byPosition));
+}
+
+/**
+ * Move the findings of one file's `local` sink into `sink`.
+ *
+ * @param {ContentSink} sink
+ * @param {ContentSink} local
+ */
+function appendSink(sink, local) {
+  sink.findings.push(...local.findings);
+  sink.allowlisted.push(...local.allowlisted);
+}
+
+/**
  * Stream a file larger than {@link MAX_SCAN_BYTES} through the per-line rule pass in
- * {@link STREAM_CHUNK_BYTES} chunks, or identify it from its first chunk as a binary format.
+ * {@link STREAM_CHUNK_BYTES} chunks. The first chunk decides the mode: a file it identifies as a
+ * binary format is streamed in binary mode, and every other file as text.
  *
  * Line semantics are exactly those of `content.split(/\r?\n/)` in {@link scanTextInto}, so a file
  * reports the same findings at the same lines and columns whichever path reads it:
@@ -1972,23 +2867,29 @@ function fileRead(operation) {
  *   - a lone `\r`, and a `\r` at the very end of the file, stay in the line;
  *   - lines are numbered from 1, and the text after the last `\n` is the final line.
  *
- * Bytes are decoded by one `StringDecoder` for the whole file, which holds back a multi-byte UTF-8
- * sequence split across two chunks until its remaining bytes arrive, so a character straddling a
- * chunk boundary decodes once, correctly, instead of as two replacement characters that would
- * shift every later column on its line. Newlines are searched for in each decoded chunk only, and
- * the pieces of a line are joined once when it ends, so a long line costs linear time.
+ * Bytes are decoded by one `StringDecoder` for the whole file. In text mode it holds back a
+ * multi-byte UTF-8 sequence split across two chunks until its remaining bytes arrive, so a
+ * character straddling a chunk boundary decodes once, correctly, instead of as two replacement
+ * characters that would shift every later column on its line; in binary mode it decodes latin1,
+ * where every byte is a character of its own. Newlines are searched for in each decoded chunk
+ * only, and the pieces of a line are joined once when it ends, so a long line costs linear time
+ * and a credential that straddles a chunk boundary is matched on the joined line.
  *
  * @param {number} fd Open descriptor of the file.
  * @param {string} relPath Repository-relative POSIX path.
  * @param {Allowlist} allowlist Validated allowlist.
  * @param {ContentSink} sink
- * @returns {{ kind: 'scanned' } | { kind: 'binary', format: string }}
+ * @returns {RegularFileOutcome}
  * @throws {TrackedFileReadError} When a read fails; findings from the part already read stay in
  *   `sink`, because they are real.
  */
 function streamScanFile(fd, relPath, allowlist, sink) {
   const chunk = Buffer.allocUnsafe(STREAM_CHUNK_BYTES);
-  const decoder = new StringDecoder('utf8');
+  let bytesRead = fileRead(() => readSync(fd, chunk, 0, chunk.length, 0));
+  const format = identifyBinary(relPath, chunk.subarray(0, bytesRead));
+  // Binary mode decodes latin1; its metadata-field pass is the caller's (see scanRegularFile),
+  // because it needs random access to the file rather than the stream.
+  const decoder = new StringDecoder(format === null ? 'utf8' : 'latin1');
   /** @type {string[]} */
   let pieces = [];
   let lineNumber = 1;
@@ -2015,55 +2916,62 @@ function streamScanFile(fd, relPath, allowlist, sink) {
   };
 
   let position = 0;
-  for (;;) {
-    const offset = position;
-    const bytesRead = fileRead(() => readSync(fd, chunk, 0, chunk.length, offset));
-    if (offset === 0) {
-      const format = identifyBinary(relPath, chunk.subarray(0, bytesRead));
-      if (format !== null) {
-        return { kind: 'binary', format };
-      }
-    }
-    if (bytesRead === 0) {
-      break;
-    }
+  while (bytesRead > 0) {
     position += bytesRead;
     consume(decoder.write(chunk.subarray(0, bytesRead)));
+    const offset = position;
+    bytesRead = fileRead(() => readSync(fd, chunk, 0, chunk.length, offset));
   }
   consume(decoder.end());
   scanLineInto(relPath, allowlist, lineNumber, pieces.join(''), sink);
-  return { kind: 'scanned' };
+  return regularFileOutcome(format);
 }
 
 /**
- * Read and scan one regular file, or identify it as a binary format and skip it.
+ * Read and scan one regular file: as text, or - when its extension and leading bytes identify a
+ * binary format - in binary mode (see {@link ContentMode}).
  *
  * A file up to {@link MAX_SCAN_BYTES} is read whole; a larger one is streamed by
  * {@link streamScanFile}. Either way the leading bytes decide binary identification and every line
- * goes through {@link scanLineInto}.
+ * goes through {@link scanLineInto}; a binary's metadata fields then go through
+ * {@link scanMetadataFieldsInto}, over the buffer or the open descriptor. A binary's findings are
+ * gathered for the file on its own first, so the two passes merge into one position-ordered list.
  *
  * @param {string} absolute Absolute path of the file.
  * @param {string} relPath Repository-relative POSIX path.
  * @param {number} size Size the work-tree entry reported.
  * @param {Allowlist} allowlist Validated allowlist.
  * @param {ContentSink} sink
- * @returns {{ kind: 'scanned' } | { kind: 'binary', format: string }}
- * @throws {TrackedFileReadError} When the file cannot be opened or read.
+ * @returns {RegularFileOutcome}
+ * @throws {TrackedFileReadError} When the file cannot be opened or read; findings from the part
+ *   already read are in `sink`, because they are real.
  */
 function scanRegularFile(absolute, relPath, size, allowlist, sink) {
   if (size <= MAX_SCAN_BYTES) {
     const buffer = fileRead(() => readFileSync(absolute));
     const format = identifyBinary(relPath, buffer);
-    if (format !== null) {
-      return { kind: 'binary', format };
+    if (format === null) {
+      scanTextInto(relPath, allowlist, buffer.toString('utf8'), sink);
+    } else {
+      /** @type {ContentSink} */
+      const local = { findings: [], allowlisted: [] };
+      scanTextInto(relPath, allowlist, buffer.toString('latin1'), local);
+      scanMetadataFieldsInto(relPath, allowlist, format, bufferSource(buffer), local);
+      appendSink(sink, local);
     }
-    scanTextInto(relPath, allowlist, buffer.toString('utf8'), sink);
-    return { kind: 'scanned' };
+    return regularFileOutcome(format);
   }
   const fd = fileRead(() => openSync(absolute, 'r'));
+  /** @type {ContentSink} */
+  const local = { findings: [], allowlisted: [] };
   try {
-    return streamScanFile(fd, relPath, allowlist, sink);
+    const outcome = streamScanFile(fd, relPath, allowlist, local);
+    if (outcome.kind === 'binary') {
+      scanMetadataFieldsInto(relPath, allowlist, outcome.format, descriptorSource(fd, size), local);
+    }
+    return outcome;
   } finally {
+    appendSink(sink, local);
     fileRead(() => closeSync(fd));
   }
 }
@@ -2199,9 +3107,10 @@ function unscanned(file, reason, detail) {
  *   - A symbolic link where git tracks one (mode {@link SYMLINK_MODE}) is scanned as its target
  *     text, which is the blob git stores for it. It is never followed: the target may lie outside
  *     the checkout, and it is the link that is tracked.
- *   - A regular file is read (streamed when large) and skipped only as a positively identified
- *     binary. A regular file standing where git tracks a symbolic link is scanned too: that is how
- *     a checkout with `core.symlinks=false` stores the link, as a file holding its target.
+ *   - A regular file is read (streamed when large) and scanned: as text, or byte for byte in binary
+ *     mode when it is a positively identified binary, which is reported as `binary` so the report
+ *     lists it. A regular file standing where git tracks a symbolic link is scanned too: that is
+ *     how a checkout with `core.symlinks=false` stores the link, as a file holding its target.
  *   - Anything else is `unscanned`: `missing` when the path is absent from the work tree,
  *     `unreadable` when the operating system refuses to stat or read it, and `wrong-type` when the
  *     entry is not what git tracks - a directory or another non-regular entry, a symbolic link
@@ -2214,8 +3123,8 @@ function unscanned(file, reason, detail) {
  * @param {Allowlist} allowlist Validated allowlist.
  * @param {ContentSink} sink
  * @param {Map<string, string | null>} ancestry The run's {@link symlinkedAncestor} cache.
- * @returns {{ kind: 'scanned' } | { kind: 'skipped', entry: SkippedFile } |
- *   { kind: 'unscanned', entry: UnscannedFile }}
+ * @returns {{ kind: 'scanned' } | { kind: 'binary', entry: BinaryFile } |
+ *   { kind: 'skipped', entry: SkippedFile } | { kind: 'unscanned', entry: UnscannedFile }}
  */
 function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
   const { file, mode } = tracked;
@@ -2262,10 +3171,7 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
     }
     const outcome = scanRegularFile(absolute, file, stats.size, allowlist, sink);
     return outcome.kind === 'binary'
-      ? {
-          kind: 'skipped',
-          entry: { file, reason: 'binary', format: outcome.format, bytes: stats.size },
-        }
+      ? { kind: 'binary', entry: { file, format: outcome.format, bytes: stats.size } }
       : outcome;
   } catch (error) {
     if (error instanceof TrackedFileReadError) {
@@ -2276,15 +3182,37 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
 }
 
 /**
- * A tracked entry the scan did not read because it holds no text to read here.
+ * A tracked file scanned in binary mode: its extension and its leading bytes agree on a format in
+ * {@link BINARY_FORMATS}, so it was scanned against every content rule byte for byte and, for
+ * every format but PDF, field by field (see {@link scanMetadataFieldsInto}). It is counted in
+ * `filesScanned` as well.
+ *
+ * What binary mode sees is what the format stores as plain ASCII bytes: PNG `tEXt` and
+ * uncompressed `iTXt` fields and every chunk keyword, in a PNG file or in a PNG image of an ICO
+ * file; JPEG comment and application segments (EXIF text, XMP packets); GIF comment, plain-text
+ * and application extensions with their sub-blocks joined; ZIP (VSIX) entry names, entry comments,
+ * the archive comment and stored entries; the WOFF and WOFF2 private data block; and uncompressed
+ * PDF objects. Nothing is decompressed or decoded, so a credential inside a PNG `zTXt` or
+ * compressed `iTXt` chunk or image data, a PDF Flate stream, a deflated ZIP or VSIX entry, or a
+ * compressed WOFF or WOFF2 table is not seen, nor is one stored as UTF-16, as hexadecimal or as a
+ * PDF octal escape. Where no field is parsed out - inside an EXIF structure, inside a file stored
+ * in a ZIP archive, in an uncompressed font table, in a JPEG segment after the start of scan, in a
+ * ZIP64 archive's directory, past the first {@link MAX_FIELD_BYTES} of a field - the bytes around a
+ * value are its context, so a value glued to a preceding letter or digit does not start a token
+ * there.
+ *
+ * @typedef {object} BinaryFile
+ * @property {string} file Repository-relative POSIX path.
+ * @property {string} format The identified format, for example `png`.
+ * @property {number} bytes Size in bytes.
+ */
+
+/**
+ * A tracked entry the scan did not read because its content is not stored in this repository.
  *
  * @typedef {object} SkippedFile
  * @property {string} file Repository-relative POSIX path.
- * @property {'binary'|'submodule'} reason `binary`: the extension and the leading bytes agree on a
- *   format in {@link BINARY_FORMATS}. `submodule`: a gitlink, whose content is another
- *   repository's.
- * @property {string} [format] The identified format, for `binary`.
- * @property {number} [bytes] Size in bytes, for `binary`.
+ * @property {'submodule'} reason A gitlink, whose content is another repository's.
  */
 
 /**
@@ -2316,10 +3244,13 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
  * @property {number} filesTracked Paths git tracks; never zero, because an empty tracked subject
  *   is a precondition failure rather than a report (see {@link scanRepository}).
  * @property {number} filesScanned Files whose content - or, for a symbolic link, whose target
- *   text - was read and scanned.
+ *   text - was read and scanned, binaries included.
  * @property {Finding[]} findings Violations, in file then line then column order.
  * @property {AllowlistedFinding[]} allowlisted Matches an allowlist entry exempted.
- * @property {SkippedFile[]} skipped Binaries and submodules, which hold no text to read here.
+ * @property {BinaryFile[]} binaries The scanned files that were positively identified binaries:
+ *   scanned against every content rule byte for byte and by metadata field, compressed payloads
+ *   not inflated.
+ * @property {SkippedFile[]} skipped Submodules, whose content is another repository's.
  * @property {UnscannedFile[]} unscanned Files that could not be examined; non-empty means the run
  *   proves nothing and exits {@link EXIT_ERROR}.
  */
@@ -2328,10 +3259,10 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
  * Scan a checkout: enumerate tracked files, apply every rule, and return the report.
  *
  * Every tracked entry ends up in exactly one of three places: scanned (counted in
- * `filesScanned`), `skipped` (a positively identified binary or a submodule), or `unscanned` (see
- * {@link examineTrackedFile}). An unscanned file does not throw - the rest of the tree is still
- * scanned and reported, so one missing file does not hide a credential elsewhere - but it makes
- * the report's `exitCode` {@link EXIT_ERROR} and `ok` false.
+ * `filesScanned`, and listed in `binaries` too when it was scanned in binary mode), `skipped` (a
+ * submodule), or `unscanned` (see {@link examineTrackedFile}). An unscanned file does not throw -
+ * the rest of the tree is still scanned and reported, so one missing file does not hide a
+ * credential elsewhere - but it makes the report's `exitCode` {@link EXIT_ERROR} and `ok` false.
  *
  * @param {{ cwd?: string, root?: string, allowlist?: unknown, allowlistPath?: string }} [options]
  *   `cwd` (or its alias `root`) is any path inside the checkout to scan; it defaults to this
@@ -2368,6 +3299,8 @@ export function scanRepository(options = {}) {
   }
   /** @type {ContentSink} */
   const sink = { findings: [], allowlisted: [] };
+  /** @type {BinaryFile[]} */
+  const binaries = [];
   /** @type {SkippedFile[]} */
   const skipped = [];
   /** @type {UnscannedFile[]} */
@@ -2383,6 +3316,9 @@ export function scanRepository(options = {}) {
     const outcome = examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry);
     if (outcome.kind === 'scanned') {
       filesScanned += 1;
+    } else if (outcome.kind === 'binary') {
+      filesScanned += 1;
+      binaries.push(outcome.entry);
     } else if (outcome.kind === 'skipped') {
       skipped.push(outcome.entry);
     } else {
@@ -2407,6 +3343,7 @@ export function scanRepository(options = {}) {
     filesScanned,
     findings,
     allowlisted,
+    binaries,
     skipped,
     unscanned: unscannedFiles,
   };
@@ -2474,13 +3411,14 @@ function renderReport(report) {
     lines.push('', ...findingsExplanation(), '');
   }
 
+  const binaryNote = report.binaries.length > 0 ? ` (${report.binaries.length} binary)` : '';
   const parts = [
-    `${report.filesScanned} ${plural(report.filesScanned, 'file')} scanned`,
+    `${report.filesScanned} ${plural(report.filesScanned, 'file')} scanned${binaryNote}`,
     `${report.findings.length} ${plural(report.findings.length, 'finding')}`,
     `${report.allowlisted.length} allowlisted`,
   ];
   if (report.skipped.length > 0) {
-    parts.push(`${report.skipped.length} skipped (binary or submodule)`);
+    parts.push(`${report.skipped.length} skipped (submodule)`);
   }
   if (report.unscanned.length > 0) {
     parts.push(`${report.unscanned.length} unscanned`);
@@ -2494,15 +3432,29 @@ function renderReport(report) {
  * @returns {string} The `--help` text, without a trailing newline.
  */
 function helpText() {
+  const binaryFormats = BINARY_FORMATS.map(({ format }) => format.toUpperCase()).join(', ');
   return [
     'Usage: node scripts/check-secrets.mjs [options]',
     '',
-    'Fails when a file git tracks carries a credential. Every tracked file is read - a file over',
-    '2 MiB is streamed, a symbolic link is read as its target text and never followed - and only',
-    'a positively identified binary (extension and leading bytes agree) or a submodule is skipped.',
-    'Each scanned file is checked against these rules:',
+    'Fails when a path git tracks, or the content it tracks, matches one of these credential',
+    'shapes. A text file is checked against every rule - one over 2 MiB is streamed - and so is',
+    'a symbolic link, read as its target text and never followed:',
     '',
     ...RULES.map((rule) => `  ${rule.id.padEnd(18)} ${rule.summary}`),
+    '',
+    'A positively identified binary - its extension and leading bytes agree on one of the',
+    `formats ${binaryFormats} -`,
+    'is checked against the same rules byte for byte, and its plaintext metadata fields are',
+    'checked again each from its own first byte, so a length prefix or a name before a value',
+    'cannot hide its start: PNG text chunks, also in ICO images; JPEG comment and application',
+    'segments; GIF extension blocks with their sub-blocks joined; ZIP (VSIX) entry names, comments',
+    'and stored entries and the archive comment; the WOFF and WOFF2 private data block. PDF',
+    'delimits its values itself. Nothing is decompressed, so a credential inside compressed data -',
+    'PNG zTXt, compressed iTXt and image data, PDF Flate streams, deflated ZIP and VSIX entries,',
+    'compressed WOFF and WOFF2 tables - is not seen, nor is text a format encodes (UTF-16,',
+    'hexadecimal). The report counts binaries as scanned and lists them under "binaries". A',
+    'submodule is skipped, because its content is another repository\u2019s, and is listed under',
+    '"skipped".',
     '',
     `The two example files ${ALLOWED_ENV_FILES.join(' and ')} are the only`,
     'environment files that may be tracked. The non-secret placeholders this repository has to',
@@ -2562,7 +3514,7 @@ function parseArgs(argv) {
       throw usageError(`unknown option: ${arg}`);
     } else {
       throw usageError(
-        `unexpected argument: ${arg}. This check takes no paths; it scans every tracked file.`,
+        `unexpected argument: ${arg}. This check takes no paths; it scans what git tracks.`,
       );
     }
   }

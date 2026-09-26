@@ -40,18 +40,13 @@
  * form - is not re-rendered when the value it published comes back round; and each value's context
  * carries the bare value, `SelectedFreight | null` or `boolean`, so there is no per-render object to
  * keep stable. One combined `{ value, publish }` object would have needed exactly that, for no gain
- * to either side. The two facts are kept apart for the same reason: the review reads the charge
- * several times a second and the placed flag once, and a single value holding both would wake every
- * reader of either whenever one of them moved.
+ * to either side. The two facts are kept apart for the same reason: they change independently, and
+ * a single value holding both would wake every reader of either whenever one of them moved.
  *
  * THE EQUALITY GUARD IS LOAD-BEARING
- * `<ShippingEtaProvider>` republishes the dispatch countdown every 250 ms and `<CartProvider>` builds
- * a fresh context value each time it does (AAP 0.8.2 defect 2), so the checkout form re-renders
- * roughly four times a second while it is merely sitting on screen. The form publishes from an
- * effect, and an effect that called `setState` with a fresh object on each of those renders would
- * turn a countdown into a state-update storm across the page. {@link isSameFreight} is therefore
- * consulted before the state is written: a field-wise-equal value is ignored, and the review column
- * re-renders only when the buyer's chosen service or its quoted rate actually changes.
+ * The form publishes from an effect that builds a fresh object each time it runs, so an identity
+ * check would treat every run as a new charge. {@link isSameFreight} is consulted before the state
+ * is written, so a field-wise-equal value - freight that has not changed - is not republished.
  *
  * NEITHER HOOK THROWS OUTSIDE THE PROVIDER
  * The defaults are inert - no chosen service, and a publisher that does nothing - so a form or a
@@ -126,9 +121,8 @@ function ignorePlacement(): void {
  * Whether two published freight charges say the same thing.
  *
  * Field-wise rather than by identity, because the publisher is called from an effect that builds a
- * fresh object every time it runs, and the form runs it several times a second (see the header).
- * The first branch settles every combination involving `null`: nothing chosen equals nothing
- * chosen, and nothing chosen never equals a charge.
+ * fresh object every time it runs (see the header). The first branch settles every combination
+ * involving `null`: nothing chosen equals nothing chosen, and nothing chosen never equals a charge.
  *
  * @param current The charge the context is holding.
  * @param next The charge a publisher is offering.

@@ -8,8 +8,8 @@
  * Statements only. A statement arrives here already redacted and already
  * parameterized — `$n` placeholders as the driver wrote them, inline literals
  * replaced with `?` by `packages/telemetry/src/redaction/sql.ts` — and the only
- * thing recorded about a result is a row *count* (AAP 0.5.2). Nothing in this
- * file transforms that text: it is not re-formatted, not pretty-printed, not
+ * thing recorded about a result is a row *count*. Nothing in this file
+ * transforms that text: it is not re-formatted, not pretty-printed, not
  * re-cased, not highlighted, not parsed, and no placeholder is ever filled in.
  * The single string operation applied anywhere below is the package's own
  * display truncation for the collapsed cell (`oneLinePreview`), and wherever a
@@ -28,40 +28,40 @@
  *
  * From the node's own `DataQuery` and nothing else. The component resolves it
  * through `../host/useQuery`, which reaches the ambient `DataProvider` — an
- * interface, never a transport (AAP 0.1.2): no socket, no `fetch`, no message
- * port, no knowledge of which host surface it is rendering inside. Ordering,
- * filtering and paging belong to the side that holds the whole capture, so a
- * sort change here is a *re-query*, never a local re-ordering, and a page is
- * appended by asking for the next `offset` rather than by slicing what arrived
- * (AAP 0.4.2). Every field read below comes from the `reads` list of this node
- * type's catalog entry — `catalogEntryFor('queryTable').reads` in
- * `packages/panel-schema/src/catalog.ts`, which is also what the semantic
- * validator checks a generated panel against — resolved into the `queries`
- * result shape by `packages/telemetry/src/aggregate/queries.ts`:
- * span identity, timing, taxonomy, label and status, with `db.statement`
- * required (a span without one forms no group), and `parentSpanId`, `source`,
- * `db.system` and `db.rowCount` read when present. The caller walk resolves a
- * call site through `parentSpanId`, not through function or route-handler keys.
+ * interface, never a transport: no socket, no `fetch`, no message port, no
+ * knowledge of which host surface it is rendering inside. Ordering, filtering
+ * and paging belong to the side that holds the whole capture, so a sort change
+ * here is a *re-query*, never a local re-ordering, and a page is appended by
+ * asking for the next `offset` rather than by slicing what arrived. Every field
+ * read below comes from the `reads` list of this node type's catalog entry —
+ * `catalogEntryFor('queryTable').reads` in `packages/panel-schema/src/catalog.ts`,
+ * which is also what the semantic validator checks a generated panel against —
+ * resolved into the `queries` result shape by
+ * `packages/telemetry/src/aggregate/queries.ts`: span identity, timing,
+ * taxonomy, label and status, with `db.statement` required (a span without one
+ * forms no group), and `parentSpanId`, `source`, `db.system` and `db.rowCount`
+ * read when present. The caller walk resolves a call site through
+ * `parentSpanId`, not through function or route-handler keys.
  *
- * ## The click that ends the acceptance flow
+ * ## Where the click-to-source flow ends
  *
- * Acceptance test 1 (AAP 0.8.4) finishes in this table: the caller chip of a
- * statement opens the editor at the call site. That chip is a `SourceLink`
- * handed the caller's own `SourceLocation` **by reference** — this file neither
- * rebuilds, adjusts nor re-validates a location — so what the host receives
- * through `PanelActions.onOpenSource` is exactly what the resolver produced.
- * A caller the resolver could not place renders as plain text rather than as a
- * control that leads nowhere.
+ * The click-to-source flow ends at this table's caller chip, which opens the
+ * editor at the statement's call site. That chip is a `SourceLink` handed the
+ * caller's own `SourceLocation` **by reference** — this file neither rebuilds,
+ * adjusts nor re-validates a location — so what the host receives through
+ * `PanelActions.onOpenSource` is exactly what the resolver produced. A caller
+ * the resolver could not place renders as plain text rather than as a control
+ * that leads nowhere.
  *
  * ## Composition
  *
  * Every visible element is a primitive or a layout primitive of this package:
  * no raw `<table>`, `<button>`, `<input>`, `<select>` or heading element, no
- * inline `style`, and no CSS value of its own (AAP 0.6.4). `DataTable` owns the
- * grid roles, the header sort reporting, the roving tab stop, the expansion
- * keys and the row state classes (`dg-is-selected`, `dg-is-expanded`), which is
- * why none of them appears here; spacing comes from `Stack`, the ordering
- * control from `Toolbar`, colour only ever from `../utils/color`.
+ * inline `style`, and no CSS value of its own. `DataTable` owns the grid roles,
+ * the header sort reporting, the roving tab stop, the expansion keys and the
+ * row state classes (`dg-is-selected`, `dg-is-expanded`), which is why none of
+ * them appears here; spacing comes from `Stack`, the ordering control from
+ * `Toolbar`, colour only ever from `../utils/color`.
  *
  * ## Keyboard: one Tab stop, and the grid's arrow keys for everything inside
  *
@@ -107,6 +107,9 @@
  *
  * @see packages/panel-schema/src/catalog.ts — the `queryTable` catalog entry
  * @see packages/telemetry/src/aggregate/queries.ts — the `queries` result shape
+ * @see docs/SECURITY.md — "Redaction": the SQL placeholder and row-count treatment
+ * @see docs/ARCHITECTURE.md — "Panel data", "The renderer contract" and "A click,
+ * end to end": the paging contract, the component rules and the click-to-source path
  */
 
 import type { DataQuery, DataQuerySort, QueryTableNode } from '@debuggen/panel-schema';
@@ -211,9 +214,9 @@ const DEFAULT_SORT: DataQuerySort = 'duration_desc';
  * Copy
  *
  * Generic throughout: no component, table, route or symbol name from any
- * inspected project appears in this file, in its markup or in its comments
- * (AAP 0.5.4), and no example statement is written down anywhere — every
- * statement on screen came from the capture.
+ * inspected project appears in this file, in its markup or in its comments,
+ * and no example statement is written down anywhere — every statement on
+ * screen came from the capture.
  * ---------------------------------------------------------------------------
  */
 
@@ -246,7 +249,8 @@ const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
 /**
  * The accessible name of the busy region while the first page resolves, ending
- * in the ellipsis every loading label of this package carries (B2-F14).
+ * in the single-character ellipsis (`…`) every loading label of this package
+ * carries, so every busy region is announced alike.
  */
 const LOADING_LABEL = 'Loading captured database queries…';
 
@@ -332,7 +336,7 @@ function failureBadgeText(errorCount: number): string {
  * on. The identity is the statement preview the row header already shows — the
  * package's own one-line display form of the received text, passed in rather
  * than re-derived here — so the name repeats what is on screen and transforms
- * nothing (AAP 0.5.2).
+ * nothing.
  *
  * @param expanded Whether the row's detail is open, which picks the verb.
  * @param statementPreview The row's statement as its header cell displays it.
@@ -516,9 +520,9 @@ const COLUMN_KEY = Object.freeze({
  * each one through `DATA_TABLE_COLUMN_TRACKS` to a grid track built from the
  * `--dg-column-min-*` floor and `--dg-column-share-*` share tokens, so this
  * table, every other visualization table and both extension surfaces agree on
- * how wide a statement or a duration is, and no length is chosen here
- * (AAP 0.6.4). Each column takes the smallest role whose floor keeps its
- * content readable, in the vocabulary every table shares:
+ * how wide a statement or a duration is, and no length is chosen here. Each
+ * column takes the smallest role whose floor keeps its content readable, in the
+ * vocabulary every table shares:
  *
  *   statement   text      the identity column: long free text that wraps and
  *                         never clips, so the widest share of spare width goes
@@ -537,12 +541,12 @@ const COLUMN_KEY = Object.freeze({
  * Every role has a non-zero floor, and `DataTable` sums the floors into the
  * grid's minimum inline size (`--dgc-min-inline`), so a panel narrower than the
  * sum scrolls horizontally with every column still readable. A floorless
- * `minmax(0, …)` track let each column shrink to its padding in a narrow
- * panel, where a chip then covered the next column's value and the caller
- * stack spilled outside its cell. And every role track is a token floor and a
- * ratio rather than a content-based size (`auto`, `min-content`): the header
- * row and each data row are separate grid containers, so a track sized from one
- * row's content would stop sitting under its own header.
+ * `minmax(0, …)` track would let each column shrink to its padding in a narrow
+ * panel, where a chip covers the next column's value and the caller stack
+ * spills outside its cell. And every role track is a token floor and a ratio
+ * rather than a content-based size (`auto`, `min-content`): the header row and
+ * each data row are separate grid containers, so a track sized from one row's
+ * content would stop sitting under its own header.
  */
 const COLUMN_WIDTH = Object.freeze({
   statement: 'text',
@@ -620,7 +624,7 @@ export interface QueryTableProps {
   /**
    * Extra classes composed after `dg-query-table`, for the layout the enclosing
    * layout node owns. Composition only: any class named by a caller is defined
-   * in `../styles/components.css` against `--dg-*` tokens (AAP 0.6.4).
+   * in `../styles/components.css` against `--dg-*` tokens.
    */
   className?: string | undefined;
 }
@@ -637,8 +641,7 @@ export interface QueryTableProps {
  *
  * `frozen` holds the pages already resolved and displayed, captured at the
  * moment the reader asked for the next one. Nothing merges, re-orders or
- * de-duplicates them: each page is appended in the order the data layer paged
- * it (AAP 0.4.2).
+ * de-duplicates them: each page is appended in the order the data layer paged it.
  */
 interface PagingState {
   /** The request these pages belong to; see {@link pagingIdentityOf}. */
@@ -890,7 +893,7 @@ function hasText(value: string): boolean {
  *
  * The distinction is load-bearing and is why this is not a `?? 0`: a group from
  * a producer that reports no row counts says nothing, and printing `0` would
- * turn "never measured" into the observation "returned no rows" (AAP 0.5.2).
+ * turn "never measured" into the observation "returned no rows".
  *
  * @param value The reported count, if any.
  * @returns The formatted count, or `n/a`.
@@ -1062,10 +1065,10 @@ function renderExecutionsCell(group: QueryGroup): ReactNode {
  * Rows returned across every execution that reported a count, or `n/a`.
  *
  * A count, never a hint that the rows themselves exist anywhere in this
- * product: nothing about a result is captured beyond its size (AAP 0.5.2),
- * which the cell's tooltip states in as many words. The figure is focusable —
- * `tabIndex={-1}`, reached by the grid's arrow keys — so that note is reachable
- * without a pointer.
+ * product: nothing about a result is captured beyond its size, which the cell's
+ * tooltip states in as many words. The figure is focusable — `tabIndex={-1}`,
+ * reached by the grid's arrow keys — so that note is reachable without a
+ * pointer.
  *
  * @param group The row.
  * @returns The cell's content.
@@ -1088,8 +1091,8 @@ function renderRowCountCell(group: QueryGroup): ReactNode {
  * One chip per code location that ran the statement, busiest first as the
  * aggregate ordered them.
  *
- * This is the last hop of the product's headline click (AAP 0.8.4): the chip is
- * a `SourceLink` handed the caller's `SourceLocation` by reference, so the
+ * The click-to-source flow ends at this table's caller chip: the chip is a
+ * `SourceLink` handed the caller's `SourceLocation` by reference, so the
  * location the host opens is field-for-field the one the resolver produced. A
  * caller the resolver could not place renders as its name in plain text — never
  * as a control that would do nothing — and a group whose executions could not
@@ -1105,9 +1108,9 @@ function renderRowCountCell(group: QueryGroup): ReactNode {
  *
  * The list is a vertical `Stack` that STRETCHES its callers across the cell,
  * and this is set explicitly because a centred list would break the cell. A
- * chip is often wider than its column. Centred, the chip overflowed both edges
- * of the cell: it started before the cell's start edge, so the start of the
- * caller's name was cut off, and its end spilled into the Rows column.
+ * chip is often wider than its column. Centred, such a chip would overflow both
+ * edges of the cell: it would start before the cell's start edge, cutting off
+ * the start of the caller's name, and its end would spill into the Rows column.
  * Stretched, every caller is exactly as wide as the cell, so the chip starts at
  * the cell's start edge and ellipsizes when there is not enough room.
  *
@@ -1732,8 +1735,9 @@ export function QueryTable(props: QueryTableProps): ReactElement {
     }
 
     if (status === 'error') {
-      // The package's one failure contract, for the view's own data: nothing is
-      // on screen, so the whole view is what failed (B2-F14, B1-F16).
+      // The package's one failure contract — the single error-state design every
+      // failed node renders — in its view scope: nothing is on screen, so the
+      // whole view is what failed.
       return shell(
         <ErrorState
           className={ERROR_CLASS}
@@ -1826,9 +1830,9 @@ export function QueryTable(props: QueryTableProps): ReactElement {
 
       {/*
        * A further page that failed gets the same error contract as a first page
-       * that did (AAP 0.6.2), in its page scope: the next-page title and lead,
-       * the rejection's cause, hint and code, the failing query as it was sent
-       * — its `offset` is the page that failed — and a retry that re-issues
+       * that did, in its page scope: the next-page title and lead, the
+       * rejection's cause, hint and code, the failing query as it was sent —
+       * its `offset` is the page that failed — and a retry that re-issues
        * exactly that request, labelled for the page. It sits below the footer
        * rather than in place of the grid, so the statements already read stay
        * on screen and the reader keeps their place.

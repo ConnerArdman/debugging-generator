@@ -122,7 +122,7 @@
       "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. With no sort the spans source orders duration_desc (DEFAULT_SORT_BY_SOURCE): evt_vl00000000000001 (1400 ms) then evt_vl00000000000220 (98.75 ms), the two unique longest durations. Start order would have given evt_vl00000000000002 second."
     },
     {
-      "name": "spans-inapplicable-sort-falls-back",
+      "name": "spans-count-desc-ranks-by-name-group",
       "ingest": ["telemetry-volume-paging.json"],
       "query": {
         "source": "spans",
@@ -135,9 +135,9 @@
         "count": 2,
         "hasNextOffset": true,
         "nextOffset": 2,
-        "orderedIds": ["evt_vl00000000000001", "evt_vl00000000000220"]
+        "orderedIds": ["evt_vl00000000000001", "evt_vl00000000000002"]
       },
-      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. count_desc does not apply to a flat record list, so the resolver falls back to the spans default duration_desc without an error: the same two rows as with no sort."
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. count_desc on a flat record list ranks each row by the size of its operation-name group, then the name in UTF-8 byte order, then the id. All 220 names are distinct, so every group has one row and the name decides: 'click TrailList refresh' (evt_vl00000000000001) sorts before 'resource /static/tiles/000002.json' (evt_vl00000000000002). The requested sort is applied, never replaced by the spans default duration_desc, which would have given evt_vl00000000000220 second."
     },
     {
       "name": "events-count-only-page",

@@ -180,9 +180,8 @@ interface Props {
 /**
  * Props of {@link InventoryKpiCardsPlaceholder}.
  *
- * Named for the component rather than shortened to `PlaceholderProps`: every identifier this
- * workspace declares becomes vocabulary the product's source may not mention, so a name that is
- * unmistakably this row's costs the product nothing.
+ * Named for the component rather than shortened to `PlaceholderProps`, so the name says which
+ * component's placeholder it describes wherever it is read.
  */
 interface InventoryKpiPlaceholderProps {
   /**

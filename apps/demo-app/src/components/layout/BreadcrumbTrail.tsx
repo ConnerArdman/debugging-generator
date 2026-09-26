@@ -144,11 +144,6 @@ export function BreadcrumbTrail(props: Props): ReactElement | null {
   // component free of indexed access - the compiler types `items[i]` as possibly `undefined`
   // under `noUncheckedIndexedAccess`, and neither a non-null assertion nor a fallback crumb
   // belongs in a list this component is iterating anyway.
-  //
-  // The locals here and below are deliberately single-token names. `scripts/check-no-hardcoding`
-  // harvests every identifier this workspace declares that has two or more camel-case tokens
-  // into the shared policy the debugging product may not name, so a local called `lastIndex`
-  // would make a thoroughly generic word part of that vocabulary for the whole repository.
   const end = items.length - 1;
 
   return (

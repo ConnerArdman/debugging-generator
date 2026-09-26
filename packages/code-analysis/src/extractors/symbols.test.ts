@@ -1285,12 +1285,14 @@ describe('symbolsExtractor over the committed corpus', () => {
   let corpus: Corpus;
   let stampsBefore: readonly FileStamp[];
 
+  // A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+  // machine can push past the 10 s hook default and so fail every case below.
   beforeAll(async () => {
     // Stamped before the project is opened, so anything the suite did to the
     // corpus — including anything `openProject` itself did — shows up.
     stampsBefore = stampTree(FIXTURE_ROOT);
     corpus = await prepareCorpus();
-  });
+  }, 30_000);
 
   afterAll(() => {
     // The corpus is an input, not a workspace. A case that wrote to it would
@@ -1868,9 +1870,11 @@ function reExtract(scratch: Scratch, file: string): readonly CodeNodeOf<'symbol'
 describe('symbolsExtractor over an on-disk scratch project', () => {
   let scratch: Scratch;
 
+  // A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+  // machine can push past the 10 s hook default and so fail every case below.
   beforeAll(() => {
     scratch = prepareScratch();
-  });
+  }, 30_000);
 
   afterAll(() => {
     rmSync(scratch.root, { recursive: true, force: true });

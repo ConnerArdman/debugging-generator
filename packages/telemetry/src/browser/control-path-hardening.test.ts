@@ -393,13 +393,27 @@ const LENGTH_UNCHANGED: Lie = (receiver) =>
   typeof receiver === 'object' && receiver !== null ? Reflect.get(receiver, 'length') : 0;
 
 /**
- * Replace, as a page script would after the agent evaluated, every built-in
- * the control path used to run on — and the ones a rewrite might reach for.
+ * Replace, as a page script evaluated after the agent would, the built-ins a
+ * control path could consult: `Array.from` and `Array.isArray`; the query,
+ * iteration and mutation methods of `Array.prototype`, `Set.prototype` and
+ * `Map.prototype`, and the array and set iterators' `next`;
+ * `Function.prototype.call`, `apply` and `bind`; the `Number` integer and
+ * finiteness predicates; the `Object` enumeration and reflection statics;
+ * `JSON.parse` and `JSON.stringify`; and `Math.min`, `max`, `ceil` and
+ * `floor`. `Math.round` is replaced without a stub (see below).
  *
- * Each lie is what makes the corresponding old code path fail: `some` → false
- * reads every hook as off, an empty iterator arms nothing, `Set.prototype.has`
- * → false retries a failed family, `Function.prototype.call` → nothing drops
- * a subscriber's delivery.
+ * Every replacement records the agent code that calls it and, in a window
+ * that lies, answers a control-path caller with its stub instead of the
+ * built-in's result. Each stub is the wrong answer that would mislead an
+ * implementation that consulted it: `Array.prototype.some` → false would read
+ * every hook as off, an empty iterator would arm nothing, `Set.prototype.has`
+ * → false would retry a failed family, and `Function.prototype.call` → a
+ * no-op would drop a subscriber's delivery.
+ *
+ * The agent's control path — frame receipt, subscriber delivery,
+ * configuration parsing and the arm/disarm decisions — runs only on
+ * intrinsics captured at evaluation, so none of these replacements changes
+ * what it decides.
  */
 function installLatePageScript(): void {
   probing = true;
@@ -714,7 +728,7 @@ describe('a late page script and the control path', () => {
     ).toBe(true);
 
     const control = sightings.filter((entry) => entry.caller === 'control');
-    // The only built-in the control path still calls takes and returns numbers.
+    // The only built-in the control path calls takes and returns numbers.
     expect(control.map((entry) => entry.label).filter((label) => label !== 'Math.round')).toEqual(
       [],
     );
@@ -1191,8 +1205,13 @@ const SERIALIZER_CORPUS: readonly unknown[] = [
   nestedArrays(64),
 ];
 
-/** The old `boundFailureField`, verbatim, run on the platform's own built-ins. */
-function priorBoundFailureField(value: string): string {
+/**
+ * The reference bound for a failure-report field, run on the platform's own
+ * built-ins: iterate code points, replace C0 controls and DEL with a space,
+ * stop at 64 code units, trim. The agent's page-proof implementation must
+ * produce the same text for every input.
+ */
+function referenceBoundFailureField(value: string): string {
   let cleaned = '';
   for (const character of value) {
     const code = character.codePointAt(0) ?? 0;
@@ -1325,7 +1344,7 @@ describe('the control-text bounds', () => {
     }
   });
 
-  it('bounds a failure report field exactly as the iterator-and-trim formulation did', () => {
+  it('bounds a failure report field exactly as the iterator-and-trim reference does', () => {
     const corpus: readonly string[] = [
       'detach',
       '  padded  ',
@@ -1351,7 +1370,7 @@ describe('the control-text bounds', () => {
         const reports = bridge
           .framesOfType('agent.error')
           .filter((frame) => frame.payload['code'] === 'producer-failure');
-        expect(reports.at(-1)?.payload['stage']).toBe(priorBoundFailureField(stage));
+        expect(reports.at(-1)?.payload['stage']).toBe(referenceBoundFailureField(stage));
       }
     } finally {
       configureTransport({ enabled: false });

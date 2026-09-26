@@ -39,8 +39,7 @@ import styles from './Card.module.css';
  * Props of {@link Card}.
  *
  * Local and deliberately not exported: a consumer types its own props and passes them through,
- * so nothing outside this module needs the shape, and the repository's guard scripts treat any
- * exported demo identifier as vocabulary the product may never mention.
+ * and one that does need this shape writes `React.ComponentProps<typeof Card>`.
  *
  * The optional members spell `| undefined` out because this workspace compiles with
  * `exactOptionalPropertyTypes`, under which `className?: string` means "absent or a string" and

@@ -143,13 +143,13 @@
  *   work was done. The commit draft leads that batch, so the parent's sequence
  *   number precedes its children's.
  * - A commit is bounded twice: at {@link MAX_RENDERS_PER_COMMIT} render events
- *   and at {@link MAX_FIBER_VISITS_PER_COMMIT} fibers visited. The demo's
- *   seeded defect 2 re-renders 48 catalogue cards on a 250 ms ticker
- *   (AAP 0.8.2); one pathological commit must not consume the transport's
- *   whole 5 000-event buffer, and — this is what the second bound buys — must
- *   not consume an unbounded slice of the commit phase either. The commit
- *   event says it was cut, and `renderedFiberCount` says how much of it was
- *   counted.
+ *   and at {@link MAX_FIBER_VISITS_PER_COMMIT} fibers visited. A context
+ *   provider that updates several times a second re-renders every one of its
+ *   dozens of consumers on each tick; one pathological commit must not
+ *   consume the transport's whole 5 000-event buffer, and — this is what the
+ *   second bound buys — must not consume an unbounded slice of the commit
+ *   phase either. The commit event says it was cut, and `renderedFiberCount`
+ *   says how much of it was counted.
  * - Nothing here sorts, clones, stringifies or retains application values.
  *
  * ## Nothing here throws, ever
@@ -246,7 +246,7 @@ import type {
  *
  * Chosen against the two numbers it sits between. The transport buffers 5 000
  * events for a whole capture (`MAX_BUFFERED_EVENTS` in `./transport.ts`), and
- * the demo's excessive-render defect re-renders 48 cards several times a
+ * an excessive-render pattern re-renders dozens of list items several times a
  * second; 500 is an order of magnitude above any commit worth reading fiber by
  * fiber, and a tenth of the buffer, so one runaway commit cannot evict the
  * interaction, request and query evidence the same capture needs.
@@ -359,7 +359,7 @@ const MAX_ROOT_NAME_LENGTH = 120;
  * The longest React `key` that may travel, in UTF-16 code units.
  *
  * A key is application-authored and frequently an identifier — which is
- * exactly why it is useful for telling the forty-eighth card from the first —
+ * exactly why it is useful for telling the last row of a list from the first —
  * so it is bounded like every other borrowed string. It is a list identity,
  * not a value: `./fiber-diff.ts` remains the only module that summarises
  * application data.
@@ -458,7 +458,7 @@ const KEY_ROOT_NAME: CommitAttributeKey = 'rootName';
  * **Addition**, spelled `fiberId` — the same spelling `./state.ts` emits, so
  * the two producers describe one instance the same way. Two components with
  * the same display name are one row when grouped by `component`; this is what
- * distinguishes the forty-eighth card from the first.
+ * distinguishes the last row of a list from the first.
  */
 const KEY_FIBER_ID = 'fiberId';
 

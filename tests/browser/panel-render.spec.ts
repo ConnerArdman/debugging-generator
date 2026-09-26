@@ -1,6 +1,6 @@
 /**
  * `panel-render` — the built extension's panel document renders a stored
- * `PanelSpec` that holds **every** catalogued node type (AAP 0.8.3).
+ * `PanelSpec` that holds **every** catalogued node type.
  *
  * ## What this spec proves, and what it leaves to others
  *
@@ -24,37 +24,34 @@
  * Nodes are addressed by their document path and their title, and data checks
  * are keyed by the protocol's closed `DataResult` vocabulary.
  *
- * ## How the panel receives the spec (delivery rung 3)
+ * ## How the panel receives the spec
  *
- * The deterministic pipeline never composes all sixteen node types in one
- * panel, so the fixture spec must be injected. The highest-fidelity way to do
- * that which actually exists was chosen:
+ * The spec is injected, because no product path can deliver it: the
+ * deterministic pipeline never composes every catalogued node type in one
+ * panel, and the service serves only panels its own pipeline generated.
  *
- * 1. *A real hydration path* — unavailable. The panel keeps no
- *    `chrome.storage` cache of panels: the worker answers `session.snapshot`
- *    by asking the service for the bound session's record and current panel,
- *    and the service holds only panels its own pipeline generated.
- * 2. *The worker's relay* — unavailable. The worker exposes no global entry
- *    point, and its port hub is closure state inside `createPortHub`; a second
- *    `runtime.onConnect` listener would race the real hub for the same port.
- * 3. *A test-owned `chrome.runtime` channel* — used. An init script replaces
- *    `chrome.runtime.connect` for the `PORT_PANEL` port only, before the panel
- *    bundle boots. Every frame the panel posts reaches {@link FakePanelWorker}
- *    here, which checks it with the extension's own `isPortRequest`, answers
- *    with frames typed by the extension's `PortRpcContract`, serves every
- *    `panelData.query` from `resolvePanelDataFixture` (whose results are
- *    validated against the protocol's `DataResult` schema), and pushes
- *    `panel.generated` as a `PortProtocolPush` built by the protocol's
- *    `createEnvelope` and checked by `isPortPush` and `parseMessage`. A change
- *    to that contract therefore breaks this spec instead of passing silently.
- *    A push the panel's port admission refuses — one carrying a specification
- *    that bypassed validation — is never applied: the panel keeps what it
- *    shows and announces the refusal, which the invalid-specification test
- *    asserts in the shipped bundle.
+ * The channel is a test-owned `chrome.runtime` port. An init script replaces
+ * `chrome.runtime.connect` for the `PORT_PANEL` port only, before the panel
+ * bundle boots; any other port still reaches the real worker. Every frame the
+ * panel posts reaches {@link FakePanelWorker} here, which checks it with the
+ * extension's own `isPortRequest`, answers with frames typed by the
+ * extension's `PortRpcContract`, serves every `panelData.query` from
+ * `resolvePanelDataFixture` (whose results are validated against the
+ * protocol's `DataResult` schema), and pushes `panel.generated` as a
+ * `PortProtocolPush` built by the protocol's `createEnvelope` and checked by
+ * `isPortPush` and `parseMessage`. A change to that contract therefore breaks
+ * this spec instead of passing silently. A push the panel's port admission
+ * refuses — one carrying a specification that bypassed validation — is never
+ * applied: the panel keeps what it shows and announces the refusal, which the
+ * invalid-specification test asserts in the shipped bundle.
  *
  * Only the transport is substituted: the React panel app, `PanelView`,
  * `PanelHost`, the component registry and every visualization component run
- * exactly as shipped, and no markup is injected.
+ * exactly as shipped, and no markup is injected. The assertions therefore
+ * prove what the shipped panel does with a spec delivered over its own port
+ * contract; the worker's relay and the service are not on this path, and
+ * `source-navigation.spec.ts` exercises them with a panel the real pipeline
+ * generated.
  *
  * ## Why the shared `openPanelPage` fixture is not used
  *
@@ -81,8 +78,10 @@
  * ## Privacy and vocabulary
  *
  * Every value rendered comes from `panel-spec.fixture.ts`, which models
- * already-redacted telemetry of `tests/fixtures/sample-next-app` (AAP 0.5.2,
- * 0.5.4): parameterized SQL, no header values, no bodies, no credentials.
+ * already-redacted telemetry of `tests/fixtures/sample-next-app`, in that
+ * app's own vocabulary and nothing of any other application: parameterized
+ * SQL, no header values, no bodies, no credentials (the product's redaction
+ * rules are in docs/SECURITY.md, section 3 "Redaction").
  */
 
 import { isDeepStrictEqual } from 'node:util';
@@ -192,10 +191,10 @@ const LOAD_FAILURE_TITLE = 'Could not load this view';
 /** `App.tsx`: the title of the notice a failed panel → worker request raises. */
 const REQUEST_FAILURE_TITLE = 'A Debug Generator request did not complete';
 
-/** `PanelHost.tsx`: the fallback banner's sentence (AAP 0.5.5), matched on its key phrase. */
+/** `PanelHost.tsx`: the banner over a `meta.fallback` panel, matched on its key phrase. */
 const FALLBACK_BANNER_PATTERN = /fallback view/i;
 
-/** `SummaryHeader.tsx`: the two separately headed halves of the summary (AAP 0.8.4). */
+/** `SummaryHeader.tsx`: the summary's two separately headed halves, facts apart from causes. */
 const OBSERVED_HEADING = 'Observed';
 const LIKELY_CAUSE_HEADING = 'Likely cause';
 
@@ -207,8 +206,8 @@ const LIKELY_CAUSE_HEADING = 'Likely cause';
 const UNKNOWN_NODE_TYPE = 'uncataloguedView';
 
 /**
- * The panel's mapping of `chrome.devtools.panels.themeName` onto the token
- * themes of AAP 0.6.3 (`src/panel/theme.ts` `panelThemeFromDevToolsThemeName`).
+ * The panel's mapping of `chrome.devtools.panels.themeName` onto the
+ * renderer's token themes (`src/panel/theme.ts` `panelThemeFromDevToolsThemeName`).
  * Dark mode is the product default, so DevTools' `'default'` selects `dark`
  * even though Chrome documents it as its light theme; `'light'` is the one
  * name that selects the light token set.
@@ -1102,7 +1101,9 @@ async function cellInColumn(grid: Locator, row: Locator, header: string): Promis
 /**
  * A node whose source resolved to nothing must say so in its own words: an
  * `EmptyState` (`role="status"`) whose message names what is missing — the
- * node's catalog label — and no data view (AAP 0.6.2).
+ * node's catalog label — and no data view (docs/ARCHITECTURE.md, section 10.4
+ * "The renderer contract": a missing signal renders a node-specific empty
+ * state, never a blank area).
  */
 async function expectEmptyState(frame: Locator, entry: QueriedNode): Promise<void> {
   const label = PANEL_NODE_CATALOG[entry.node.type].label;
@@ -1214,7 +1215,7 @@ async function expectResultDrawn(
         result.queries.length,
       );
       for (const group of result.queries) {
-        // Parameterized text only (AAP 0.5.2): the statement carries placeholders.
+        // Parameterized text only, never inline literals: the statement carries placeholders.
         expect(group.statement).toMatch(/\$\d+/);
         await expect(grid).toContainText(group.statement);
       }

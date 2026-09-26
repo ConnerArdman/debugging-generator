@@ -2550,6 +2550,172 @@ describe('aggregateCleanupStatus', () => {
 // Serialisation and idempotence
 // ---------------------------------------------------------------------------
 
+/**
+ * One `failed` session holding one retained conflict and a `generated` one
+ * whose record restores cleanly — the store the silent-restart case seeds.
+ */
+async function seedRetainedConflict(h: Harness): Promise<Seeded> {
+  addSession(h, SESSION.failed, 'failed');
+  addSession(h, SESSION.generated, 'generated');
+  await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+
+  return seedRecord(h, {
+    sessionId: SESSION.failed,
+    file: FILE.needle,
+    fileState: 'edited',
+    verdict: 'conflict',
+  });
+}
+
+/** The report the scripted engine returns for a seeded conflict on its next pass. */
+function engineReport(h: Harness, seeded: Seeded): ModificationConflict {
+  const report = h.conflicts.get(seeded.record.id);
+
+  if (report === undefined) {
+    throw new Error(`No conflict fixture was seeded for ${seeded.record.id}.`);
+  }
+
+  return report;
+}
+
+/**
+ * `previous` with `changes` applied and the `dropped` members removed, through
+ * the real `parseModificationConflict`, so every revision is a report the
+ * schema accepts.
+ */
+function revisedConflict(
+  previous: ModificationConflict,
+  changes: Partial<ModificationConflict>,
+  dropped: readonly (keyof ModificationConflict)[] = [],
+): ModificationConflict {
+  const omitted = new Set<string>(dropped);
+  const next = Object.fromEntries(
+    Object.entries({ ...previous, ...changes }).filter(([key]) => !omitted.has(key)),
+  );
+
+  return unwrap(parseModificationConflict(next));
+}
+
+/**
+ * The same report with its own keys — and those of `diffs` — written in the
+ * reverse of the schema's order, as a builder other than the schema's may
+ * spell it.
+ */
+function withKeysReversed(conflict: ModificationConflict): ModificationConflict {
+  const {
+    recordId,
+    sessionId,
+    file,
+    reason,
+    expectedHash,
+    actualHash,
+    backupPath,
+    detectedAt,
+    message,
+    diffs,
+  } = conflict;
+  const reversedDiffs =
+    diffs === undefined
+      ? undefined
+      : {
+          ...(diffs.originalToCurrent === undefined
+            ? {}
+            : { originalToCurrent: diffs.originalToCurrent }),
+          ...(diffs.instrumentedToCurrent === undefined
+            ? {}
+            : { instrumentedToCurrent: diffs.instrumentedToCurrent }),
+          ...(diffs.originalToInstrumented === undefined
+            ? {}
+            : { originalToInstrumented: diffs.originalToInstrumented }),
+        };
+
+  return {
+    ...(reversedDiffs === undefined ? {} : { diffs: reversedDiffs }),
+    message,
+    detectedAt,
+    backupPath,
+    ...(actualHash === undefined ? {} : { actualHash }),
+    expectedHash,
+    reason,
+    file,
+    sessionId,
+    recordId,
+  };
+}
+
+/**
+ * How the engine's report about one retained conflict changes between two
+ * starts. Each revision first changes the fixture the way the developer or the
+ * disk would — so the module's end-state verification finds what the report
+ * says — and keeps `recordId` and `detectedAt`, so only the stated field can be
+ * what makes the stored verdict stale.
+ */
+interface ConflictRevision {
+  readonly label: string;
+  readonly revise: (seeded: Seeded, previous: ModificationConflict) => ModificationConflict;
+}
+
+const CONFLICT_REVISIONS: readonly ConflictRevision[] = [
+  {
+    label: 'a backup-missing reason',
+    revise: (seeded, previous) => {
+      // The only branch in which the engine says `backup-missing`: the file
+      // holds the instrumented bytes again and the original is gone.
+      writeFileSync(seeded.path, seeded.instrumentedBytes);
+      rmSync(seeded.record.backupPath);
+
+      return revisedConflict(
+        previous,
+        {
+          reason: 'backup-missing',
+          actualHash: seeded.record.instrumentedHash,
+          message: `${seeded.record.file} holds the instrumented content, but its original is no longer at ${seeded.record.backupPath}.`,
+        },
+        ['diffs'],
+      );
+    },
+  },
+  {
+    label: 'a backup-corrupt reason',
+    revise: (seeded, previous) => {
+      // The instrumented bytes are back and the backup no longer hashes to
+      // the digest it is filed under.
+      writeFileSync(seeded.path, seeded.instrumentedBytes);
+      writeFileSync(seeded.record.backupPath, `${CONTENT_MARKER} not the original\n`);
+
+      return revisedConflict(
+        previous,
+        {
+          reason: 'backup-corrupt',
+          actualHash: seeded.record.instrumentedHash,
+          message: `${seeded.record.file} holds the instrumented content, but the backup at ${seeded.record.backupPath} is not its original.`,
+        },
+        ['diffs'],
+      );
+    },
+  },
+  {
+    label: 'a second developer edit',
+    revise: (seeded, previous) => {
+      const secondEdit = `${seeded.editedBytes}// ${CONTENT_MARKER} edited again\n`;
+      writeFileSync(seeded.path, secondEdit);
+
+      return revisedConflict(previous, {
+        actualHash: sha256Hex(secondEdit),
+        diffs: { instrumentedToCurrent: `@@ -1 +1,2 @@ ${DIFF_MARKER} edited again` },
+      });
+    },
+  },
+  {
+    label: 'a changed message',
+    revise: (seeded, previous) => {
+      return revisedConflict(previous, {
+        message: `${seeded.record.file} still differs from the instrumented content; its original stays at ${seeded.record.backupPath}.`,
+      });
+    },
+  },
+];
+
 describe('serialisation and idempotence', () => {
   it('serialises two concurrent ends of one session into a single restore pass', async () => {
     const h = createHarness();
@@ -2642,6 +2808,169 @@ describe('serialisation and idempotence', () => {
     expect(h.sink.delivered).toHaveLength(2);
     expect(h.sessions.updates).toEqual([]);
     expect(first.bySession[SESSION.failed]).toEqual(second.bySession[SESSION.failed]);
+  });
+
+  it.each(CONFLICT_REVISIONS)(
+    'delivers $label for the same record on the next start, and the session carries it',
+    async ({ revise }) => {
+      const h = createHarness();
+      const conflicted = await seedRetainedConflict(h);
+      const deps = startupDeps(h, { outcomeSink: h.sink });
+
+      unwrap(await reconcileModificationsOnStartup(deps));
+      expect(h.sink.delivered).toHaveLength(2);
+
+      const previous = engineReport(h, conflicted);
+      const revised = revise(conflicted, previous);
+
+      // Preconditions: the same record, the same pass clock, a different report.
+      expect(revised.recordId).toBe(conflicted.record.id);
+      expect(revised.detectedAt).toBe(previous.detectedAt);
+      expect(revised).not.toEqual(previous);
+      h.conflicts.set(conflicted.record.id, revised);
+
+      const second = unwrap(await reconcileModificationsOnStartup(deps));
+
+      expect(second.bySession[SESSION.failed]?.status).toBe('conflict');
+      expect(h.sink.delivered).toHaveLength(3);
+      expect(h.sink.delivered[2]).toEqual({
+        sessionId: SESSION.failed,
+        outcome: { status: 'conflict', conflicts: [revised], completedAt: FIXED_NOW },
+      });
+      expect(h.sessions.rows.get(SESSION.failed)?.cleanup).toEqual({
+        status: 'conflict',
+        completedAt: FIXED_NOW,
+        conflicts: [revised],
+      });
+      // The manager persisted it; this module wrote nothing through `update`.
+      expect(h.sessions.updates).toEqual([]);
+    },
+  );
+
+  it.each(CONFLICT_REVISIONS)(
+    'without a sink, writes $label into the cleanup sub-object once and never the status',
+    async ({ revise }) => {
+      const h = createHarness();
+      const conflicted = await seedRetainedConflict(h);
+      const original = h.sessions.rows.get(SESSION.failed);
+
+      unwrap(await reconcileModificationsOnStartup(startupDeps(h)));
+      const firstPass = h.sessions.updates.length;
+      const revised = revise(conflicted, engineReport(h, conflicted));
+      h.conflicts.set(conflicted.record.id, revised);
+
+      unwrap(await reconcileModificationsOnStartup(startupDeps(h)));
+
+      const written = h.sessions.updates.slice(firstPass);
+      expect(written.map((record) => record.id)).toEqual([SESSION.failed]);
+      expect(written[0]?.status).toBe(original?.status);
+      expect(withoutCleanup(written[0])).toEqual(withoutCleanup(original));
+      expect(written[0]?.cleanup).toEqual({
+        status: 'conflict',
+        completedAt: FIXED_NOW,
+        conflicts: [revised],
+      });
+    },
+  );
+
+  it.each([
+    ['through the sink', true],
+    ['without a sink', false],
+  ] as const)(
+    'stays silent %s when a retained conflict is re-reported with nothing new but a later detectedAt',
+    async (_label, withSink) => {
+      const h = createHarness();
+      const conflicted = await seedRetainedConflict(h);
+      const deps = startupDeps(h, withSink ? { outcomeSink: h.sink } : {});
+
+      unwrap(await reconcileModificationsOnStartup(deps));
+      const delivered = h.sink.delivered.length;
+      const updated = h.sessions.updates.length;
+      const stored = h.sessions.rows.get(SESSION.failed);
+      const previous = engineReport(h, conflicted);
+
+      // The real engine stamps every re-report with its pass clock.
+      h.conflicts.set(
+        conflicted.record.id,
+        revisedConflict(previous, { detectedAt: previous.detectedAt + 60_000 }),
+      );
+
+      const second = unwrap(await reconcileModificationsOnStartup(deps));
+
+      expect(second.bySession[SESSION.failed]?.status).toBe('conflict');
+      expect(h.sink.delivered).toHaveLength(delivered);
+      expect(h.sessions.updates).toHaveLength(updated);
+      // The stored report keeps the stamp of the conflict's first detection.
+      expect(h.sessions.rows.get(SESSION.failed)).toEqual(stored);
+      expect(stored?.cleanup.conflicts).toEqual([previous]);
+    },
+  );
+
+  it('stays silent when the stored report spells the same conflict in another key order', async () => {
+    const h = createHarness();
+    const conflicted = await seedRetainedConflict(h);
+    const deps = startupDeps(h, { outcomeSink: h.sink });
+    h.conflicts.set(
+      conflicted.record.id,
+      revisedConflict(engineReport(h, conflicted), {
+        diffs: {
+          originalToInstrumented: `@@ -1 +1 @@ ${DIFF_MARKER} instrumented`,
+          instrumentedToCurrent: `@@ -1 +1 @@ ${DIFF_MARKER} edited`,
+        },
+      }),
+    );
+
+    unwrap(await reconcileModificationsOnStartup(deps));
+    expect(h.sink.delivered).toHaveLength(2);
+
+    const row = h.sessions.rows.get(SESSION.failed);
+    const stored = row?.cleanup.conflicts[0];
+
+    if (row === undefined || stored === undefined) {
+      throw new Error('The first start recorded no conflict on the session.');
+    }
+
+    const reordered = withKeysReversed(stored);
+
+    // Precondition: every key, nested ones included, in another order; the same content.
+    expect(Object.keys(reordered)).toEqual(Object.keys(stored).reverse());
+    expect(Object.keys(reordered.diffs ?? {})).toEqual(Object.keys(stored.diffs ?? {}).reverse());
+    expect(reordered).toEqual(stored);
+    h.sessions.rows.set(SESSION.failed, {
+      ...row,
+      cleanup: { ...row.cleanup, conflicts: [reordered] },
+    });
+
+    unwrap(await reconcileModificationsOnStartup(deps));
+
+    expect(h.sink.delivered).toHaveLength(2);
+    expect(h.sessions.updates).toEqual([]);
+  });
+
+  it('stays silent when a report read back through JSON meets one that spells an absent member as undefined', async () => {
+    const h = createHarness();
+    const conflicted = await seedRetainedConflict(h);
+    const deps = startupDeps(h, { outcomeSink: h.sink });
+    const withoutDiffs = revisedConflict(engineReport(h, conflicted), {}, ['diffs']);
+    h.conflicts.set(conflicted.record.id, withoutDiffs);
+
+    unwrap(await reconcileModificationsOnStartup(deps));
+    expect(h.sink.delivered).toHaveLength(2);
+
+    // The store keeps the record as JSON, which has no `undefined`.
+    const row = h.sessions.rows.get(SESSION.failed);
+    const roundTripped = unwrap(parseSessionRecord(JSON.parse(JSON.stringify(row))));
+    h.sessions.rows.set(SESSION.failed, roundTripped);
+    expect('diffs' in (roundTripped.cleanup.conflicts[0] ?? {})).toBe(false);
+
+    const spelled: ModificationConflict = { ...withoutDiffs, diffs: undefined };
+    expect('diffs' in spelled).toBe(true);
+    h.conflicts.set(conflicted.record.id, spelled);
+
+    unwrap(await reconcileModificationsOnStartup(deps));
+
+    expect(h.sink.delivered).toHaveLength(2);
+    expect(h.sessions.updates).toEqual([]);
   });
 });
 

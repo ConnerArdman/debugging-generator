@@ -165,8 +165,8 @@ const MAX_ORIGIN_LENGTH = 512;
  * Exported because this is also the schema of the **acting tab**: the inspected
  * tab a DevTools frame or request acts for. The Chrome service worker carries
  * every inspected tab over one paired credential and one WebSocket, so the
- * service can hold a DevTools principal to "only the session bound to that tab"
- * (AAP §0.5.6) only when each frame and request says which tab it is for:
+ * service can confine a DevTools principal to the session bound to that tab
+ * only when each frame and request says which tab it is for:
  *
  * - `../envelope.ts` declares the envelope's optional `tabId` with it, and
  *   `createEnvelope` validates its `tabId` option against it;

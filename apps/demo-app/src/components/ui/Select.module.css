@@ -132,11 +132,10 @@
  *
  * The height floor is the one metric of this variant that is NOT simply a step down: it is the
  * shared `--ls-control-sm`, and `Input.module.css` declares the same floor on its own `sm` rule -
- * the matching requirement at the head of this file applies to it like every other metric. Sized
- * from padding alone this control and the field beside it both came out at 29.5px in the
- * dashboard's filter row, next to a 23px `sm` Button. `min-block-size` raises the box without
- * touching the padding pair, so the caret's reserved lane and its background positions below are
- * unaffected. */
+ * the matching requirement at the head of this file applies to it like every other metric, and the
+ * shared floor is what lines this control up with a `sm` field and a `sm` Button in one toolbar
+ * row. `min-block-size` raises the box without touching the padding pair, so the caret's reserved
+ * lane and its background positions below are unaffected. */
 .root[data-size='sm'] {
   min-block-size: var(--ls-control-sm, 32px);
   padding-block: var(--ls-space-1, 4px);
@@ -192,13 +191,10 @@
 /* Disabled, last of the state rules so it wins over the error and hover states: an unavailable
  * control should read as unavailable first. The caret dims with the rest of the control.
  *
- * The opacity is declared rather than left to the user agent. Chrome fades a disabled `<select>`
- * to about 0.70 of its own accord, which is neither the 0.55 Button and Pill use nor the 1.0 this
- * folder's Input used to pin, so the four primitives disagreed on what "unavailable" looks like
- * while none of them had actually chosen 0.70. Reading `--ls-disabled-opacity` replaces the
- * engine's number with the system's one and makes the set agree; an inactive control is exempt from
- * the 4.5:1 text minimum (WCAG 1.4.3), and the recessed fill, the dimmed caret and the
- * `not-allowed` cursor carry the state alongside the dimming. */
+ * The opacity is declared from `--ls-disabled-opacity` rather than left to the engine's own
+ * default fade for a disabled `<select>`, so this control dims by exactly the amount Button, Pill
+ * and Input dim by. An inactive control is exempt from the 4.5:1 text minimum (WCAG 1.4.3), and
+ * the recessed fill, the dimmed caret and the `not-allowed` cursor carry the state as well. */
 .root:disabled {
   --select-caret-color: var(--ls-mist, #cbd5e1);
 

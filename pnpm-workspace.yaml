@@ -22,7 +22,7 @@ enablePrePostScripts: true
 
 # NODE_OPTIONS for every script pnpm runs, which is where the one measured memory
 # requirement lives so that no script has to carry a runtime flag or a path into
-# node_modules. `pnpm lint` is exactly `eslint . --max-warnings 0` (AAP 0.8.5), and
+# node_modules. `pnpm lint` is exactly `eslint . --max-warnings 0`, and
 # its type-aware pass holds every project's TypeScript program in one process: on
 # the full tree it aborts with "JavaScript heap out of memory" under Node 24's
 # default ~4 GiB heap and completes with this 8 GiB ceiling. A ceiling is not an
@@ -106,13 +106,14 @@ allowBuilds:
 # which runs as the blocking "Audit dependencies" step of the `verify` job in
 # .github/workflows/ci.yml, directly after `pnpm install --frozen-lockfile`. Any
 # advisory at or above `low` fails that job until it is reconciled here. It is
-# deliberately NOT a root script and not part of the `verify` script: AAP 0.7.1
-# Group 0 fixes the root script list and AAP 0.8.5 defines `verify` exactly once,
-# and `verify` must stay runnable offline, which an audit call is not - so run the
-# same command locally before pushing a dependency change. A reviewed advisory -
-# one accepted rather than eliminated - is recorded here beside the overrides as a
-# comment carrying its GHSA id, the reason it is accepted and the date, so the
-# exception is reviewable in the pull request that adds it; there is none today.
+# deliberately NOT a root script and not part of the `verify` script: the root
+# script list and the `verify` chain are fixed (README.md, "Testing and quality
+# gates"), and `verify` must stay runnable offline, which an audit call is not -
+# so run the same command locally before pushing a dependency change. A reviewed
+# advisory - one accepted rather than eliminated - is recorded here beside the
+# overrides as a comment carrying its GHSA id, the reason it is accepted and the
+# date, so the exception is reviewable in the pull request that adds it; there is
+# none today.
 overrides:
   # GHSA-ggr8-5vv4-36mx (high): stack exhaustion when merging recursive object
   # graphs, patched in 8.0.0. Arrives as prisma -> @prisma/config -> deepmerge-ts,

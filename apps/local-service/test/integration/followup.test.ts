@@ -58,6 +58,17 @@
  *   held, so the route can only answer by recognising the attempt's identity.
  *   Asking the answered attempt again is refused before any stage runs, and a
  *   question sent under a new id is appended as its own follow-up.
+ * - **The `followups` log and the session record are one history.** After the
+ *   paths above, every session's `followups` rows equal its record's ladder,
+ *   outcome links included. A trigger that aborts only the record write
+ *   growing the ladder makes an ask fail with nothing stored: the `followups`
+ *   row inserted in the same transaction is rolled back with it, before any
+ *   decision call.
+ * - **A follow-up is answered on the panel it was decided against, or not at
+ *   all.** A third session's existing-evidence follow-up has its decision held
+ *   while another writer stores the next panel version through the service's
+ *   own store; released, the follow-up regenerates nothing, stores and pushes no
+ *   panel, stays unanswered and files the session `failed` as `supersedes-stale`.
  *
  * ## Rules ruling
  *
@@ -115,6 +126,7 @@ import type { PanelSpec } from '@debuggen/panel-schema';
 import {
   CLEANUP_STATUSES,
   FOLLOW_UP_ATTEMPT_ID_PREFIX,
+  FOLLOW_UP_OUTCOME_KEYS,
   PROGRESS_STAGES,
   PROGRESS_STATUSES,
   SESSION_STATUSES,
@@ -127,7 +139,17 @@ import type {
   SessionRecord,
   SessionStatus,
 } from '@debuggen/protocol';
-import { DebuggenError, isErr, newActionId, newId } from '@debuggen/shared';
+import {
+  DebuggenError,
+  isErr,
+  newActionId,
+  newEventId,
+  newId,
+  newPanelId,
+  newProducerId,
+  newSpanId,
+  newTraceId,
+} from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 import { SECURE_FILE_MODE, sha256Hex, sha256OfFile } from '@debuggen/shared/node';
 import { TELEMETRY_TIERS } from '@debuggen/telemetry';
@@ -284,26 +306,29 @@ type IngressEvent = ReturnType<typeof readTelemetryBatch>[number];
  * capture after the first gets its own id block, following the fixture README's
  * id registry: the event-id tag becomes `f<block>`, the trace id's first hex
  * digit and the span ids' twelfth position become `<block>`, and the producer
- * ordinals move past the registry's last taken value. Only identities change —
- * kinds, timings, attributes and the parent/child shape (the deliberate orphan
- * included) are carried over verbatim.
+ * ordinals move past the registry's last taken value, zero-padded to the
+ * registry's two final digits so every producer id keeps its 16 characters
+ * after the prefix. Only identities change — kinds, timings, attributes and the
+ * parent/child shape (the deliberate orphan included) are carried over
+ * verbatim.
  *
  * @param events The parsed committed batch.
- * @param block A digit 1–3, unique per capture within this file.
+ * @param block A digit 1–4, unique per capture within this file.
  */
 function reidentifyBatch(events: readonly IngressEvent[], block: number): IngressEvent[] {
-  if (!Number.isInteger(block) || block < 1 || block > 3) {
-    throw new RangeError('A re-identified batch needs a block from 1 to 3.');
+  if (!Number.isInteger(block) || block < 1 || block > 4) {
+    throw new RangeError('A re-identified batch needs a block from 1 to 4.');
   }
   const digit = String(block);
   const span = (id: string): string => `${id.slice(0, 12)}${digit}${id.slice(13)}`;
+  const ordinal = String(6 + block).padStart(2, '0');
   return events.map((event) => ({
     ...event,
     id: event.id.replace(/^evt_[a-z]{2}/u, `evt_f${digit}`),
     traceId: `${digit}${event.traceId.slice(1)}`,
     spanId: span(event.spanId),
     ...(event.parentSpanId === undefined ? {} : { parentSpanId: span(event.parentSpanId) }),
-    producerId: `${event.producerId.slice(0, -1)}${String(6 + block)}`,
+    producerId: `${event.producerId.slice(0, -2)}${ordinal}`,
   }));
 }
 
@@ -376,12 +401,14 @@ function inProject(project: FixtureProjectCopy, file: string): string {
  * whose session record cannot account for its plan row, and the chain) and
  * five in the conflict session (the first delta, an attempt whose decision
  * fails, that attempt's retry, a new question under a new attempt id, and the
- * conflict). The refused re-ask of an answered attempt reaches no model call,
- * so it has no step. Exactly this many script steps exist, and the last test
- * asserts every one was served — a repair turn or an unexpected extra decision
- * would shift the queue and fail loudly.
+ * conflict), and one in the predecessor session (the existing-evidence
+ * follow-up whose panel moved while its decision was held). The refused re-ask
+ * of an answered attempt reaches no model call, so it has no step. Exactly this
+ * many script steps exist, and the last test asserts every one was served — a
+ * repair turn or an unexpected extra decision would shift the queue and fail
+ * loudly.
  */
-const FOLLOW_UP_COUNT = 11;
+const FOLLOW_UP_COUNT = 12;
 
 /**
  * What one follow-up's decision call answers: a decision handed to the stage's
@@ -2278,6 +2305,299 @@ describe('an edit made between two installs of one file', () => {
     expect(stored.status).toBe(STATUS.ended);
     expect(stored.cleanup.status).toBe(CLEANUP.conflict);
     expect(stored.cleanup.conflicts.map((conflict) => conflict.file)).toContain(CORPUS.serviceFile);
+  });
+});
+
+describe('a follow-up whose panel predecessor moved', () => {
+  /** The inspected tab of this block's session, distinct from every other block's tab. */
+  const PREDECESSOR_TAB = 43;
+
+  /** The progress stage the stale-predecessor refusal is filed under. */
+  const GENERATE_PANEL_STAGE = memberOf(PROGRESS_STAGES, 'generate-panel');
+
+  /** The follow-up stage's record of a failed run: its fields carry the stage, code and reason. */
+  const FOLLOW_UP_FAILED_LOG = 'Follow-up stage failed.';
+
+  /** A third session, on its own copy of the corpus, whose panel another writer supersedes. */
+  let session: LiveSession;
+
+  /** The capture the session's panel was generated from. */
+  let captureId: string;
+
+  beforeAll(async () => {
+    const project = await harness.copyFixtureProject();
+    session = await openReadySession(
+      project,
+      PREDECESSOR_TAB,
+      'Why does the trail report wait so long before it shows the conditions?',
+    );
+    ({ captureId } = await captureAndGenerate(
+      session,
+      reidentifyBatch(readTelemetryBatch(CROSS_TIER_BATCH), 4),
+    ));
+  });
+
+  it('stores and pushes no panel, regenerates nothing and stays unanswered when another panel supersedes the one it was decided against', async () => {
+    const question = 'Which part of loading the trail report is the slowest?';
+    const before = storedSession(session.id);
+    expect(before.status).toBe(STATUS.generated);
+    const baseline = only(panelsOf(session.id), 'panel');
+    const analysesBefore = analysesOf(session.id);
+    const rowsBefore = followUpRowsOf(session.id);
+    const devtoolsMark = session.devtools.received.length;
+    const failedLogsBefore = harness.logger.withMessage(FOLLOW_UP_FAILED_LOG).length;
+
+    // The decision is held, so the follow-up has loaded and recorded what it is
+    // decided against — the baseline panel — before anything else may change.
+    let asked: AskedFollowUp;
+    let competing: PanelSpec;
+    const release = holdNextDecision();
+    try {
+      asked = await askFollowUp(session, question, {
+        needsNewCapture: false,
+        additionalActions: [],
+      });
+      const recorded = unwrap(asked.answered, 'session.question');
+      expect(last(recorded.followUps, 'follow-up').question).toBe(question);
+
+      // Meanwhile another writer stores the session's next panel version, superseding the baseline.
+      competing = unwrap(
+        harness.repos.panels.insertPanel(
+          {
+            ...baseline,
+            id: newPanelId(),
+            panelVersion: baseline.panelVersion + 1,
+            supersedes: baseline.id,
+          },
+          { captureId },
+        ),
+        'panels.insertPanel (the competing panel)',
+      );
+      unwrap(validatePanelSpec(competing), 'validatePanelSpec(competing panel)');
+    } finally {
+      release();
+    }
+    const { mark } = asked;
+
+    // Released, the follow-up is refused and the session filed as failed at the panel step.
+    const failed = await waitForStored(
+      session.id,
+      (record) => record.status === STATUS.failed,
+      'the follow-up is refused and the session is filed as failed',
+    );
+    await waitForPushedStatus(session, mark, STATUS.failed);
+    await waitFor(
+      session.devtools,
+      'session.updated',
+      (message, index) =>
+        index >= devtoolsMark &&
+        message.payload.session.id === session.id &&
+        message.payload.session.status === STATUS.failed,
+      HARNESS_TIMEOUTS.pipeline,
+    );
+    expect(statusWalk(session.editor, session.id, mark, STATUS.generated)).toEqual([
+      STATUS.generated,
+      STATUS.analyzing,
+      STATUS.failed,
+    ]);
+    await waitFor(
+      session.editor,
+      'session.progress',
+      (message, index) =>
+        index >= mark &&
+        message.payload.sessionId === session.id &&
+        message.payload.stage === GENERATE_PANEL_STAGE &&
+        message.payload.status === PROGRESS_FAILED,
+    );
+    const refusal = last(
+      harness.logger
+        .withMessage(FOLLOW_UP_FAILED_LOG)
+        .slice(failedLogsBefore)
+        .filter((record) => record.fields['sessionId'] === session.id),
+      'follow-up failure record',
+    );
+    expect(refusal.fields).toMatchObject({
+      stage: GENERATE_PANEL_STAGE,
+      code: 'SESSION_INVALID_STATE',
+      reason: 'supersedes-stale',
+    });
+
+    // The panel ladder holds exactly the baseline and the competing panel: nothing
+    // superseding the stale baseline was stored beside it.
+    expect(panelsOf(session.id)).toEqual([baseline, competing]);
+    // Refused before the analysis was regenerated: its ladder is unchanged.
+    expect(analysesOf(session.id)).toEqual(analysesBefore);
+    expect(failed.analyses).toEqual(before.analyses);
+    expect(failed.panelIds).toEqual(before.panelIds);
+
+    // No follow-up panel reached either user interface.
+    const panelPushes = [
+      ...session.editor.received.slice(mark),
+      ...session.devtools.received.slice(devtoolsMark),
+    ].filter(
+      (message) =>
+        isMessageOfType(message, 'panel.generated') && message.payload.sessionId === session.id,
+    );
+    expect(panelPushes).toEqual([]);
+
+    // The follow-up is recorded, and stays unanswered — in the record and in the store.
+    const followUp = last(failed.followUps, 'follow-up');
+    expect(failed.followUps).toHaveLength(before.followUps.length + 1);
+    expect(followUp.question).toBe(question);
+    expect(isFollowUpAnswered(followUp)).toBe(false);
+    const rows = followUpRowsOf(session.id);
+    expect(rows).toHaveLength(rowsBefore.length + 1);
+    expect(isFollowUpAnswered(last(rows, 'stored follow-up'))).toBe(false);
+  });
+
+  it('ends the failed session with every patch restored', async () => {
+    const ended = unwrap(await harness.endSession(session.id), 'session.end');
+    expect(ended.cleanup).toBe(CLEANUP.clean);
+    await assertTreeUnchanged(session.project.root, session.project.snapshot);
+    for (const record of await modificationsOf(session.id)) {
+      expect(record.status).toBe(MODIFICATION.reverted);
+    }
+    expect(storedSession(session.id).status).toBe(STATUS.ended);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The followups log and the session record: one durable history
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The inspected tab of the session whose ask the store refuses to mirror. */
+const DURABILITY_TAB = 44;
+
+/** The shape of every session id the service mints, checked before one is spelled into DDL. */
+const INJECTABLE_ID = /^[A-Za-z0-9_-]+$/u;
+
+/**
+ * The batch with every identity minted afresh — event, trace, span and
+ * producer ids, each mapped consistently so the parent/child shape (the
+ * deliberate orphan included) is carried over — for a capture of a session
+ * outside the fixture README's id blocks, which {@link reidentifyBatch} has
+ * already spent on the captures above.
+ */
+function freshlyIdentifiedBatch(events: readonly IngressEvent[]): IngressEvent[] {
+  const traces = new Map<string, string>();
+  const spans = new Map<string, string>();
+  const producers = new Map<string, string>();
+  const mapped = (ids: Map<string, string>, id: string, mint: () => string): string => {
+    const known = ids.get(id);
+    if (known !== undefined) {
+      return known;
+    }
+    const minted = mint();
+    ids.set(id, minted);
+    return minted;
+  };
+  return events.map((event) => ({
+    ...event,
+    id: newEventId(),
+    traceId: mapped(traces, event.traceId, newTraceId),
+    spanId: mapped(spans, event.spanId, newSpanId),
+    ...(event.parentSpanId === undefined
+      ? {}
+      : { parentSpanId: mapped(spans, event.parentSpanId, newSpanId) }),
+    producerId: mapped(producers, event.producerId, newProducerId),
+  }));
+}
+
+describe('the followups log and the session record hold one durable history', () => {
+  it('holds every session’s followups rows equal to its record’s ladder after the follow-up paths above', () => {
+    const listed = unwrap(harness.repos.sessions.list(), 'sessions.list');
+    const rows: FollowUpRecord[] = [];
+    for (const { id } of listed.items) {
+      const logged = followUpRowsOf(id);
+      expect(logged, `the followups rows of ${id}`).toEqual(storedSession(id).followUps);
+      rows.push(...logged);
+    }
+    // Both paths stamped their outcome links on the log as well as the ladder.
+    expect(rows.filter((row) => isFollowUpAnswered(row)).length).toBeGreaterThan(0);
+    for (const key of FOLLOW_UP_OUTCOME_KEYS) {
+      expect(
+        rows.some((row) => row[key] !== undefined),
+        `a followups row carrying ${key}`,
+      ).toBe(true);
+    }
+  });
+
+  it('rolls the followups row back when the session record cannot mirror an ask, before any decision call', async () => {
+    const project = await harness.copyFixtureProject();
+    const session = await openReadySession(
+      project,
+      DURABILITY_TAB,
+      'Which step of this page waits the longest before its first rows appear?',
+    );
+    const completedBefore = harness.logger.withMessage(OPERATION_COMPLETED_LOG).length;
+    await captureAndGenerate(session, freshlyIdentifiedBatch(readTelemetryBatch(CROSS_TIER_BATCH)));
+    // The operation that generated the panel has released the session, so the
+    // ask below meets the injected failure rather than a `pipeline-busy` refusal.
+    await waitUntil(
+      () =>
+        harness.logger
+          .withMessage(OPERATION_COMPLETED_LOG)
+          .slice(completedBefore)
+          .find(
+            (record) =>
+              record.fields['sessionId'] === session.id &&
+              record.fields['status'] === STATUS.generated,
+          ),
+      'the operation that generated the panel has released the session',
+      HARNESS_TIMEOUTS.pipeline,
+    );
+    const before = storedSession(session.id);
+    expect(before.status).toBe(STATUS.generated);
+    const rowsBefore = followUpRowsOf(session.id);
+    const decisionCalls = scripted.calls.filter((call) => call.stage === FOLLOW_UP_STAGE).length;
+
+    // The injected failure: a TEMP trigger on the service's own connection that
+    // aborts only the record write that grows the follow-up ladder — the
+    // mirror of the `followups` row the same unit inserted first. Every other
+    // write of the session, the move to `failed` included, goes through.
+    if (!INJECTABLE_ID.test(session.id)) {
+      throw new Error('The session id cannot be quoted into a trigger.');
+    }
+    const trigger = `followup_suite_refuse_mirror_${session.id.replaceAll('-', '_')}`;
+    harness.store.db.exec(
+      `CREATE TEMP TRIGGER ${trigger} BEFORE UPDATE ON sessions
+       WHEN OLD.id = '${session.id}'
+         AND json_array_length(NEW.record, '$.followUps') > json_array_length(OLD.record, '$.followUps')
+       BEGIN SELECT RAISE(ABORT, 'followup suite: injected follow-up mirror failure'); END;`,
+    );
+    try {
+      const asked = await sendFollowUp(
+        session,
+        'Which of those steps waits on the database?',
+        newId(FOLLOW_UP_ATTEMPT_ID_PREFIX),
+      );
+      if (!isErr(asked.answered)) {
+        throw new Error('An ask whose record write the store refused was answered as recorded.');
+      }
+      expect(asked.answered.error.code).toBe('STORE_ERROR');
+      const failed = await waitForStored(
+        session.id,
+        (record) => record.status === STATUS.failed,
+        'the follow-up that could not be recorded is filed as failed',
+      );
+
+      // Neither durable view holds the ask: the row was rolled back with the
+      // record write that could not mirror it.
+      expect(failed.followUps).toEqual(before.followUps);
+      expect(followUpRowsOf(session.id)).toEqual(rowsBefore);
+    } finally {
+      harness.store.db.exec(`DROP TRIGGER IF EXISTS temp.${trigger};`);
+    }
+
+    // The ask failed before the decision: no model call was made for it.
+    expect(scripted.calls.filter((call) => call.stage === FOLLOW_UP_STAGE)).toHaveLength(
+      decisionCalls,
+    );
+    expect(followUpRowsOf(session.id)).toEqual(storedSession(session.id).followUps);
+
+    const ended = unwrap(await harness.endSession(session.id), 'session.end');
+    expect(ended.cleanup).toBe(CLEANUP.clean);
+    await assertTreeUnchanged(project.root, project.snapshot);
   });
 });
 

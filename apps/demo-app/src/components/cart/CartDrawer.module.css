@@ -91,9 +91,7 @@
   /* `minmax(0, 1fr)` rather than the implicit `auto` column, for the same reason the global
    * `.ls-split` utility writes it: an `auto` track takes its base size from its widest item's
    * min-content width, so one long word in the head or a list row would widen all three rows past
-   * the sheet instead of being wrapped or truncated inside it. Measured before this was pinned: a
-   * long heading grew the rows to 953px inside a 416px sheet and carried the close control 522px
-   * outside the viewport. */
+   * the sheet instead of being wrapped or truncated inside it. */
   grid-template-rows: auto 1fr auto;
   grid-template-columns: minmax(0, 1fr);
   border-inline-start: 1px solid var(--ls-border, #cbd5e1);
@@ -132,9 +130,9 @@
  *
  * `min-width: 0` and the single-line truncation are what keep the row honest: a flex item's
  * automatic minimum size is its min-content width, so without them a long heading would push the
- * close control out past the sheet's inline edge - measured at 216px outside the panel and off
- * the viewport entirely - and grow this row at the scrolling row's expense. Truncation is visual
- * only; the heading keeps its full text, which is what `aria-labelledby` reads. */
+ * close control out past the sheet's inline edge and grow this row at the scrolling row's expense.
+ * Truncation is visual only; the heading keeps its full text, which is what `aria-labelledby`
+ * reads. */
 .title {
   min-width: 0;
   overflow: hidden;

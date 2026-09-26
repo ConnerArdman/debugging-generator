@@ -1,7 +1,7 @@
 /**
  * `Timeline` — the cross-tier correlated view of one interaction: every
  * captured span placed on a shared time axis, grouped into lanes by the tier
- * that produced it (AAP 0.6.2).
+ * that produced it.
  *
  * This module is the component behind the node catalog's `timeline` type, and
  * it is the node a "where did the time go" panel opens with. It has to be able
@@ -9,16 +9,16 @@
  * the state update, the request, the server span that answered it, the route
  * handler, the service functions nested inside it, the datastore call at the
  * bottom, the outgoing call beside it, the response and the render that
- * followed — as one ordered tree with a duration on every row (AAP 0.4.2).
+ * followed — as one ordered tree with a duration on every row.
  *
  * ## Data arrives through the node's query, and only through it
  *
  * The node carries a `DataQuery` whose source the catalog restricts to `trace`
  * or `spans`; this file resolves it with `../host/useQuery` and touches no
- * socket, no `fetch` and no service internals (AAP 0.4.2). The two payload
- * shapes are normalised into ONE render-local model ({@link TimelineBar}) and
- * the branch is taken on the QUERY'S OWN SOURCE — the discriminant the panel
- * was authored with — never by inspecting the data's shape:
+ * socket, no `fetch` and no service internals. The two payload shapes are
+ * normalised into ONE render-local model ({@link TimelineBar}) and the branch
+ * is taken on the QUERY'S OWN SOURCE — the discriminant the panel was authored
+ * with — never by inspecting the data's shape:
  *
  * - `trace` resolves to a correlated `TraceTree`, whose nesting is already
  *   decided. It is walked children-only, from the roots, by
@@ -34,7 +34,7 @@
  *   unique only within its trace and an unfiltered page can hold several —
  *   and the forest is flattened depth-first, so a parent is
  *   always drawn before its children and a subtree stays contiguous — the
- *   parent-before-child order AAP 0.2.3 fixes, which a child whose clock reads
+ *   canonical parent-before-child order, which a child whose clock reads
  *   earlier than its parent's cannot reorder. Siblings, and the roots, follow
  *   the canonical keys: `startTime`, then `producerId`, then the producer's
  *   own `seq`, then the store's `ingestSeq` as the final tie-break. Depth is
@@ -74,8 +74,7 @@
  * `../utils/color`; this file performs no interval arithmetic of its own and
  * writes no colour, length or spacing literal. A bar's kind colour travels to
  * the stylesheet as `--dgc-bar-color` and a lane's tier accent as
- * `--dgc-lane-color`, which are the only inline values written anywhere below
- * (AAP 0.6.4).
+ * `--dgc-lane-color`, which are the only inline values written anywhere below.
  *
  * ## An SVG alone is not a representation
  *
@@ -116,8 +115,9 @@
  * through `useViewSelection` and matched with `matchesPanelSelection` — by
  * event id, or by the same trace and span. Activating a bar or a row reports
  * the span through `onSelectEvent`, which is where the host records it, and
- * every view of the panel moves its mark together. Outside a host the view
- * falls back to its own last activation, exactly as it behaved on its own.
+ * every view of the panel moves its mark together. Outside a host — a surface
+ * that embeds this view alone, or a suite that mounts it — there is nothing to
+ * share a selection with, and the view marks its own last activation.
  *
  * ## Evidence is rendered as it arrives
  *
@@ -127,8 +127,7 @@
  *   bar, and its alternative candidates are named in the row's description: by
  *   the operation each recorded and its span id, where the candidate is a span
  *   of the same trace among the rows on screen, and by its span id alone
- *   otherwise. A guessed relationship must never read as a measured one
- *   (AAP 0.4.2).
+ *   otherwise. A guessed relationship must never read as a measured one.
  * - An async continuation attributed with a **single** candidate is inferred
  *   rather than measured, but not in doubt: its edge is solid, in the info
  *   tone, and the description names the mechanism. The dependency graph draws
@@ -152,9 +151,9 @@
  *   table below the canvas lists exactly the rows the window draws, a span
  *   selected elsewhere in the panel pages the window to it, and the window
  *   returns to the walk's first row when the node's query changes.
- * - URLs, statements and attribute values arrive redacted and truncated
- *   (AAP 0.5.2). They are rendered exactly as given: nothing here reconstructs
- *   a URL, expands a statement or dumps an attribute bag.
+ * - URLs, statements and attribute values arrive redacted and truncated. They
+ *   are rendered exactly as given: nothing here reconstructs a URL, expands a
+ *   statement or dumps an attribute bag.
  *
  * ## The styling contract this file declares for `../styles/components.css`
  *
@@ -296,11 +295,11 @@ import { SourceLink } from './SourceLink';
  * ---------------------------------------------------------------------------
  * The catalog entry, and the vocabulary taken from it
  *
- * The node catalog is the single registry of node types (AAP 0.6.2): which
- * sources this node may read and which telemetry fields it reads are declared
- * there and imported here, never restated. A source the catalog does not allow
- * is reported as a failure rather than drawn from, because a panel that asked
- * for an aggregate has asked for something this view cannot place on an axis.
+ * The node catalog is the single registry of node types: which sources this
+ * node may read and which telemetry fields it reads are declared there and
+ * imported here, never restated. A source the catalog does not allow is
+ * reported as a failure rather than drawn from, because a panel that asked for
+ * an aggregate has asked for something this view cannot place on an axis.
  * ---------------------------------------------------------------------------
  */
 
@@ -417,9 +416,9 @@ const BAR_LABEL_SEPARATOR = ' · ';
  * The render-local model
  *
  * THIS IS NOT A SCHEMA. The shapes that cross a process boundary are defined
- * exactly once, in `@debuggen/telemetry` (AAP 0.2.3), and this package imports
- * them as types only. What follows is the flat, already-positioned view of them
- * that this one component draws — one row per span, whichever payload it came
+ * exactly once, in `@debuggen/telemetry`, and this package imports them as
+ * types only. What follows is the flat, already-positioned view of them that
+ * this one component draws — one row per span, whichever payload it came
  * from — so that the two payload shapes are reconciled in ONE place instead of
  * in every branch of the render. Its field names deliberately echo the
  * telemetry timeline row (`depth`, `offsetMs`'s origin, `durationMs`), so a
@@ -569,8 +568,8 @@ type UnassignedBar = Omit<TimelineBar, 'laneIndex'>;
  * newer than this build. Each key is therefore read through a narrowing reader
  * below, and each key's NAME is written here as a string literal: the telemetry
  * package publishes those names as runtime constants, and this package depends
- * on it for types only (AAP 0.2.2), so importing the constant would add a
- * runtime edge the layering forbids. The names are the ones
+ * on it for types only, so importing the constant would add a runtime edge the
+ * layering forbids. The names are the ones
  * `packages/telemetry/src/schema/attributes.ts` declares.
  * ---------------------------------------------------------------------------
  */
@@ -800,10 +799,10 @@ function compareCodeUnits(left: string, right: string): number {
 }
 
 /**
- * The SIBLING order of a flat page: the canonical keys AAP 0.2.3 fixes, each
- * reached only when every earlier key ties — `startTime`, then `producerId`,
- * then the producer's own `seq`, then the store's `ingestSeq` — with the event
- * id as defence in depth.
+ * The SIBLING order of a flat page: the canonical keys (`docs/ARCHITECTURE.md`,
+ * "Ordering"), each reached only when every earlier key ties — `startTime`,
+ * then `producerId`, then the producer's own `seq`, then the store's
+ * `ingestSeq` — with the event id as defence in depth.
  *
  * It orders siblings, and the roots of the loaded forest, and nothing else.
  * Parent-before-child outranks every one of these keys and is established by
@@ -813,11 +812,11 @@ function compareCodeUnits(left: string, right: string): number {
  *
  * A local mirror of `@debuggen/telemetry`'s `compareEventsCanonical`, key for
  * key and comparison for comparison. It is mirrored rather than imported
- * because this package depends on telemetry for types only (AAP 0.2.2), and
- * importing the function would add a runtime edge the layering forbids. Like
- * that function it compares with `<`/`>` alone, so a non-finite number — which
- * the event schema rejects, but which a store an older build wrote could still
- * hand over — falls through to the next key instead of returning `NaN` into the
+ * because this package depends on telemetry for types only, and importing the
+ * function would add a runtime edge the layering forbids. Like that function
+ * it compares with `<`/`>` alone, so a non-finite number — which the event
+ * schema rejects, but which a store an older build wrote could still hand
+ * over — falls through to the next key instead of returning `NaN` into the
  * sort. `ingestSeq` is distinct for every stored row, which is what makes the
  * order total; the id only separates hand-built or replayed records that reuse
  * an arrival number, so the order still never depends on the sort algorithm.
@@ -2168,7 +2167,7 @@ function lineageNoteFor(row: TimelineBar, spanNames: SpanNames): string | undefi
  *
  * Used for the bar's own description, for the detail strip and for the tooltip
  * on the row's name, so the three cannot drift apart. Values arrive redacted
- * and truncated and are rendered exactly as given (AAP 0.5.2).
+ * and truncated and are rendered exactly as given.
  *
  * @param row The row to describe.
  * @param origin The window start its offset is measured from.
@@ -2679,8 +2678,8 @@ function TimelineOperationName({
 }
 
 /**
- * The columns of the tabular equivalent: the fields AAP 0.6.2 says this node
- * reads, in the order a reader scans them.
+ * The columns of the tabular equivalent: the fields this node's catalog entry
+ * declares it reads, in the order a reader scans them.
  *
  * A row's location is handed to `SourceLink` BY REFERENCE and field for field —
  * not copied, not normalised, not rounded — because the object the chip raises
@@ -2698,7 +2697,7 @@ function TimelineOperationName({
  * holds focus instead (see this module's header).
  *
  * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
- * in `../primitives/DataTable`, AAP 0.6.4), and the table resolves each role
+ * in `../primitives/DataTable`), and the table resolves each role
  * to a track built from the design system's column floor and share tokens -
  * the same track every other table gives content of that kind. The operation
  * and its source chip are `name`, the identifier role; the kind chip is

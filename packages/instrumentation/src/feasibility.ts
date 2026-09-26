@@ -2,9 +2,9 @@
  * The **pre-install feasibility gate**: the last thing that looks at an
  * instrumentation plan before anything is written into a developer's project.
  *
- * AAP §0.7.1 Group 1 states this module's job in one clause — "feasibility
- * rejects actions whose file/symbol is absent from the graph" — and AAP §0.5.3
- * states where it sits in the sequence a model's proposal travels through:
+ * Its job in one clause: reject the actions whose file or symbol is absent from
+ * the code graph. It sits here in the sequence a model's proposal travels
+ * through:
  *
  * ```text
  * model output
@@ -26,19 +26,19 @@
  *
  * - `./installer.ts` runs it as its pre-install gate: every
  *   {@link InfeasibleAction} becomes an `UnavailableSignal`
- *   (`../adapter.ts`) whose `reason` and `hint` are rendered verbatim into
- *   AAP §0.5.5's sentence — "Could not enable ‹signal›: ‹reason›. Continuing
+ *   (`../adapter.ts`) whose `reason` and `hint` are rendered verbatim into the
+ *   developer-facing sentence "Could not enable ‹signal›: ‹reason›. Continuing
  *   with: ‹enabled list›." — and the action is dropped rather than attempted.
  * - `apps/local-service/src/pipeline/stages/plan.ts` runs it immediately after
  *   normalisation, so a plan that would instrument nothing is caught while the
  *   session can still fall back to a runtime-only default plan. Its rejections
  *   become `session.progress` detail and, where nothing at all survives,
- *   `instrumentation.failed` detail (AAP §0.4.2).
+ *   `instrumentation.failed` detail.
  *
  * Both callers get **data, not exceptions**: a rejection is a finding on the
  * report, because "this target cannot be instrumented" is an ordinary answer
- * about an ordinary project and AAP §0.5.5 requires it to reach the developer
- * as an explanation rather than as a stack trace. A thrown
+ * about an ordinary project, and it has to reach the developer as an
+ * explanation rather than as a stack trace. A thrown
  * {@link DebuggenError} here means something else entirely — a context that is
  * missing the graph queries every check is made against, which is a
  * programming error in the caller and not a statement about the project.
@@ -77,7 +77,7 @@
  * or hook, a body that reaches for `super` or `new.target`, and a sloppy-mode
  * body whose `arguments` object is observable. Those need the whole transform;
  * reaching for it here would make every planning round pay for the patch layer.
- * The one wrapper constraint AAP §0.5.1 states outright — a generator cannot be
+ * The one wrapper constraint this gate owns outright — a generator cannot be
  * wrapped — is checked here, on the declaration the shared resolver returned.
  *
  * What this module guarantees is the half the planner needs: a plan that passes
@@ -220,8 +220,8 @@ const NON_ADDRESSABLE_DECLARATION_KINDS: readonly SymbolDeclarationKind[] = Obje
  * a planning problem, a `duplicate-action` is neither and needs no developer
  * action at all), while the developer reads
  * {@link InfeasibleAction.reason} and {@link InfeasibleAction.hint}. A code is
- * therefore never shown on its own — AAP §0.5.5 requires an explanation a
- * developer can act on, and an internal identifier is not one.
+ * therefore never shown on its own — a refusal reaches the developer as an
+ * explanation they can act on, and an internal identifier is not one.
  *
  * - `'no-adapter'` — no registered adapter claims the action's type, so nothing
  *   would install it whatever its file says. Only reported when a resolver was
@@ -244,8 +244,7 @@ const NON_ADDRESSABLE_DECLARATION_KINDS: readonly SymbolDeclarationKind[] = Obje
  *   hint names the qualified spellings that do address one of them.
  * - `'unsupported-generator'` — the declaration is a generator function. A
  *   wrapper that calls the body as a function cannot preserve `yield`: the
- *   consumer would receive the wrapper's return value instead of an iterator
- *   (AAP §0.5.1).
+ *   consumer would receive the wrapper's return value instead of an iterator.
  * - `'unsupported-async-generator'` — the same, for an `async function*`. Kept
  *   apart from the previous code because the two are different facts about the
  *   declaration and a caller may want to word them differently.
@@ -325,8 +324,10 @@ export function isFeasibilityRejectionCode(value: unknown): value is Feasibility
 /**
  * One action that cannot be installed, and what the developer can do about it.
  *
- * The three fields beyond the action are the graceful-degradation channel of
- * AAP §0.5.5, in the wording `../adapter.ts` fixes for an `UnavailableSignal`:
+ * The three fields beyond the action are the graceful-degradation channel —
+ * how a signal that cannot be enabled is explained while capture continues
+ * with the rest — in the wording `../adapter.ts` fixes for an
+ * `UnavailableSignal`:
  *
  * - `reason` states **what was observed**, as a fragment that reads after a
  *   colon: "the code index holds no entry for 'src/server/x.ts'". Never a
@@ -337,8 +338,9 @@ export function isFeasibilityRejectionCode(value: unknown): value is Feasibility
  * Both are single-line and composed entirely from the action and the injected
  * context — a project-relative path, a symbol, an action type, a candidate
  * location the code graph reported. No path, project name or symbol is written
- * into this repository, which is the AAP §0.5.4 line this module is scanned
- * against.
+ * into this repository: product source carries no knowledge of any particular
+ * project, and `scripts/check-no-hardcoding.mjs` scans this module to hold it
+ * to that.
  */
 export interface InfeasibleAction {
   /** The action that was refused, unchanged and by reference. */
@@ -529,8 +531,8 @@ function bounded(value: string, limit: number): string {
  * Each rejection states something specific first, and this is the tail they
  * share: an action that cannot be installed as a patch is not the end of an
  * investigation, because runtime hooks are the product's default route and edit
- * no file at all (AAP §0.5.1). Saying so is what keeps a rejection from reading
- * like a dead end.
+ * no file at all. Saying so is what keeps a rejection from reading like a dead
+ * end.
  */
 const RUNTIME_ALTERNATIVE = 'A runtime signal needs no file edit at all.';
 
@@ -539,7 +541,7 @@ const RUNTIME_ALTERNATIVE = 'A runtime signal needs no file edit at all.';
 //
 // One function per question, each returning `undefined` when the action passes
 // and a `Rejection` when it does not, so the evaluation below reads as the
-// ordered list AAP §0.7.1 describes.
+// ordered list documented on `checkFeasibility`.
 // ---------------------------------------------------------------------------
 
 /**
@@ -901,7 +903,7 @@ function declaredOwnersOf(nodes: readonly CodeNode[], name: string): (string | u
  * declaration in a position no wrapper can address is refused here rather than
  * at install time.
  *
- * On the declaration the resolver returns, the AAP §0.5.1 template constraint
+ * On the declaration the resolver returns, the wrapper template's constraint
  * is applied: the wrapper moves the original body into an inner function and
  * calls it, which a generator's `yield` cannot survive — the consumer would
  * receive the wrapper's return value instead of an iterator.
@@ -1169,8 +1171,8 @@ function isNonAddressablePosition(value: unknown): value is PatchNonAddressableP
  *
  * Separate codes for the plain and the `async` form, because they are different
  * facts about the declaration and a caller may word them differently; the
- * consequence is the same, and it is the one AAP §0.5.1 states. An arrow
- * function is never a generator.
+ * consequence is the same: the wrapper cannot preserve `yield`, so neither form
+ * is patched. An arrow function is never a generator.
  *
  * @param fn The function-like node the shared resolver returned.
  * @param action The action under test.
@@ -1222,7 +1224,7 @@ function unsupportedShape(action: InstrumentationAction, file: string, clause: s
  * declaration with no function body at all — already describe the body, or its
  * absence, and a second clause about it would repeat or contradict the first.
  * One fragment on one line, which is how it reads after "Could not enable
- * ‹signal›: " (AAP §0.5.5).
+ * ‹signal›: " in the message the developer sees.
  *
  * @param file The normalised project-relative path.
  * @param symbol The symbol as the plan spelled it.
@@ -1327,7 +1329,7 @@ function patchSiteKey(file: string, symbol: string): string {
 /**
  * Decides which of a plan's actions can actually be installed on this project.
  *
- * The ordered gate of AAP §0.7.1 Group 1, run by `./installer.ts` before a
+ * The ordered pre-install gate, run by `./installer.ts` before a
  * single byte is written and by `apps/local-service/src/pipeline/stages/plan.ts`
  * as soon as a plan has been normalised. Every action is judged
  * **independently**, and the first failing check is the one reported — a target
@@ -1358,7 +1360,7 @@ function patchSiteKey(file: string, symbol: string): string {
  *
  * **Nothing is thrown for a rejection.** Every refusal is an
  * {@link InfeasibleAction} on the report, carrying the two sentences a
- * developer reads (AAP §0.5.5). A {@link DebuggenError} with code `'INTERNAL'`
+ * developer reads. A {@link DebuggenError} with code `'INTERNAL'`
  * is thrown only for a context that cannot be used at all — no graph, no
  * queries, no project root, no logger — which is a defect in the caller and
  * says nothing about the project.

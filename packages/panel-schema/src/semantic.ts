@@ -144,7 +144,7 @@
  * A malformed field that carries no claim of its own — an `evidence` value that
  * is not a list, a `query` that is not an object, a filter `traceId` that is
  * not a string — is still `./validate.ts`'s to report and is read as far as it
- * can be, exactly as before: it hides nothing this module could check.
+ * can be: it hides nothing this module could check.
  *
  * The capture is read **once**, into a plain copy of exactly the fields the
  * checks consult, and a capture any of whose reads throws is read as one that
@@ -2741,14 +2741,14 @@ function framesOf(
  *
  * The traversal is `./spec.ts`'s `walkPanelNodes`, reproduced rather than
  * called, because that one trusts what it walks: it reads `type` and
- * `children` directly and ends in `assertNever`, so one unknown node type
- * throws out of it and every node after that one goes unchecked — which is how
- * a fabricated trace filter placed after an unrecognised node used to pass.
- * The order and the paths are the same: pre-order, siblings in document order,
- * an explicit stack rather than recursion, top-level nodes at `['layout', n]`
- * and children at `[…, 'children', n]`. So a well-formed layout is gathered
- * exactly as before, and a resolver is asked about the same ids in the same
- * order.
+ * `children` directly and ends in `assertNever`, so an unknown node type would
+ * throw out of it and leave every node after that one unchecked. This walk
+ * never throws and visits every node, in the same order and at the same paths:
+ * pre-order, siblings in document order, an explicit stack rather than
+ * recursion, top-level nodes at `['layout', n]` and children at
+ * `[…, 'children', n]`. So a well-formed layout yields the claims a
+ * `walkPanelNodes` traversal of it would, and a resolver is asked about the
+ * same ids in the same order.
  *
  * Per node, in this order:
  *
@@ -2877,9 +2877,9 @@ type FallbackRead =
  * empty-observed requirement. Never throws.
  *
  * A `meta` that is absent or not an object, and a flag that is anything but
- * `true`, read as "not a fallback panel", exactly as before. A read that throws
- * is reported at the field that threw, because a flag that cannot be read can
- * neither exempt a panel nor be assumed not to.
+ * `true`, read as "not a fallback panel". A read that throws is reported at the
+ * field that threw, because a flag that cannot be read can neither exempt a
+ * panel nor be assumed not to.
  */
 function readFallbackFlag(spec: object): FallbackRead {
   const meta = readField(spec, META_FIELD);
@@ -3519,9 +3519,9 @@ const SEMANTIC_HINT = `Every observed fact and likely cause must cite events thi
  * wrong problem.
  *
  * States the shape required rather than the value received, and names the
- * failure for what AAP 0.5.3 makes it — a document that skipped, or no longer
- * satisfies, the syntactic validation that precedes this step is a product
- * defect, never a model mistake to repair.
+ * failure for what it is — a document that skipped, or no longer satisfies,
+ * the syntactic validation that precedes this step is a product defect, never
+ * a model mistake to repair.
  */
 const MALFORMED_SPEC_HINT = `A panel specification must be an object with a layout array and a summary object whose observed and likelyCauses lists, where present, are arrays. A value that fails this never passed the syntactic validator: run validatePanelSpec on it before checking it against a capture, treat the failure as a product defect rather than a model mistake, and show the deterministic fallback panel for this capture instead of retrying the model. The issue paths in this error's details name the fields that could not be read; nothing else in the value was checked against the capture.`;
 
@@ -3532,8 +3532,8 @@ const MALFORMED_SPEC_HINT = `A panel specification must be an object with a layo
  * issues beside the unreadable elements.
  *
  * Lists the element shapes this module requires rather than the value found,
- * and gives the same AAP 0.5.3 disposition: a product defect upstream, never a
- * model mistake to repair.
+ * and gives the same disposition: a product defect upstream, never a model
+ * mistake to repair.
  */
 const MALFORMED_ELEMENT_HINT = `Every observed fact and likely cause must be an object whose evidence cites events by eventId, every layout node must be an object whose type is in the node catalog, and every container's children must be a list. Elements that are not could not be read, so the claims inside them were not checked against the capture; every other claim was. A document like this never passed the syntactic validator: run validatePanelSpec on it before checking it against a capture, treat the failure as a product defect rather than a model mistake, and show the deterministic fallback panel for this capture instead of retrying the model. The issue paths in this error's details name each element that could not be read and each claim the capture does not support.`;
 

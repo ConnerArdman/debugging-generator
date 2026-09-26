@@ -1,7 +1,7 @@
 /**
  * The lifecycle of the generic fixture application `tests/fixtures/sample-next-app` — the
- * generalization target of AAP §0.8.4 acceptance test 4, the run that proves no demo knowledge is
- * baked into the product.
+ * target of `generalization.spec.ts`, the run that proves no demo knowledge is baked into the
+ * product.
  *
  * It offers the same contract as `demo-app.ts` (launch through the product's launcher, the
  * tracked-file snapshot, the restoration check, the residual-instrumentation gate, a serving
@@ -94,8 +94,8 @@
  *
  * 1. **It never writes under `tests/fixtures/sample-next-app`.** It reads the fixture's
  *    `package.json` as text and drives the app over HTTP; the dev server's own output is
- *    git-ignored, and the product alone patches and restores source (AAP §0.5.1). Fixture source
- *    is never imported (`tests/tsconfig.json` excludes `fixtures/**`).
+ *    git-ignored, and the product alone patches and restores source. Fixture source is never
+ *    imported (`tests/tsconfig.json` excludes `fixtures/**`).
  * 2. **It never starts `next dev` itself and never signals a process.** It asks the launcher to
  *    start and stop its own child; a server it did not launch is reported, never stopped. It
  *    never scans the process table.
@@ -661,8 +661,8 @@ function probeSampleApp(options: ServingProbeOptions): Promise<ServingProbeResul
 }
 
 /**
- * Whether the fixture answers a GET (default path `/`) with a status below 500 — the AAP §0.5.1
- * "the application keeps serving" probe, as `demo-app.ts` defines it for the demo.
+ * Whether the fixture answers a GET (default path `/`) with a status below 500 — the probe that
+ * the application keeps serving after its session ends, as `demo-app.ts` defines it for the demo.
  */
 export async function isServing(options: ServingProbeOptions = {}): Promise<boolean> {
   return (await probeSampleApp(options)).serving;

@@ -496,11 +496,18 @@ describe('a debugging session, walked end to end through the real routes and pus
   let unboundInstrumentRows: ProgressRow[];
   let unboundUnavailable: HarnessMessage<'instrumentation.ready'>['payload']['unavailable'];
 
-  /** A pure read of the session through the DevTools credential: no replay is broadcast. */
+  /**
+   * A pure read of the session through the DevTools credential, with the read
+   * proof pairing issued with it, as the extension reads: no replay is broadcast.
+   */
   async function readSession(): Promise<SessionRecord> {
     const read = await harness
       .http(devtools.credential.token, { origin: devtools.credential.origin })
-      .request('session.get', { params: { id: session.id }, tabId: TAB_ID });
+      .request('session.get', {
+        params: { id: session.id },
+        tabId: TAB_ID,
+        readProof: devtools.credential.readProof,
+      });
     if (isErr(read)) {
       throw new Error(`session.get was refused (${read.error.code}): ${read.error.message}`);
     }
@@ -1732,5 +1739,114 @@ describe('a cleanup that fails, filed through the real manager, progress emitter
       const diagnostic = record.fields[LOG_ERROR_FIELD_KEY];
       expect(diagnostic).toMatchObject({ type: 'DebuggenError', code: 'CLEANUP_PARTIAL' });
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * An end whose binding removal the store refuses: `ended` is stored with it or not at all
+ * ---------------------------------------------------------------------------------------------- */
+
+describe(`a ${route('session.end')} whose tab-binding removal the store refuses`, () => {
+  it('leaves the session open and bound, and the retried end stores `ended` with the binding removed', async () => {
+    // Its own session on its own copy and tab, so the walk above is untouched.
+    const tabId = TAB_ID + 2;
+    const copy = await harness.copyFixtureProject();
+    const before = await snapshotTree(copy.root);
+    const launched = await harness.launchDevServer(copy.root);
+    if (isErr(launched)) {
+      throw new Error(`the dev server did not launch (${launched.error.code})`);
+    }
+    const origin = new URL(launched.value.devServerUrl).origin;
+    const editor = await harness.editor(copy.root);
+    const created = await harness.createSession({ projectRoot: copy.root, question: QUESTION });
+    const tab = await harness.connectDevtools({ tabId });
+    const bound = await harness.bindTab(tab.client, {
+      tabId,
+      url: `${origin}/`,
+      origin,
+      sessionId: created.id,
+    });
+    if (isErr(bound)) {
+      throw new Error(`session.bind was refused (${bound.error.code}): ${bound.error.message}`);
+    }
+    const report = tab.client.send('agent.ready', {
+      tabId,
+      documentId: 'doc_lifecycle000000003',
+      producerId: newProducerId(),
+      url: `${origin}/`,
+      installedBeforeReact: true,
+      reactDetected: true,
+    });
+    expect(await tab.client.flush()).toBe(true);
+    expect(tab.client.errorsFor(report.id)).toEqual([]);
+    await waitForRecord(
+      editor,
+      created.id,
+      (record) => record.status === STATUS.ready && record.boundTab?.tabId === tabId,
+    );
+
+    /** The session as the service's store holds it, and the tab its `bindings` row names. */
+    const storedState = (): { readonly record: SessionRecord; readonly boundTabId?: number } => {
+      const record = harness.repos.sessions.get(created.id);
+      const binding = harness.repos.sessions.getBindingBySession(created.id);
+      if (isErr(record) || record.value === undefined || isErr(binding)) {
+        throw new Error('the session or its binding could not be read from the store');
+      }
+      return binding.value === undefined
+        ? { record: record.value }
+        : { record: record.value, boundTabId: binding.value.tab.tabId };
+    };
+    const mark = editor.received.length;
+
+    // The injected failure: a TEMP trigger on the service's own connection that
+    // aborts every removal of this session's `bindings` row — the write the
+    // manager commits together with `ended`.
+    if (!/^[A-Za-z0-9_-]+$/u.test(created.id)) {
+      throw new Error('The session id cannot be quoted into a trigger.');
+    }
+    const trigger = `lifecycle_block_unbind_${created.id.replaceAll('-', '_')}`;
+    harness.store.db.exec(
+      `CREATE TEMP TRIGGER ${trigger} BEFORE DELETE ON bindings WHEN OLD.session_id = '${created.id}' BEGIN SELECT RAISE(ABORT, 'session-lifecycle suite: injected binding delete failure'); END;`,
+    );
+    try {
+      const refused = await harness.endSession(created.id);
+      if (!isErr(refused)) {
+        throw new Error('session.end was expected to be refused, but it succeeded.');
+      }
+      expect(refused.error.code).toBe('STORE_ERROR');
+
+      // Nothing ended: the status, the record's tab and the binding row all stay.
+      const open = storedState();
+      expect(open.record.status).toBe(STATUS.ready);
+      expect(open.record.boundTab?.tabId).toBe(tabId);
+      expect(open.boundTabId).toBe(tabId);
+      expect(await editor.flush()).toBe(true);
+      expect(
+        framesOf(editor, 'session.updated', created.id, mark).filter(
+          (frame) => frame.payload.session.status === STATUS.ended,
+        ),
+      ).toEqual([]);
+    } finally {
+      harness.store.db.exec(`DROP TRIGGER IF EXISTS temp.${trigger};`);
+    }
+
+    // With the store writable again, ending again re-runs the idempotent
+    // cleanup and stores `ended` together with the binding's removal.
+    const ended = await harness.endSession(created.id);
+    if (isErr(ended)) {
+      throw new Error(`session.end was refused (${ended.error.code}): ${ended.error.message}`);
+    }
+    expect(ended.value.cleanup).toBe(CLEANUP.clean);
+    const closed = storedState();
+    expect(closed.record.status).toBe(STATUS.ended);
+    expect(closed.record.boundTab).toBeUndefined();
+    expect(closed.boundTabId).toBeUndefined();
+    const announced = await waitForRecord(
+      editor,
+      created.id,
+      (record) => record.status === STATUS.ended,
+    );
+    expect(announced.payload.session).toEqual(closed.record);
+    await assertTreeUnchanged(copy.root, before);
   });
 });

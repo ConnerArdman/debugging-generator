@@ -1,11 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
-  <!-- An open-end spanner on the 45 degree diagonal x + y = 24, the only diagonal of the six
-       glyphs, so it is never taken for a circular or a rectilinear sibling at chip size. The
-       shank runs 5.14 18.86 to a throat at 13.6 10.4 inside the head band, which welds the two
-       and centres the mark on the diagonal; the head is one path, a 3.4 radius arc of 279
-       degrees about 16.1 7.9 with a prong off either end and a 2.65 unit mouth still open at
-       16 px. Stroked with the currentColor keyword over a slate root colour: by its path the
-       file is its own document and resolves that keyword against itself, yet inherits inlined. -->
+  <!-- Open-end spanner category glyph, used as a CSS mask by the category glyph component, so its
+       alpha is the shape. Keep it fill-free at the family's 1.75 stroke and legible at 16 px.
+       Viewed on its own, currentColor resolves to the slate root colour. -->
   <path d="M5.14 18.86 L13.6 10.4" />
   <path d="M20.41 6.7 L19.49 7.62 A3.4 3.4 0 1 1 16.38 4.51 L17.3 3.59" />
 </svg>

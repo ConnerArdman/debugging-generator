@@ -1,22 +1,21 @@
 /**
  * Lumen Supply - one recommended product inside the recommendations strip.
  *
- * The strip appears twice on a product page: full size in the detail body, and as a short row
- * inside the site header. Both mounts render this same tile from the same props, and the whole
- * difference between them - a vertical card where a page has the room for one, and a thumbnail
- * beside a single line of name and price where the site header's fixed 64px bar does not - is
- * stated in `RecommendationTile.module.css` and selected by the `data-variant` attribute written
- * below. Nothing the tile does varies with the variant.
+ * The tile has two presentation variants, `detail` and `compact`, and renders identically from the
+ * same props in both: the same elements, the same text and the same destination. The
+ * `data-variant` attribute written below selects presentation only, and the whole difference is
+ * stated in `RecommendationTile.module.css` - `detail` is a vertical card, and `compact` is a
+ * thumbnail beside one line of name and price, sized for a single fixed-height row. Nothing the
+ * tile does varies with the variant.
  *
  * ITS OWN PRESENTATION UNIT, NOT THE CATALOG'S CARD
  * The catalog has a product card of its own, and this tile deliberately borrows nothing from it:
- * no component, no stylesheet rule, no shared class. The two live in different places and answer
- * different questions - a catalog card is a shopping surface with a quantity and an add-to-cart
- * control, while a tile in this strip is a suggestion to look at something else - so the strip is
- * a link, a thumbnail, a name and a price. A strip that mounted the catalog's card would carry
- * that card's controls and everything they read into the site header on every page of the
- * storefront, which is both more markup than a suggestion needs and a second place where the
- * cart's behaviour would have to be reasoned about.
+ * no component, no stylesheet rule, no shared class. The two answer different questions - a
+ * catalog card is a shopping surface with a quantity and an add-to-cart control, while a tile in
+ * this strip is a suggestion to look at something else - so the tile is a link, a thumbnail, a
+ * name and a price. Borrowing nothing from the card is what keeps the tile free of cart controls
+ * and of everything they read: a suggestion needs none of that markup, and the cart's behaviour
+ * stays with the components that own it.
  *
  * A PURE PRESENTATIONAL COMPONENT
  * No `'use client'` directive, no hook, no state, no effect, no ref, and no `memo`, `useMemo` or
@@ -37,8 +36,8 @@
  * The figure is `@/components/ui/Price`, which takes the payload's whole number of cents and owns
  * every formatting decision; nothing here does arithmetic on an amount or spells one out. The
  * name is printed exactly as it arrives and is clamped by the stylesheet - to two lines in the
- * page, to one in the header - rather than shortened here, so the full wording stays selectable
- * and searchable while a row of tiles keeps one height.
+ * `detail` variant, to one in `compact` - rather than shortened here, so the full wording stays
+ * selectable and searchable while a row of tiles keeps one height.
  *
  * ELEMENTS
  * The anchor from `next/link` wrapping `<span class="media"> > <img>` and `<span class="body"> >
@@ -93,9 +92,9 @@ interface Props {
   item: RecommendationItem;
 
   /**
-   * Which of the stylesheet's two measures to paint: `detail` for the strip in a product page's
-   * body, `compact` for the shorter row in the site header. Presentation only - the tile renders
-   * the same elements, the same text and the same destination either way.
+   * Which of the stylesheet's two variants to paint: `detail`, the full-size vertical card, or
+   * `compact`, the thumbnail-beside-text arrangement for a single fixed-height row. Presentation
+   * only - the tile renders the same elements, the same text and the same destination either way.
    *
    * @default 'detail'
    */
@@ -172,12 +171,12 @@ export function RecommendationTile({ item, variant = 'detail', className }: Prop
           The endpoint's own merchandising line, printed under the figure. It is inside the anchor
           like the name and the price, so it joins the link's accessible name and a reader hears
           why the suggestion is being made rather than only what it is; it is phrasing content and
-          adds no second target inside the link. The stylesheet mutes it, lets it wrap in full -
+          adds no second target inside the link. The stylesheet mutes it and lets it wrap in full -
           the sentence ends in the name of the product on screen, which is the part a clamp would
-          cut - and leaves it out of the header's row, which has no height for a footnote at all:
-          `display: none`
-          takes it out of that layout and out of that link's accessible name alike, so a reader
-          there hears the name and the price, exactly as they are shown.
+          cut. The `compact` variant does not display it, because a single fixed-height row has no
+          height for a footnote: `display: none` removes it from that layout and from that link's
+          accessible name alike, so a reader hears the name and the price exactly as they are
+          shown. The reason is displayed in the `detail` variant only.
         */}
         {reason.length === 0 ? null : <span className={styles.reason}>{reason}</span>}
       </span>

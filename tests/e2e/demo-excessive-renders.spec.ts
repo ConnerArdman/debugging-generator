@@ -1,6 +1,7 @@
 /**
- * AAP §0.8.4 acceptance test 2 — "Why is this component rendering so many
- * times?" — against the Lumen Supply catalog (docs/DEMO.md, Walkthrough 2).
+ * Seeded defect 2 of the demo — excessive renders — proven end to end for
+ * "Why is this component rendering so many times?" against the Lumen Supply
+ * catalog (docs/DEMO.md, Walkthrough 2 and "Defect 2 — excessive renders").
  *
  * What a pass proves, all through the real pipeline and a real capture:
  *
@@ -22,11 +23,12 @@
  *    key names with bounded summaries only; every render event is a browser
  *    span with a component, a phase and trace context.
  * 5. **The panel is materially different from the slow-interaction panel**
- *    (AAP §0.6.5). The slow-interaction baseline is derived IN THIS FILE — this
- *    spec runs before `demo-slow-interaction.spec.ts`, so it never depends on
- *    that one — and the two panels share only the permitted nodes
- *    (`metricCards`, `sourceLink`): their visualization bodies are disjoint and
- *    even their metric cards differ.
+ *    (docs/DEMO.md, "How the three panels differ"). The slow-interaction
+ *    baseline is derived IN THIS FILE — this spec runs before
+ *    `demo-slow-interaction.spec.ts`, so it never depends on that one — and
+ *    the two panels share only the permitted nodes (`metricCards`,
+ *    `sourceLink`): their visualization bodies are disjoint and even their
+ *    metric cards differ.
  *
  * What this spec does not re-test: the renderer's component behaviour
  * (`packages/panel-renderer/src/components/RenderTable.test.tsx`) and the
@@ -35,10 +37,10 @@
  * and a materially different panel.
  *
  * Instrumentation arrives only through the real installer and leaves only
- * through the real cleanup (AAP §0.5.1): nothing here writes to `apps/demo-app`,
- * and `afterAll` proves every tracked demo file is byte-identical to its
- * pre-session content. `tests/e2e/**` is excluded from the no-hardcoding guard
- * (AAP §0.5.4), which is why the demo's component names appear below.
+ * through the real cleanup: nothing here writes to `apps/demo-app`, and
+ * `afterAll` proves every tracked demo file is byte-identical to its
+ * pre-session content. `tests/e2e/**` is excluded from the no-hardcoding
+ * guard, which is why the demo's component names appear below.
  */
 
 import type { Frame, Locator, Page } from '@playwright/test';
@@ -110,14 +112,14 @@ import { waitForStreamedContent, withEditorAnnouncement } from './helpers/demo-a
 // The questions, the targets and the demo's observable surface
 // ---------------------------------------------------------------------------
 
-/** The developer's question, verbatim: AAP §0.6.5's second demonstrated question. */
+/** The developer's question, verbatim from `docs/DEMO.md` Walkthrough 2. */
 const QUESTION = 'Why is this component rendering so many times?';
 
-/** The slow-interaction question the comparison baseline asks (AAP §0.6.5, first row). */
+/** The slow-interaction question the comparison baseline asks (`docs/DEMO.md` Walkthrough 1). */
 const BASELINE_QUESTION = 'Why is this button slow?';
 
 /** What the composition assertions prove, for their failure text. */
-const AAP_COMPOSITION = `AAP §0.6.5 ("${QUESTION}" against "${BASELINE_QUESTION}")`;
+const COMPOSITION_CONTEXT = `The render panel composition for "${QUESTION}" versus "${BASELINE_QUESTION}"`;
 
 /** The card component whose renders the defect multiplies (`memo(ProductCardBody)`). */
 const CARD_COMPONENT = 'ProductCard';
@@ -179,14 +181,14 @@ const REFILL_QUANTITY = 2;
 /** The capture signal React render tracking answers to (`plan.capture`). */
 const REACT_SIGNAL = 'react';
 
-/** The React adapter's render-tracking action (AAP §0.2.3), claimed by adapter `react` in runtime mode. */
+/** The React adapter's render-tracking action, claimed by adapter `react` in runtime mode. */
 const REACT_ACTION_TYPE = 'react-render-tracking';
 const REACT_ADAPTER_ID = 'react';
 
 /** The React adapter's runtime hook as `instrumentation.ready` labels it ("React renders and commits"). */
 const REACT_HOOK_PATTERN = /\bReact renders?\b/iu;
 
-/** The metric cards AAP §0.6.5 gives the render panel. */
+/** The metric cards the render panel shows (docs/DEMO.md, "How the three panels differ"). */
 const RENDER_CARD_METRICS: readonly MetricId[] = [
   'render_count',
   'unchanged_render_count',
@@ -194,7 +196,7 @@ const RENDER_CARD_METRICS: readonly MetricId[] = [
   'blocking_time',
 ];
 
-/** The metric cards AAP §0.6.5 gives the slow-interaction panel. */
+/** The metric cards the slow-interaction panel shows (docs/DEMO.md, "How the three panels differ"). */
 const DURATION_CARD_METRICS: readonly MetricId[] = [
   'total_duration',
   'frontend_duration',
@@ -202,7 +204,10 @@ const DURATION_CARD_METRICS: readonly MetricId[] = [
   'database_duration',
 ];
 
-/** The render views of AAP §0.6.5, of which the render panel must compose at least two. */
+/**
+ * The render views `docs/DEMO.md` lists for this question, of which the render
+ * panel must compose at least two.
+ */
 const RENDER_VIEW_TYPES: readonly PanelNodeType[] = [
   'componentTree',
   'stateTransitions',
@@ -1248,7 +1253,7 @@ test.describe('demo defect 2 — excessive renders on the idle catalog', () => {
         tracker: active,
       }));
 
-    // The baseline is only a baseline if it is the latency panel AAP §0.6.5
+    // The baseline is only a baseline if it is the latency panel `docs/DEMO.md`
     // describes: a real, generated panel with the trace and query views.
     const spec = expectValidPanelSpec(required(baseline.outcome.panel, 'the baseline panel'), {
       message: 'The slow-interaction baseline',
@@ -1533,7 +1538,7 @@ test.describe('demo defect 2 — excessive renders on the idle catalog', () => {
     const spec = expectValidPanelSpec(required(renderPanel, 'the render panel'), {
       message: 'The render panel',
     });
-    const types = expectNodeTypes(spec, ['renderTable'], { message: AAP_COMPOSITION });
+    const types = expectNodeTypes(spec, ['renderTable'], { message: COMPOSITION_CONTEXT });
 
     const views = RENDER_VIEW_TYPES.filter((type) => types.has(type));
     expect(
@@ -1574,7 +1579,7 @@ test.describe('demo defect 2 — excessive renders on the idle catalog', () => {
     );
     expectDisjointVisualizations(render, slow, {
       labels: ['render panel', 'slow-interaction panel'],
-      message: AAP_COMPOSITION,
+      message: COMPOSITION_CONTEXT,
     });
 
     // The same ruling, stated directly: after removing the layout containers

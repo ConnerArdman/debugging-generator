@@ -40,6 +40,9 @@
  * - one named method per HTTP operation the commands and views use, plus a
  *   typed passthrough for the rest — every path comes from the protocol's
  *   route table by operation id, never from a string written here;
+ * - {@link readModificationJournal}, the one walk of the paged modification
+ *   journal, which every reader of a whole journal uses so none mistakes a
+ *   page for the journal;
  * - one typed {@link ServiceClient.send} for the frames the editor itself
  *   writes after the handshake — `source.result`, its answer to a forwarded
  *   `source.open` — delegating to whichever socket client is current.
@@ -160,6 +163,7 @@ import { WebSocket } from 'ws';
 
 import {
   HttpClient,
+  MODIFICATIONS_PAGE_MAX_LIMIT,
   ReconnectingWsClient,
   isAuthExemptOperation,
   parseServiceOrigin,
@@ -185,6 +189,7 @@ import type {
   MessageHandler,
   MessagePayload,
   MessageType,
+  ModificationRecord,
   ModificationsResponse,
   PairStartResponse,
   SendOutcome,
@@ -204,7 +209,7 @@ import type {
   WsStateChangeDetail,
   WsUnauthorizedDetail,
 } from '@debuggen/protocol';
-import { DebuggenError, err, isErr, isOk, newMessageId, noopLogger } from '@debuggen/shared';
+import { DebuggenError, err, isErr, isOk, newMessageId, noopLogger, ok } from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
 
 import type { EditorCredentialStore } from './auth';
@@ -961,7 +966,8 @@ export interface ServiceClient extends ServiceClientDisposable {
    * records — so one answer never carries the whole journal's diffs when those
    * exceed the budget. `total` is the journal's full length and `nextOffset` is
    * `null` exactly when this page ends the journal; a caller reports `total`,
-   * never the page's length, as the journal's size.
+   * never the page's length, as the journal's size. A caller that needs every
+   * record walks the pages through {@link readModificationJournal}.
    *
    * `window` travels as the `limit` and `offset` query parameters and is
    * refused locally, with `PROTOCOL_INVALID_MESSAGE`, when a member is out of
@@ -2893,6 +2899,248 @@ class ExtensionServiceClient implements ServiceClient {
       this.#announcedState = undefined;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reading a whole modification journal
+// ---------------------------------------------------------------------------
+
+/** The operation {@link readModificationJournal} walks, as its failures name it. */
+const MODIFICATIONS_LIST_OPERATION = 'modifications.list' satisfies HttpOperation;
+
+/**
+ * The most pages {@link readModificationJournal} requests in one walk:
+ * {@link MODIFICATIONS_PAGE_MAX_LIMIT}. The protocol admits no page that
+ * carries no record while records remain, and a journal holds at most that
+ * many records, so a service that keeps the paging rule ends every walk well
+ * inside the cap; the cap only bounds one that does not.
+ */
+export const MODIFICATION_JOURNAL_PAGE_CAP = MODIFICATIONS_PAGE_MAX_LIMIT;
+
+/** What {@link readModificationJournal} gathered from one walk of the journal. */
+export interface ModificationJournalRead {
+  /**
+   * Every record the pages carried, in journal order, each id once: offset
+   * paging over a journal that grows between two requests can repeat a record
+   * on both pages, and the first occurrence is kept.
+   */
+  readonly modifications: readonly ModificationRecord[];
+  /** The journal's length as the last page that answered counted it. */
+  readonly total: number;
+  /**
+   * `true` exactly when a page answered `nextOffset: null`, so the walk reached
+   * the journal's end. `false` when a failure, the deadline, the abort signal,
+   * {@link MODIFICATION_JOURNAL_PAGE_CAP} or a page that did not move past the
+   * one before ended it first.
+   */
+  readonly complete: boolean;
+  /** How many pages answered. */
+  readonly pages: number;
+  /**
+   * The failure that ended an incomplete walk: a page's own `Err`, or the
+   * `TRANSPORT_DISCONNECTED` refusal to request another page once the deadline
+   * elapsed (`details.cancelled: 'timeout'`) or the signal aborted
+   * (`details.cancelled: 'aborted'`). Absent for a complete walk and for one
+   * the page cap or a non-advancing page ended.
+   */
+  readonly failure?: DebuggenError | undefined;
+}
+
+/** The options of {@link readModificationJournal}. */
+export interface ModificationJournalReadOptions extends SessionEndpointCallOptions {
+  /**
+   * The bound on the whole walk, in milliseconds, counted from the call. Each
+   * page is sent with what is left of it as its `timeoutMs` — or with the
+   * caller's own `timeoutMs` when that is tighter — and no page is requested
+   * once nothing is left. Omitted, or not a finite positive number, means no
+   * bound on the walk: each page is then bounded by `timeoutMs`, or by the
+   * client's own deadline for the operation.
+   */
+  readonly deadlineMs?: number | undefined;
+}
+
+/** Whether `value` is a usable bound: a finite number above zero. */
+function isPositiveFinite(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * Why the walk must not request another page, or `undefined` while it may:
+ * the abort signal fired, or the walk's deadline elapsed. Each refusal has the
+ * shape of the protocol client's own cancellation failure, so a caller renders
+ * it exactly like a page that was cancelled in flight.
+ *
+ * @param signal The caller's abort signal, when one was given.
+ * @param deadlineAt The walk's epoch-millisecond deadline, when it has one.
+ * @param deadlineMs The walk's bound as the caller stated it, for the message.
+ */
+function journalWalkInterruption(
+  signal: AbortSignal | undefined,
+  deadlineAt: number | undefined,
+  deadlineMs: number | undefined,
+): DebuggenError | undefined {
+  if (signal?.aborted === true) {
+    return new DebuggenError(
+      'TRANSPORT_DISCONNECTED',
+      'The modification journal read was cancelled before the journal ended',
+      {
+        hint: 'The caller cancelled the read. Nothing was retried; read the journal again if the rest is still wanted.',
+        details: { operation: MODIFICATIONS_LIST_OPERATION, cancelled: 'aborted' },
+      },
+    );
+  }
+  if (deadlineAt !== undefined && deadlineAt - Date.now() <= 0) {
+    return new DebuggenError(
+      'TRANSPORT_DISCONNECTED',
+      `The modification journal was not read to its end within ${String(deadlineMs)} ms`,
+      {
+        hint: 'The local service did not answer every page of the journal in time. Check that it is running and not stalled, then read the journal again.',
+        details: {
+          operation: MODIFICATIONS_LIST_OPERATION,
+          cancelled: 'timeout',
+          ...(deadlineMs === undefined ? {} : { timeoutMs: deadlineMs }),
+        },
+      },
+    );
+  }
+  return undefined;
+}
+
+/**
+ * The `timeoutMs` of the next page: what is left of the walk's deadline, or
+ * the caller's own per-call bound when that is tighter; the caller's bound
+ * unchanged — including `undefined` — when the walk has no deadline.
+ *
+ * @param callTimeoutMs The caller's `timeoutMs`, when one was given.
+ * @param deadlineAt The walk's epoch-millisecond deadline, when it has one.
+ */
+function journalPageTimeout(
+  callTimeoutMs: number | undefined,
+  deadlineAt: number | undefined,
+): number | undefined {
+  if (deadlineAt === undefined) {
+    return callTimeoutMs;
+  }
+  const remaining = Math.max(1, deadlineAt - Date.now());
+  return isPositiveFinite(callTimeoutMs) ? Math.min(callTimeoutMs, remaining) : remaining;
+}
+
+/**
+ * Reads a session's whole modification journal (`GET /sessions/:id/modifications`)
+ * by walking its pages along `nextOffset`.
+ *
+ * The service bounds every page by count and by diff bytes, so a journal whose
+ * diffs exceed one page's budget arrives in several pages, and a reader that
+ * takes the first page for the journal silently loses the rest. The walk:
+ *
+ * - asks for the service's default window first — its largest page — so an
+ *   ordinary journal costs exactly one request, then `{ offset: nextOffset }`
+ *   for each following page;
+ * - sends every page to `options.endpoint` with `options.signal`, and bounds it
+ *   by `options.timeoutMs` and by what is left of `options.deadlineMs`;
+ * - keeps records in journal order, each id once (the first occurrence), and
+ *   reports the last answered page's `total`;
+ * - stops complete at the page whose `nextOffset` is `null`, and incomplete —
+ *   keeping every record gathered so far — at a later page's failure, a thrown
+ *   page request, the deadline, the abort signal,
+ *   {@link MODIFICATION_JOURNAL_PAGE_CAP} pages, or a `nextOffset` that does
+ *   not move past the offset just requested.
+ *
+ * Nothing is logged here — records name the developer's files and carry their
+ * source as diffs — and nothing is retried. A caller applies the gathered
+ * records once, after the walk, and states an incomplete read as incomplete.
+ *
+ * @example
+ * ```ts
+ * const read = await readModificationJournal(client, sessionId, {
+ *   endpoint: state.activeSessionEndpoint,
+ *   deadlineMs: 3_000,
+ * });
+ * if (isOk(read)) {
+ *   state.applyModificationJournal(sessionId, read.value.modifications, read.value.total);
+ * }
+ * ```
+ *
+ * @param client The service client; only `getModifications` is called.
+ * @param sessionId The session whose journal is read.
+ * @param options The owning endpoint, the abort signal, the per-page timeout
+ *   and the deadline of the whole walk.
+ * @returns The first page's failure as an `Err`; otherwise what the walk
+ *   gathered, marked complete or not. Never rejects.
+ */
+export async function readModificationJournal(
+  client: Pick<ServiceClient, 'getModifications'>,
+  sessionId: string,
+  options: ModificationJournalReadOptions = {},
+): Promise<Result<ModificationJournalRead, DebuggenError>> {
+  const { deadlineMs, timeoutMs, ...call } = options;
+  const deadlineAt = isPositiveFinite(deadlineMs) ? Date.now() + deadlineMs : undefined;
+  const statedDeadline = isPositiveFinite(deadlineMs) ? deadlineMs : undefined;
+
+  const readPage = async (
+    window: ListPageRequest | undefined,
+  ): Promise<Result<ModificationsResponse, DebuggenError>> => {
+    const interruption = journalWalkInterruption(call.signal, deadlineAt, statedDeadline);
+    if (interruption !== undefined) {
+      return err(interruption);
+    }
+    try {
+      return await client.getModifications(sessionId, window, {
+        ...call,
+        timeoutMs: journalPageTimeout(timeoutMs, deadlineAt),
+      });
+    } catch (thrown) {
+      // The client never rejects; a double or a wrapper might, and a throw on
+      // a later page must not discard the records the earlier pages carried.
+      return err(DebuggenError.from(thrown));
+    }
+  };
+
+  const first = await readPage(undefined);
+  if (isErr(first)) {
+    return first;
+  }
+
+  const gathered: ModificationRecord[] = [];
+  const seen = new Set<string>();
+  const take = (answered: ModificationsResponse): void => {
+    for (const record of answered.modifications) {
+      if (!seen.has(record.id)) {
+        seen.add(record.id);
+        gathered.push(record);
+      }
+    }
+  };
+
+  let page = first.value;
+  let pages = 1;
+  let requestedOffset = 0;
+  let failure: DebuggenError | undefined;
+  take(page);
+
+  while (
+    page.nextOffset !== null &&
+    page.nextOffset > requestedOffset &&
+    pages < MODIFICATION_JOURNAL_PAGE_CAP
+  ) {
+    requestedOffset = page.nextOffset;
+    const answer = await readPage({ offset: requestedOffset });
+    if (isErr(answer)) {
+      failure = answer.error;
+      break;
+    }
+    page = answer.value;
+    pages += 1;
+    take(page);
+  }
+
+  return ok({
+    modifications: gathered,
+    total: page.total,
+    complete: page.nextOffset === null,
+    pages,
+    ...(failure === undefined ? {} : { failure }),
+  });
 }
 
 // ---------------------------------------------------------------------------

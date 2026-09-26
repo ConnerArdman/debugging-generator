@@ -521,7 +521,8 @@ type ViewCommandId =
   | 'debuggen.endSession'
   | 'debuggen.openSource'
   | 'debuggen.launchDevServer'
-  | 'debuggen.pairChrome';
+  | 'debuggen.pairChrome'
+  | 'debuggen.showModifications';
 
 /** The webview actions that run a contributed command. */
 type CommandBackedAction = Extract<
@@ -533,6 +534,7 @@ type CommandBackedAction = Extract<
   | 'openFile'
   | 'launchDevServer'
   | 'pairChrome'
+  | 'loadModifications'
 >;
 
 /** One command-backed action: the command it runs and how to say it failed to run. */
@@ -555,6 +557,10 @@ const COMMAND_ROUTES: Readonly<Record<CommandBackedAction, CommandRoute>> = Obje
   openFile: { command: 'debuggen.openSource', failure: 'open that source location' },
   launchDevServer: { command: 'debuggen.launchDevServer', failure: 'launch the dev server' },
   pairChrome: { command: 'debuggen.pairChrome', failure: 'start pairing with Chrome' },
+  loadModifications: {
+    command: 'debuggen.showModifications',
+    failure: 'load the file modifications',
+  },
 });
 
 /**
@@ -1270,14 +1276,21 @@ export class SessionViewProvider implements vscode.WebviewViewProvider, vscode.D
       case 'endSession':
       case 'launchDevServer':
       case 'pairChrome':
+      case 'loadModifications':
         this.dispatchCommand(message.type);
         return;
       case 'openFile':
-        // The parser has validated the location's shape (a safe
-        // project-relative path, 1-based line and column). Containment is
-        // `debuggen.openSource`'s: it enforces the session's project root —
-        // one enforcement point, reached through the command, so no path is
-        // resolved here.
+        // The parser has validated the location's shape only (a safe
+        // project-relative path, 1-based line and column). That is lexical: it
+        // cannot see a link, so `src/link/passwd` passes it when `src/link`
+        // points at `/etc`. Containment belongs to `debuggen.openSource`,
+        // whose opener, `openSourceLocation`, is the canonical gate: it
+        // realpaths the session root and the target, requires a regular file
+        // with a pinned device and inode inside the root, re-probes it without
+        // following links, re-checks that identity and the loaded text after
+        // the load and reveals that verified document at the canonical path.
+        // The location is forwarded exactly as parsed and nothing is opened
+        // or resolved here, so no frame reaches the editor around that gate.
         this.dispatchCommand(message.type, [message.location]);
         return;
       case 'requestTarget':

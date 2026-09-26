@@ -47,10 +47,11 @@
  *    error's closed code and failure class — never with its **content**. The
  *    parsed input is model prose (a panel's title, summary and labels) that can
  *    echo developer source or personal data, a thrown message can quote it,
- *    and a log record passes no redaction checkpoint (AAP §0.5.2 places them at
- *    telemetry ingest and on the outbound prompt), so writing either would be
- *    CWE-532. The thrown value itself travels on, in-process only, as the
- *    rejection's `cause`, which `DebuggenError.toPayload` never serialises.
+ *    and a log record passes no redaction checkpoint (they sit at telemetry
+ *    ingest and on the outbound prompt — docs/SECURITY.md, "Redaction"), so
+ *    writing either would be CWE-532. The thrown value itself travels on,
+ *    in-process only, as the rejection's `cause`, which
+ *    `DebuggenError.toPayload` never serialises.
  * 7. **Cancellation is honoured before every call**, so an abandoned session
  *    never spends a request.
  *

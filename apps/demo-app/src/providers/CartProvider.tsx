@@ -653,6 +653,7 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
     return () => {
       controller.abort();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // A document the browser froze and later restored - Back and Forward from a page in the same
@@ -724,6 +725,7 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
       window.removeEventListener('pageshow', restored);
       document.removeEventListener('visibilitychange', shown);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function addLine(draft: CartItemDraft): Promise<void> {

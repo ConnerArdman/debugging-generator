@@ -8,8 +8,8 @@
  * `@debuggen/shared` and below nothing — `apps/local-service` consumes it, and
  * `apps/vscode-extension` bundles it (through the service) into the VSIX — so
  * `pnpm build` (`pnpm demo:generate && pnpm -r build`) builds `@debuggen/shared`
- * first and then this package, and every consumer type-checks against the
- * declarations emitted here.
+ * first and then this package, and every consumer loads or bundles the
+ * JavaScript emitted here.
  *
  * The one job of this file is to emit — deterministically, on a clean clone,
  * with only `@debuggen/shared` built before it — exactly the two paths that
@@ -88,10 +88,13 @@ export default defineConfig({
   target: 'es2023',
 
   /**
-   * Declarations are non-negotiable: `dist/index.d.ts` is what
-   * `apps/local-service` type-checks its pipeline stages against, including the
-   * generic `generateStructured<T>(schema, req)` signature that carries each
-   * stage's Zod authoring schema through to its parsed result.
+   * Declarations are non-negotiable: `dist/index.d.ts` is the packed-tarball
+   * entry of the `exports` map's source-first `types` array, carrying the
+   * generic `generateStructured<T>(schema, req)` signature that threads each
+   * stage's Zod authoring schema through to its parsed result. Inside the
+   * repository `apps/local-service` type-checks its pipeline stages against
+   * this project's `.tsbuild` declarations instead (root tsconfig.json,
+   * `"// no-aliases"`).
    *
    * The three overrides below are each required, not defensive. tsup's
    * declaration step builds its own TypeScript program: it reads the `tsconfig`

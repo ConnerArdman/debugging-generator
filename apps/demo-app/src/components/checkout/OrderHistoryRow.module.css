@@ -17,14 +17,11 @@
  *
  * WHY THE FOUR TRACKS SHARE THE ROW RATHER THAN CROWDING ITS END
  * Each track is `minmax(<floor>, <fraction>)`, so the four of them divide the row 2:1:1:1 and the
- * floors below are minimums rather than widths. Three fixed trailing tracks were the arrangement
- * before, and on a full-width page they left the whole surplus - some 680px of it at a 1136px
- * row - inside the first track as an empty band between the order reference and its status, with
- * the three values huddled against the right edge. Dividing the surplus instead spreads the four
+ * floors below are minimums rather than widths. Dividing the surplus this way spreads the four
  * columns across the row, which is how the reader scans one order as a single line rather than as
- * two distant clusters. The fractions still resolve identically for the header strip and for
- * every row, because both are laid out in boxes of the same width, so the alignment contract
- * below is untouched by the change.
+ * two distant clusters. The fractions resolve identically for the header strip and for every row,
+ * because both are laid out in boxes of the same width, which is what the alignment contract below
+ * relies on.
  *
  * Alignment contract with `OrderHistoryList.module.css`, whose `.columns` header strip (order,
  * status, items, total) states the same template:

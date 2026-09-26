@@ -1,14 +1,14 @@
 /**
- * Tooltip - measured, fixed placement of the open bubble (Q4-B2 F03).
+ * Tooltip - measured, fixed placement of the open bubble.
  *
- * The bubble used to be absolutely positioned inside its wrapper, so every `overflow` between the
- * trigger and the panel clipped it - the description of a table's first row was cut off under the
- * table's own header. An open bubble is now `position: fixed` at coordinates this primitive
- * measures, and these tests pin that measurement: the requested side, the gap read back from the
- * stylesheet's placement margin, the flip to the opposite side, the clamp to the viewport, the
- * right-to-left inline axis, re-placement on scroll, and the clean-up on close. They also pin the
- * two structural guarantees the rest of the package relies on: the bubble never leaves its
- * trigger's wrapper (no portal), and it stays mounted - described, hidden - while closed.
+ * An open bubble is `position: fixed` at coordinates this primitive measures, which keeps it clear
+ * of every scroll container's overflow clip between the trigger and the panel. These tests pin
+ * that measurement: the requested side, the gap read back from the stylesheet's placement margin,
+ * the flip to the opposite side, the clamp to the viewport, the right-to-left inline axis,
+ * re-placement on scroll and on resize, and the clean-up on close. They also pin the structural
+ * and focus guarantees the rest of the package relies on: the bubble never leaves its trigger's
+ * wrapper (no portal), it stays mounted - described, hidden - while closed, and Escape closes it
+ * without moving focus.
  *
  * The controlled mode (`open`, `describesTrigger`) is pinned last: an owner-held bubble is placed
  * by the same measurement, hover, focus and Escape are left to the owner, and handing control
@@ -196,7 +196,7 @@ afterEach(() => {
   Reflect.deleteProperty(document.documentElement, 'clientHeight');
 });
 
-describe('Tooltip fixed placement (Q4-B2 F03)', () => {
+describe('Tooltip fixed placement', () => {
   it('places a top bubble above its trigger, corrected for the placement margin', () => {
     const { trigger, bubble } = renderTooltip('top');
 
@@ -339,7 +339,7 @@ describe('Tooltip fixed placement (Q4-B2 F03)', () => {
   });
 });
 
-describe('Tooltip structure (Q4-B2 F03)', () => {
+describe('Tooltip structure', () => {
   it('keeps the open bubble inside its trigger wrapper rather than portalling it', () => {
     const { trigger, bubble } = renderTooltip('top');
 

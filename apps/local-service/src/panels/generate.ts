@@ -50,6 +50,21 @@
  * analysis and a validated panel both exist, and the stage supplies that guard
  * context from the {@link PanelGenerationResult} returned here.
  *
+ * ## The version ladder, and the predecessor a caller decided against
+ *
+ * A new panel is the session's next `panelVersion` and names the latest
+ * stored panel in `supersedes`. A caller that decided what to ask against one
+ * particular panel — the existing-evidence follow-up — names it in
+ * {@link PanelGenerationRequest.expectedPredecessor}, and the new panel then
+ * supersedes exactly that panel or is never stored. The rule is held twice: here,
+ * before any model call, so a session whose latest panel has moved on spends
+ * nothing; and authoritatively by the store, inside the transaction that
+ * inserts the panel, so a writer that slips in between that read and the insert
+ * is refused too. Both refusals reach the caller as one error —
+ * `SESSION_INVALID_STATE` with `details.reason: 'supersedes-stale'` — and
+ * neither stores, substitutes a fallback for or broadcasts anything: a panel
+ * whose version chain describes a different question is never delivered.
+ *
  * ## The prompt lives in a file, never here
  *
  * The instructions are `apps/local-service/prompts/generate-panel/vNNN.md`,
@@ -159,8 +174,9 @@ import type {
 } from '@debuggen/telemetry';
 
 import { sessionLogger, subsystemLogger } from '../logging.js';
+import { redactEmbeddedUrlsDeep, redactQuestionText } from '../pipeline/context-builder.js';
 import type { SessionBroadcaster } from '../sessions/manager.js';
-import type { PanelsRepo } from '../store/panels-repo.js';
+import type { PanelsRepo, PanelsRepoFailureReason } from '../store/panels-repo.js';
 import type { FallbackPanelBuilder } from './fallback.js';
 import { PANEL_FAILURE_POLICY } from './validate.js';
 import type {
@@ -346,6 +362,18 @@ export interface PanelGenerationRequest {
    * versions keep resolving — otherwise the manifest's current one.
    */
   readonly promptVersion?: PromptVersion | undefined;
+  /**
+   * The panel the caller decided against, when it decided against one. When
+   * present the new panel must supersede exactly this panel: a session whose
+   * latest panel is another one — or none — is refused before the model is
+   * called, and the store checks the same rule again, authoritatively, inside
+   * the transaction that inserts the panel. Either refusal is
+   * `SESSION_INVALID_STATE` with `details.reason: 'supersedes-stale'`, and
+   * nothing is stored or broadcast. Absent, the caller holds no expectation and
+   * the new panel supersedes whatever panel is latest at generation time, as
+   * the capture path does.
+   */
+  readonly expectedPredecessor?: PanelId | undefined;
   /** Cancels the generation; nothing is stored or broadcast once it aborts. */
   readonly signal?: AbortSignal | undefined;
 }
@@ -392,11 +420,19 @@ export interface PanelGenerator {
    * Never throws. Resolves to `ok` with a stored panel — a model panel that
    * passed all four gates, or the deterministic fallback — or to `err` with a
    * typed error: the provider's own error, a prompt configuration error, a
-   * store failure, or a fallback that could not be built.
+   * store failure, a fallback that could not be built, or the stale-predecessor
+   * refusal described below.
    *
    * When the session already holds a panel, the new one is its next version
    * and names it in `supersedes` (the new-capture follow-up path replaces the
-   * panel on screen just as the existing-evidence path does).
+   * panel on screen just as the existing-evidence path does). With
+   * {@link PanelGenerationRequest.expectedPredecessor} set, that panel must be
+   * the session's latest — checked before the model call and again by the
+   * store inside its insert transaction — or the generation is refused with
+   * `SESSION_INVALID_STATE` and `details.reason: 'supersedes-stale'`, having
+   * stored and broadcast nothing. The same refusal answers a store that finds
+   * another panel stored between this module's read of the ladder and its
+   * insert, whether or not the caller named a predecessor.
    */
   generate(request: PanelGenerationRequest): Promise<Result<PanelGenerationResult, DebuggenError>>;
 
@@ -404,7 +440,11 @@ export interface PanelGenerator {
    * The existing-evidence follow-up: the same pipeline with the follow-up
    * question appended to `{{question}}`, stored as `panelVersion n + 1` with
    * `supersedes` naming panel `n`. The previous row is never touched. Refused
-   * with `SESSION_INVALID_STATE` when the session holds no panel to supersede.
+   * with `SESSION_INVALID_STATE` when the session holds no panel to supersede,
+   * and — when the request names the panel `n` it was decided against in
+   * `expectedPredecessor` — with `details.reason: 'supersedes-stale'` when the
+   * session's latest panel is no longer that panel, before the model call or
+   * inside the store's insert transaction; nothing is stored or broadcast then.
    */
   regenerate(
     request: PanelRegenerationRequest,
@@ -739,7 +779,10 @@ function captureContext(summary: CaptureSummary): Readonly<Record<string, unknow
  * - `populatedSources` and `capture` → `{{captureOverview}}`, the two halves of
  *   the overview: how much each data source holds, and the bounded sections.
  *
- * The question and the output schema are prompt-only and never appear here.
+ * `analysis` and `capture` have every embedded URL's query values masked
+ * (`redactEmbeddedUrlsDeep`) before either the input or the text is derived,
+ * so the two stay identical and the outbound guard accepts them. The question
+ * and the output schema are prompt-only and never appear here.
  */
 export interface PanelStageContext {
   /** The structured `input` of the model request. */
@@ -763,18 +806,25 @@ export function buildPanelStageContext(
   analysis: AnalysisResult,
   summary: CaptureSummary,
 ): PanelStageContext {
-  const analysisSection = toJsonObject({
-    observed: analysis.observed,
-    likelyCauses: analysis.likelyCauses,
-    metrics: analysis.metrics,
-  });
+  // The analysis is model-authored prose and the overview carries captured
+  // names and addresses, so either can quote a queried URL (`/api/x?id=7`). The
+  // outbound guard refuses one that still carries a value, so both sections
+  // are masked with the pipeline's code-safe embedded-URL masker before the
+  // structured input and the prompt text are derived from them.
+  const analysisSection = redactEmbeddedUrlsDeep(
+    toJsonObject({
+      observed: analysis.observed,
+      likelyCauses: analysis.likelyCauses,
+      metrics: analysis.metrics,
+    }),
+  );
   const nodeCatalog = toJsonValue(
     PANEL_NODE_CATALOG_ENTRIES.map(catalogEntryContext),
     0,
     new Set<object>(),
   );
   const populatedSources = toJsonObject(populatedSourceCounts(summary));
-  const capture = toJsonObject(captureContext(summary));
+  const capture = redactEmbeddedUrlsDeep(toJsonObject(captureContext(summary)));
 
   return {
     input: {
@@ -790,14 +840,18 @@ export function buildPanelStageContext(
 
 /**
  * The text of `{{question}}`: the session's question, and on a regeneration
- * the follow-up after it, each bounded. The words are passed through as data;
- * nothing inspects them.
+ * the follow-up after it, each redacted and then bounded by the pipeline's
+ * `redactQuestionText` — credential shapes and pasted header values become
+ * `[redacted]`, every embedded query value becomes `?` — exactly as every other
+ * stage renders a question. Each is redacted on its own before the
+ * two are joined, so the separator can never end or start a URL run. The words
+ * are passed through as data; nothing inspects them.
  */
 function questionTextFor(question: string, followUpQuestion: string | undefined): string {
-  const asked = question.slice(0, MAX_QUESTION_CHARS);
+  const asked = redactQuestionText(question, MAX_QUESTION_CHARS).text;
   return followUpQuestion === undefined
     ? asked
-    : `${asked}${QUESTION_SEPARATOR}${followUpQuestion.slice(0, MAX_QUESTION_CHARS)}`;
+    : `${asked}${QUESTION_SEPARATOR}${redactQuestionText(followUpQuestion, MAX_QUESTION_CHARS).text}`;
 }
 
 /**
@@ -823,6 +877,20 @@ const REQUEST_DEFECT_HINT =
 /** The next step when a regeneration finds no panel to supersede. */
 const NOTHING_TO_REGENERATE_HINT =
   'A follow-up regenerates the panel a session already holds. Generate the first panel for the capture, or take the new-capture follow-up path.';
+
+/** The next step when the panel a generation must supersede is no longer the session's latest. */
+const PREDECESSOR_MOVED_HINT =
+  "The session's panel changed while this answer was being prepared, so nothing was stored or shown. Ask again; the answer is then built on the panel the session now holds.";
+
+/**
+ * The `details.reason` of a predecessor that is no longer the session's latest
+ * panel. The store reports the same reason when it refuses such an insert
+ * inside its transaction, and this module answers both with one error. The
+ * `satisfies` clause ties the literal to the store's own reason vocabulary, so
+ * a rename there fails to compile here rather than silently letting a stale
+ * insert refusal pass through as a raw store error.
+ */
+const SUPERSEDES_STALE_REASON = 'supersedes-stale' satisfies PanelsRepoFailureReason;
 
 /** The next step when no summary was supplied and no summary port is configured. */
 const MISSING_SUMMARY_PORT_HINT =
@@ -861,6 +929,43 @@ function panelError(
     },
     ...(cause === undefined ? {} : { cause }),
   });
+}
+
+/**
+ * The refusal of a generation whose predecessor is no longer the session's
+ * latest panel — the shape of the analyze stage's own stale-supersedes refusal:
+ * `SESSION_INVALID_STATE`, this stage and `reason: 'supersedes-stale'`.
+ *
+ * @param latestPanelVersion The version of the panel the session holds now,
+ * when this module read it; omitted when the store refused the insert.
+ * @param cause The store's refusal, when the store detected the move inside its
+ * insert transaction.
+ * @returns The typed error: versions and codes only, never panel content.
+ */
+function predecessorMovedError(
+  latestPanelVersion: number | undefined,
+  cause?: DebuggenError,
+): DebuggenError {
+  return panelError(
+    'SESSION_INVALID_STATE',
+    'The panel this generation was asked to supersede is no longer the latest panel of the session; nothing was stored or broadcast.',
+    PREDECESSOR_MOVED_HINT,
+    {
+      reason: SUPERSEDES_STALE_REASON,
+      ...(latestPanelVersion === undefined ? {} : { latestPanelVersion }),
+    },
+    cause,
+  );
+}
+
+/**
+ * Whether the store refused an insert because another panel became the
+ * session's latest between this module's read of the ladder and the insert.
+ * Compared by the store's enumerated reason: that is its contract, whatever
+ * code the refusal carries.
+ */
+function isStalePredecessorRefusal(error: DebuggenError): boolean {
+  return error.details?.['reason'] === SUPERSEDES_STALE_REASON;
 }
 
 /** Whether a generation has been abandoned. */
@@ -975,8 +1080,11 @@ function settle(): void {
  * for one session run one after another, so the version read from the ladder
  * and the insert that uses it cannot interleave with another generation of the
  * same session — `UNIQUE(session_id, panel_version)` stays an invariant the
- * store enforces rather than a race this module loses. Different sessions run
- * concurrently.
+ * store enforces rather than a race this module loses. A panel stored for the
+ * session by anything outside this queue is caught by the store's own
+ * predecessor check inside its insert transaction, and answered with the
+ * stale-predecessor refusal rather than a panel superseding the wrong
+ * predecessor. Different sessions run concurrently.
  *
  * @param deps The provider, prompt loader, validator, fallback builder, panel
  * store and the optional summary port, broadcaster, logger and id factory.
@@ -1204,6 +1312,29 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
   };
 
   /**
+   * The answer to an insert the store refused because another panel became
+   * the session's latest after this generation read the ladder: the
+   * stale-predecessor refusal, with the store's error as its cause. Nothing is
+   * stored, no fallback is substituted and nothing is broadcast — a fallback
+   * would supersede the same stale panel and be refused the same way.
+   */
+  const refuseMovedPredecessor = (
+    scope: GenerationScope,
+    refusal: DebuggenError,
+    fallback: boolean,
+  ): Result<never, DebuggenError> => {
+    const error = predecessorMovedError(undefined, refusal);
+    scope.log.warn(error.message, {
+      stage: PANEL_PROMPT_STAGE,
+      reason: SUPERSEDES_STALE_REASON,
+      code: refusal.code,
+      panelVersion: scope.panelVersion,
+      fallback,
+    });
+    return err(error);
+  };
+
+  /**
    * Replaces a rejected panel with the deterministic fallback of `./fallback.ts`
    * and stores and broadcasts it through the same path as a model panel.
    *
@@ -1272,6 +1403,9 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
 
     const stored = deps.panels.insertPanel(built.value, { captureId: scope.captureId });
     if (!stored.ok) {
+      if (isStalePredecessorRefusal(stored.error)) {
+        return refuseMovedPredecessor(scope, stored.error, true);
+      }
       scope.log.error('The deterministic fallback panel could not be stored.', {
         stage: PANEL_PROMPT_STAGE,
         code: stored.error.code,
@@ -1336,8 +1470,11 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
       return err(error);
     }
 
-    // The version ladder: read inside this session's queue, so the insert
-    // below takes exactly this rung.
+    // The version ladder: read inside this session's queue, so no other
+    // generation of this module takes the rung between this read and the insert
+    // below. A writer outside the queue is caught by the store, which refuses —
+    // inside its insert transaction — a panel whose predecessor is no longer the
+    // session's latest; that refusal is answered by `refuseMovedPredecessor`.
     const latest = deps.panels.getLatestPanel(sessionId);
     if (!latest.ok) {
       sessionLog.warn('The latest panel of the session could not be read.', {
@@ -1355,6 +1492,20 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
       sessionLog.warn(error.message, { stage: PANEL_PROMPT_STAGE });
       return err(error);
     }
+    // A caller that decided against one particular panel is answered on that
+    // panel or not at all. A session whose latest panel is another one is
+    // refused here, before a model call is spent; nothing is stored or sent.
+    const { expectedPredecessor } = request;
+    if (expectedPredecessor !== undefined && latest.value?.id !== expectedPredecessor) {
+      const latestPanelVersion = latest.value?.panelVersion;
+      const error = predecessorMovedError(latestPanelVersion);
+      sessionLog.warn(error.message, {
+        stage: PANEL_PROMPT_STAGE,
+        reason: SUPERSEDES_STALE_REASON,
+        ...(latestPanelVersion === undefined ? {} : { latestPanelVersion }),
+      });
+      return err(error);
+    }
     const version = deps.panels.nextPanelVersion(sessionId);
     if (!version.ok) {
       sessionLog.warn('The next panel version of the session could not be read.', {
@@ -1363,7 +1514,9 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
       });
       return err(version.error);
     }
-    const supersedes = latest.value?.id;
+    // The expected predecessor when the caller named one — equal to the latest
+    // panel after the check above — otherwise the latest panel, if any.
+    const supersedes = expectedPredecessor ?? latest.value?.id;
 
     const id = tryCatch(() => mintId(), 'INTERNAL');
     if (!id.ok) {
@@ -1497,6 +1650,11 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
 
     const stored = deps.panels.insertPanel(checked.value.spec, { captureId });
     if (!stored.ok) {
+      // Another panel became the session's latest after the ladder was read:
+      // refused inside the store's transaction, never answered with a fallback.
+      if (isStalePredecessorRefusal(stored.error)) {
+        return refuseMovedPredecessor(scope, stored.error, false);
+      }
       // The store re-parses every panel; a refusal of the document itself is a
       // rejection like any other, answered with the fallback. Anything else is
       // the store's own failure and passes through.

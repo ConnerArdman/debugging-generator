@@ -14,10 +14,11 @@
  *    `maxBufferedEvents` events and at most `TAIL_UNDELIVERED_RETENTION_MS`
  *    from the outage's first undelivered attempt; past either bound it is
  *    truncated or released, counted, and logged apart from ordinary overflow.
- * 3. **Nothing else changed.** Invalid frames are still discarded (they would
- *    fail again), duplicates are still skipped — retained events included —
- *    the provenance guard still refuses anything that is not a persisted event
- *    of its session, and `close()` still releases every timer.
+ * 3. **Rejection and shutdown are final.** An invalid frame is discarded rather
+ *    than retried, because it would fail again; a duplicate is skipped whether
+ *    its original waits in the backlog or was recently sent; the provenance
+ *    guard refuses anything that is not a persisted event of its session; and
+ *    `close()` releases every timer, a pending retry included.
  *
  * ## Fixture conventions
  *

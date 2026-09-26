@@ -22,7 +22,13 @@
  *   suite hermetic — the containment gate is judged against a throwaway tree,
  *   never the developer's workspace, and no workspace folder is ever added
  *   (`updateWorkspaceFolders` in a single-folder window restarts the extension
- *   host and would end the run).
+ *   host and would end the run). Its canonical gate is exercised with real
+ *   links planted in that tree: directory and final-component links out of the
+ *   root are refused whether or not the outside file exists, an in-project
+ *   link opens its canonical target, and a service pin (computed here
+ *   independently, as the service defines it) opens only the file it names — a
+ *   link re-pointed or a file replaced after the pin was taken, the symlink
+ *   substitution a queued `source.open` is exposed to, opens nothing.
  * - `revealLocationInEditor` is the policy-free primitive the URI handler
  *   builds on. It is exercised against the read-only fixture workspace and a
  *   scratch file outside it, and no containment error is ever expected from
@@ -77,11 +83,19 @@ import * as vscode from 'vscode';
 import {
   HIGHLIGHT_DURATION_MS,
   disposeSourceRevealResources,
+  forwardedSourcePin,
   hasActiveHighlight,
   openSourceLocation,
+  revealDocumentInEditor,
   revealLocationInEditor,
+  sourceResultFor,
 } from '../../src/source/open-location';
-import type { OpenSourceDeps, RevealOutcome } from '../../src/source/open-location';
+import type {
+  OpenSourceContext,
+  OpenSourceDeps,
+  RevealOutcome,
+  SourceOpenPin,
+} from '../../src/source/open-location';
 import {
   cleanupScratch,
   closeAllEditors,
@@ -89,6 +103,7 @@ import {
   fixtureFile,
   fixtureWorkspaceRoot,
   makeSourceLocation,
+  plantSymlink,
   stopTrackedProcesses,
   waitFor,
   writeFixtureFile,
@@ -157,6 +172,7 @@ const SHORT_HIGHLIGHT_MS = 150;
 const PATH_OUTSIDE_PROJECT = errorCode('PATH_OUTSIDE_PROJECT');
 const PROTOCOL_INVALID_MESSAGE = errorCode('PROTOCOL_INVALID_MESSAGE');
 const PROJECT_NOT_FOUND = errorCode('PROJECT_NOT_FOUND');
+const FS_UNSAFE_PATH = errorCode('FS_UNSAFE_PATH');
 
 /** The fixture workspace's two revealable modules, project-relative POSIX. */
 const SAMPLE_MODULE = 'src/sample-module.ts';
@@ -381,15 +397,15 @@ function spyOnReveal(): {
   readonly calls: RevealCall[];
 } {
   const calls: RevealCall[] = [];
-  const reveal: NonNullable<OpenSourceDeps['reveal']> = (uri, line, column, options) => {
+  const reveal: NonNullable<OpenSourceDeps['reveal']> = (document, line, column, options) => {
     calls.push({
-      uri: uri.toString(),
+      uri: document.uri.toString(),
       line,
       column,
       endLine: options?.endLine,
       symbol: options?.symbol,
     });
-    return revealLocationInEditor(uri, line, column, options);
+    return revealDocumentInEditor(document, line, column, options);
   };
   return { reveal, calls };
 }
@@ -541,6 +557,34 @@ function longFileSource(): string {
     );
   }
   return `${lines.join('\n')}\n`;
+}
+
+/** Joins a project-relative POSIX path onto an absolute root with the platform's separators. */
+function under(root: string, relativePosixPath: string): string {
+  return path.join(root, ...relativePosixPath.split('/'));
+}
+
+/**
+ * The pin the service would put on a forwarded `source.open` for `file`,
+ * computed here independently of the product: the target's path relative to
+ * the canonical root with every link resolved, and the device and inode of a
+ * `bigint` `lstat` of that canonical path, in canonical decimal.
+ */
+async function pinOf(root: string, file: string): Promise<SourceOpenPin> {
+  const realRoot = await fsp.realpath(root);
+  const realTarget = await fsp.realpath(under(root, file));
+  const stats = await fsp.lstat(realTarget, { bigint: true });
+  assert.ok(stats.isFile(), `the pinned target of ${file} must be a regular file`);
+  return {
+    file: path.relative(realRoot, realTarget).split(path.sep).join('/'),
+    dev: String(stats.dev),
+    ino: String(stats.ino),
+  };
+}
+
+/** The canonical-gate reason a refusal carries in its details. */
+function refusalReason(error: DebuggenError): unknown {
+  return error.details?.['reason'];
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +823,87 @@ describe('open-location: the editor end of click-to-source', function () {
         !editor.visibleRanges.some((range) => range.start.line === 0),
         `line 1 is still in view after revealing line ${longAnchor.line}: the editor did not scroll`,
       );
+    });
+
+    it('opens a location reached through an in-project link at its canonical target, never at the link path', async function () {
+      // A final-component link and a directory link, both staying inside the root.
+      const fileLink = 'links/inside/reveal-alias.ts';
+      const directoryLink = 'links/inside/features-alias';
+      const fileLinkPath = under(projectRoot, fileLink);
+      plantSymlink(fileLinkPath, path.relative(path.dirname(fileLinkPath), targetFile));
+      plantSymlink(under(projectRoot, directoryLink), path.dirname(targetFile));
+
+      for (const file of [fileLink, `${directoryLink}/${path.basename(targetFile)}`]) {
+        assert.equal(await fsp.realpath(under(projectRoot, file)), targetFile, `${file} is a link`);
+        const log = captureLog();
+        const spy = spyOnReveal();
+        const { showWarning, warnings } = collectWarnings();
+
+        const outcome = expectOk(
+          await openSourceLocation(
+            targetLocation({ file }),
+            { projectRoot },
+            { logger: log.logger, reveal: spy.reveal, showWarning },
+          ),
+          `openSourceLocation through ${file}`,
+        );
+
+        assert.deepEqual(
+          spy.calls.map((call) => call.uri),
+          [vscode.Uri.file(targetFile).toString()],
+          `${file}: the primitive receives the canonical URI, not the link path`,
+        );
+        assert.equal(
+          outcome.editor.document.uri.fsPath,
+          targetFile,
+          `${file}: the editor shows the canonical path`,
+        );
+        assertCursorOnAnchor(outcome, await activeEditorFor(targetFile), targetAnchor);
+        assert.deepEqual(warnings, [], `${file}: a contained link raises no warning`);
+        // Neither the roots nor where the link points reach the log.
+        assertDisclosesNoPath(
+          log.rendered,
+          [projectRoot, foreignRoot, SCRATCH_TARGET],
+          `the log of ${file}`,
+        );
+      }
+    });
+
+    it('opens a forwarded location whose pin matches what it resolves, directly and through an in-project link', async function () {
+      const direct = 'pin/valid/pinned-module.ts';
+      const alias = 'pin/valid/pinned-alias.ts';
+      const directFile = writeFixtureFile(projectRoot, direct, SCRATCH_TARGET_SOURCE);
+      plantSymlink(under(projectRoot, alias), path.basename(directFile));
+      const pinned = await pinOf(projectRoot, direct);
+      assert.equal(pinned.file, direct, 'the pin names the canonical project-relative path');
+      assert.deepEqual(
+        await pinOf(projectRoot, alias),
+        pinned,
+        'the alias pins its canonical target',
+      );
+
+      for (const file of [direct, alias]) {
+        const log = captureLog();
+        const spy = spyOnReveal();
+        const { showWarning, warnings } = collectWarnings();
+
+        const outcome = expectOk(
+          await openSourceLocation(
+            targetLocation({ file }),
+            { projectRoot, pinned },
+            { logger: log.logger, reveal: spy.reveal, showWarning },
+          ),
+          `a pinned open of ${file}`,
+        );
+
+        assert.deepEqual(
+          spy.calls.map((call) => call.uri),
+          [vscode.Uri.file(directFile).toString()],
+        );
+        assertCursorOnAnchor(outcome, await activeEditorFor(directFile), targetAnchor);
+        assert.deepEqual(warnings, []);
+        assert.equal(loggedFields(log, 'info', 'Opened a source location')['pinned'], true);
+      }
     });
   });
 
@@ -1035,12 +1160,15 @@ describe('open-location: the editor end of click-to-source', function () {
      * and all violations are reported together. The error value and the
      * "opened nothing" evidence are independent verdicts, and a refusal that
      * regressed must show which of them broke, not only the first.
+     *
+     * `pinned`, when given, is the service's pin of a forwarded frame.
      */
     async function assertRefusedWithoutOpening(
       location: SourceLocation,
       root: string,
       code: DebuggenErrorCode,
       what: string,
+      pinned?: SourceOpenPin,
     ): Promise<DebuggenError> {
       const roots = [projectRoot, foreignRoot];
       const before = snapshotEditors();
@@ -1050,11 +1178,13 @@ describe('open-location: the editor end of click-to-source', function () {
       const log = captureLog();
       const spy = spyOnReveal();
       const { showWarning, warnings } = collectWarnings();
-      const result = await openSourceLocation(
-        location,
-        { projectRoot: root },
-        { logger: log.logger, reveal: spy.reveal, showWarning },
-      );
+      const context: OpenSourceContext =
+        pinned === undefined ? { projectRoot: root } : { projectRoot: root, pinned };
+      const result = await openSourceLocation(location, context, {
+        logger: log.logger,
+        reveal: spy.reveal,
+        showWarning,
+      });
 
       const violations: string[] = [];
       function check(guarantee: string, assertion: () => void): void {
@@ -1240,6 +1370,366 @@ describe('open-location: the editor end of click-to-source', function () {
         'a blank root',
       );
       assert.equal(error.cause, undefined, 'a blank root is refused before the containment gate');
+    });
+
+    it('refuses a location that leaves the project through an in-project directory link, whether or not the outside file exists', async function () {
+      const link = 'links/escape/foreign-directory';
+      plantSymlink(under(projectRoot, link), path.dirname(foreignFile));
+      const present = `${link}/${path.basename(foreignFile)}`;
+      const absent = `${link}/absent-module.ts`;
+      assert.equal(
+        await fsp.realpath(under(projectRoot, present)),
+        foreignFile,
+        'the link path names the real foreign file',
+      );
+      await assert.rejects(fsp.lstat(under(foreignRoot, 'src/absent-module.ts')));
+
+      const errors: DebuggenError[] = [];
+      for (const file of [present, absent]) {
+        const location = makeSourceLocation({ file, line: 1, column: 1 });
+        assert.ok(isOk(parseSourceLocation(location)), `${file} passes every lexical check`);
+        const error = await assertRefusedWithoutOpening(
+          location,
+          projectRoot,
+          FS_UNSAFE_PATH,
+          `a directory link out of the project (${file})`,
+        );
+        assert.equal(refusalReason(error), 'leaves-project');
+        errors.push(error);
+      }
+
+      // No filesystem oracle: an outside file that exists and one that does
+      // not are refused with one code, one sentence and one hint.
+      const [first, second] = errors;
+      assert.ok(first !== undefined && second !== undefined);
+      assert.equal(first.hint, second.hint);
+      assert.equal(
+        first.message.replace(`${present}:1:1`, '<at>'),
+        second.message.replace(`${absent}:1:1`, '<at>'),
+      );
+    });
+
+    it('refuses a final-component link to a file outside the project, and a dangling one alike', async function () {
+      const existing = 'links/escape/foreign-file.ts';
+      const dangling = 'links/escape/dangling-file.ts';
+      plantSymlink(under(projectRoot, existing), foreignFile);
+      plantSymlink(under(projectRoot, dangling), under(foreignRoot, 'src/absent-module.ts'));
+
+      for (const file of [existing, dangling]) {
+        const error = await assertRefusedWithoutOpening(
+          makeSourceLocation({ file, line: 1, column: 1 }),
+          projectRoot,
+          FS_UNSAFE_PATH,
+          `a final-component link out of the project (${file})`,
+        );
+        assert.equal(refusalReason(error), 'leaves-project');
+      }
+    });
+
+    it('refuses a file missing from the project, and a directory, before any editor call', async function () {
+      const missing = await assertRefusedWithoutOpening(
+        makeSourceLocation({ file: 'src/features/absent-module.ts', line: 1, column: 1 }),
+        projectRoot,
+        PROJECT_NOT_FOUND,
+        'a file missing from the project',
+      );
+      assert.equal(refusalReason(missing), 'missing');
+
+      const directory = await assertRefusedWithoutOpening(
+        makeSourceLocation({ file: path.posix.dirname(SCRATCH_TARGET), line: 1, column: 1 }),
+        projectRoot,
+        PROJECT_NOT_FOUND,
+        'a directory',
+      );
+      assert.equal(refusalReason(directory), 'not-a-file');
+    });
+
+    it('refuses a pinned location whose link was re-pointed after the service checked it (symlink substitution during queued delivery)', async function () {
+      const directory = 'pin/repointed';
+      writeFixtureFile(projectRoot, `${directory}/first.ts`, SCRATCH_TARGET_SOURCE);
+      writeFixtureFile(projectRoot, `${directory}/second.ts`, SCRATCH_TARGET_SOURCE);
+      const link = `${directory}/current.ts`;
+      const linkPath = under(projectRoot, link);
+      plantSymlink(linkPath, 'first.ts');
+      // What the service proved and pinned before the frame was queued.
+      const pinned = await pinOf(projectRoot, link);
+      assert.equal(pinned.file, `${directory}/first.ts`);
+
+      // While the frame is in flight the link is re-pointed at another file
+      // of the project: contained, and still not what the service checked ...
+      await fsp.unlink(linkPath);
+      plantSymlink(linkPath, 'second.ts');
+      const inside = await assertRefusedWithoutOpening(
+        targetLocation({ file: link }),
+        projectRoot,
+        FS_UNSAFE_PATH,
+        'a link re-pointed inside the project',
+        pinned,
+      );
+      assert.equal(refusalReason(inside), 'pin-mismatch');
+
+      // ... or out of the project altogether.
+      await fsp.unlink(linkPath);
+      plantSymlink(linkPath, foreignFile);
+      const outside = await assertRefusedWithoutOpening(
+        targetLocation({ file: link }),
+        projectRoot,
+        FS_UNSAFE_PATH,
+        'a link re-pointed out of the project',
+        pinned,
+      );
+      assert.equal(refusalReason(outside), 'leaves-project');
+
+      // Pointed back, the same frame opens: the refusals above were the pin's.
+      await fsp.unlink(linkPath);
+      plantSymlink(linkPath, 'first.ts');
+      const { showWarning, warnings } = collectWarnings();
+      expectOk(
+        await openSourceLocation(
+          targetLocation({ file: link }),
+          { projectRoot, pinned },
+          { showWarning },
+        ),
+        'the pinned link once it points back',
+      );
+      assert.deepEqual(warnings, []);
+    });
+
+    it('refuses a pinned location whose file was replaced by a new inode at the same path', async function () {
+      const file = 'pin/replaced/module.ts';
+      const original = writeFixtureFile(projectRoot, file, SCRATCH_TARGET_SOURCE);
+      const pinned = await pinOf(projectRoot, file);
+
+      // Same path, same bytes, different file: identity, not content, decides.
+      const replacement = writeFixtureFile(projectRoot, `${file}.next`, SCRATCH_TARGET_SOURCE);
+      await fsp.rename(replacement, original);
+      const replaced = await pinOf(projectRoot, file);
+      assert.equal(replaced.file, pinned.file, 'the canonical path is unchanged');
+      assert.notEqual(replaced.ino, pinned.ino, 'the replacement is a different inode');
+
+      const error = await assertRefusedWithoutOpening(
+        targetLocation({ file }),
+        projectRoot,
+        FS_UNSAFE_PATH,
+        'a file replaced after the service checked it',
+        pinned,
+      );
+      assert.equal(refusalReason(error), 'pin-mismatch');
+    });
+
+    it('refuses a pin whose file, device or inode differs from what the location resolves to', async function () {
+      const file = 'pin/mismatch/module.ts';
+      const alias = 'pin/mismatch/alias.ts';
+      const other = 'pin/mismatch/other.ts';
+      const target = writeFixtureFile(projectRoot, file, SCRATCH_TARGET_SOURCE);
+      writeFixtureFile(projectRoot, other, SCRATCH_TARGET_SOURCE);
+      plantSymlink(under(projectRoot, alias), path.basename(target));
+      const pinned = await pinOf(projectRoot, file);
+      const otherPin = await pinOf(projectRoot, other);
+
+      const wrongPins: readonly (readonly [string, string, SourceOpenPin])[] = [
+        ['another file of the project', file, { ...pinned, file: other }],
+        // The lexical link path is not the canonical path the service pins.
+        ['the link path instead of its canonical target', alias, { ...pinned, file: alias }],
+        ['another inode', file, { ...pinned, ino: otherPin.ino }],
+        ['another device', file, { ...pinned, dev: String(BigInt(pinned.dev) + 1n) }],
+        ["another file's whole pin", file, otherPin],
+      ];
+      for (const [what, location, pin] of wrongPins) {
+        const error = await assertRefusedWithoutOpening(
+          targetLocation({ file: location }),
+          projectRoot,
+          FS_UNSAFE_PATH,
+          `a pin naming ${what}`,
+          pin,
+        );
+        assert.equal(refusalReason(error), 'pin-mismatch', `a pin naming ${what}`);
+      }
+    });
+  });
+
+  describe('a forwarded source.open without a pin', function () {
+    it('is refused with FS_UNSAFE_PATH and answered with constant copy of its own that repeats nothing', async function () {
+      const refused = forwardedSourcePin(undefined);
+      assert.ok(isErr(refused), 'an unpinned forward is refused');
+      assert.equal(refused.error.code, FS_UNSAFE_PATH);
+
+      const pinned = await pinOf(projectRoot, SCRATCH_TARGET);
+      const accepted = forwardedSourcePin(pinned);
+      assert.ok(isOk(accepted), 'a pinned forward passes');
+      assert.deepEqual(accepted.value, pinned);
+
+      const answered = { sessionId: 'sess_unpinned', ref: 'msg_unpinned' } as const;
+      const answer = sourceResultFor(answered, { kind: 'not-opened', code: refused.error.code });
+      assert.ok(isOk(answer) && answer.value.status === 'failed', 'the answer is a failure');
+      assert.equal(answer.value.error.code, FS_UNSAFE_PATH);
+
+      // FS_UNSAFE_PATH has a sentence of its own rather than the fallback a
+      // code without an entry gets.
+      const fallback = sourceResultFor(answered, {
+        kind: 'not-opened',
+        code: errorCode('CAPTURE_EMPTY'),
+      });
+      assert.ok(isOk(fallback) && fallback.value.status === 'failed');
+      assert.notEqual(answer.value.error.message, fallback.value.error.message);
+
+      const wire = JSON.stringify(answer.value);
+      assertDisclosesNoPath(
+        [wire],
+        [projectRoot, SCRATCH_TARGET, refused.error.message],
+        'the unpinned answer',
+      );
+    });
+  });
+
+  describe('a file changed between the identity probe and the editor load', function () {
+    beforeEach(async function () {
+      await openBaselineEditor(fixtureFile(BASELINE_MODULE));
+    });
+
+    /** What an outside file holds when its text is not the proved file's. */
+    const OUTSIDE_SOURCE = 'export const outsideOnlyValue = 42;\n';
+
+    /**
+     * A `loadDocument` seam for the interleaving the post-load checks exist
+     * for. When the gate asks the editor to load the canonical document —
+     * after the no-follow probe has proved the inode — it moves the proved
+     * file aside, puts a link to `outside` at its path, and only then lets the
+     * real editor read that path. With `restore`, the proved file is moved
+     * back as soon as the editor has read, so the path names the proved inode
+     * again by the time the gate looks.
+     */
+    function swapDuringLoad(
+      file: string,
+      outside: string,
+      restore: boolean,
+    ): {
+      readonly load: NonNullable<OpenSourceDeps['loadDocument']>;
+      readonly loads: vscode.TextDocument[];
+    } {
+      const target = under(projectRoot, file);
+      const heldAside = `${target}.held`;
+      const loads: vscode.TextDocument[] = [];
+      const load: NonNullable<OpenSourceDeps['loadDocument']> = async (uri) => {
+        assert.equal(uri.fsPath, target, 'the gate loads the canonical path only');
+        await fsp.rename(target, heldAside);
+        plantSymlink(target, outside);
+        try {
+          const document = await vscode.workspace.openTextDocument(uri);
+          loads.push(document);
+          return document;
+        } finally {
+          if (restore) {
+            await fsp.unlink(target);
+            await fsp.rename(heldAside, target);
+          }
+        }
+      };
+      return { load, loads };
+    }
+
+    it('refuses, showing nothing, a file swapped for a link to an outside file after the probe — same text or not, forwarded or opened by the command and the view', async function () {
+      const sameText = writeFixtureFile(foreignRoot, 'race/same-text.ts', SCRATCH_TARGET_SOURCE);
+      const otherText = writeFixtureFile(foreignRoot, 'race/other-text.ts', OUTSIDE_SOURCE);
+      const cases: readonly (readonly [string, string, boolean])[] = [
+        ['a forwarded frame, outside file with the same text', sameText, true],
+        ['a forwarded frame, outside file with other text', otherText, true],
+        // `debuggen.openSource` and the view's `openFile` frame, which
+        // dispatches to it, open with exactly this pin-less context.
+        ['the command and the view, outside file with the same text', sameText, false],
+        ['the command and the view, outside file with other text', otherText, false],
+      ];
+
+      let index = 0;
+      for (const [what, outside, forwarded] of cases) {
+        index += 1;
+        const file = `race/kept/module-${String(index)}.ts`;
+        writeFixtureFile(projectRoot, file, SCRATCH_TARGET_SOURCE);
+        const pinned = await pinOf(projectRoot, file);
+        const context: OpenSourceContext = forwarded ? { projectRoot, pinned } : { projectRoot };
+
+        const before = snapshotEditors();
+        const foreignDocumentsBefore = documentsUnder([foreignRoot]);
+        const log = captureLog();
+        const spy = spyOnReveal();
+        const { showWarning, warnings } = collectWarnings();
+        const swap = swapDuringLoad(file, outside, false);
+
+        const result = await openSourceLocation(targetLocation({ file }), context, {
+          logger: log.logger,
+          reveal: spy.reveal,
+          showWarning,
+          loadDocument: swap.load,
+        });
+
+        assert.equal(swap.loads.length, 1, `${what}: the swap ran between the probe and the load`);
+        const error = expectErr(result, FS_UNSAFE_PATH, what);
+        assert.equal(refusalReason(error), 'changed', what);
+        assert.deepEqual(spy.calls, [], `${what} reached the reveal primitive`);
+        assert.deepEqual(snapshotEditors(), before, `${what} showed a document`);
+        assert.deepEqual(
+          documentsUnder([foreignRoot]),
+          foreignDocumentsBefore,
+          `${what} loaded the outside file under its own name`,
+        );
+        assert.equal(warnings.length, 1, `${what} warned ${String(warnings.length)} times`);
+        assertDisclosesNoPath(
+          [...warnings, ...log.rendered],
+          [projectRoot, foreignRoot, outside],
+          what,
+        );
+      }
+    });
+
+    it('opens a file re-pointed and restored within the editor read only when the text read is that of the proved file, and reveals that same verified document', async function () {
+      const file = 'race/restored/module.ts';
+      const target = writeFixtureFile(projectRoot, file, SCRATCH_TARGET_SOURCE);
+      const sameText = writeFixtureFile(
+        foreignRoot,
+        'race/restored-same.ts',
+        SCRATCH_TARGET_SOURCE,
+      );
+      const pinned = await pinOf(projectRoot, file);
+      const swap = swapDuringLoad(file, sameText, true);
+      const revealed: vscode.TextDocument[] = [];
+      const { showWarning, warnings } = collectWarnings();
+
+      const outcome = expectOk(
+        await openSourceLocation(
+          targetLocation({ file }),
+          { projectRoot, pinned },
+          {
+            showWarning,
+            loadDocument: swap.load,
+            reveal: (document, line, column, options) => {
+              revealed.push(document);
+              return revealDocumentInEditor(document, line, column, options);
+            },
+          },
+        ),
+        'a file restored within the editor read',
+      );
+
+      assert.equal(swap.loads.length, 1, 'the swap ran between the probe and the load');
+      assert.equal(revealed.length, 1, 'one reveal');
+      assert.strictEqual(
+        revealed[0],
+        swap.loads[0],
+        'the reveal shows the document the gate verified',
+      );
+      assert.strictEqual(outcome.editor.document, swap.loads[0]);
+      assert.equal(outcome.editor.document.uri.fsPath, target, 'shown under the canonical path');
+      assert.equal(
+        outcome.editor.document.getText(),
+        SCRATCH_TARGET_SOURCE,
+        'what is shown is the text of the proved file',
+      );
+      assert.deepEqual(
+        await pinOf(projectRoot, file),
+        pinned,
+        'the canonical path still names the pinned inode',
+      );
+      assert.deepEqual(warnings, []);
     });
   });
 });

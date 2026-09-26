@@ -54,7 +54,7 @@
  * that signal escapes the shell of the render, and the boundary absorbs it first. So `proxy.ts`
  * looks the slug up ahead of rendering, with the same slug schema this file parses with, and
  * rewrites an address no product owns to the not-found route, which answers with a 404 status
- * line - what an uptime monitor, a CDN and an automated test read.
+ * line - what an uptime monitor, a CDN and a search crawler read.
  *
  * The document is decided by `generateMetadata`, because Next.js resolves a page's metadata as one
  * unit. Ask the render alone, and the answer arrives after the loading boundary has flushed the
@@ -124,13 +124,11 @@ interface Props {
  * root layout, which declares it once as the `'%s · Lumen Supply'` template every nested route
  * inherits, so this reads `Product details · Lumen Supply` in the browser.
  *
- * It names the page rather than the product, even though the product's own name would title the
- * tab more precisely, and that is unchanged: this route exists to be a clean example of one
- * interaction's work, and the one title it delivers is a property of the page, not of the row
- * behind it. A slug no product owns is not titled from here at all: `proxy.ts` rewrites its address
- * to the not-found route before this file runs, and one that reaches this file anyway is answered
- * by `generateMetadata` with `notFound()` - either way `app/not-found.tsx` supplies its own "Page
- * not found".
+ * It titles the page rather than the product, so every product page carries the same tab title.
+ * A slug no product owns is not titled from here at all: `proxy.ts` rewrites its address to the
+ * not-found route before this file runs, and one that reaches this file anyway is answered by
+ * `generateMetadata` with `notFound()` - either way `app/not-found.tsx` supplies its own "Page not
+ * found".
  */
 const PAGE_TITLE = 'Product details';
 
@@ -142,8 +140,7 @@ const PAGE_TITLE = 'Product details';
  * resolves metadata in its own pass, and `storefrontRequest` sends its `fetch` with
  * `cache: 'no-store'`, which opts the request out of Next.js's own per-request memoization - so
  * without something here the two passes would issue two identical `GET /api/products/[slug]`
- * calls, and a page whose whole purpose is to be a legible example of one interaction's work would
- * double its own traffic.
+ * calls for every page request, doubling the load on the endpoint and the database behind it.
  *
  * React's `cache()` is that something. It memoizes by argument for the lifetime of a single
  * request's render, so the second caller receives the first caller's promise: one HTTP call, one
@@ -157,11 +154,6 @@ const PAGE_TITLE = 'Product details';
  * callers already handle. A rejection is memoized exactly as a value is, so the render replays the
  * rejection `generateMetadata` saw rather than retrying the read - which is precisely what the
  * notice path needs: metadata keeps the page's title, the render answers the failure.
- *
- * Named in upper case like the copy constants below. `scripts/check-no-hardcoding.mjs` harvests
- * this workspace's declared names with two or more camel-case tokens into the vocabulary no
- * product file may then contain, and drops all-caps constants, so a module constant here is
- * written the way the rest of the demo writes them.
  */
 const PRODUCT_FOR_SLUG = cache(async (slug: string): Promise<ProductDetail> =>
   loadProductDetail({ slug, origin: storefrontOrigin() }),
@@ -276,12 +268,12 @@ export default async function ProductDetailPage({ params }: Props): Promise<Reac
     // `notFound` signals by throwing, so it is called from the catch rather than from the block
     // above: called inside the `try`, its control-flow error would be caught here and a missing
     // product would render as a failure instead of as a missing page. The endpoint reports a slug
-    // no product owns as `NOT_FOUND`, which is the same statement the service made directly. Such a
-    // slug normally never gets here - `proxy.ts` rewrites its address to the not-found route before
+    // no product owns as `NOT_FOUND`, passing on the catalog service's own answer. Such a slug
+    // normally never gets here - `proxy.ts` rewrites its address to the not-found route before
     // rendering - and when one does, because the proxy's lookup fell through or the product was
     // removed after it, the metadata pass has already answered the request with the not-found page
-    // by the time the render is reached. This stays because the render's answer must depend on
-    // neither, and because the call is still the right one to make here - only later than the head
+    // by the time the render is reached. The render checks all the same, because its answer must
+    // depend on neither, and the call is the right one to make here - only later than the head
     // needs it.
     if (error instanceof StorefrontApiError && error.code === 'NOT_FOUND') {
       notFound();
@@ -397,10 +389,9 @@ export default async function ProductDetailPage({ params }: Props): Promise<Reac
       <RecommendationsRail productId={product.id} variant="detail" />
 
       {/*
-        Renders nothing. The site header is drawn by the root layout, which makes it an ancestor of
-        this route rather than a descendant, so this marker publishes the product on screen to the
-        store the header subscribes to. Placed last because it contributes no markup: it belongs to
-        the page's behaviour rather than to its composition.
+        Renders nothing: it publishes the product on screen to a shared store, for components the
+        root layout draws outside this route. Placed last because it contributes no markup: it
+        belongs to the page's behaviour rather than to its composition.
       */}
       <ActiveProductMarker productId={product.id} />
     </div>

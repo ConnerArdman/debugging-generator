@@ -1,14 +1,14 @@
 /**
  * `EmptyState` — the "there is nothing of that kind here" structural state of
- * the in-repo design system (AAP 0.6.2, 0.6.3, 0.6.4).
+ * the in-repo design system.
  *
- * AAP 0.6.2 obliges every catalogued visualization component to declare three
- * states, not one: an empty state carrying a node-specific message, a loading
- * state while the host's provider resolves its query, and an error state
- * carrying the query and a retry action. This module is the first of those
- * three, and the section closes with the renderer contract that decides how
- * seriously to take it — a node the renderer cannot fill must never leave "a
- * blank area". This component is what stands in that space.
+ * Every catalogued visualization component declares three states, not one: an
+ * empty state carrying a node-specific message, a loading state while the
+ * host's provider resolves its query, and an error state carrying the query
+ * and a retry action (the renderer contract in docs/ARCHITECTURE.md). This
+ * module is the first of those three, and the renderer contract decides how
+ * seriously to take it — a node the renderer cannot fill must never leave a
+ * blank area. This component is what stands in that space.
  *
  * ## It sits on the normal path, not the exceptional one
  *
@@ -24,8 +24,8 @@
  * that are working perfectly.
  *
  * A blank region would be worse than either, because it is indistinguishable
- * from a component that failed silently — which is the reading AAP 0.6.2's
- * "never a blank area" rule exists to prevent.
+ * from a component that failed silently — which is the reading the "never a
+ * blank area" rule exists to prevent.
  *
  * ## Tier 3, and the narrowest possible composition
  *
@@ -35,8 +35,7 @@
  * — the glyph and the action arrive from the caller as nodes, already
  * configured. So the only thing above this file in the package's dependency
  * order is whoever renders it, which is what lets all thirteen visualization
- * components and the host layer use it without any risk of a cycle
- * (AAP 0.2.2, 0.6.2).
+ * components and the host layer use it without any risk of a cycle.
  *
  * ## The caller owns every word
  *
@@ -46,20 +45,21 @@
  * the node writes it. Two consequences follow, and both are requirements rather
  * than preferences:
  *
- *   1. AAP 0.5.4 forbids any knowledge of a target application inside the
- *      product. Empty-state copy is the single most likely place for a
- *      component, service, table or route name from an inspected project to
- *      leak into shipped code, and the copy is the one thing this file does not
- *      contain — so there is nothing here for the gate to find.
+ *   1. The product holds no knowledge of a target application, a rule
+ *      `pnpm check:no-hardcoding` enforces. Empty-state copy is the single
+ *      most likely place for a component, service, table or route name from an
+ *      inspected project to leak into shipped code, and the copy is the one
+ *      thing this file does not contain — so there is nothing here for the gate
+ *      to find.
  *   2. The wording a caller supplies names, in generic product vocabulary, what
  *      was looked for and not found. It describes the evidence class the node
  *      draws, never a value read out of a capture and never a fragment of a
  *      developer's own codebase.
  *
- * The same shape serves the last rung of AAP 0.6.4's degradation ladder — the
- * "placeholder flagged as a gap" a panel falls back to when the catalog has no
- * component for what was asked for — which is why `message` alone is a complete
- * call: no icon, no title and no action are required to render.
+ * The same shape serves the last rung of the renderer's degradation ladder —
+ * the placeholder flagged as a gap that a panel falls back to when the catalog
+ * has no component for what was asked for — which is why `message` alone is a
+ * complete call: no icon, no title and no action are required to render.
  *
  * ## No heading element, in any form
  *
@@ -69,40 +69,22 @@
  * insert an outline level that the `Heading` primitive and `layout/Section`
  * never sanctioned — and a skipped or duplicated level is invisible on screen
  * while being exactly what a screen-reader user navigates by. Outline decisions
- * belong to the components that own the surrounding structure (AAP 0.6.4).
+ * belong to the components that own the surrounding structure.
  *
- * ## A polite status, and why that is the accessible choice
+ * ## A polite, settled status
  *
- * The container is `role="status"` by default. An empty state is the answer a
- * settled query gave — "this capture holds nothing of that kind" — and it
- * replaces the loading state that stood in the same place a moment earlier. A
- * screen-reader user who heard "loading" has to hear what the load resolved
- * to, or the region falls silent and reads exactly like a component that
- * failed without saying so. `status` is the polite live region: it waits for
- * the reader to finish what they are listening to and never interrupts, and it
- * has nothing new to say while its words stay the same — React leaves an
- * unchanged node's text untouched — so an unrelated re-render of the panel
- * around it stays silent.
- *
- * The three states divide the announcements once, so each speaks in its own
- * register: `LoadingState` is the BUSY status (`aria-busy="true"`) while a
- * query is in flight, this component is the settled status that follows it,
- * and `ErrorState` owns the assertive `alert` when a query fails. No
- * `aria-live`, `aria-atomic` or `aria-busy` is added on top of the role — the
- * role implies the polite, atomic announcement already, and restating it would
- * be a second place for the two to disagree. A caller that renders an empty
- * state inside a region that already speaks for it — a filtered result inside
- * a grid whose toolbar announces its own count, say — passes its own `role`,
- * which wins over the default.
+ * The container is `role="status"` by default: the polite announcement of what
+ * a settled query resolved to. A caller whose surrounding region already
+ * speaks for it passes its own `role`, which replaces the default.
  *
  * ## Appearance is class names, and nothing else
  *
  * Not one colour, length, font or radius appears in this module, and there is
  * no inline `style` object, no width, no height and no minimum height: the
  * container's geometry and every visual value belong to
- * `../styles/components.css`, which resolves them to `--dg-*` tokens
- * (AAP 0.6.3, 0.6.4). The class contract this file DECLARES, and that
- * `components.css` must implement:
+ * `../styles/components.css`, where every visual value resolves to a `--dg-*`
+ * token. The class contract this file DECLARES, and that `components.css`
+ * must implement:
  *
  *   dg-empty-state              the block — a centred column on
  *                               `--dg-surface-base`, or on
@@ -138,8 +120,8 @@ import { Text } from './Text';
  * box: an empty wrapper still carries that wrapper's gap and padding, which
  * shows up as an unexplained blank strip above or below the copy. `0` is
  * renderable and stays renderable, and no value is ever coerced into visible
- * text — AAP 0.6.4's defensive rule is that "null" and "undefined" must never
- * reach the screen as words.
+ * text — the renderer's defensive rule is that "null" and "undefined" must
+ * never reach the screen as words.
  *
  * The predicate is local on purpose. It is three comparisons over a React type
  * and nothing about it is design-system vocabulary, so it stays private to this
@@ -196,8 +178,8 @@ export interface EmptyStateProps extends ContainerAttributes {
    * product vocabulary, the class of evidence this node draws and states that
    * the capture holds none of it — the reader's next question is "did I capture
    * the wrong thing?", and this sentence is what answers it. Never interpolate
-   * a symbol, path, table or route name read out of an inspected project
-   * (AAP 0.5.4).
+   * a symbol, path, table or route name read out of an inspected project: the
+   * product holds no knowledge of a target application.
    *
    * Rendered as body text through `Text` at the `--dg-text-sm` role in
    * `--dg-text-muted`, because it explains rather than announces.
@@ -221,15 +203,16 @@ export interface EmptyStateProps extends ContainerAttributes {
    *
    * It is rendered inside a wrapper this component marks `aria-hidden="true"`,
    * so it is never part of the accessible name — the copy carries the whole
-   * meaning, and the glyph reinforces it (AAP 0.6.4: colour and iconography are
-   * never the sole indicator).
+   * meaning, and the glyph reinforces it: colour and iconography are never the
+   * sole indicator.
    *
    * Pass the glyph already carrying the global `dg-icon` class —
    * `icon={<SomeGlyph className="dg-icon" />}` — so it takes its `1em` square
    * and `currentColor` from `../styles/base.css` and scales with the type role
    * around it. Never pass an icon library's numeric `size` or `color` prop:
-   * those are hardcoded values, which AAP 0.6.4 forbids. This module imports no
-   * icon library at all; the glyph is the caller's choice.
+   * those are hardcoded values, and every visual value resolves to a `--dg-*`
+   * token. This module imports no icon library at all; the glyph is the
+   * caller's choice.
    *
    * Omitted, absent or blank, no wrapper is rendered and the column starts at
    * the copy.
@@ -242,15 +225,16 @@ export interface EmptyStateProps extends ContainerAttributes {
    * It is a node rather than a label plus a callback so that this file never
    * invents user-facing copy: the caller passes a `Button` it has already
    * labelled and wired — the same primitive every other control in the product
-   * uses (AAP 0.6.4 permits no raw `<button>` above the primitives layer) — and
+   * uses, since no raw `<button>` is written where a primitive exists — and
    * this component only positions it. A `sm` `secondary` or `ghost` button suits
    * the density of a panel section; a primary fill would make an absence look
    * like the surface's main action.
    *
    * The action is entirely the caller's: this component renders it, raises
-   * nothing itself, and never fetches, retries or inspects a data provider
-   * (AAP 0.4.2). Omitted, the state is purely informational, which is the form
-   * AAP 0.6.4's "flagged as a gap" placeholder uses.
+   * nothing itself, and never fetches, retries or inspects a data provider:
+   * data reaches the renderer only through the host's `DataProvider`. Omitted,
+   * the state is purely informational, which is the form the gap placeholder
+   * uses.
    */
   action?: ReactNode | undefined;
 
@@ -302,7 +286,7 @@ export interface EmptyStateProps extends ContainerAttributes {
  * />
  *
  * @example
- * // The minimal form, and the one AAP 0.6.4's gap placeholder uses.
+ * // The minimal form, and the one the degradation ladder's gap placeholder uses.
  * <EmptyState message={nodeSpecificSentence} />
  */
 export function EmptyState(props: EmptyStateProps): ReactElement {

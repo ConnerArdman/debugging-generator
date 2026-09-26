@@ -14,6 +14,12 @@
  *   (`src/source/open.ts` deliberately does not import `src/source/resolve.ts`),
  *   and every resolver of `SOURCE_RESOLVED_BY` is sent with a confidence that
  *   differs from its default, so a re-stamp would be caught.
+ * - **The target is pinned.** Every forward carries `pinned`: the file relative
+ *   to the canonical root with every link resolved, and the device and inode of
+ *   a `bigint` `lstat` of it. A link re-pointed out of the project while the
+ *   frame waits for the editor leaves the pin naming the file that was proved,
+ *   so an editor enforcing it refuses; a frame that arrives already carrying a
+ *   pin is refused before anything is forwarded.
  * - **Containment against a real directory layout.** The copied fixture
  *   project gets a real prefix sibling (`<projectRoot>-evil`, which a bare
  *   `startsWith` would wrongly accept) and real symbolic links planted at run
@@ -68,8 +74,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { access, mkdir, realpath, symlink, unlink } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { access, lstat, mkdir, realpath, symlink, unlink } from 'node:fs/promises';
+import { basename, join, relative } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -106,7 +112,11 @@ import type { DebuggenErrorCode, SourceLocation, SourceResolvedBy } from '@debug
 import { createFileExclusive, sha256OfFile } from '@debuggen/shared/node';
 
 import { SOURCE_OPEN_REJECTIONS } from '../../src/source/open.js';
-import type { SourceOpenRejection, SourceOpenUndelivered } from '../../src/source/open.js';
+import type {
+  SourceOpenPin,
+  SourceOpenRejection,
+  SourceOpenUndelivered,
+} from '../../src/source/open.js';
 import {
   DEFAULT_FIXTURE_PROJECT,
   HARNESS_TIMEOUTS,
@@ -879,16 +889,61 @@ function expectForwardedOnlyTo(
 }
 
 /**
+ * The pin a forward of a file under `root` must carry: `file` as given, relative
+ * to the canonical root, and the device and inode of a non-following `bigint`
+ * `lstat` of it, in canonical decimal.
+ */
+async function pinOf(root: string, file: string): Promise<SourceOpenPin> {
+  const stats = await lstat(join(await realpath(root), file), { bigint: true });
+  return { file, dev: String(stats.dev), ino: String(stats.ino) };
+}
+
+/**
+ * What an editor enforcing the pin concludes about a forwarded frame, by the
+ * rule the pin states: resolve the location against the canonical project
+ * root, and open only a regular file inside it whose relative path and `bigint`
+ * identity equal the pin. A location that no longer resolves is a refusal.
+ */
+async function pinStillMatches(root: string, message: SourceOpenMessage): Promise<boolean> {
+  const { location, pinned } = message.payload;
+  if (pinned === undefined) {
+    return false;
+  }
+  const canonicalRoot = toPosix(await realpath(root));
+  let target: string;
+  try {
+    target = toPosix(await realpath(join(canonicalRoot, location.file)));
+  } catch (error: unknown) {
+    if (error instanceof Error && 'code' in error) {
+      return false;
+    }
+    throw error;
+  }
+  if (!isWithin(canonicalRoot, target)) {
+    return false;
+  }
+  const stats = await lstat(target, { bigint: true });
+  return (
+    stats.isFile() &&
+    toPosix(relative(canonicalRoot, target)) === pinned.file &&
+    String(stats.dev) === pinned.dev &&
+    String(stats.ino) === pinned.ino
+  );
+}
+
+/**
  * Asserts a forwarded frame is a valid `source.open` envelope of its own whose
  * payload is exactly what was sent — the location deep-equal, `confidence`
- * and `resolvedBy` untouched.
+ * and `resolvedBy` untouched — plus the pin of `canonicalFile`, the file the
+ * location resolves to under `root`.
  */
-function expectFaithfulForward(
+async function expectFaithfulForward(
   message: SourceOpenMessage,
   sessionId: string,
   location: SourceLocation,
   sentFrameId: string,
-): void {
+  pin: { readonly root: string; readonly canonicalFile: string },
+): Promise<void> {
   const reparsed = parseMessage(JSON.parse(encodeMessage(message)));
   if (isErr(reparsed)) {
     throw new Error(`The forwarded frame does not re-parse: ${reparsed.error.message}`);
@@ -899,10 +954,17 @@ function expectFaithfulForward(
   if (isErr(payload)) {
     throw new Error(`The forwarded payload does not validate: ${payload.error.message}`);
   }
-  expect(payload.value).toStrictEqual({ sessionId, location });
+  expect(payload.value).toStrictEqual({
+    sessionId,
+    location,
+    pinned: await pinOf(pin.root, pin.canonicalFile),
+  });
   expect(message.sessionId).toBe(sessionId);
   expect(message.id, 'the service forwards a fresh envelope, not the sender frame').not.toBe(
     sentFrameId,
+  );
+  expect(await pinStillMatches(pin.root, message), 'an editor enforcing the pin opens it').toBe(
+    true,
   );
 }
 
@@ -1026,7 +1088,10 @@ describe('forwarding a contained location to the editor', () => {
       );
 
       const message = expectForwardedOnlyTo(observation, editorA);
-      expectFaithfulForward(message, sessionA.id, location, observation.frameId);
+      await expectFaithfulForward(message, sessionA.id, location, observation.frameId, {
+        root: sandbox.root,
+        canonicalFile: SERVICE_FILE,
+      });
       // Forwarded, not re-resolved: the confidence travels exactly as it was sent.
       expect(message.payload.location.confidence).toBe(location.confidence);
       expect(handlerRecords(observation).map((record) => record.fields['delivered'])).toEqual([1]);
@@ -1043,7 +1108,7 @@ describe('forwarding a contained location to the editor', () => {
   );
 
   it('accepts a file reached through a link that stays inside the project', async () => {
-    const { devtoolsA, editorA, sessionA } = state();
+    const { devtoolsA, editorA, sessionA, sandbox } = state();
     const location = locationFor(ALIAS_LINK, 1);
 
     const observation = await observe(
@@ -1052,13 +1117,79 @@ describe('forwarding a contained location to the editor', () => {
     );
 
     const message = expectForwardedOnlyTo(observation, editorA);
-    expectFaithfulForward(message, sessionA.id, location, observation.frameId);
-    // The location is forwarded as sent: the link's own name, never its canonical target.
+    await expectFaithfulForward(message, sessionA.id, location, observation.frameId, {
+      root: sandbox.root,
+      canonicalFile: SERVICE_FILE,
+    });
+    // The location is forwarded as sent: the link's own name, never its canonical
+    // target — which is what the pin names instead.
     expect(message.payload.location.file).toBe(ALIAS_LINK);
+    expect(message.payload.pinned?.file).toBe(SERVICE_FILE);
 
     await answerAsEditor(editorA, message, { status: 'opened' });
     const relayed = await relayedResult(devtoolsA.client, observation.frameId, sessionA.id);
     expect(relayed.status).toBe('opened');
+  });
+
+  it('pins the proved file, so a link re-pointed out of the project while the frame is queued is refused', async () => {
+    const { devtoolsA, editorA, sessionA, sandbox } = state();
+    const location = locationFor(ALIAS_LINK, 5);
+    const linkPath = join(sandbox.root, ALIAS_LINK);
+    const proved = await pinOf(sandbox.root, SERVICE_FILE);
+
+    const observation = await observe(
+      devtoolsA.client,
+      typedFrame(devtoolsA.client, { sessionId: sessionA.id, location }),
+    );
+    // The service checked the link while it stayed inside, and pinned its target.
+    const message = expectForwardedOnlyTo(observation, editorA);
+    await expectFaithfulForward(message, sessionA.id, location, observation.frameId, {
+      root: sandbox.root,
+      canonicalFile: SERVICE_FILE,
+    });
+
+    // The frame is delivered and waits for the editor to act; before it does, the
+    // link is swapped to the outside file. The location still names the same link.
+    try {
+      await unlink(linkPath);
+      await symlink(sandbox.outsideFile, linkPath);
+
+      const canonicalRoot = toPosix(await realpath(sandbox.root));
+      const nowResolved = toPosix(await realpath(linkPath));
+      const now = await lstat(nowResolved, { bigint: true });
+      expect(isWithin(canonicalRoot, nowResolved), 'the swapped link leads out').toBe(false);
+      // What the editor now finds is not what the pin names ...
+      expect({
+        file: toPosix(relative(canonicalRoot, nowResolved)),
+        dev: String(now.dev),
+        ino: String(now.ino),
+      }).not.toEqual(message.payload.pinned);
+      expect(String(now.ino)).not.toBe(message.payload.pinned?.ino);
+      // ... while the pin still names the file the service proved, so an editor
+      // enforcing it refuses rather than opening the outside file.
+      expect(message.payload.pinned).toEqual(proved);
+      expect(await pinStillMatches(sandbox.root, message)).toBe(false);
+
+      // That refusal is what the sender hears, under its own ref.
+      await answerAsEditor(editorA, message, {
+        status: 'failed',
+        error: {
+          code: CODE.FS_UNSAFE_PATH,
+          message: 'The file changed after Debug Generator checked it, so VS Code did not open it.',
+        },
+      });
+      const relayed = await relayedResult(devtoolsA.client, observation.frameId, sessionA.id);
+      expect(relayed.status).toBe('failed');
+    } finally {
+      await unlink(linkPath);
+      await symlink(basename(SERVICE_FILE), linkPath);
+    }
+
+    expect(await realpath(linkPath), 'the in-project link is restored').toBe(
+      join(sandbox.root, SERVICE_FILE),
+    );
+    expectNoLeak(sandbox, observation);
+    await expectTargetsUntouched(sandbox);
   });
 
   it('refuses a missing file distinctly from a containment refusal', async () => {
@@ -1440,7 +1571,10 @@ describe('authorization and the stored project root', () => {
       typedFrame(editorB, { sessionId: sessionB.id, location }),
     );
     const message = expectForwardedOnlyTo(againstB, editorB);
-    expectFaithfulForward(message, sessionB.id, location, againstB.frameId);
+    await expectFaithfulForward(message, sessionB.id, location, againstB.frameId, {
+      root: projectB.root,
+      canonicalFile: OTHER_PROJECT_FILE,
+    });
     // An editor that asked is answered like a panel: by its own frame's ref.
     await answerAsEditor(editorB, message, { status: 'opened' });
     expect((await relayedResult(editorB, againstB.frameId, sessionB.id)).status).toBe('opened');
@@ -1467,6 +1601,43 @@ describe('authorization and the stored project root', () => {
     // The unknown key may be named; its value — another project's root — never is.
     expect(reply.message).not.toContain(projectB.root);
     expectNoLeak(sandbox, smuggled);
+  });
+
+  it('refuses a frame that carries a pin of its own, before anything is forwarded', async () => {
+    const { devtoolsA, editorA, sessionA, sandbox } = state();
+    // Distinctive, well-formed identities: a reply or record quoting one is an echo.
+    const devMarker = '918273645546372819';
+    const inoMarker = '5647382910019283746';
+    const pins: readonly SourceOpenPin[] = [
+      // A page nominating the file it wants trusted ...
+      { file: 'src/nominated.service.ts', dev: devMarker, ino: inoMarker },
+      // ... and even a pin that truthfully describes the requested file: only the
+      // service's own proof becomes a pin.
+      await pinOf(sandbox.root, SERVICE_FILE),
+    ];
+
+    for (const [index, pinned] of pins.entries()) {
+      for (const sender of [devtoolsA.client, editorA]) {
+        // A location the service would otherwise forward to the editor.
+        const location = locationFor(SERVICE_FILE, index);
+        const refused = await observe(
+          sender,
+          typedFrame(sender, { sessionId: sessionA.id, location, pinned }),
+        );
+
+        const error = expectRefusedResult(refused, CODE.PROTOCOL_INVALID_MESSAGE);
+        expectHandlerRefusal(refused, REJECTION['invalid-payload'], 'pin-not-permitted');
+        const surfaces = [
+          JSON.stringify(error),
+          ...refused.records.map((record) => record.line),
+        ].join('\n');
+        for (const value of [devMarker, inoMarker, 'src/nominated.service.ts']) {
+          expect(surfaces, 'the refusal quotes nothing of the supplied pin').not.toContain(value);
+        }
+        expectNoLeak(sandbox, refused);
+      }
+    }
+    await expectTargetsUntouched(sandbox);
   });
 
   it('refuses an editor whose announced workspace does not cover the stored root', async () => {
@@ -1599,7 +1770,10 @@ describe(`with no editor connected (the ${NO_EDITOR_CLIENT} outcome)`, () => {
       typedFrame(devtoolsA.client, { sessionId: sessionA.id, location }),
     );
     const message = expectForwardedOnlyTo(observation, lateEditor);
-    expectFaithfulForward(message, sessionA.id, location, observation.frameId);
+    await expectFaithfulForward(message, sessionA.id, location, observation.frameId, {
+      root: projectA.root,
+      canonicalFile: SERVICE_FILE,
+    });
     await answerAsEditor(lateEditor, message, { status: 'opened' });
     expect((await relayedResult(devtoolsA.client, observation.frameId, sessionA.id)).status).toBe(
       'opened',

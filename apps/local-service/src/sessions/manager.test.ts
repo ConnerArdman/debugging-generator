@@ -1,6 +1,8 @@
 /**
  * Tests for `./manager.ts`'s follow-up ladder: {@link SessionManager.appendFollowUp},
- * {@link placeFollowUpAttempt} and {@link SessionManager.recordFollowUpOutcome}.
+ * {@link placeFollowUpAttempt} and {@link SessionManager.recordFollowUpOutcome};
+ * and for how {@link SessionManager.end} stores `ended` with the tab binding's
+ * removal.
  *
  * The promise under test is that a Retry of a failed follow-up never leaves a
  * duplicate behind — on the record's ladder **or** in the store's `followups`
@@ -25,13 +27,27 @@
  * 5. **The store's own guard**: the repository refuses to log one attempt
  *    twice, and a retry whose row is missing is an error, never an insert.
  * 6. **Outcome after a retry** stamps the retried entry.
- * 7. **Privacy**: no log record carries the question.
+ * 7. **One store unit per ask and per outcome**: the `followups` row and the
+ *    ladder entry that mirrors it are written together, so a record write the
+ *    store refuses leaves both views as they were, broadcasts nothing, and
+ *    asking or stamping again then succeeds. An outcome reaches the row as
+ *    well as the ladder — found by its attempt id, or, for an entry stored
+ *    without one, as the session's newest row only when it is provably the
+ *    same entry — and a row the log lost or disagrees on refuses the stamp.
+ * 8. **`end` and the tab binding**: `ended` is stored together with the
+ *    removal of the session's `bindings` row, so a refused removal leaves the
+ *    session open and bound and ending again ends it unbound; ending an ended
+ *    session removes a row an earlier build left behind, and answers the
+ *    store's error when it cannot.
+ * 9. **Privacy**: no log record carries the question.
  *
  * The store is the real one — `openStore` against a file in a private `mkdtemp`
  * sandbox, never `:memory:` — and so are the sessions repository and the
  * progress emitter over it, so the record each case reads back is the one the
  * service would replay. Only the broadcaster is substituted, by a recorder, and
- * no cleanup runner is injected. Statuses are driven through the manager's own
+ * no cleanup runner is injected; a store failure is a real one, raised by a
+ * temporary trigger on the case's own connection
+ * ({@link withRefusedWrites}). Statuses are driven through the manager's own
  * API along legal edges of `./state-machine.ts`; the clock is injected and
  * advanced explicitly, so every `askedAt` is predictable — distinct unless a
  * case holds it still on purpose. No environment variable is read, no socket
@@ -422,6 +438,68 @@ const SINGLE_LINK_CASES: SingleLinkCase[] = [
   { link: 'panelId', outcome: () => ({ panelId: newPanelId() }) },
 ];
 
+/**
+ * Asserts that the two durable views of the session's follow-ups — the
+ * `followups` log `listFollowUps` reads and the record's ladder — hold one
+ * history, and answers it.
+ */
+function oneHistory(sessionId: SessionId): readonly FollowUpRecord[] {
+  const ladder = stored(sessionId).followUps;
+  expect(unwrap(h.sessions.listFollowUps(sessionId))).toEqual(ladder);
+  return ladder;
+}
+
+/** The writes {@link withRefusedWrites} can make the store refuse for one session. */
+type RefusedWrite = 'record' | 'binding';
+
+/** The trigger event and the row guard of each {@link RefusedWrite}. */
+const REFUSED_WRITE_TRIGGERS: Readonly<
+  Record<RefusedWrite, { readonly event: string; readonly column: string }>
+> = Object.freeze({
+  record: { event: 'UPDATE ON sessions', column: 'id' },
+  binding: { event: 'DELETE ON bindings', column: 'session_id' },
+});
+
+/** The shape of every session id the manager mints, checked before one is spelled into DDL. */
+const INJECTABLE_ID = /^[A-Za-z0-9_-]+$/u;
+
+/** How many faults this file has injected, so every trigger name is unique. */
+let injectedFaults = 0;
+
+/**
+ * Runs `body` while a temporary trigger on the case's own store connection
+ * refuses one kind of write for one session — a real failure of the store's
+ * statement, not a stub: `record` aborts every update of the session's
+ * `sessions` row (the write behind every record change), `binding` every
+ * delete of its `bindings` row. The trigger is dropped whatever `body` does,
+ * so the retry after it meets a writable store.
+ */
+async function withRefusedWrites<T>(
+  sessionId: SessionId,
+  write: RefusedWrite,
+  body: () => Promise<T>,
+): Promise<T> {
+  if (!INJECTABLE_ID.test(sessionId)) {
+    throw new Error('A session id with unexpected characters cannot be named in a trigger.');
+  }
+  injectedFaults += 1;
+  const trigger = `manager_suite_refuse_${write}_${String(injectedFaults)}`;
+  const { event, column } = REFUSED_WRITE_TRIGGERS[write];
+  h.store.db.exec(
+    `CREATE TEMP TRIGGER ${trigger} BEFORE ${event} WHEN OLD.${column} = '${sessionId}'
+     BEGIN SELECT RAISE(ABORT, 'injected ${write} write failure'); END`,
+  );
+  try {
+    return await body();
+  } finally {
+    h.store.db.exec(`DROP TRIGGER IF EXISTS temp.${trigger}`);
+  }
+}
+
+/** The manager's `error` record for an ask neither of whose writes was stored. */
+const FOLLOW_UP_NOT_RECORDED_LOG =
+  'a follow-up could not be recorded; neither its follow-up row nor the session record was stored';
+
 /* -------------------------------------------------------------------------------------------------
  * The cases
  * ---------------------------------------------------------------------------------------------- */
@@ -800,6 +878,291 @@ describe('recordFollowUpOutcome after a retry', () => {
       { question: FOLLOW_UP, askedAt: retried.askedAt, attemptId: id, attempt: 2, ...links },
       { question: REWORDED_FOLLOW_UP, askedAt: next.askedAt, attemptId: nextId, attempt: 1 },
     ]);
+  });
+});
+
+describe('appendFollowUp stores the followups row and the record as one unit', () => {
+  it('rolls a new follow-up row back when the record cannot mirror it; the same ask then records it once', async () => {
+    const session = await generatedSession();
+    const id = attemptId();
+    const before = stored(session.id);
+    const framesBefore = h.frames.length;
+
+    const refusal = await withRefusedWrites(session.id, 'record', () =>
+      refusedAsk(session.id, FOLLOW_UP, id),
+    );
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(stored(session.id)).toEqual(before);
+    expect(oneHistory(session.id)).toEqual([]);
+    expect(h.frames.length).toBe(framesBefore);
+    expect(
+      h.logs.filter((log) => log.level === 'error' && log.message === FOLLOW_UP_NOT_RECORDED_LOG),
+    ).toHaveLength(1);
+
+    // Nothing of the refused ask survived, so asking again is a first ask.
+    const asked = await ask(session.id, FOLLOW_UP, id);
+
+    expect(asked.session.followUps).toEqual([
+      { question: FOLLOW_UP, askedAt: asked.askedAt, attemptId: id, attempt: 1 },
+    ]);
+    expect(oneHistory(session.id)).toEqual(asked.session.followUps);
+    expect(lastUpdated(session.id)).toEqual(asked.session);
+  });
+
+  it('keeps the failed attempt’s row as it was when the record cannot mirror its retry; the retry then records attempt 2', async () => {
+    const session = await generatedSession();
+    const id = attemptId();
+    const failed = await failedFollowUp(session.id, FOLLOW_UP, id);
+    const before = stored(session.id);
+    const framesBefore = h.frames.length;
+
+    const refusal = await withRefusedWrites(session.id, 'record', () =>
+      refusedAsk(session.id, REWORDED_FOLLOW_UP, id),
+    );
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(stored(session.id)).toEqual(before);
+    // The row the retry rewrote inside the unit is back to attempt 1.
+    expect(oneHistory(session.id)).toEqual([
+      { question: FOLLOW_UP, askedAt: failed.askedAt, attemptId: id, attempt: 1 },
+    ]);
+    expect(h.frames.length).toBe(framesBefore);
+
+    const retried = await ask(session.id, REWORDED_FOLLOW_UP, id);
+
+    expect(retried.session.followUps).toEqual([
+      { question: REWORDED_FOLLOW_UP, askedAt: retried.askedAt, attemptId: id, attempt: 2 },
+    ]);
+    expect(oneHistory(session.id)).toEqual(retried.session.followUps);
+    expect(lastUpdated(session.id)).toEqual(retried.session);
+  });
+});
+
+describe('recordFollowUpOutcome stamps the followups row and the record as one unit', () => {
+  /** Every outcome link at once, each freshly minted. */
+  const allLinks = (): FollowUpOutcome => ({
+    needsNewCapture: true,
+    planVersion: 2,
+    captureId: newCaptureId(),
+    analysisId: newAnalysisId(),
+    panelId: newPanelId(),
+  });
+
+  /**
+   * Gives the session's ladder one entry without an attempt id, as a build
+   * before attempts carried an identity stored it, and logs `row` — the same
+   * entry, a disagreeing one, or none — beside it.
+   */
+  function withLegacyEntry(
+    sessionId: SessionId,
+    entry: FollowUpRecord,
+    row: FollowUpRecord | undefined,
+  ): void {
+    if (row !== undefined) {
+      unwrap(h.sessions.appendFollowUp(sessionId, row));
+    }
+    unwrap(h.sessions.update({ ...stored(sessionId), followUps: [entry], updatedAt: h.tick() }));
+  }
+
+  it('writes every outcome link to the followups row as well as the ladder', async () => {
+    const session = await generatedSession();
+    const id = attemptId();
+    const asked = await ask(session.id, FOLLOW_UP, id);
+    const links = allLinks();
+
+    const answered = await answer(session.id, links);
+
+    const expected: FollowUpRecord[] = [
+      { question: FOLLOW_UP, askedAt: asked.askedAt, attemptId: id, attempt: 1, ...links },
+    ];
+    expect(answered.followUps).toEqual(expected);
+    expect(oneHistory(session.id)).toEqual(expected);
+    expect(lastUpdated(session.id)).toEqual(answered);
+  });
+
+  it('changes neither view when the record cannot take the outcome; stamping again then writes both', async () => {
+    const session = await generatedSession();
+    const asked = await ask(session.id, FOLLOW_UP, attemptId());
+    const before = stored(session.id);
+    const framesBefore = h.frames.length;
+    const links = allLinks();
+
+    const refused = await withRefusedWrites(session.id, 'record', () => {
+      h.tick();
+      return h.manager.recordFollowUpOutcome(session.id, links);
+    });
+
+    expect(isErr(refused) && refused.error.code).toBe('STORE_ERROR');
+    expect(stored(session.id)).toEqual(before);
+    // The row the unit stamped first is back to the unanswered ask.
+    expect(oneHistory(session.id)).toEqual(asked.session.followUps);
+    expect(h.frames.length).toBe(framesBefore);
+
+    const answered = await answer(session.id, links);
+
+    expect(answered.followUps).toEqual(
+      asked.session.followUps.map((entry) => ({ ...entry, ...links })),
+    );
+    expect(oneHistory(session.id)).toEqual(answered.followUps);
+  });
+
+  it('refuses to stamp an identified entry whose row the log lost, changing nothing', async () => {
+    const session = await generatedSession();
+    await ask(session.id, FOLLOW_UP, attemptId());
+    h.store.statement('DELETE FROM followups WHERE session_id = ?').run(session.id);
+    const before = stored(session.id);
+    const framesBefore = h.frames.length;
+
+    h.tick();
+    const refused = await h.manager.recordFollowUpOutcome(session.id, allLinks());
+
+    expect(isErr(refused) && refused.error.code).toBe('STORE_ERROR');
+    expect(isErr(refused) && refused.error.details?.['reason']).toBe('follow-up-attempt-not-found');
+    expect(stored(session.id)).toEqual(before);
+    expect(unwrap(h.sessions.listFollowUps(session.id))).toEqual([]);
+    expect(h.frames.length).toBe(framesBefore);
+  });
+
+  it('stamps a legacy entry without an attempt id in both views', async () => {
+    const session = await generatedSession();
+    const legacy: FollowUpRecord = { question: FOLLOW_UP, askedAt: h.tick() };
+    withLegacyEntry(session.id, legacy, legacy);
+    const links = allLinks();
+
+    const answered = await answer(session.id, links);
+
+    expect(answered.followUps).toEqual([{ ...legacy, ...links }]);
+    expect(oneHistory(session.id)).toEqual(answered.followUps);
+  });
+
+  it.each([
+    {
+      log: 'a newest row asked at another instant',
+      row: (entry: FollowUpRecord): FollowUpRecord | undefined => ({
+        ...entry,
+        askedAt: entry.askedAt + 1,
+      }),
+      reason: 'follow-up-log-disagrees',
+    },
+    {
+      log: 'a newest row that carries an attempt id',
+      row: (entry: FollowUpRecord): FollowUpRecord | undefined => ({
+        ...entry,
+        attemptId: attemptId(),
+        attempt: 1,
+      }),
+      reason: 'follow-up-log-disagrees',
+    },
+    {
+      log: 'no row',
+      row: (): FollowUpRecord | undefined => undefined,
+      reason: 'follow-up-not-found',
+    },
+  ])('refuses a legacy entry against $log, changing neither view', async ({ row, reason }) => {
+    const session = await generatedSession();
+    const legacy: FollowUpRecord = { question: FOLLOW_UP, askedAt: h.tick() };
+    withLegacyEntry(session.id, legacy, row(legacy));
+    const before = stored(session.id);
+    const rowsBefore = unwrap(h.sessions.listFollowUps(session.id));
+    const framesBefore = h.frames.length;
+
+    h.tick();
+    const refused = await h.manager.recordFollowUpOutcome(session.id, allLinks());
+
+    expect(isErr(refused) && refused.error.code).toBe('STORE_ERROR');
+    expect(isErr(refused) && refused.error.details?.['reason']).toBe(reason);
+    expect(stored(session.id)).toEqual(before);
+    expect(unwrap(h.sessions.listFollowUps(session.id))).toEqual(rowsBefore);
+    expect(h.frames.length).toBe(framesBefore);
+  });
+});
+
+describe('end removes the tab binding in the transaction that stores `ended`', () => {
+  /** The inspected tab every case binds. */
+  const TAB = Object.freeze({ tabId: 7, url: `${DEV_SERVER_URL}/` });
+
+  /** Binds the tab to the session in both durable views, as the binding route does. */
+  async function bindTab(sessionId: SessionId): Promise<void> {
+    unwrap(h.sessions.upsertBinding({ tabId: TAB.tabId, sessionId, url: TAB.url }));
+    h.tick();
+    unwrap(await h.manager.setBoundTab(sessionId, TAB));
+  }
+
+  /** The tab the store's `bindings` table binds to the session, if any. */
+  function boundInStore(sessionId: SessionId): unknown {
+    return unwrap(h.sessions.getBindingBySession(sessionId))?.tab;
+  }
+
+  /** Ends a session whose end must succeed. */
+  async function endNow(sessionId: SessionId): Promise<SessionRecord> {
+    h.tick();
+    return unwrap(await h.manager.end(sessionId)).session;
+  }
+
+  it('keeps the session open and bound when the binding cannot be removed; ending again ends it unbound', async () => {
+    const session = await generatedSession();
+    await bindTab(session.id);
+    const framesBefore = h.frames.length;
+
+    const refused = await withRefusedWrites(session.id, 'binding', () => {
+      h.tick();
+      return h.manager.end(session.id);
+    });
+
+    expect(isErr(refused) && refused.error.code).toBe('STORE_ERROR');
+    const open = stored(session.id);
+    expect(open.status).toBe('generated');
+    expect(open.boundTab).toEqual(TAB);
+    expect(boundInStore(session.id)).toEqual(TAB);
+    // The rolled-back move was never announced.
+    expect(
+      h.frames
+        .slice(framesBefore)
+        .filter(
+          (frame) =>
+            frame.message.type === 'session.updated' &&
+            frame.message.payload.session.status === 'ended',
+        ),
+    ).toEqual([]);
+
+    const ended = await endNow(session.id);
+
+    expect(ended.status).toBe('ended');
+    expect(ended.boundTab).toBeUndefined();
+    expect(stored(session.id)).toEqual(ended);
+    expect(boundInStore(session.id)).toBeUndefined();
+    expect(lastUpdated(session.id)).toEqual(ended);
+  });
+
+  it('removes a binding row an earlier build left on an ended session, re-running nothing else', async () => {
+    const session = await generatedSession();
+    const ended = await endNow(session.id);
+    // What an earlier build could leave behind: `ended` stored, the row not removed.
+    unwrap(h.sessions.upsertBinding({ tabId: TAB.tabId, sessionId: session.id, url: TAB.url }));
+    const framesBefore = h.frames.length;
+
+    const again = unwrap(await h.manager.end(session.id));
+
+    expect(again.session).toEqual(ended);
+    expect(stored(session.id)).toEqual(ended);
+    expect(boundInStore(session.id)).toBeUndefined();
+    expect(h.frames.length).toBe(framesBefore);
+  });
+
+  it('answers the store’s error when that residual row cannot be removed; ending again removes it', async () => {
+    const session = await generatedSession();
+    const ended = await endNow(session.id);
+    unwrap(h.sessions.upsertBinding({ tabId: TAB.tabId, sessionId: session.id, url: TAB.url }));
+
+    const refused = await withRefusedWrites(session.id, 'binding', () => h.manager.end(session.id));
+
+    expect(isErr(refused) && refused.error.code).toBe('STORE_ERROR');
+    expect(stored(session.id)).toEqual(ended);
+    expect(boundInStore(session.id)).toEqual(TAB);
+
+    expect(unwrap(await h.manager.end(session.id)).session).toEqual(ended);
+    expect(boundInStore(session.id)).toBeUndefined();
   });
 });
 

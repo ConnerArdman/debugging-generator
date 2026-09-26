@@ -1,77 +1,22 @@
 /**
  * Lumen Supply - the root segment's loading UI.
  *
- * Next.js wraps the root layout's `{children}` in a Suspense boundary whose fallback is this file,
- * renders it while the requested route resolves, and swaps it for that route's markup the moment
- * the markup is ready. Declared at the root, the boundary covers the catalog at `/` and every
- * route beneath the root layout that declares no loading boundary of its own: the product detail,
- * cart, checkout, orders and dashboard routes. None of them has a `loading.tsx`, so this is the
- * state every one of them opens with while its page resolves; the dashboard additionally holds a
- * `<Suspense>` of its own inside its page, around the part of it that waits.
+ * Next.js renders this file as the Suspense fallback around the root layout's `{children}`, so it
+ * is the loading state of the catalog and of every route beneath the root layout that declares no
+ * `loading.tsx` of its own. Nothing here depends on which route is waiting.
  *
- * THE PRODUCT ROUTE'S 404 IS DECIDED BEFORE THIS BOUNDARY IS REACHED
- * Because this boundary also covers `/products/[slug]`, a `notFound()` that route raises while
- * rendering arrives inside a stream whose status line has already been sent, so it can replace
- * the markup but no longer the status. The 404 for a slug no product owns is therefore decided
- * before rendering begins, by `proxy.ts` beside the `app/` directory, which looks the slug up and
- * rewrites an address no product owns to the not-found route (a dotted address that names no
- * public file is rewritten there by `next.config.ts` instead). This file stays as it is for every
- * route: nothing here knows or needs to know which route is waiting.
+ * Because the boundary also wraps `/products/[slug]`, that route streams under a `200` status sent
+ * before it renders, and a `notFound()` raised there cannot change the status. The 404 for
+ * a slug no product owns is therefore decided before rendering, by `proxy.ts`, and a dotted address
+ * naming no public file is sent to the not-found route by the rewrite in `next.config.ts`.
  *
- * WHAT IT RESERVES, AND WHY THAT SHAPE
- * Every page of the storefront opens with the same heading block, and the address a visitor lands
- * on - the catalog - continues with a grid of product cards, so the reservation is those two
- * pieces: the head's two lines of type, then a grid of card-shaped placeholders. Reserving the box
- * the content will occupy - rather than centring a spinner in an empty region - is what keeps the
- * header, navigation and footer still while the swap happens, and it is what makes the wait read
- * as "this page is arriving" instead of "something is happening somewhere". The grid is shaped
- * after the catalog rather than after an average of every route because the catalog is where a
- * visit begins; a route with less below its heading replaces the placeholders with less, which
- * moves nothing above them.
- *
- * Twelve cards, not the catalog's full page of forty-eight: a dozen fills a desktop fold and a
- * little past it, which is as much as a reader can see while the wait lasts. Reserving the whole
- * page would claim screen space below the fold that the reader never sees the placeholder for.
- *
- * COMPOSITION: THE PAGE UTILITIES AND TWO COMPONENTS, NOTHING ELSE
- * Route files under `app/**` declare no CSS Module of their own, so the arrangement here comes
- * from the documented `.ls-*` page-composition utilities in `app/globals.css` - `.ls-stack` for
- * the page's vertical rhythm, `.ls-page-head` for the heading block, `.ls-page-lede` for the
- * sentence measure under a title - and every painted surface comes from a component:
- * `@/components/ui/Skeleton` for one placeholder bar and `@/components/catalog/ProductCardSkeleton`
- * for the grid. No length, colour or breakpoint is written into this file, and no element here
- * carries a style attribute.
- *
- * Both utilities sit on elements this file owns rather than on an element a component renders.
- * That division is `globals.css`'s own: a component's module is emitted after the global
- * stylesheet, so a utility placed on a component's root loses the cascade for every property the
- * module also declares - which is the right outcome, since the component owns its own box, but it
- * would leave the class silently doing nothing. Hence the small wrapper around the lede
- * placeholder: the measure belongs to the page, the surface belongs to `Skeleton`.
- *
- * ACCESSIBILITY: ONE STATUS MESSAGE, AND NO DECORATION IN THE TREE
- * Exactly one busy region exists in this subtree, and `ProductCardSkeleton` is what renders it:
- * it carries `role="status"` and `aria-busy="true"` on the element that holds its own
- * screen-reader text, so the wait is announced once, politely, and is reported as over when real
- * content replaces this tree. Nothing here wraps that in a second status region or adds a
- * competing live region, because two of them would announce the same wait twice. The head's
- * placeholders are `aria-hidden` by construction - `Skeleton` renders them that way, holds no
- * text and this file adds none - so a reader hears the message and not the grey boxes, and the
- * busy state is never carried by motion alone: the placeholder stays a visible reserved box when
- * `Skeleton.module.css` stops its shimmer for a reader who has asked for less motion.
- *
- * A SERVER COMPONENT THAT READS NOTHING
- * No client-component directive at the top of this file, no hook, no event handler and no browser
- * global - and nothing read from the clock, the environment or a random source, so this file
- * renders identically for every request and the markup a server sends always matches the markup a
- * browser first produces. There is no data access of any kind either: a loading boundary that
- * queried the database would delay the very swap it exists to cover, and it would break
- * `next build`, which renders this route with no database reachable.
- *
- * There is also deliberately no route segment configuration here. `dynamic`, `revalidate` and
- * `runtime` are honoured in `layout.tsx`, `page.tsx` and `route.ts` only; `app/layout.tsx` already
- * declares `dynamic = 'force-dynamic'` for every segment beneath it, and a second declaration in
- * this file would be inert rather than additive.
+ * The reservation is the heading block every page opens with, then twelve card placeholders in the
+ * catalog's grid, so the header, navigation and footer stay still when the content swaps in.
+ * Exactly one status region exists in this subtree, rendered by `ProductCardSkeleton` with the busy
+ * message; the heading placeholders are `aria-hidden`, so the wait is announced once. There is no
+ * main landmark - `app/layout.tsx` owns it - and no data access, clock or random read: the fallback
+ * must render at once and identically on server and client, and `next build` renders it with no
+ * database reachable.
  */
 
 import type { ReactElement } from 'react';
@@ -113,7 +58,8 @@ const BUSY_MESSAGE = 'Loading products';
  *   - `.ls-page-head` reserves the heading block - a page's `<h1>` with its sentence underneath -
  *     with a bar for each. The title bar takes the full measure and the lede bar is held to the
  *     reading measure by the wrapper around it, so the block reads as a heading and a sentence
- *     rather than as two identical rules across the page.
+ *     rather than as two identical rules across the page. The measure sits on a wrapper because
+ *     a utility placed on `Skeleton`'s own root would lose the cascade to its module class.
  *   - `ProductCardSkeleton` reserves the content grid and owns the busy region, the announcement
  *     and the card geometry.
  *

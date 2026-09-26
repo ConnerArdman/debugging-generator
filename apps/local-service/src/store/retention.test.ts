@@ -26,6 +26,15 @@
  *    and not through a sibling that merely shares the root's name as a prefix.
  * 6. **A dry run is honest, one bad item never aborts the pass, and no report
  *    or log line carries a secret, a diff or a question.**
+ * 7. **A scoped sweep stays inside its workspace.** A sweep scoped to project A
+ *    — what `session.purge` runs for an editor that announced only A — removes
+ *    A's aged sessions, orphan backups and caches and leaves every item of B,
+ *    and every item whose project is unknown, in place and unreported; the
+ *    unscoped start-up sweep over the same state stays machine-wide. The scope
+ *    is awaited, outside every transaction, so a scope that resolves roots on
+ *    disk keeps a link inside A that points into B; and a directory-shaped
+ *    cache entry is inspected whole — one holding more documents than the
+ *    sweep reads, a subdirectory, or a document it cannot attribute is kept.
  *
  * The store is the real one: `openStore` against a file in an `mkdtemp`
  * sandbox — never `:memory:` — so WAL and the `foreign_keys` pragma behave as
@@ -87,6 +96,7 @@ import {
 import type { AnalysisResult, PanelSpec, SessionRecord, SessionStatus } from '@debuggen/protocol';
 import {
   isErr,
+  isWithin,
   newCaptureId,
   newEventId,
   newPanelId,
@@ -99,6 +109,7 @@ import {
 import type { CaptureId, LogFields, LogLevel, Logger, SessionId } from '@debuggen/shared';
 import { SECURE_DIR_MODE, sha256OfFileSync } from '@debuggen/shared/node';
 
+import { canonicalizePath } from '../config.js';
 import { openStore } from './db.js';
 import type { Store } from './db.js';
 import {
@@ -112,6 +123,7 @@ import {
   BACKUP_PROBE_BATCH_SIZE,
   DEFAULT_RETENTION_DAYS,
   IN_FLIGHT_SESSION_STATUSES,
+  MAX_INDEX_METADATA_FILES,
   MAX_REPORTED_ITEMS,
   ORPHAN_BACKUP_GRACE_DAYS,
   RETENTION_CANDIDATE_PAGE_SIZE,
@@ -122,6 +134,7 @@ import type {
   RetentionIssue,
   RetentionOptions,
   RetentionReport,
+  RetentionScope,
 } from './retention.js';
 import {
   SELECT_RETENTION_CANDIDATES_AFTER_SQL,
@@ -2498,5 +2511,597 @@ describe('determinism', () => {
     });
     // The conflict is still unresolved, so it is still — and only — retained.
     expect(again.sessionsRetainedForConflicts).toEqual(first.sessionsRetainedForConflicts);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Scoped sweeps — `session.purge` for one editor's workspace
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A scope admitting `folder` and everything under it, as an editor's announced folder does. */
+function scopeOf(folder: string): RetentionScope {
+  return (projectRoot) => isWithin(folder, projectRoot);
+}
+
+/** What {@link seedTwoWorkspaces} planted, for the assertions that follow a sweep. */
+interface TwoWorkspaces {
+  readonly agedA: SessionId;
+  readonly agedB: { readonly sessionId: SessionId; readonly contents: SeededContents };
+  readonly conflictB: SessionId;
+  readonly activeB: SessionId;
+  readonly orphanA: string;
+  readonly orphanB: string;
+  readonly ghostOrphan: string;
+  readonly stray: string;
+  readonly cacheA: string;
+  readonly cacheB: string;
+  readonly cacheNone: string;
+  readonly cacheOpaque: string;
+  readonly cacheMixed: string;
+}
+
+/**
+ * Seeds two workspaces with work for every rule. Project A holds one aged
+ * session and an orphan in the backup directory of a live session under it;
+ * project B holds the same plus an aged session kept by a conflict and an aged
+ * one still capturing — both of which a sweep would name in its report. Beside
+ * them: an orphan whose session row is gone, a stray file directly under
+ * `backups/`, and aged cache entries recording A, B, nothing, both, or not a
+ * document at all. No session of either project root was updated inside the
+ * window, so no cache is kept for being active.
+ */
+async function seedTwoWorkspaces(harness: Harness): Promise<TwoWorkspaces> {
+  const agedA = (await seedFullSession(harness, AGED_AT, { projectRoot: PROJECT_A })).sessionId;
+  const agedB = await seedFullSession(harness, AGED_AT, { projectRoot: PROJECT_B });
+  const conflictB = (
+    await seedFullSession(
+      harness,
+      AGED_AT,
+      { projectRoot: PROJECT_B },
+      { status: 'conflict', backupAt: ANCIENT_AT },
+    )
+  ).sessionId;
+  const activeB = seedSession(harness, {
+    projectRoot: PROJECT_B,
+    updatedAt: AGED_AT,
+    status: 'capturing',
+  });
+
+  const liveA = seedSession(harness, { projectRoot: `${PROJECT_A}/live`, updatedAt: RECENT_AT });
+  const liveB = seedSession(harness, { projectRoot: `${PROJECT_B}/live`, updatedAt: RECENT_AT });
+  const orphanA = writeLooseBackup(harness, liveA, hashOf(harness, 'scoped:a'), ANCIENT_AT);
+  const orphanB = writeLooseBackup(harness, liveB, hashOf(harness, 'scoped:b'), ANCIENT_AT);
+  const ghostOrphan = writeLooseBackup(
+    harness,
+    fixedSessionId('scoped-ghost'),
+    hashOf(harness, 'scoped:ghost'),
+    ANCIENT_AT,
+  );
+  const stray = join(harness.backupsDir, hashOf(harness, 'scoped:stray'));
+  writeDatedFile(stray, 'stray bytes\n', ANCIENT_AT);
+
+  const cacheA = writeIndexEntry(
+    harness,
+    'a.json',
+    { index: { projectRoot: PROJECT_A } },
+    ANCIENT_AT,
+  );
+  const cacheB = writeIndexEntry(
+    harness,
+    'b.json',
+    { index: { projectRoot: PROJECT_B } },
+    ANCIENT_AT,
+  );
+  const cacheNone = writeIndexEntry(harness, 'none.json', {}, ANCIENT_AT);
+  const cacheOpaque = writeIndexEntry(harness, 'opaque.bin', 'opaque bytes', ANCIENT_AT);
+  const cacheMixed = join(harness.indexCacheDir, 'mixed');
+  writeDatedFile(
+    join(cacheMixed, 'a.json'),
+    JSON.stringify({ projectRoot: PROJECT_A }),
+    ANCIENT_AT,
+  );
+  writeDatedFile(
+    join(cacheMixed, 'b.json'),
+    JSON.stringify({ projectRoot: PROJECT_B }),
+    ANCIENT_AT,
+  );
+  setAge(cacheMixed, ANCIENT_AT);
+
+  return {
+    agedA,
+    agedB,
+    conflictB,
+    activeB,
+    orphanA,
+    orphanB,
+    ghostOrphan,
+    stray,
+    cacheA,
+    cacheB,
+    cacheNone,
+    cacheOpaque,
+    cacheMixed,
+  };
+}
+
+/** The `retention sweep finished` records the sweep logged. */
+function finishedRecords(harness: Harness): CapturedLog[] {
+  return harness.logs.filter((entry) => entry.message === 'retention sweep finished');
+}
+
+describe('scoped sweeps: session.purge for one workspace', () => {
+  it("removes workspace A's aged sessions, orphans and caches, and leaves every item of B unread and unreported", async () => {
+    const fixture = await seedTwoWorkspaces(h);
+    const bCounts = scopedCounts(h, fixture.agedB.sessionId);
+
+    const report = await sweep(h, { scope: scopeOf(PROJECT_A) });
+
+    // A's aged session went completely, with its backup directory.
+    expect(report.sessionIdsDeleted).toEqual([fixture.agedA]);
+    expect(report.sessionsDeleted).toBe(1);
+    expect(sessionExists(h, fixture.agedA)).toBe(false);
+    expect(present(join(h.backupsDir, fixture.agedA))).toBe(false);
+    expect(present(fixture.orphanA)).toBe(false);
+    expect(present(fixture.cacheA)).toBe(false);
+    expect(report).toMatchObject({
+      // The aged session's directory, and the live A directory its orphan emptied.
+      backupDirsDeleted: 2,
+      orphanBackupsDeleted: 1,
+      indexCachesDeleted: 1,
+      // B's conflict and B's capturing session are not A's to report.
+      sessionsRetainedForConflicts: [],
+      sessionsRetainedActive: [],
+      errors: [],
+    });
+
+    // Every item of B, and every item whose project is unknown, is untouched.
+    for (const sessionId of [fixture.agedB.sessionId, fixture.conflictB, fixture.activeB]) {
+      expect(sessionExists(h, sessionId)).toBe(true);
+    }
+    expect(scopedCounts(h, fixture.agedB.sessionId)).toEqual(bCounts);
+    expect(sha256OfFileSync(fixture.agedB.contents.modification.backupPath)).toBe(
+      fixture.agedB.contents.modification.digest,
+    );
+    for (const kept of [
+      fixture.orphanB,
+      fixture.ghostOrphan,
+      fixture.stray,
+      fixture.cacheB,
+      fixture.cacheNone,
+      fixture.cacheOpaque,
+      fixture.cacheMixed,
+    ]) {
+      expect(present(kept)).toBe(true);
+    }
+    expect(finishedRecords(h).at(-1)?.fields).toMatchObject({ scoped: true, sessionsDeleted: 1 });
+  });
+
+  it('stays machine-wide without a scope: the same state is swept exactly as before', async () => {
+    const fixture = await seedTwoWorkspaces(h);
+
+    const report = await sweep(h);
+
+    expect(report.sessionIdsDeleted).toEqual([fixture.agedA, fixture.agedB.sessionId].sort());
+    expect(report.sessionsRetainedForConflicts).toEqual([fixture.conflictB]);
+    expect(report.sessionsRetainedActive).toEqual([fixture.activeB]);
+    // Both live directories' orphans, the ownerless one and the stray file.
+    expect(report.orphanBackupsDeleted).toBe(4);
+    // Every aged cache entry: none of their projects was opened inside the window.
+    expect(report.indexCachesDeleted).toBe(5);
+    for (const gone of [
+      fixture.orphanA,
+      fixture.orphanB,
+      fixture.ghostOrphan,
+      fixture.stray,
+      fixture.cacheA,
+      fixture.cacheB,
+      fixture.cacheNone,
+      fixture.cacheOpaque,
+      fixture.cacheMixed,
+    ]) {
+      expect(present(gone)).toBe(false);
+    }
+    expect(report.errors).toEqual([]);
+    expect(finishedRecords(h).at(-1)?.fields).toMatchObject({ scoped: false });
+  });
+
+  it('leaves the other workspace to its own editor: a B-scoped sweep then removes what A left', async () => {
+    const fixture = await seedTwoWorkspaces(h);
+    await sweep(h, { scope: scopeOf(PROJECT_A) });
+
+    const report = await sweep(h, { scope: scopeOf(PROJECT_B) });
+
+    expect(report.sessionIdsDeleted).toEqual([fixture.agedB.sessionId]);
+    expect(report.sessionsRetainedForConflicts).toEqual([fixture.conflictB]);
+    expect(report.sessionsRetainedActive).toEqual([fixture.activeB]);
+    expect(present(fixture.orphanB)).toBe(false);
+    expect(present(fixture.cacheB)).toBe(false);
+    // Whose project is unknown, or spans both, waits for the machine-wide sweep.
+    for (const kept of [
+      fixture.ghostOrphan,
+      fixture.stray,
+      fixture.cacheNone,
+      fixture.cacheOpaque,
+      fixture.cacheMixed,
+    ]) {
+      expect(present(kept)).toBe(true);
+    }
+  });
+
+  it('removes an entry recording several roots once the scope admits all of them', async () => {
+    const fixture = await seedTwoWorkspaces(h);
+
+    const report = await sweep(h, { scope: scopeOf('/workspace') });
+
+    expect(present(fixture.cacheMixed)).toBe(false);
+    expect(present(fixture.cacheA)).toBe(false);
+    expect(present(fixture.cacheB)).toBe(false);
+    // Neither an entry that records no project nor a non-document is anyone's.
+    expect(present(fixture.cacheNone)).toBe(true);
+    expect(present(fixture.cacheOpaque)).toBe(true);
+    expect(report.indexCachesDeleted).toBe(3);
+  });
+
+  it('reports on a scoped dry run exactly what the scoped sweep then removes', async () => {
+    await seedTwoWorkspaces(h);
+    const treeBefore = snapshotTree(h);
+    const rowsBefore = tableTotals(h);
+
+    const dry = await sweep(h, { scope: scopeOf(PROJECT_A), dryRun: true });
+
+    expect(snapshotTree(h)).toEqual(treeBefore);
+    expect(tableTotals(h)).toEqual(rowsBefore);
+    const real = await sweep(h, { scope: scopeOf(PROJECT_A) });
+    expect(comparable(real)).toEqual(comparable(dry));
+  });
+
+  it('reads a scope that throws as outside, keeping everything, and logs only its code', async () => {
+    const fixture = await seedTwoWorkspaces(h);
+    const treeBefore = snapshotTree(h);
+    const rowsBefore = tableTotals(h);
+
+    const report = await sweep(h, {
+      scope: () => {
+        throw new Error(`scope failure quoting ${SENTINEL}`);
+      },
+    });
+
+    expect(report).toMatchObject({
+      sessionsDeleted: 0,
+      orphanBackupsDeleted: 0,
+      indexCachesDeleted: 0,
+      sessionsRetainedForConflicts: [],
+      sessionsRetainedActive: [],
+    });
+    expect(snapshotTree(h)).toEqual(treeBefore);
+    expect(tableTotals(h)).toEqual(rowsBefore);
+    expect(sessionExists(h, fixture.agedA)).toBe(true);
+    expect(
+      h.logs.some((entry) => entry.message.startsWith('the retention scope check failed')),
+    ).toBe(true);
+    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+  });
+
+  it('answers CONFIG_INVALID, deleting nothing, for a scope that is not a predicate', async () => {
+    await seedTwoWorkspaces(h);
+    const rowsBefore = tableTotals(h);
+
+    const result = await runRetention(depsOf(h), {
+      scope: 'project-a' as unknown as RetentionScope,
+    });
+
+    expect(isErr(result)).toBe(true);
+    if (isErr(result)) {
+      expect(result.error.code).toBe('CONFIG_INVALID');
+    }
+    expect(tableTotals(h)).toEqual(rowsBefore);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Scoped sweeps — a scope that resolves roots on disk, awaited outside every transaction
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A scope built the way `session.purge` builds one: the workspace folder is
+ * canonicalised once, and a root is admitted only when it lies under the
+ * folder lexically **and** its own canonical location lies under the
+ * canonical folder. A root whose location cannot be established is refused.
+ */
+async function canonicalScopeOf(folder: string): Promise<RetentionScope> {
+  const canonicalFolder = unwrap(await canonicalizePath(folder));
+  return async (projectRoot) => {
+    if (!isWithin(folder, projectRoot)) {
+      return false;
+    }
+    const canonicalRoot = await canonicalizePath(projectRoot);
+    return !isErr(canonicalRoot) && isWithin(canonicalFolder, canonicalRoot.value);
+  };
+}
+
+/**
+ * Writes the directory-shaped cache entry `index/<name>/` holding `children`
+ * — each serialised like {@link writeIndexEntry} does — and dates every file
+ * and then the directory itself {@link ANCIENT_AT}.
+ */
+function writeIndexDirectory(
+  harness: Harness,
+  name: string,
+  children: Readonly<Record<string, unknown>>,
+): string {
+  const directory = join(harness.indexCacheDir, name);
+  for (const [child, document] of Object.entries(children)) {
+    const body = typeof document === 'string' ? document : JSON.stringify(document);
+    writeDatedFile(join(directory, child), body, ANCIENT_AT);
+  }
+  setAge(directory, ANCIENT_AT);
+  return directory;
+}
+
+/** `count` cache documents recording `projectRoot`, named so they list in order. */
+function documentsRecording(count: number, projectRoot: string): Record<string, unknown> {
+  const documents: Record<string, unknown> = {};
+  for (let index = 1; index <= count; index += 1) {
+    documents[`doc-${String(index).padStart(3, '0')}.json`] = { index: { projectRoot } };
+  }
+  return documents;
+}
+
+/** The message of the `debug` record a scoped sweep writes for a directory it kept unattributed. */
+const KEPT_DIRECTORY_LOG =
+  'a scoped sweep kept an index-cache directory it could not attribute whole';
+
+/** The directories a scoped sweep kept unattributed after `mark` log records, and why. */
+function keptDirectories(harness: Harness, mark = 0): Record<string, unknown>[] {
+  return harness.logs
+    .slice(mark)
+    .filter((entry) => entry.level === 'debug' && entry.message === KEPT_DIRECTORY_LOG)
+    .map(({ fields }) => ({
+      target: fields['target'],
+      reason: fields['reason'],
+      documents: fields['documents'],
+    }));
+}
+
+describe('scoped sweeps: a scope that resolves roots on disk', () => {
+  it("keeps a session whose root is a link inside A resolving into B, and removes A's real one", async () => {
+    const workspaceA = join(h.root, 'workspaces', 'a');
+    const realA = join(workspaceA, 'app');
+    const projectInB = join(h.root, 'workspaces', 'b', 'app');
+    mkdirSync(realA, { recursive: true });
+    mkdirSync(projectInB, { recursive: true });
+    const linkToB = join(workspaceA, 'link-to-b');
+    symlinkSync(projectInB, linkToB, 'dir');
+    // Lexically the link is A's: a scope that only compared strings would sweep it.
+    expect(isWithin(workspaceA, linkToB)).toBe(true);
+
+    const agedReal = (await seedFullSession(h, AGED_AT, { projectRoot: realA })).sessionId;
+    const agedLinked = await seedFullSession(h, AGED_AT, { projectRoot: linkToB });
+    const linkedCounts = scopedCounts(h, agedLinked.sessionId);
+    const orphanLinked = writeLooseBackup(
+      h,
+      agedLinked.sessionId,
+      hashOf(h, 'linked:orphan'),
+      ANCIENT_AT,
+    );
+    const cacheReal = writeIndexEntry(
+      h,
+      'real.json',
+      { index: { projectRoot: realA } },
+      ANCIENT_AT,
+    );
+    const cacheLinked = writeIndexEntry(
+      h,
+      'linked.json',
+      { index: { projectRoot: linkToB } },
+      ANCIENT_AT,
+    );
+    const directoryLinked = writeIndexDirectory(h, 'linked-directory', {
+      'a.json': { projectRoot: realA },
+      'b.json': { projectRoot: linkToB },
+    });
+
+    const report = await sweep(h, { scope: await canonicalScopeOf(workspaceA) });
+
+    // A's real project went, with its backups and its cache.
+    expect(report.sessionIdsDeleted).toEqual([agedReal]);
+    expect(present(join(h.backupsDir, agedReal))).toBe(false);
+    expect(present(cacheReal)).toBe(false);
+    expect(report).toMatchObject({
+      indexCachesDeleted: 1,
+      orphanBackupsDeleted: 0,
+      sessionsRetainedForConflicts: [],
+      sessionsRetainedActive: [],
+      errors: [],
+    });
+    // Everything recorded against the link really lives in B, and stays.
+    expect(sessionExists(h, agedLinked.sessionId)).toBe(true);
+    expect(scopedCounts(h, agedLinked.sessionId)).toEqual(linkedCounts);
+    expect(sha256OfFileSync(agedLinked.contents.modification.backupPath)).toBe(
+      agedLinked.contents.modification.digest,
+    );
+    for (const kept of [orphanLinked, cacheLinked, directoryLinked, projectInB]) {
+      expect(present(kept)).toBe(true);
+    }
+  });
+
+  it('awaits an asynchronous scope for every rule, and never while a transaction is open', async () => {
+    const fixture = await seedTwoWorkspaces(h);
+    const asked = new Set<string>();
+    let askedInsideTransaction = 0;
+    const scope: RetentionScope = async (projectRoot) => {
+      if (h.store.db.isTransaction) {
+        askedInsideTransaction += 1;
+      }
+      // Settles on a later turn of the event loop, as a scope reading the disk does.
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      if (h.store.db.isTransaction) {
+        askedInsideTransaction += 1;
+      }
+      asked.add(projectRoot);
+      return isWithin(PROJECT_A, projectRoot);
+    };
+
+    const report = await sweep(h, { scope });
+
+    expect(askedInsideTransaction).toBe(0);
+    // Sessions, backup directories and caches of both workspaces were asked about.
+    expect(asked).toEqual(
+      new Set([PROJECT_A, PROJECT_B, `${PROJECT_A}/live`, `${PROJECT_B}/live`]),
+    );
+    expect(report.sessionIdsDeleted).toEqual([fixture.agedA]);
+    expect(report).toMatchObject({
+      backupDirsDeleted: 2,
+      orphanBackupsDeleted: 1,
+      indexCachesDeleted: 1,
+      sessionsRetainedForConflicts: [],
+      sessionsRetainedActive: [],
+      errors: [],
+    });
+    for (const gone of [fixture.orphanA, fixture.cacheA]) {
+      expect(present(gone)).toBe(false);
+    }
+    for (const sessionId of [fixture.agedB.sessionId, fixture.conflictB, fixture.activeB]) {
+      expect(sessionExists(h, sessionId)).toBe(true);
+    }
+    for (const kept of [fixture.orphanB, fixture.cacheB, fixture.cacheMixed, fixture.cacheNone]) {
+      expect(present(kept)).toBe(true);
+    }
+  });
+
+  it('reads a scope that rejects as outside, keeping everything, and logs only its code', async () => {
+    await seedTwoWorkspaces(h);
+    const treeBefore = snapshotTree(h);
+    const rowsBefore = tableTotals(h);
+
+    const report = await sweep(h, {
+      scope: () => Promise.reject(new Error(`scope rejection quoting ${SENTINEL}`)),
+    });
+
+    expect(report).toMatchObject({
+      sessionsDeleted: 0,
+      orphanBackupsDeleted: 0,
+      indexCachesDeleted: 0,
+      sessionsRetainedForConflicts: [],
+      sessionsRetainedActive: [],
+    });
+    expect(snapshotTree(h)).toEqual(treeBefore);
+    expect(tableTotals(h)).toEqual(rowsBefore);
+    expect(
+      h.logs.some((entry) => entry.message.startsWith('the retention scope check failed')),
+    ).toBe(true);
+    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Scoped sweeps — a directory-shaped cache entry is inspected whole
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('scoped sweeps: a directory-shaped cache entry is inspected whole', () => {
+  it('keeps a directory holding more documents than the sweep reads, even when only the last records B', async () => {
+    const crowded = writeIndexDirectory(h, 'crowded', {
+      ...documentsRecording(MAX_INDEX_METADATA_FILES, PROJECT_A),
+      // Listed last, so a sweep that sampled the first documents never saw it.
+      'doc-999.json': { index: { projectRoot: PROJECT_B } },
+    });
+
+    const scoped = await sweep(h, { scope: scopeOf(PROJECT_A) });
+
+    expect(present(crowded)).toBe(true);
+    expect(scoped.indexCachesDeleted).toBe(0);
+    expect(scoped.errors).toEqual([]);
+    expect(keptDirectories(h)).toEqual([
+      {
+        target: relativeToHome(h, crowded),
+        reason: 'too-many-documents',
+        documents: MAX_INDEX_METADATA_FILES + 1,
+      },
+    ]);
+
+    // Not even a scope admitting every root it records removes what it did not read whole.
+    const mark = h.logs.length;
+    const wide = await sweep(h, { scope: scopeOf('/workspace') });
+    expect(present(crowded)).toBe(true);
+    expect(wide.indexCachesDeleted).toBe(0);
+    expect(keptDirectories(h, mark)).toHaveLength(1);
+
+    // The machine-wide sweep is unchanged: it samples, finds no active project, removes.
+    const machineWide = await sweep(h);
+    expect(machineWide.indexCachesDeleted).toBe(1);
+    expect(present(crowded)).toBe(false);
+  });
+
+  it('keeps a directory holding an unreadable or a rootless document, or a subdirectory', async () => {
+    const garbled = writeIndexDirectory(h, 'garbled', {
+      'a.json': { projectRoot: PROJECT_A },
+      'b.json': 'not json at all',
+    });
+    const rootless = writeIndexDirectory(h, 'rootless', {
+      'a.json': { projectRoot: PROJECT_A },
+      'b.json': { index: {} },
+    });
+    // Its subdirectory holds B's document, which a one-level walk never reads
+    // but a tree removal would take with it.
+    const nested = writeIndexDirectory(h, 'nested', { 'a.json': { projectRoot: PROJECT_A } });
+    const shard = join(nested, 'shard');
+    writeDatedFile(join(shard, 'b.json'), JSON.stringify({ projectRoot: PROJECT_B }), ANCIENT_AT);
+    setAge(shard, ANCIENT_AT);
+    setAge(nested, ANCIENT_AT);
+    const garbledFile = writeIndexEntry(h, 'garbled.json', 'not json at all', ANCIENT_AT);
+
+    const scoped = await sweep(h, { scope: scopeOf(PROJECT_A) });
+
+    expect(scoped.indexCachesDeleted).toBe(0);
+    expect(scoped.errors).toEqual([]);
+    for (const kept of [garbled, rootless, nested, garbledFile]) {
+      expect(present(kept)).toBe(true);
+    }
+    expect(keptDirectories(h)).toEqual([
+      { target: relativeToHome(h, garbled), reason: 'unreadable-document', documents: 2 },
+      { target: relativeToHome(h, nested), reason: 'nested-directory', documents: 1 },
+      { target: relativeToHome(h, rootless), reason: 'rootless-document', documents: 2 },
+    ]);
+
+    // The machine-wide sweep removes all four, exactly as it always has.
+    const machineWide = await sweep(h);
+    expect(machineWide.indexCachesDeleted).toBe(4);
+    for (const gone of [garbled, rootless, nested, garbledFile]) {
+      expect(present(gone)).toBe(false);
+    }
+  });
+
+  it('still removes a directory of at most the documents it reads, each recording a root the scope admits', async () => {
+    const full = writeIndexDirectory(h, 'full', {
+      ...documentsRecording(MAX_INDEX_METADATA_FILES, PROJECT_A),
+      'graph.bin': 'graph bytes',
+    });
+    const single = writeIndexDirectory(h, 'single', {
+      'meta.json': { projectRoot: `${PROJECT_A}/packages/web` },
+    });
+    // No document at all: it records no project, so it is nobody's to remove.
+    const bare = writeIndexDirectory(h, 'bare', { 'graph.bin': 'graph bytes' });
+
+    const report = await sweep(h, { scope: scopeOf(PROJECT_A) });
+
+    expect(report.indexCachesDeleted).toBe(2);
+    expect(present(full)).toBe(false);
+    expect(present(single)).toBe(false);
+    expect(present(bare)).toBe(true);
+    expect(report.errors).toEqual([]);
+    expect(keptDirectories(h)).toEqual([]);
+  });
+
+  it('keeps an attributable directory that records a project active inside the window', async () => {
+    seedSession(h, { projectRoot: PROJECT_A, updatedAt: RECENT_AT });
+    const owned = writeIndexDirectory(h, 'owned', documentsRecording(2, PROJECT_A));
+
+    const report = await sweep(h, { scope: scopeOf(PROJECT_A) });
+
+    expect(present(owned)).toBe(true);
+    expect(report.indexCachesDeleted).toBe(0);
+    expect(keptDirectories(h)).toEqual([]);
   });
 });

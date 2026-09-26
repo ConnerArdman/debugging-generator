@@ -59,22 +59,14 @@
  * the hook call conditional - which is what `react-hooks/rules-of-hooks` forbids, and what would
  * break the moment a caller passed the prop on one render and omitted it on the next.
  *
- * IT RE-RENDERS SEVERAL TIMES A SECOND, AND THAT IS THE POINT
- * `<ShippingEtaProvider>` republishes the dispatch countdown every 250 ms and `<CartProvider>`
- * builds a fresh context value each time it does, so `useCartSummary` recomputes and this panel
- * re-renders roughly four times a second for as long as it is mounted. That is the storefront's
- * behaviour under investigation, not a defect in this file: there is no `memo`, no `useMemo`, no
- * `useCallback`, no selector layer and no equality guard anywhere below, and none may be added -
- * the excessive-render acceptance test exists to discover exactly this propagation path.
- *
  * NOTHING HERE READS A CLOCK
  * No timestamp is taken, no timer is scheduled and no interval is started. The countdown arrives
  * as `dispatchCountdownMs` - a number the provider read from the clock after it mounted, or `null`
  * before its first reading - so the markup the server produced and the first markup the browser
- * renders always agree and the cart raises no hydration warning for a capture to record. Before
- * that first reading the panel simply prints `estimatedDeliveryLabel` and no countdown, which is
- * why nothing here suppresses a hydration warning either. The countdown is folded down to whole
- * minutes as well, so the sentence changes once a minute rather than four times a second.
+ * renders always agree and the cart raises no hydration warning. Before that first reading the
+ * panel simply prints `estimatedDeliveryLabel` and no countdown, which is why nothing here
+ * suppresses a hydration warning either. The countdown is folded down to whole minutes as well, so
+ * the sentence changes at most once a minute.
  *
  * MARKUP AND APPEARANCE
  * The rows are label-and-value pairs, so they are a `<dl>` with a `<div>` group per row, exactly
@@ -258,9 +250,9 @@ const MINUTES_PER_HOUR = 60;
  * not a usable number at all - and the caller then prints the dispatch estimate on its own rather
  * than a sentence built from a non-finite value.
  *
- * The result is coarse on purpose. Seconds are folded into whole minutes, so a panel that
- * re-renders several times a second still prints wording that changes once a minute, and a
- * shopper reading the line is not watching digits flicker while they check a subtotal.
+ * The result is coarse on purpose. Seconds are folded into whole minutes, so the wording changes
+ * at most once a minute, and a shopper reading the line is not watching digits flicker while they
+ * check a subtotal.
  *
  * @param countdownMs Milliseconds until the next dispatch cut-off, as the cart published them.
  */
@@ -622,8 +614,7 @@ export function CartTotalsPanel({
           ))}
 
           {/* The closing row exists only where charges do: without them the merchandise row above
-              is already the closing figure, and a second row repeating it is exactly the
-              duplicate this block used to print under the word "Total". */}
+              is already the closing figure, so the same total is never stated twice. */}
           {hasCharges ? (
             <div className={clsx(styles.row, styles.total)}>
               <dt className={styles.rowLabel}>
@@ -656,9 +647,9 @@ export function CartTotalsPanel({
         {/* `role="paragraph"` restores what the layout takes away, and is not a duplicate of the
             element's own semantics: this line is laid out as a flex container so the qualifying
             label can sit beside its sentence, and Chromium maps role `paragraph` onto block-flow
-            boxes only - measured in the browser, the note and dispatch lines below are exposed as
-            paragraphs while this one was ignored, so a reader navigating by paragraph skipped the
-            one line that carries the freight state. */}
+            boxes only. The explicit role keeps it exposed as a paragraph like the note and
+            dispatch lines around it, so a reader navigating by paragraph reaches the one line
+            that carries the freight state. */}
         {/* Printed only where the surface quotes merchandise alone; a surface quoting charges
             says what is true of this order's freight on the freight row itself. See the reasoning
             beside `freight` above. */}

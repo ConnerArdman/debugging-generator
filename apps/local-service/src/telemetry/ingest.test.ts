@@ -20,7 +20,9 @@
  * 3. **Redaction wiring and the store contract.** Every row handed to the store
  *    is exactly a redactor output plus its attribution; the correlator and the
  *    tail receive the rows the store *returned*; planted credentials reach
- *    neither; the epoch-millisecond time base survives untouched.
+ *    neither, nor do query values and header lines quoted in free-text
+ *    attributes and `log` names, on either transport; the epoch-millisecond
+ *    time base survives untouched.
  * 4. **Batch discipline and graceful failure (AAP §0.5.5).** Bounds, drops,
  *    malformed siblings, replays, store and subsystem failures — and no input
  *    of any shape makes a call throw or a promise reject.
@@ -101,6 +103,8 @@ import type {
 import {
   KIND_ATTRIBUTE_KEYS,
   MIN_EPOCH_MS,
+  REDACTION_MARKER,
+  REDACTION_MASK,
   REQUEST_KINDS,
   SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
   TELEMETRY_KINDS,
@@ -255,6 +259,72 @@ function sentinel(label: string): string {
   return ['captured', label, 'm4rk3r'].join('-');
 }
 
+/** A private query value quoted in page prose, not in a URL attribute. */
+const PROSE_QUERY_VALUE = 'SHORT42';
+
+/** A query value made only of characters prose also ends a sentence with. */
+const PUNCTUATION_QUERY_VALUE = '!!!!';
+
+/**
+ * A six-character bearer token: too short to be denied by its shape, even
+ * after `Bearer `, so only the `Authorization:` line quoting it marks it as a
+ * credential. Assembled from fragments like every other credential-shaped
+ * value in this file.
+ */
+const SHORT_BEARER_TOKEN: string = ['S3', 'CR', 'ET'].join('');
+
+/** A session cookie pair, as a `Cookie:` line in free text carries it. */
+const COOKIE_PAIR: string = ['session', 'abc'].join('=');
+
+/** A query-bearing reference quoted in the name of a `log` event. */
+const LOG_NAME_REFERENCE = '/p?id=7';
+
+/**
+ * Free text a page or a dev server can put under **ordinary** attribute names:
+ * none is a URL, stack or header key, and none names a credential, so only the
+ * redactor's pass over generic strings stands between these values and the
+ * store and the live tail.
+ */
+const FREE_TEXT_ATTRIBUTES: Readonly<Record<string, string>> = Object.freeze({
+  note: `Visited /reset?code=${PROSE_QUERY_VALUE} before clicking`,
+  note2: `/reset?code=${PUNCTUATION_QUERY_VALUE}`,
+  detail: `Authorization: Bearer ${SHORT_BEARER_TOKEN}`,
+  message: `Cookie: ${COOKIE_PAIR}`,
+  // A message line that quotes a frame, then a frame with a bare-relative
+  // query: stack text loses every query value and keeps the frame position.
+  'error.stack':
+    `Error: reset?code=${PROSE_QUERY_VALUE}; f@http://h.test/a.js?v=1:1:1\n` +
+    `    at h (src/a.ts?code=${PROSE_QUERY_VALUE}:3:4)`,
+});
+
+/**
+ * {@link FREE_TEXT_ATTRIBUTES} as redaction must leave them: the prose and the
+ * header names survive, while every query value becomes the mask and every
+ * header value the marker — both read from the upstream rules, never restated.
+ */
+const REDACTED_FREE_TEXT_ATTRIBUTES: Readonly<Record<string, string>> = Object.freeze({
+  note: `Visited /reset?code=${REDACTION_MASK} before clicking`,
+  note2: `/reset?code=${REDACTION_MASK}`,
+  detail: `Authorization: ${REDACTION_MARKER}`,
+  message: `Cookie: ${REDACTION_MARKER}`,
+  'error.stack':
+    `Error: reset?code=${REDACTION_MASK} f@http://h.test/a.js?v=${REDACTION_MASK}\n` +
+    `    at h (src/a.ts?code=${REDACTION_MASK}:3:4)`,
+});
+
+/**
+ * Every fragment of the free-text material whose absence from each persisted
+ * and tailed payload is asserted. `session=abc` is searched with its name, so
+ * a hex identifier that happens to contain `abc` cannot match.
+ */
+const FREE_TEXT_LEAKS: readonly string[] = Object.freeze([
+  PROSE_QUERY_VALUE,
+  PUNCTUATION_QUERY_VALUE,
+  SHORT_BEARER_TOKEN,
+  COOKIE_PAIR,
+  LOG_NAME_REFERENCE,
+]);
+
 /* -------------------------------------------------------------------------------------------------
  * Event fixtures
  * ---------------------------------------------------------------------------------------------- */
@@ -345,6 +415,33 @@ function makeDbIngress(statement: string): TelemetryEventIngress {
 /** A server request span as the dev-server preload reports it. */
 function makeServerIngress(): TelemetryEventIngress {
   return makeIngress({ kind: 'http.server', tier: 'server', name: 'POST /api/one' });
+}
+
+/**
+ * An event carrying {@link FREE_TEXT_ATTRIBUTES} and nothing else, so its
+ * redacted bag is compared whole.
+ *
+ * @param overrides Fields replacing the defaults, typically `kind` and `tier`.
+ */
+function makeFreeTextIngress(
+  overrides: Partial<TelemetryEventIngress> = {},
+): TelemetryEventIngress {
+  return makeIngress({ attributes: { ...FREE_TEXT_ATTRIBUTES }, ...overrides });
+}
+
+/**
+ * A `log` event whose name quotes {@link LOG_NAME_REFERENCE}: neither a
+ * request nor a query kind, so its name is masked as free text.
+ *
+ * @param tier The producing tier; `log` is reported by either.
+ */
+function makeLogNameIngress(tier: TelemetryEventIngress['tier']): TelemetryEventIngress {
+  return makeIngress({
+    kind: 'log',
+    tier,
+    name: `error at ${LOG_NAME_REFERENCE}`,
+    attributes: { 'log.level': 'error' },
+  });
 }
 
 /**
@@ -477,8 +574,10 @@ interface FakeSessionsRepo {
 /**
  * A sessions-store double holding one fixed secret.
  *
- * @param secret The value handed out; {@link REQUEST_KEY_SECRET} unless a case
- * needs a malformed one.
+ * @param log The shared call-order log; every secret read pushes `secret`.
+ * @param options How the double answers: `behaviour` is `ok` (the default),
+ * `err` or `throw`, and `secret` is the value an `ok` read hands out —
+ * {@link REQUEST_KEY_SECRET} unless a case needs a malformed one.
  */
 function fakeSessionsRepo(
   log: CallTag[],
@@ -903,6 +1002,69 @@ function dropCounts(nonZero: Partial<Record<DropReason, number>> = {}): Record<D
   return counts;
 }
 
+/** A row persisted or tailed by one pipeline stage. */
+type StageRow = AttributedEvent | TelemetryEvent;
+
+/** The row of `rows` carrying event `id`; fails the case when there is none. */
+function rowWithId(rows: readonly StageRow[], id: string): StageRow {
+  const row = rows.find((candidate) => candidate.id === id);
+
+  if (row === undefined) {
+    throw new Error(`expected a row for event ${id}`);
+  }
+
+  return row;
+}
+
+/**
+ * Asserts, on the rows handed to the store **and** on the rows pushed to the
+ * live tail, that the event `freeTextId` (built by `makeFreeTextIngress`)
+ * carries exactly {@link REDACTED_FREE_TEXT_ATTRIBUTES} and records every
+ * masked path, and that the `log` event `logId` (built by
+ * `makeLogNameIngress`) has its name's query value masked. Then asserts that
+ * no {@link FREE_TEXT_LEAKS} fragment survives anywhere in what the store was
+ * handed, what it returned, or what the tail was pushed, each serialised
+ * whole.
+ *
+ * @param h The pipeline that ingested the batch; its tail was pushed once.
+ * @param freeTextId The id of the free-text event.
+ * @param logId The id of the `log` event.
+ */
+function expectFreeTextMaskedEverywhere(h: Harness, freeTextId: string, logId: string): void {
+  expect(h.tail.push).toHaveBeenCalledTimes(1);
+
+  const stages: readonly (readonly [string, readonly StageRow[]])[] = [
+    ['persisted', insertedRows(h.repo)],
+    ['tailed', h.tail.push.mock.calls[0]?.[1] ?? []],
+  ];
+
+  for (const [stage, rows] of stages) {
+    const freeText = rowWithId(rows, freeTextId);
+
+    expect(freeText.attributes, `${stage} free-text attributes`).toEqual(
+      REDACTED_FREE_TEXT_ATTRIBUTES,
+    );
+    expect(freeText.redacted, `${stage} redacted paths`).toEqual(
+      expect.arrayContaining(Object.keys(FREE_TEXT_ATTRIBUTES)),
+    );
+    expect(rowWithId(rows, logId).name, `${stage} log name`).toBe(
+      `error at /p?id=${REDACTION_MASK}`,
+    );
+  }
+
+  const payloads: readonly (readonly [string, string])[] = [
+    ['store insert', JSON.stringify(h.repo.calls)],
+    ['store result', JSON.stringify(h.repo.returned)],
+    ['live tail', JSON.stringify(h.tail.push.mock.calls)],
+  ];
+
+  for (const [payload, text] of payloads) {
+    for (const leak of FREE_TEXT_LEAKS) {
+      expect(text, `the ${payload} payload carries ${leak}`).not.toContain(leak);
+    }
+  }
+}
+
 /* =================================================================================================
  * The fixtures themselves
  * ============================================================================================== */
@@ -955,10 +1117,12 @@ describe('the mandatory order', () => {
       await h.ingest.ingest(BROWSER_CONTEXT, [makeRequestIngress('/api/one?itemId=A')]),
     );
 
-    // The order is fixed by the folder brief and AAP §0.7.1 Group 2 row 6:
     // validate → request_key → redact → attribute → persist → correlate → tail.
-    // Attribution is resolved once and the secret read once *before* the first
-    // event is hashed, because the HMAC is keyed per session.
+    // The key is an HMAC of the unredacted URL, so it is computed before
+    // redaction masks the query; redaction precedes persistence and the tail,
+    // so nothing raw is stored or broadcast. Attribution is resolved once and
+    // the secret read once *before* the first event is hashed, because the
+    // HMAC is keyed per session.
     expect(h.log).toEqual([
       'resolve',
       'secret',
@@ -1083,9 +1247,9 @@ describe('the mandatory order', () => {
 
     const report = expectReport(await h.ingest.ingest(BROWSER_CONTEXT, batch));
 
-    // The folder brief mandates `createRequestKeyHasher` over the one-shot
-    // `computeRequestKey`: the HMAC key is imported once per hasher, so one
-    // build per batch is one key import per batch.
+    // Ingest keys through `createRequestKeyHasher`, not the one-shot
+    // `computeRequestKey`, because the HMAC key is imported once per hasher:
+    // one build per batch is one key import per batch, not one per request.
     expect(h.sessions.requested).toEqual([SESSION]);
     expect(h.privacy.hasherBuilds()).toBe(1);
     expect(h.privacy.hashed).toHaveLength(batch.length);
@@ -1827,6 +1991,57 @@ describe('redaction wiring and the store contract', () => {
     const queryRow = onlyRow(server.repo);
     expect(queryRow.redacted).toContain(STATEMENT_KEY);
     expect(stringAttribute(queryRow, STATEMENT_KEY)).toContain('SELECT id FROM widgets');
+  });
+
+  it('masks query values and header lines in free-text attributes and log names before the store and the live tail', async () => {
+    const h = harness();
+    const freeText = makeFreeTextIngress();
+    const logged = makeLogNameIngress('browser');
+    // The same private value in a request URL, so the batch also proves that
+    // masking free text leaves the key on the unredacted URL.
+    const requestUrl = `/reset?code=${PROSE_QUERY_VALUE}`;
+    const request = makeRequestIngress(requestUrl);
+
+    const report = expectReport(
+      await h.ingest.ingest(BROWSER_CONTEXT, [freeText, logged, request]),
+    );
+
+    expect(report.persisted).toBe(3);
+    expectFreeTextMaskedEverywhere(h, freeText.id, logged.id);
+
+    const requestRow = rowWithId(insertedRows(h.repo), request.id);
+    expect(requestRow.attributes[URL_KEY]).toBe(`/reset?code=${REDACTION_MASK}`);
+    expect(h.privacy.hashed).toEqual([{ method: 'GET', url: requestUrl }]);
+    expect(requestRow.attributes[REQUEST_KEY_ATTRIBUTE]).toBe(
+      await independentDigest('GET', requestUrl),
+    );
+
+    // A fixed point: re-redacting what a page agent already redacted changes nothing.
+    for (const row of insertedRows(h.repo)) {
+      expect(redactEvent(row)).toEqual(row);
+    }
+  });
+
+  it('masks the same free text in a server-agent batch from the ingest route', async () => {
+    const h = harness();
+    const freeText = makeFreeTextIngress({
+      kind: 'function',
+      tier: 'server',
+      name: 'function handleAction',
+    });
+    const logged = makeLogNameIngress('server');
+
+    const report = expectReport(
+      await h.ingest.ingestFromServerAgent({
+        projectRoot: PROJECT_ONE,
+        scopedProjectRoot: PROJECT_ONE,
+        events: [freeText, logged],
+      }),
+    );
+
+    expect(report.persisted).toBe(2);
+    expect(insertedRows(h.repo).map((row) => row.tier)).toEqual(['server', 'server']);
+    expectFreeTextMaskedEverywhere(h, freeText.id, logged.id);
   });
 
   it('preserves fractional epoch-millisecond startTime and duration exactly, end to end', async () => {

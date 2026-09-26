@@ -36,13 +36,14 @@
  *    so a manifest that names a version no file provides — or a prompt whose
  *    placeholders have drifted from the stage that renders it — fails here
  *    rather than at the first stage of a developer's first session.
- * 6. **A committed prompt version never changes.** AAP 0.5.3 makes every
- *    `vNNN.md` immutable once committed, because a session records the
- *    versions it used and a reopened session or a follow-up replays them. The
- *    same cases pin each committed version to a SHA-256 digest and load every
- *    version the manifest lists — superseded ones included — through
- *    `loadVersion`, so an in-place rewrite of a version a stored session cites
- *    fails here instead of silently changing what that session replays.
+ * 6. **A committed prompt version never changes.** Every `vNNN.md` is
+ *    immutable once committed (docs/ARCHITECTURE.md, "Boundary rules"),
+ *    because a session records the versions it used and a reopened session or
+ *    a follow-up replays them. The same cases pin each committed version to a
+ *    SHA-256 digest and load every version the manifest lists — superseded
+ *    ones included — through `loadVersion`, so an in-place rewrite of a
+ *    version a stored session cites fails here instead of silently changing
+ *    what that session replays.
  *
  * ## How caching is observed without mocking the filesystem
  *
@@ -1977,9 +1978,9 @@ function readShippedManifest(): unknown {
 /**
  * The SHA-256 digest of every committed prompt version, by stage and version.
  *
- * AAP 0.5.3 makes a committed `vNNN.md` immutable: a session records the
- * versions it rendered, and a reopened session or a follow-up loads exactly
- * those versions again through `loadVersion`. A file rewritten in place under a
+ * A committed `vNNN.md` is immutable: a session records the versions it
+ * rendered, and a reopened session or a follow-up loads exactly those
+ * versions again through `loadVersion`. A file rewritten in place under a
  * version a stored session already cites would therefore replay different
  * instructions under the same identifier, with nothing anywhere recording the
  * change. This table is what makes that rewrite visible: every committed
@@ -2171,9 +2172,9 @@ describe('the shipped prompt tree', () => {
   });
 
   it('pins every committed prompt version to the text it was committed with', () => {
-    // THE IMMUTABILITY CASE (AAP 0.5.3). A version file on disk that the table
-    // does not know is an unregistered version; a digest that no longer matches
-    // is a committed version rewritten in place, which is exactly the change a
+    // THE IMMUTABILITY CASE. A version file on disk that the table does not
+    // know is an unregistered version; a digest that no longer matches is a
+    // committed version rewritten in place, which is exactly the change a
     // stored session citing that version cannot detect.
     for (const stage of PROMPT_STAGES) {
       const pinned = COMMITTED_PROMPT_DIGESTS[stage];

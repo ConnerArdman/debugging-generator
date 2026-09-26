@@ -278,9 +278,8 @@ const WRITTEN =
  * The postal field's hint once freight has actually been quoted for the destination.
  *
  * This sentence is a statement about the store's answer, not about the value in the field, so it
- * is shown only while a settled quote exists for that destination. It used to be the field's
- * permanent hint, which meant a buyer correcting a code the store had just refused was reading an
- * assurance that it had been priced.
+ * is shown only while a settled quote exists for that destination. A buyer correcting a code the
+ * store has refused is therefore never told that it was priced.
  */
 const QUOTED_DESTINATION_HINT = 'Freight is quoted for this destination.';
 
@@ -1494,8 +1493,8 @@ export function CheckoutForm({
    * to whenever a buyer chose anything but the middle service.
    *
    * Four primitives rather than an object, because they are what the publishing effect below
-   * depends on: an object literal in a dependency array is a fresh identity on every render, and
-   * this form re-renders several times a second (AAP 0.8.2 defect 2).
+   * depends on: an object literal in a dependency array is a fresh identity on every render, so
+   * the effect would run on every render rather than when the charge changes.
    */
   const quotedOptions = freight.quote?.options ?? null;
   const quotedChoice =
@@ -1658,11 +1657,11 @@ export function CheckoutForm({
    * already names it, the page has said so and this stays quiet.
    *
    * Both kinds of record are logged where they report something, because a silent failure is the
-   * hardest kind to find in production and this one used to leave no trace at all: the line names
-   * the attempt and when it went out, which is what makes it worth reading in a bug report. An
-   * order the address already names is the exception and is logged by neither: the reference is on
-   * the page, so nothing was lost sight of, and a line saying a receipt was never shown would be
-   * untrue of the very page printing the order number.
+   * hardest kind to find in production: the line names the attempt and when it went out, which is
+   * what makes it worth reading in a bug report. An order the address already names is the
+   * exception and is logged by neither: the reference is on the page, so nothing was lost sight
+   * of, and a line saying a receipt was never shown would be untrue of the very page printing the
+   * order number.
    *
    * This is the one effect in the file that publishes state from its own body, and there is no
    * alternative to it: what it publishes comes from session storage, storage cannot be read while
@@ -1686,6 +1685,7 @@ export function CheckoutForm({
       attempt.current = record.idempotencyKey;
       sent.current = record.draft;
       // A hydration-safe read of session storage; see the note above this effect.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setFailure(INTERRUPTED);
       // Whether a draft came back is logged and the draft is not: it holds the buyer's contact
       // and address, which have no place in a console.
@@ -1723,14 +1723,13 @@ export function CheckoutForm({
 
   // The chosen freight charge, published for the review column beside this form. The dependencies
   // are the four primitives the charge is made of and the publisher, which is stable for the life
-  // of its provider, so this runs when the chosen service or its quoted rate changes and not when
-  // the cart or the dispatch countdown does - and the value itself is built inside the effect,
-  // where a fresh object costs nothing. Nothing the current quote offers - no destination yet, a
-  // lookup in flight or failed, a cart too large to quote, a service the quote omits - publishes
-  // `null`, which the column renders as a charge still to be established rather than as a zero;
-  // the cleanup publishes `null` too, so a form that goes away leaves no freight row behind it.
-  // The publisher ignores a value equal to the one already published, which is what keeps a form
-  // re-rendering four times a second from writing state four times a second.
+  // of its provider, so this runs when the chosen service or its quoted rate changes and on no
+  // other render - and the value itself is built inside the effect, where a fresh object costs
+  // nothing. Nothing the current quote offers - no destination yet, a lookup in flight or failed,
+  // a cart too large to quote, a service the quote omits - publishes `null`, which the column
+  // renders as a charge still to be established rather than as a zero; the cleanup publishes
+  // `null` too, so a form that goes away leaves no freight row behind it. The publisher ignores a
+  // value equal to the one already published, so an unchanged charge writes no state.
   useEffect(() => {
     if (
       chosenOptionId === null ||
@@ -1853,9 +1852,8 @@ export function CheckoutForm({
   /**
    * Remember that the buyer has finished with `field`, so its message may be shown.
    *
-   * Returns the same object when the field is already known, so a form that re-renders several
-   * times a second (AAP 0.8.2 defect 2) does not write state on every blur of an already-blurred
-   * field.
+   * Returns the same object when the field is already touched, so blurring an already-blurred
+   * field writes no new state.
    */
   function touch(field: CheckoutFieldKey): void {
     setTouched((current) => (current[field] === true ? current : { ...current, [field]: true }));
@@ -2245,11 +2243,10 @@ export function CheckoutForm({
           The freight group inside is also passed `pending` in its own right, so it reads as
           unavailable whether it is read through this group or on its own.
 
-          `styles.fields` is a reset, and it exists because a fieldset arrives with a border, a
-          padding and a min-width of its own, and because the four groups below were direct
-          children of `.root`'s column before this element existed. It reproduces that column
-          exactly - same direction, same gap - so the rhythm, the hairline between consecutive
-          groups and the field grid's container query all resolve exactly as they did. */}
+          `styles.fields` is a reset: it removes the border, padding and min-width a fieldset
+          arrives with, and lays the four groups below out as `.root`'s column does - same
+          direction, same gap - so the rhythm, the hairline between consecutive groups and the
+          field grid's container query all resolve against the form. */}
       <fieldset className={styles.fields} disabled={pending}>
         <section className={styles.section}>
           <h2 className={styles.sectionTitle}>Contact details</h2>
@@ -2642,11 +2639,11 @@ export function CheckoutForm({
       ) : null}
 
       {/* Why the place-order control is unavailable, in the words of the labels above the fields.
-          It is the answer to the question a disabled button asks and used not to answer: the
-          control is inert, so pressing it reports nothing, and a buyer who cannot see what is
-          missing has nowhere to go. `role="status"` rather than an alert, because this is guidance
-          and not a failure - and because its text changes only when a field's validity changes,
-          never on a keystroke, so it announces once per thing settled. */}
+          It answers the question a disabled button raises: the control is inert, so pressing it
+          reports nothing, and a buyer who cannot see what is missing has nowhere to go.
+          `role="status"` rather than an alert, because this is guidance and not a failure - and
+          because its text changes only when a field's validity changes, never on a keystroke, so
+          it announces once per thing settled. */}
       {blocked === null ? null : (
         <p className={styles.outstanding} role="status">
           {blocked}

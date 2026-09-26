@@ -1,93 +1,52 @@
 /**
- * The evidence rule of the analysis stage: deterministic fact candidates the
- * model must cite, verification of what the model returned, and assembly and
- * persistence of the accepted analysis.
+ * The evidence rule of the analysis stage. Four jobs:
  *
- * AAP 0.8.4 states the product's central integrity rule and names this file as
- * its first checkpoint: "`AnalysisResult.observed` items must cite evidence ids
- * that exist in the capture (checked in `apps/local-service/src/analysis/facts.ts`
- * and again by `packages/panel-schema/src/semantic.ts`)". AAP 0.7.1 Group 2 adds
- * the other half of this module's job — "deterministic fact candidates (slowest
- * spans, duplicate groups, render outliers) that the model must cite" — and AAP
- * 0.4.2 fixes the artifact, `AnalysisResult { observed, likelyCauses, metrics }`,
- * together with the follow-up ladder that stores a regenerated analysis as
- * version *n + 1* whose `supersedes` names version *n*.
+ * 1. **Fact candidates** ({@link buildFactCandidates}): deterministic
+ *    statements from fixed, value-substituting templates over the bounded
+ *    analysis input, each citing persisted event ids. Kinds name measurement
+ *    mechanisms and the developer's question is never read. Candidates are
+ *    offered to the model; nothing here promotes one into an observed fact.
+ * 2. **Verification** ({@link AnalysisFacts.verifyFindings}) of every citation
+ *    and every suggested location the model returned. Accepted findings are
+ *    returned exactly as parsed — never moved, rewritten, re-ranked, padded or
+ *    dropped.
+ * 3. **Assembly and persistence** ({@link AnalysisFacts.acceptFindings}): the
+ *    protocol's constructor builds the `AnalysisResult`, it is re-validated and
+ *    stored as the session's next version, `supersedes` naming the latest one;
+ *    a version collision is reported, never retried or overwritten.
+ * 4. **Evidence resolvers** ({@link AnalysisFacts.createEvidenceResolvers}) for
+ *    `panels/validate.ts`, backed by the same lookups.
  *
- * The module therefore does four things and nothing else:
+ * ## Capture-scoped evidence
  *
- * 1. **Fact candidates** ({@link buildFactCandidates}). Pure, deterministic
- *    statements built from measured values of the bounded analysis input, each
- *    already carrying {@link EventRef}s whose ids are persisted event ids read
- *    from the aggregates' own occurrence and event ids. They are *inputs offered
- *    to the model*: nothing here ever promotes a candidate into an observed fact.
- * 2. **Verification** ({@link AnalysisFacts.verifyFindings}). Every evidence
- *    reference of every observed fact *and* every likely cause is resolved
- *    against the capture's `telemetry_events` rows through the store's own
- *    lookups, and resolved as *one* event: each id must exist in the capture,
- *    a cited span must be the cited event's own span, and the cited event must
- *    be one of the cited trace's events in the capture. A cited span that
- *    cannot be checked — the port offers no span lookup — fails closed
- *    (`span-unverifiable`) rather than passing unchecked. One reference that
- *    fails any of these rejects the whole analysis, so valid ids of unrelated
- *    events cannot be combined into a citation.
- * 3. **Assembly and persistence** ({@link AnalysisFacts.acceptFindings}). The
- *    verified findings become an `AnalysisResult` through the protocol's single
- *    constructor, are re-validated, and are stored as the session's next
- *    analysis version.
- * 4. **The evidence resolvers** ({@link AnalysisFacts.createEvidenceResolvers})
- *    that `panels/validate.ts` hands to `validateAgainstCapture`, backed by the
- *    same lookups, so checkpoint two decides every citation instead of reporting
- *    what the bounded summary cannot see as unverifiable.
+ * Every evidence reference of every observed fact and likely cause must resolve
+ * to *one* event of this capture: its event id exists in the capture, a cited
+ * trace id is that event's trace there, and a cited span id is that event's own
+ * span. Existence is asked of the store through {@link EvidenceLookupPort} —
+ * never of the bounded summary — and a span the port cannot look up fails
+ * closed (`span-unverifiable`). A suggested location must name a regular file
+ * inside the session project once every symbolic link is resolved. One failed
+ * check rejects the whole analysis as a typed `Err`; there is no fallback
+ * analysis.
  *
- * ## Guarantees, and where each comes from
+ * ## Privacy
  *
- * - **Facts and hypotheses stay separate (AAP 0.8.4).** `Fact` and `Hypothesis`
- *   are the upstream types from `@debuggen/panel-schema`, validated through
- *   `@debuggen/protocol`'s findings schema. Verification never moves, rewrites,
- *   re-ranks, pads or drops an item; accepted findings are returned exactly as
- *   parsed.
- * - **The store is the authority on existence.** A `CaptureSummary` carries
- *   bounded top-N sections and no exhaustive id set, so it is never the id
- *   universe: existence is asked of the injected {@link EvidenceLookupPort},
- *   which the service satisfies with `TelemetryRepo`.
- * - **No fabricated analysis (AAP 0.5.3, 0.5.5).** There is no fallback
- *   analysis. A rejection is a typed `Err`, so the state machine can route the
- *   session to `failed` instead of presenting a failure as a result.
- * - **Privacy by construction (AAP 0.5.2).** Candidates are built from
- *   already-redacted persisted evidence; interpolated labels pass through the
- *   telemetry scrubber, long unbroken tokens are shortened, request groups are
- *   named by method and path (never by the request-key digest), and every
- *   candidate is checked with the outbound guard's own inspector before it is
- *   offered. Errors and logs carry JSON paths, codes, counts and product-minted
- *   ids only — never a statement, an attribute value, SQL or a source excerpt.
- * - **No hardcoded behaviour (AAP 0.5.4).** Candidate kinds are mechanism-named,
- *   statements are fixed value-substituting templates, and the developer's
- *   question is never read.
- * - **Versioned, never overwritten (AAP 0.4.2).** The version comes from the
- *   store's `nextAnalysisVersion`, `supersedes` from its latest analysis, and a
- *   version collision is reported rather than retried.
- * - **Injected and total.** Ports, logger, clock and id generator are injected;
- *   nothing reads the environment, the filesystem, the network or a timer, and
- *   nothing throws for an expected failure — a throwing port arrives as `Err`.
+ * Candidates are built from already-redacted evidence: labels are scrubbed,
+ * long tokens shortened, request groups named by method and path (never by
+ * digest), and every candidate passes the outbound guard's inspector before it
+ * is offered. The location check reads filesystem metadata only, through the
+ * injectable {@link LocationFilePort}. Errors and logs carry JSON paths, codes,
+ * counts and product-minted ids only — never a statement, an attribute value,
+ * SQL, a source excerpt, a filesystem path or an errno.
  *
- * @example
- * ```ts
- * const facts = createAnalysisFacts({ evidence: telemetryRepo, store: panelsRepo, logger });
- * const candidates = facts.candidatesFor({ input, summary });
- * // … the analyze prompt runs with the candidates in its input …
- * const accepted = await facts.acceptFindings(modelOutput, {
- *   sessionId,
- *   captureId,
- *   projectRoot,
- *   metrics: summary.metrics,
- * });
- * if (!accepted.ok) {
- *   // The analysis was rejected; nothing was stored.
- * }
- * ```
+ * Ports, logger, clock and id generator are injected; nothing reads the
+ * environment, the network or a timer, and nothing throws for an expected
+ * failure — a throwing port arrives as `Err`.
  *
  * @module
  */
+
+import { lstatSync, realpathSync } from 'node:fs';
 
 import {
   DebuggenError,
@@ -99,14 +58,18 @@ import {
   isWithin,
   newAnalysisId,
   noopLogger,
+  normalizePosix,
   nowEpochMs,
   ok,
   parseSourceLocation,
+  resolveRealPathWithinProject,
   resolveWithinProject,
   roundMs,
+  toPosix,
   type AnalysisId,
   type CaptureId,
   type Logger,
+  type RealPathResolver,
   type Result,
   type SessionId,
   type SourceLocation,
@@ -295,10 +258,6 @@ export const FACT_CANDIDATE_THRESHOLDS = Object.freeze({
   minStateChanges: 3,
 });
 
-/* -------------------------------------------------------------------------------------------------
- * Candidate shapes
- * ---------------------------------------------------------------------------------------------- */
-
 /**
  * One deterministic fact candidate: a value-substituted statement about the
  * capture and the persisted events that substantiate it.
@@ -310,17 +269,13 @@ export const FACT_CANDIDATE_THRESHOLDS = Object.freeze({
 export type FactCandidate = {
   /** Stable id: `fc-<kind>-<ordinal within kind>`. */
   readonly id: string;
-  /** What mechanism the candidate reports. */
   readonly kind: FactCandidateKind;
-  /** The statement, from a fixed template with measured values substituted. */
   readonly statement: string;
   /** At least one reference to a persisted event of the capture. */
   readonly evidence: readonly EventRef[];
-  /** The metric the candidate restates, when it restates one. */
   readonly metricId?: MetricId;
   /** The measured value the statement leads with. */
   readonly value?: number;
-  /** The unit of {@link FactCandidate.value}. */
   readonly unit?: string;
   /** A validated project-relative location the evidence points at, when one is known. */
   readonly suggestedLocation?: SourceLocation;
@@ -480,7 +435,10 @@ export type FactVerificationContext = {
   readonly sessionId: SessionId;
   /** The capture every citation must resolve in. */
   readonly captureId: CaptureId;
-  /** Absolute path of the session's project root; suggested locations must lie inside it. */
+  /**
+   * Absolute path of the session's project root; a suggested location must name
+   * a regular file inside it once every symbolic link is resolved.
+   */
   readonly projectRoot: string;
 };
 
@@ -626,12 +584,47 @@ export interface AnalysisStorePort {
   listAnalyses(sessionId: SessionId): Result<readonly AnalysisResult[], DebuggenError>;
 }
 
+/**
+ * The filesystem metadata reads that verify a suggested location: two
+ * synchronous questions about absolute paths, never a read of file content.
+ * Defaults to `node:fs` (`realpathSync`, `lstatSync`); a test injects its own.
+ */
+export interface LocationFilePort {
+  /**
+   * The canonical absolute path of `absolutePath`, every symbolic link
+   * resolved, final component included. Throws when it cannot be resolved; a
+   * throw rejects the location, it never escapes verification.
+   */
+  realpath(absolutePath: string): string;
+  /**
+   * Whether `absolutePath` itself — not followed — is a regular file. `false`
+   * for a directory, a link, a device or a path that cannot be examined.
+   */
+  isRegularFile(absolutePath: string): boolean;
+}
+
+/** The production {@link LocationFilePort}: `realpathSync`, and `lstatSync` for the file type. */
+const NODE_LOCATION_FILES: LocationFilePort = Object.freeze({
+  realpath: (absolutePath: string): string => realpathSync(absolutePath),
+  isRegularFile: (absolutePath: string): boolean => {
+    try {
+      return lstatSync(absolutePath).isFile();
+    } catch {
+      // Missing, unreadable or refused: whatever the errno, it is not a file
+      // this analysis may point the developer at, and the errno is not kept.
+      return false;
+    }
+  },
+});
+
 /** Injected dependencies of {@link createAnalysisFacts}. */
 export type AnalysisFactsDeps = {
   /** Existence lookups over the capture's persisted events. */
   readonly evidence: EvidenceLookupPort;
   /** The analysis history. */
   readonly store: AnalysisStorePort;
+  /** Filesystem metadata for suggested-location checks; defaults to `node:fs`. */
+  readonly files?: LocationFilePort | undefined;
   /** Logger; a child bound to the `analysis` subsystem is derived from it. */
   readonly logger?: Logger | undefined;
   /** Clock (epoch ms) for `createdAt` defaults and timing logs. */
@@ -2032,14 +2025,63 @@ function citedRefs(findings: AnalysisFindings): CitedRef[] {
   return refs;
 }
 
+/** An absolute path in the form {@link isWithin} compares, so equality means the same path. */
+function comparablePath(absolutePath: string): string {
+  return normalizePosix(toPosix(absolutePath));
+}
+
+/**
+ * Whether the project-relative `file` names a regular file inside
+ * `projectRoot` on disk, every symbolic link resolved.
+ *
+ * Text cannot see a link: `src/link/passwd` passes the lexical gate and opens
+ * `/etc/passwd` when `src/link` points at `/etc`. So the root and the target's
+ * directory chain are canonicalised with {@link resolveRealPathWithinProject},
+ * the target is then canonicalised in full — the editor follows a link at the
+ * final component too — and the canonical target must be strictly inside the
+ * canonical root and, examined without following, a regular file. A link that
+ * stays inside the project is accepted: it names a project file either way.
+ *
+ * Total: a failed resolution, a throwing or ill-typed port answer and every
+ * other failure is `false`. Nothing about the answer — no path, no target, no
+ * errno — is kept.
+ */
+function isProjectFileOnDisk(projectRoot: string, file: string, files: LocationFilePort): boolean {
+  try {
+    const resolveRealPath: RealPathResolver = (absolutePath) => files.realpath(absolutePath);
+    const resolved = resolveRealPathWithinProject(projectRoot, file, resolveRealPath);
+    if (!resolved.ok) {
+      return false;
+    }
+    const canonicalTarget: unknown = files.realpath(resolved.value.path);
+    if (typeof canonicalTarget !== 'string') {
+      return false;
+    }
+    const root = comparablePath(resolved.value.projectRoot);
+    const target = comparablePath(canonicalTarget);
+    if (target === root || !isWithin(root, target)) {
+      return false;
+    }
+    const regularFile: unknown = files.isRegularFile(target);
+    return regularFile === true;
+  } catch {
+    // A port that threw is a location that could not be verified, and an
+    // unverified location is refused like an escaping one.
+    return false;
+  }
+}
+
 /**
  * Checks every suggested location: a valid `SourceLocation` whose file is a
- * safe project-relative path resolving inside `projectRoot`. String-level only
- * — the file is never opened or stat'ed.
+ * safe project-relative path inside `projectRoot` as text *and* on disk
+ * ({@link isProjectFileOnDisk}). The filesystem check runs only once the
+ * lexical one passed, reads metadata only, and every failure of either is one
+ * `location-outside-project` issue at the location's `file` path.
  */
 function locationIssues(
   findings: AnalysisFindings,
   projectRoot: string,
+  files: LocationFilePort,
 ): { readonly issues: FactVerificationIssue[]; readonly checked: number } {
   const issues: FactVerificationIssue[] = [];
   let checked = 0;
@@ -2056,7 +2098,12 @@ function locationIssues(
     }
     const file = parsed.value.file;
     const resolved = isSafeRelativePath(file) ? resolveWithinProject(projectRoot, file) : undefined;
-    if (resolved === undefined || !resolved.ok || !isWithin(projectRoot, resolved.value)) {
+    if (
+      resolved === undefined ||
+      !resolved.ok ||
+      !isWithin(projectRoot, resolved.value) ||
+      !isProjectFileOnDisk(projectRoot, file, files)
+    ) {
       issues.push(issueAt(`${path}.file`, 'location-outside-project'));
     }
   }
@@ -2160,10 +2207,13 @@ function traceMembersOf(
  * once for the distinct event ids, once for the distinct trace ids, once per
  * distinct span id, and once per page of each distinct cited trace whose
  * membership still has to be established (see {@link traceMembersOf}).
+ * Suggested locations are checked on disk through `files`
+ * ({@link locationIssues}).
  *
  * @param findings Findings that passed `parseAnalysisFindings`.
  * @param context The session, capture and project to verify against.
  * @param lookup The evidence lookups.
+ * @param files Filesystem metadata for suggested locations; defaults to `node:fs`.
  * @returns The report — valid or not — or `Err` when a lookup failed or a trace
  * page did not advance, in which case nothing can be concluded.
  */
@@ -2171,6 +2221,7 @@ export function collectFactVerificationReport(
   findings: AnalysisFindings,
   context: FactVerificationContext,
   lookup: EvidenceLookupPort,
+  files: LocationFilePort = NODE_LOCATION_FILES,
 ): Result<FactVerificationReport, DebuggenError> {
   const issues = structuralIssues(findings);
   const refs = citedRefs(findings);
@@ -2299,7 +2350,7 @@ export function collectFactVerificationReport(
     }
   }
 
-  const locations = locationIssues(findings, context.projectRoot);
+  const locations = locationIssues(findings, context.projectRoot, files);
   issues.push(...locations.issues);
 
   return ok(
@@ -2435,8 +2486,8 @@ function versionTakenError(result: AnalysisResult, cause: DebuggenError): Debugg
  * ports when it runs, so the object can be shared by the analyze stage, the
  * follow-up stage and panel validation.
  *
- * @param deps The evidence lookups, the analysis store, and optional logger,
- * clock and id generator.
+ * @param deps The evidence lookups, the analysis store, and optional
+ * filesystem port, logger, clock and id generator.
  * @returns The subsystem.
  */
 export function createAnalysisFacts(deps: AnalysisFactsDeps): AnalysisFacts {
@@ -2496,7 +2547,12 @@ export function createAnalysisFacts(deps: AnalysisFactsDeps): AnalysisFacts {
     if (invalidContext !== undefined) {
       return err(invalidContext);
     }
-    const report = collectFactVerificationReport(parsed.value, context, deps.evidence);
+    const report = collectFactVerificationReport(
+      parsed.value,
+      context,
+      deps.evidence,
+      deps.files ?? NODE_LOCATION_FILES,
+    );
     if (!report.ok) {
       return err(report.error);
     }

@@ -78,9 +78,13 @@
  * reply, and `cleanup.completed` cannot reach a window whose socket is closed.
  * So, before the notice, the owning service is asked for the session's
  * authoritative record (`GET /sessions/:id`, whose `cleanup.conflicts[]`
- * carry each `file` and `backupPath`) and its modification journal
- * (`GET /sessions/:id/modifications`), and both are projected into the store
- * (`applySessionRecord`, `applyModificationJournal`). The notice then names
+ * carry each `file` and `backupPath`) and, concurrently, its whole
+ * modification journal (`GET /sessions/:id/modifications`, walked page by page
+ * by `readModificationJournal` within {@link CLEANUP_DETAIL_TIMEOUT_MS}), and
+ * both are projected into the store (`applySessionRecord`, and
+ * `applyModificationJournal` once with every gathered record and the
+ * journal's `total`, so a read that stopped early shows as incomplete in the
+ * view rather than as the whole journal). The notice then names
  * every conflicted file, one sentence each and at most
  * {@link MAX_CONFLICT_SENTENCES}: "‹file› was edited while instrumented. Debug
  * Generator will not overwrite it. Original saved at ‹backup path›." for a
@@ -126,8 +130,9 @@
  * and {@link captureServiceEndpoint} from here at runtime, and
  * `./start-session` also its {@link SESSION_CREATE_TIMEOUT_MS} budget; `src/extension.ts`
  * imports {@link endSessionsForShutdown}. This module imports only types from
- * `./index`, `../state` and `../service/client`, so the module graph stays
- * acyclic.
+ * `./index` and `../state`, and from `../service/client` its types and
+ * `readModificationJournal`; none of them imports a command module, so the
+ * module graph stays acyclic.
  *
  * @module
  */
@@ -136,6 +141,7 @@ import type { CleanupStatus, ModificationConflict } from '@debuggen/protocol';
 import { DebuggenError, assertNever, err, isErr, isOk, ok } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
 
+import { readModificationJournal } from '../service/client';
 import type { ServiceClient } from '../service/client';
 import type { CreatedSession, ExtensionState } from '../state';
 
@@ -228,9 +234,10 @@ const REPLACEMENT_WORDING: Readonly<Record<ReplacementPurpose, ReplacementWordin
 const SERVICE_URL_SETTING = 'debuggen.serviceUrl';
 
 /**
- * The bound on each of the two requests that load a settled `partial` or
- * `conflict` cleanup's details (see {@link loadCleanupDetails}); the notice
- * waits for them, so they must not stall it.
+ * The bound on the two reads that load a settled `partial` or `conflict`
+ * cleanup's details (see {@link loadCleanupDetails}): the record request's
+ * timeout, and the deadline of the whole journal walk, however many pages it
+ * takes. The notice waits for both, so neither may stall it.
  */
 const CLEANUP_DETAIL_TIMEOUT_MS = 3_000;
 
@@ -532,15 +539,20 @@ async function settledRequest<T>(
  * though no `cleanup.completed` or `session.updated` can reach a window whose
  * socket is closed.
  *
- * The two requests run concurrently, each bounded by
- * {@link CLEANUP_DETAIL_TIMEOUT_MS}. A journal that cannot be loaded only
- * leaves the view's list as it was; a record that cannot be loaded, or that
- * names no conflict, yields `undefined`, and the caller keeps its status-only
- * wording. Logs carry codes and counts only — never a file or backup path.
+ * The record request and the journal walk (`readModificationJournal`, every
+ * page along `nextOffset`) run concurrently, each bounded by
+ * {@link CLEANUP_DETAIL_TIMEOUT_MS} — the walk as a whole, whatever its page
+ * count. Every record the walk gathered is applied once with the journal's
+ * `total`, including a walk a later page's failure or the deadline cut short,
+ * so the view lists what was loaded and states what was not. A journal whose
+ * first page cannot be loaded only leaves the view's list as it was; a record
+ * that cannot be loaded, or that names no conflict, yields `undefined`, and
+ * the caller keeps its status-only wording. Logs carry codes and counts only —
+ * never a file or backup path.
  *
  * @param ctx The command context.
  * @param sessionId The session `session.end` answered for.
- * @param owner The session's owning endpoint, where both requests go.
+ * @param owner The session's owning endpoint, where every request goes.
  * @param command The command on whose behalf the details are loaded, for logs.
  * @returns The conflicts the store now holds, one per file, or `undefined`.
  */
@@ -550,10 +562,16 @@ async function loadCleanupDetails(
   owner: string,
   command: CommandId,
 ): Promise<readonly ModificationConflict[] | undefined> {
-  const call = { endpoint: owner, timeoutMs: CLEANUP_DETAIL_TIMEOUT_MS };
   const [record, journal] = await Promise.all([
-    settledRequest(() => ctx.client.getSession(sessionId, call)),
-    settledRequest(() => ctx.client.getModifications(sessionId, undefined, call)),
+    settledRequest(() =>
+      ctx.client.getSession(sessionId, { endpoint: owner, timeoutMs: CLEANUP_DETAIL_TIMEOUT_MS }),
+    ),
+    settledRequest(() =>
+      readModificationJournal(ctx.client, sessionId, {
+        endpoint: owner,
+        deadlineMs: CLEANUP_DETAIL_TIMEOUT_MS,
+      }),
+    ),
   ]);
 
   let conflicts: readonly ModificationConflict[] = [];
@@ -584,7 +602,18 @@ async function loadCleanupDetails(
       code: journal.error.code,
     });
   } else {
-    ctx.state.applyModificationJournal(sessionId, journal.value.modifications);
+    const read = journal.value;
+    ctx.state.applyModificationJournal(sessionId, read.modifications, read.total);
+    if (!read.complete) {
+      ctx.logger.warn('Modification journal read stopped before its end', {
+        command,
+        sessionId,
+        total: read.total,
+        listed: read.modifications.length,
+        complete: read.complete,
+        ...(read.failure === undefined ? {} : { code: read.failure.code }),
+      });
+    }
   }
 
   const files = oneConflictPerFile(conflicts);
@@ -594,6 +623,8 @@ async function loadCleanupDetails(
       sessionId,
       conflicts: files.length,
       modifications: isErr(journal) ? 'unavailable' : journal.value.total,
+      listed: isErr(journal) ? 0 : journal.value.modifications.length,
+      complete: isErr(journal) ? false : journal.value.complete,
     });
   }
   return files.length === 0 ? undefined : files;

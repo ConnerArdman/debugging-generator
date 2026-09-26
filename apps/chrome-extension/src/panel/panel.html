@@ -5,26 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Debug Generator</title>
     <!--
-      The "Debug Generator" DevTools panel document.
-
-      src/devtools/devtools.ts creates the panel from this page at runtime, so the
-      manifest never names it; vite.config.ts builds it as an explicit Rollup input
-      to dist/src/panel/panel.html. That path is a contract: do not rename or move
-      this file. The page also opens directly as an ordinary extension page, so
-      nothing here may assume chrome.devtools exists.
-
-      Minimal on purpose: one mount element and one module script. main.tsx imports
-      the renderer stylesheet, which Vite emits and links, and every visual value is
-      a renderer token, so this document carries no link, style block or inline style.
-
-      No theme attribute on the html element, and none should be added (not even
-      data-theme="dark"): dark is the token set the stylesheet serves from :root,
-      and main.tsx writes the resolved DevTools theme onto this root before the
-      first paint.
+      src/devtools/devtools.ts opens this page through chrome.devtools.panels.create, so no
+      manifest key names it; vite.config.ts builds it as an explicit input emitted at
+      dist/src/panel/panel.html, and that path is a contract. No theme attribute (not even
+      data-theme="dark") belongs on the html element: dark is the :root token set, and
+      main.tsx applies the resolved DevTools theme before first paint.
     -->
   </head>
   <body>
-    <!-- Mount element: main.tsx throws at start-up when id="root" is missing. -->
     <div id="root"></div>
     <script type="module" src="./main.tsx"></script>
   </body>

@@ -8,12 +8,12 @@
  * component already redacted and already parameterized — `$n` placeholders as
  * the driver wrote them, inline literals replaced with `?` by
  * `packages/telemetry/src/redaction/sql.ts` — and the only thing recorded about
- * a result is a row *count* (AAP 0.5.2). So the cases below assert that the
- * statement is **displayed, never transformed**: the expanded block holds the
- * received text byte for byte, the collapsed cell holds this package's own
- * documented display preview of it and carries the untouched text beside it, no
- * placeholder is ever filled in, no control offers to run, copy or reveal
- * anything, and nothing resembling a result row is rendered anywhere.
+ * a result is a row *count*. So the cases below assert that the statement is
+ * **displayed, never transformed**: the expanded block holds the received text
+ * byte for byte, the collapsed cell holds this package's own documented display
+ * preview of it and carries the untouched text beside it, no placeholder is ever
+ * filled in, no control offers to run, copy or reveal anything, and nothing
+ * resembling a result row is rendered anywhere.
  *
  * Byte fidelity here is not pedantry. The parameterized statement *is* the
  * guarantee: a later "nicer SQL display" — a trim, a re-case, a pretty-print, a
@@ -22,25 +22,25 @@
  * only assertion that keeps such a change honest, which is why these cases
  * compare against the fixture string and not against a normalised variant of it.
  *
- * **Second, the click that ends the acceptance flow.** Acceptance test 1
- * (AAP 0.8.4) finishes in this table: the caller chip of a statement opens the
- * editor at the call site. The caller case asserts what the host actually
- * receives through `PanelActions.onOpenSource` — equal to the location the
- * resolver produced, with the same key set — because every hop after this one
- * acts blind on the object it is handed (AAP 0.4.2), and a caller the resolver
- * could not place must render as text rather than as a control leading nowhere.
+ * **Second, the end of the click-to-source flow.** The click-to-source flow ends
+ * at this table's caller chip, which opens the editor at the statement's call
+ * site. The caller case asserts what the host actually receives through
+ * `PanelActions.onOpenSource` — equal to the location the resolver produced,
+ * with the same key set — because every hop after this one acts blind on the
+ * object it is handed, and a caller the resolver could not place must render as
+ * text rather than as a control leading nowhere.
  *
  * **Third, the paging and ordering contract.** `POST /sessions/:id/panel-data`
  * applies `filter`, `sort`, `limit` and `offset` and answers with `total` and
- * `nextOffset` (AAP 0.4.2), so ordering is a *re-query* rather than a local
- * re-ranking, a page is appended at the offset the service reported, the footer
- * says how much of the result is on screen, and a bounded occurrence list says
- * that it is bounded.
+ * `nextOffset`, so ordering is a *re-query* rather than a local re-ranking, a
+ * page is appended at the offset the service reported, the footer says how much
+ * of the result is on screen, and a bounded occurrence list says that it is
+ * bounded.
  *
- * Alongside those, AAP 0.8.3 asks every component suite here for the three
- * states of a query-backed view — loading, empty and error — each driven
- * through a stub `DataProvider` that respectively never settles, resolves an
- * empty page and rejects.
+ * Alongside those, every component suite here covers the three states of a
+ * query-backed view — loading, empty and error — each driven through a stub
+ * `DataProvider` that respectively never settles, resolves an empty page and
+ * rejects.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -61,10 +61,10 @@
  *     nothing here calls `aggregateQueries` or `normalizeSqlStatement`, since a
  *     suite that computed its own fixtures could not tell a component that
  *     displayed a value from one that recomputed it.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): a statement over a table
- *     named `example_items`, callers in `src/example/repository.ts`. No table,
- *     column, component, service or route name of any inspected application
- *     appears here, in the fixtures or in the comments.
+ *   - **Generic fixture vocabulary only**: a statement over a table named
+ *     `example_items`, callers in `src/example/repository.ts`. No table, column,
+ *     component, service or route name of any inspected application appears
+ *     here, in the fixtures or in the comments.
  *   - **Queries by role and accessible name.** The grid, its rows, the header
  *     controls, the chips, the tooltips and the footer buttons are all reached
  *     that way; a class is read only off an element already obtained
@@ -76,6 +76,9 @@
  * @see ./QueryTable for the component, its four states and its class contract.
  * @see ../host/DataProvider for the seam the stubs below implement.
  * @see ../host/useQuery for the loading/empty/error machine they drive.
+ * @see docs/SECURITY.md, "Redaction", for the SQL placeholder and row-count treatment.
+ * @see docs/ARCHITECTURE.md, "Panel data", "The renderer contract" and "A click, end to end",
+ * for the paging contract, the three states and the click-to-source path.
  */
 
 import {
@@ -118,10 +121,10 @@ import { sourceLinkAccessibleName } from './SourceLink';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Application-neutral throughout (AAP 0.5.4). The identifiers are shaped as a
- * capture shapes them — a 32-hex trace id, 16-hex span ids, epoch-millisecond
- * start times, millisecond durations — because the component reads those fields
- * and formats them.
+ * Application-neutral throughout. The identifiers are shaped as a capture
+ * shapes them — a 32-hex trace id, 16-hex span ids, epoch-millisecond start
+ * times, millisecond durations — because the component reads those fields and
+ * formats them.
  * ---------------------------------------------------------------------------
  */
 
@@ -200,8 +203,8 @@ const SOURCE_LINE = 84;
 const SOURCE_COLUMN = 9;
 
 /**
- * A complete, resolved location — the object the acceptance hop must deliver to
- * the host unchanged.
+ * A complete, resolved location — the object the click-to-source flow must
+ * deliver to the host unchanged.
  */
 const BASE_SOURCE: SourceLocation = {
   file: SOURCE_FILE,
@@ -374,9 +377,9 @@ const EMPTY_MESSAGE_PATTERN = /no database queries were captured/i;
  *
  * Each word names a control that would imply the product holds a result set, can
  * re-issue a statement against the developer's database, or can reveal the
- * values a placeholder stands for. None of that evidence was ever captured
- * (AAP 0.5.2), so none of these controls may exist — and asserting their absence
- * by name is what would catch one arriving later under a plausible label.
+ * values a placeholder stands for. None of that evidence was ever captured, so
+ * none of these controls may exist — and asserting their absence by name is
+ * what would catch one arriving later under a plausible label.
  */
 const FORBIDDEN_CONTROL_PATTERN = /run|execute|re-?issue|explain|copy|reveal|parameter|value|row/i;
 
@@ -740,8 +743,7 @@ function pendingAfterFirstProvider(first: QueryPage): StubProvider {
  * A provider that rejects every query.
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
- * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * implementation for: the code and hint it carries are what the error state renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -764,7 +766,7 @@ interface ActionSpies {
   /** The event-selection spy. */
   readonly onSelectEvent: Mock<(ref: PanelEventRef) => void>;
 
-  /** The open-source spy — the last hop of the acceptance flow. */
+  /** The open-source spy — where the click-to-source flow reaches the host. */
   readonly onOpenSource: Mock<(location: SourceLocation) => void>;
 
   /** The disclosure spy. */
@@ -1116,12 +1118,12 @@ describe('QueryTable states', () => {
     expect(busy.getAttribute('aria-live')).toBe('polite');
     expect(busy.classList.contains('dg-query-table__loading')).toBe(true);
 
-    // Announced like every other busy region of the package, ellipsis included
-    // (B2-F14).
+    // Announced like every other busy region of the package: the label ends in
+    // the single-character ellipsis (`…`) every loading label carries.
     expect(busy.textContent).toContain(LOADING_LABEL);
 
     // Nothing is drawn yet: no grid, therefore no rows, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -1136,8 +1138,7 @@ describe('QueryTable states', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     // Queried by a generic substring of the product's own copy rather than by a
-    // restatement of the sentence: product vocabulary, naming no inspected
-    // application (AAP 0.5.4).
+    // restatement of the sentence: product vocabulary, naming no inspected application.
     const message = await screen.findByText(EMPTY_MESSAGE_PATTERN);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
 
@@ -1204,8 +1205,8 @@ describe('QueryTable states', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    // One design for every failed node (B2-F14, B1-F16), in its fixed order:
-    // the default glyph, the view-scope title, the generic lead followed by the
+    // One error-state design for every failed node, in its fixed order: the
+    // default glyph, the view-scope title, the generic lead followed by the
     // provider's own cause, the provider's hint on a line of its own, the code
     // as a chip, the query, and a retry.
     const alert = await screen.findByRole('alert');
@@ -1344,8 +1345,8 @@ describe('QueryTable rows', () => {
   it('renders rows in the order the provider returned them, without re-sorting', async () => {
     // The page is deliberately not in total-time order (640 ms, then 1175 ms)
     // while the node asks for `duration_desc`: the service applied the ordering
-    // it was given (AAP 0.4.2), so a component that re-ranked the page locally
-    // would show an order no response ever reported.
+    // it was given, so a component that re-ranked the page locally would show an
+    // order no response ever reported.
     const stub = resolvingProvider(PROVIDER_ORDER);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -1380,7 +1381,7 @@ describe('QueryTable statement fidelity', () => {
     // THE assertion of this file. Equality against the fixture string itself,
     // not against a normalised variant of it: every `$1`, the `?` the redactor
     // left, all three runs of interior spaces, every newline and every unit of
-    // leading indentation, in the order they arrived (AAP 0.5.2).
+    // leading indentation, in the order they arrived.
     expect(statement.textContent).toBe(STATEMENT);
 
     // Stated again as the properties a "nicer SQL display" would break, so that
@@ -1449,8 +1450,8 @@ describe('QueryTable statement fidelity', () => {
     const collapsed = collapsedStatement(dataRow(0));
 
     // The formatter's form, and the bound it enforces: 120 code points including
-    // the single-code-point ellipsis, which is the privacy bound AAP 0.5.2 fixes
-    // on any captured preview rather than a layout preference.
+    // the single-code-point ellipsis, which is the privacy bound on every
+    // captured preview rather than a layout preference.
     expect(collapsed).toBe(oneLinePreview(LONG_STATEMENT));
     expect([...collapsed]).toHaveLength(120);
     expect(collapsed.endsWith('…')).toBe(true);
@@ -1479,7 +1480,7 @@ describe('QueryTable statement fidelity', () => {
     // one row disclosure and one caller chip. Asserted as a set rather than by
     // the absence of a named control, because an affordance added later would
     // arrive under a name this file could not have predicted — and the evidence
-    // to build one was never captured (AAP 0.5.2).
+    // to build one was never captured.
     expect(controlNames()).toEqual(
       [EXECUTIONS_SORT_NAME, TOTAL_TIME_SORT_NAME, EXPAND_ROW_NAME, SOURCE_CHIP_NAME].sort(),
     );
@@ -1539,7 +1540,7 @@ describe('QueryTable statement fidelity', () => {
   it('says a row count was never reported rather than printing zero', async () => {
     // A producer that reports no row counts says nothing about a result. Zero
     // would turn "never measured" into the observation "returned no rows", and
-    // the two must not look alike (AAP 0.5.2).
+    // the two must not look alike.
     const stub = resolvingProvider([makeQueryGroup({ totalRowCount: undefined })]);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -1634,8 +1635,8 @@ describe('QueryTable callers', () => {
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2), and this is the last
-    // hop of acceptance test 1 (AAP 0.8.4).
+    // this one acts on the object it is handed, and the click-to-source flow
+    // ends at this table's caller chip.
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -1693,9 +1694,9 @@ describe('QueryTable callers', () => {
  * happy-dom performs no layout, so these cases pin the INPUTS the browser lays
  * the grid out from: the width role of each column the component hands
  * `DataTable`, the token-built track template and floor `DataTable` derives
- * from them, and the `Stack` variants the caller cell is built from. Every one
- * of them was a cause of the caller chips spilling out of their column over the
- * Rows and Executions values in a real browser.
+ * from them, and the `Stack` variants the caller cell is built from. Each of
+ * them decides, in a real browser, whether the caller chips stay inside their
+ * column or spill over the Rows and Executions values beside it.
  * ---------------------------------------------------------------------------
  */
 
@@ -1718,7 +1719,7 @@ const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
  * A reference to one of the column-geometry tokens a role track is built from.
  * Removing every such reference from a track template must leave nothing but
  * the `minmax()` frames and the spaces between tracks: no number and no unit is
- * the component's own (AAP 0.6.4).
+ * the component's own.
  */
 const COLUMN_TOKEN_REFERENCE = /var\(--dg-column-(?:min|share)-[a-z]+\)/gu;
 
@@ -1762,7 +1763,7 @@ describe('QueryTable column layout', () => {
     );
     expect(template.replace(COLUMN_TOKEN_REFERENCE, '')).toMatch(/^(?:minmax\(, \)| )+$/u);
 
-    // Not one track is the floorless `minmax(0, …)` that let every column
+    // Not one track is a floorless `minmax(0, …)`, which would let every column
     // collapse to its padding and a caller chip paint over the Rows and
     // Executions values beside it: each role's floor is a positive length in
     // every theme.
@@ -1799,8 +1800,8 @@ describe('QueryTable column layout', () => {
       const list = soleMatch(dataRow(index), '.dg-query-table__callers');
 
       // The vertical list stretches its callers to the cell's width. A centred
-      // list let a chip wider than the column overflow both edges, starting
-      // before the cell and ending over the Rows column.
+      // list would let a chip wider than the column overflow both edges,
+      // starting before the cell and ending over the Rows column.
       expect(list.classList.contains('dg-stack--vertical')).toBe(true);
       expect(list.classList.contains('dg-stack--align-stretch')).toBe(true);
       expect(list.classList.contains('dg-stack--align-center')).toBe(false);
@@ -1852,9 +1853,9 @@ describe('QueryTable column layout', () => {
   });
 
   it('opens exactly the location of the caller clicked, once per click, from a crowded cell', async () => {
-    // Two resolved callers whose names are far longer than their column, the
-    // case in which the chips used to overflow the cell. The layout fix must
-    // not change what a click sends.
+    // Two resolved callers whose names are far longer than their column. The
+    // chips are clipped inside the cell, and each click still sends exactly the
+    // clicked caller's location, once.
     const nearSource: SourceLocation = {
       file: 'src/example/items/list-service.ts',
       line: 88,
@@ -2023,7 +2024,7 @@ describe('QueryTable expansion', () => {
 
     // A bounded list that says it is bounded: the aggregate carried two of four
     // executions while keeping every count exact, and saying so is the
-    // difference between a bounded list and a wrong one (AAP 0.4.2).
+    // difference between a bounded list and a wrong one.
     const notice = within(detail).getByText(/the rest were not carried/i);
     expect(notice.textContent).toContain(formatCount(FIRST_GROUP.occurrences.length));
     expect(notice.textContent).toContain(formatCount(FIRST_GROUP.executionCount));
@@ -2232,7 +2233,7 @@ describe('QueryTable paging', () => {
 
     // A service that reported no total leaves this view unable to know whether
     // more rows exist, so the sentence states the count it has rather than
-    // printing a placeholder where a number belongs (AAP 0.4.2).
+    // printing a placeholder where a number belongs.
     await screen.findByText(`Showing ${formatCount(2)} statements`);
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
   });
@@ -2278,8 +2279,8 @@ describe('QueryTable paging', () => {
     await screen.findByRole('grid');
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
 
-    // A failed second page gets the same error contract as a failed first page
-    // (AAP 0.6.2): an alert carrying the rejection's message, hint and code.
+    // A failed second page gets the same error contract as a failed first page:
+    // an alert carrying the rejection's message, hint and code.
     const alert = await screen.findByRole('alert');
     expect(alert.classList.contains('dg-query-table__error')).toBe(true);
     expect(alert.textContent).toContain('Could not load the next page');
@@ -2299,8 +2300,8 @@ describe('QueryTable paging', () => {
     });
 
     // The rows already read stay on screen, and the failure is never dressed as
-    // an empty result (AAP 0.5.5). A failed page reports no total, so the
-    // footer states only the count it holds, and offers no page past the failure.
+    // an empty result. A failed page reports no total, so the footer states only
+    // the count it holds, and offers no page past the failure.
     expect(screen.getByRole('grid')).toBeDefined();
     expect(collapsedStatements()).toEqual([oneLinePreview(STATEMENT)]);
     expect(screen.getByText(`Showing ${formatCount(1)} statements`)).toBeDefined();

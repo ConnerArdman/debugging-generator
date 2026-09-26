@@ -39,10 +39,13 @@
  * ## What this module does not do
  *
  * `../auth.ts` owns the whole pairing mechanism: the eight-character CSPRNG code,
- * the five-minute validity, the single-use rule, hash-only storage in
- * `pairing_codes`, the five-failure / sixty-second lockout (per origin and
- * global), and the issuance of the DevTools credential in the same transaction
- * that marks the code used. This file generates no code, counts no failure,
+ * compared exactly as submitted (this file passes `code` through untouched —
+ * no trimming, no case folding), the five-minute validity, the single-use rule,
+ * hash-only storage in `pairing_codes`, the five-failure / sixty-second lockout
+ * — one service-wide lockout, never keyed by the caller-controlled `Origin`, so
+ * forged extension ids share it — and the issuance of the DevTools credential,
+ * scoped to the redeeming extension's id, in the same transaction that marks
+ * the code used. This file generates no code, counts no failure,
  * hashes nothing and reads no credential file; it is an authorization-correct,
  * leak-free HTTP shell over {@link AuthService.startPairing} and
  * {@link AuthService.completePairing}. It registers nothing either: it returns
@@ -63,8 +66,8 @@
  *
  * ## Secrets discipline
  *
- * The pairing code and the minted token exist in this module only on the way
- * into exactly one response body. Neither is logged, persisted, re-read, placed
+ * The pairing code, the minted token and the read proof issued with it exist
+ * in this module only on the way into exactly one response body. None is logged, persisted, re-read, placed
  * in a `DebuggenError` (message, hint or details) or included in any other
  * response. Every log record here carries constant text plus an operation id, an
  * error code or a status. Validation failures are rendered by protocol's
@@ -628,7 +631,7 @@ export function createPairRoutes(deps: PairRoutesDeps): PairRouteHandlers {
    * protocol's schema, then the code and the request's own `Origin` header go
    * to the access boundary, which refuses a non-extension origin, applies the
    * lockout, checks the code, and issues a DevTools credential scoped to the
-   * extension id in that origin. Its refusals are folded by
+   * extension id in that origin, with the read proof its reads carry. Its refusals are folded by
    * {@link normalizePairingRefusal} before they are answered.
    */
   const completePairing: PairRouteHandler = async (c) => {
@@ -656,10 +659,15 @@ export function createPairRoutes(deps: PairRoutesDeps): PairRouteHandlers {
       );
     }
 
-    // The token travels from here into the response body and nowhere else. If
-    // the drift branch below were ever taken, the credential just issued would
-    // reach no client and stay unusable until the next rotation removes it.
-    const response = parseHttpResponse(PAIR_COMPLETE, { token: redeemed.value.token });
+    // The token and the read proof issued with it travel from here into the
+    // response body and nowhere else: this is the only moment the service ever
+    // holds the proof in plaintext. If the drift branch below were ever taken,
+    // the credential just issued would reach no client and stay unusable until
+    // the next rotation removes it.
+    const response = parseHttpResponse(PAIR_COMPLETE, {
+      token: redeemed.value.token,
+      readProof: redeemed.value.readProof,
+    });
     if (isErr(response)) {
       logger.error('a pairing response did not satisfy its protocol schema', {
         operation: PAIR_COMPLETE,

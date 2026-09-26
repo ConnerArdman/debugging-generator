@@ -76,6 +76,7 @@ import {
   QUERY_KINDS,
   RENDER_KINDS,
   REQUEST_KINDS,
+  TELEMETRY_KINDS,
   type TelemetryKind,
   type TelemetryTier,
 } from '../schema/kinds.js';
@@ -168,6 +169,13 @@ const PEM_BLOCK =
  * `example.test`, which resolves nowhere.
  */
 const CONTACT_ADDRESS = 'person' + '@example.test';
+
+/**
+ * A credential shorter than the standalone bearer rule's eight-character
+ * threshold, assembled from fragments. Only the header-line rule can remove
+ * it, which is what the free-text header cases below rely on.
+ */
+const SHORT_CREDENTIAL = 'S3' + 'CRET';
 
 /**
  * An attribute **name** with no structure and high entropy: thirty-two
@@ -350,6 +358,41 @@ describe('redactAttributes — header values', () => {
     });
 
     expect(redacted.responseHeaders).toBe(REDACTION_MARKER);
+  });
+
+  it('masks a value under a key that is itself a denied header name, in any case', () => {
+    // A log attribute or a React state summary holding `document.cookie`
+    // carries the header's value under the header's own name; a cookie pair
+    // matches no content pattern and `cookie` is not a key-like name, so only
+    // the header rule can recognise it.
+    const cookiePair = ['sid', 'QQZZ7'].join('=');
+    const { attributes, report } = redactAttributesWithFindings({
+      cookie: cookiePair,
+      Cookie: cookiePair,
+      'SET-COOKIE': [cookiePair, cookiePair],
+      authorization: 'Basic QQZZ7',
+      'x-auth-token': 'QQZZ7',
+      cookieBanner: 'accepted',
+    });
+
+    expect(attributes).toEqual({
+      cookie: REDACTION_MARKER,
+      Cookie: REDACTION_MARKER,
+      'SET-COOKIE': [REDACTION_MARKER, REDACTION_MARKER],
+      authorization: REDACTION_MARKER,
+      'x-auth-token': REDACTION_MARKER,
+      cookieBanner: 'accepted',
+    });
+    expect(report.rules).toContain('sensitive-header');
+    expect(JSON.stringify(attributes)).not.toContain('QQZZ7');
+    expect(redactAttributes(attributes)).toEqual(attributes);
+  });
+
+  it('masks a denied-header-named field at any depth of a summarised object', () => {
+    const cookiePair = ['session', 'QQZZ7'].join('=');
+    const redacted = redactAttributes({ detail: { request: { cookie: cookiePair, id: 7 } } });
+
+    expect(redacted).toEqual({ detail: { request: { cookie: REDACTION_MARKER, id: 7 } } });
   });
 });
 
@@ -735,12 +778,16 @@ describe('redactAttributes — stack text', () => {
       'cause.stack': `at boot (http://127.0.0.1:20450/c.js?email=${CONTACT_ADDRESS})`,
     });
 
+    // Neither frame ends in a position, so nothing separates the closing
+    // bracket from the last query value — `)` is a legal value character — and
+    // it is masked with the value rather than kept.
     expect(redacted.componentStack).toBe(
-      `at AlphaPanel (http://127.0.0.1:20450/b.js?email=${REDACTION_MASK})`,
+      `at AlphaPanel (http://127.0.0.1:20450/b.js?email=${REDACTION_MASK}`,
     );
     expect(redacted['cause.stack']).toBe(
-      `at boot (http://127.0.0.1:20450/c.js?email=${REDACTION_MASK})`,
+      `at boot (http://127.0.0.1:20450/c.js?email=${REDACTION_MASK}`,
     );
+    expect(JSON.stringify(redacted)).not.toContain(CONTACT_ADDRESS);
   });
 
   it('leaves a stack whose frames carry no URL untouched', () => {
@@ -750,6 +797,87 @@ describe('redactAttributes — stack text', () => {
       'at send (src/lib/alpha-client.ts:18:3)\n    at flush (src/lib/alpha-client.ts:31:9)';
 
     expect(redactAttributes({ initiator: stack }, { kind: 'fetch' }).initiator).toBe(stack);
+  });
+
+  it("masks a URL quoted in an error stack's message line and keeps every frame position", () => {
+    // A stack's first line is the thrown error's message: the same text
+    // `error.message` carries, so it must not travel unmasked here either.
+    const message = `failed /reset?email=${CONTACT_ADDRESS}`;
+    const stack =
+      `Error: ${message}\n` +
+      `    at load (http://127.0.0.1:20450/a.js?v=${CONTACT_ADDRESS}:1:1)\n` +
+      '    at send (src/a.ts:18:3)';
+    const { attributes, report } = redactAttributesWithFindings(
+      { 'error.message': message, 'error.stack': stack },
+      { kind: 'error' },
+    );
+
+    expect(attributes['error.message']).toBe(`failed /reset?email=${REDACTION_MASK}`);
+    expect(attributes['error.stack']).toBe(
+      `Error: failed /reset?email=${REDACTION_MASK}\n` +
+        `    at load (http://127.0.0.1:20450/a.js?v=${REDACTION_MASK}:1:1)\n` +
+        '    at send (src/a.ts:18:3)',
+    );
+    expect(report.rules).toEqual(['url-query-value']);
+    expect(redactAttributes(attributes, { kind: 'error' })).toEqual(attributes);
+  });
+
+  it("masks quoted, bare-relative and query-only references in a stack's message line", () => {
+    // `error.message` masks these as free text; the stack carries the same
+    // message on its first line, so it must lose the same values.
+    const message = "failed '/reset?code=QQZZ7' then reset?code=WWXX9 and ?code=ZZYY3";
+    const stack =
+      `Error: ${message}\n` +
+      '    at load (http://127.0.0.1:20450/a.js?v=QQZZ7:1:1)\n' +
+      'send@http://127.0.0.1:20450/b.js?v=WWXX9:18:3';
+    // A bound above the stack's length, so the assertion reads every frame.
+    const context = { kind: 'error' } as const;
+    const options = { maxPreviewLength: 1_024 };
+    const { attributes, report } = redactAttributesWithFindings(
+      { 'error.message': message, 'error.stack': stack, 'cause.stack': stack },
+      context,
+      options,
+    );
+    const maskedMessage = `failed '/reset?code=${REDACTION_MASK}' then reset?code=${REDACTION_MASK} and ?code=${REDACTION_MASK}`;
+
+    expect(attributes['error.message']).toBe(maskedMessage);
+    for (const key of ['error.stack', 'cause.stack']) {
+      const redacted = attributes[key] as string;
+
+      expect(redacted.startsWith(`Error: ${maskedMessage}\n`), key).toBe(true);
+      for (const value of ['QQZZ7', 'WWXX9', 'ZZYY3']) {
+        expect(redacted, key).not.toContain(value);
+      }
+    }
+    expect(attributes['error.stack']).toBe(
+      `Error: ${maskedMessage}\n` +
+        `    at load (http://127.0.0.1:20450/a.js?v=${REDACTION_MASK}:1:1)\n` +
+        `send@http://127.0.0.1:20450/b.js?v=${REDACTION_MASK}:18:3`,
+    );
+    expect(report.rules).toEqual(['url-query-value']);
+    expect(redactAttributes(attributes, context, options)).toEqual(attributes);
+  });
+
+  it('masks a message line that quotes a frame, and a bare-relative query on a frame line', () => {
+    // A line is a frame only as a whole; and a frame line still loses every
+    // query value, keeping its position.
+    const stack =
+      'Error: failed reset?code=QQZZ7; fn@https://h.test/app.js?v=1:10:5\n' +
+      '    at handler (src/a.ts?code=WWXX9:3:4)';
+    const { attributes, report } = redactAttributesWithFindings(
+      { 'error.stack': stack },
+      { kind: 'error' },
+      { maxPreviewLength: 1_024 },
+    );
+
+    expect(attributes['error.stack']).toBe(
+      `Error: failed reset?code=${REDACTION_MASK} fn@https://h.test/app.js?v=${REDACTION_MASK}\n` +
+        `    at handler (src/a.ts?code=${REDACTION_MASK}:3:4)`,
+    );
+    expect(report.rules).toEqual(['url-query-value']);
+    expect(redactAttributes(attributes, { kind: 'error' }, { maxPreviewLength: 1_024 })).toEqual(
+      attributes,
+    );
   });
 
   it('masks a stack idempotently', () => {
@@ -1125,6 +1253,60 @@ describe('redactAttributes — preview families', () => {
     expect((redacted.nextValue as Record<string, unknown>).preview).toBe(`"${REDACTION_MARKER}"`);
   });
 
+  it('masks the query values of a URL a prop or state preview carries, and keeps the prop name', () => {
+    const asRender = redactAttributes(
+      {
+        component: 'AlphaPanel',
+        changedProps: [
+          {
+            key: 'href',
+            previous: {
+              type: 'string',
+              preview: `"/items?owner=${CONTACT_ADDRESS}"`,
+              truncated: false,
+            },
+            next: {
+              type: 'string',
+              preview: `"https://h.test/items?owner=${CONTACT_ADDRESS}#row"`,
+              truncated: false,
+            },
+          },
+        ],
+      },
+      { kind: 'render' },
+    );
+    const entry = (asRender.changedProps as Record<string, unknown>[])[0] as Record<
+      string,
+      unknown
+    >;
+
+    expect(entry.key).toBe('href');
+    expect((entry.previous as Record<string, unknown>).preview).toBe(
+      `"/items?owner=${REDACTION_MASK}"`,
+    );
+    expect((entry.next as Record<string, unknown>).preview).toBe(
+      `"https://h.test/items?owner=${REDACTION_MASK}#${REDACTION_MASK}"`,
+    );
+
+    const asState = redactAttributesWithFindings(
+      {
+        hookLabel: 'returnTo',
+        nextValue: {
+          type: 'string',
+          preview: `"/checkout?coupon=${CONTACT_ADDRESS}"`,
+          truncated: false,
+        },
+      },
+      { kind: 'state' },
+    );
+
+    expect((asState.attributes.nextValue as Record<string, unknown>).preview).toBe(
+      `"/checkout?coupon=${REDACTION_MASK}"`,
+    );
+    expect(asState.report.rules).toContain('url-query-value');
+    expect(JSON.stringify([asRender, asState.attributes])).not.toContain(CONTACT_ADDRESS);
+  });
+
   it('bounds a preview a summary claimed was already bounded', () => {
     // The division of labour, stated as a test: `../browser/fiber-diff.ts`
     // applies the *name* rule with each prop's own name and bounds the
@@ -1249,6 +1431,131 @@ describe('redactAttributes — generic values', () => {
       REDACTION_MARKER,
       'fedcba9876543210',
     ]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * URLs and header lines inside free text
+ *
+ * A page-controlled string under an ordinary key is persisted and broadcast
+ * like any other value, so a URL it quotes loses its query values and a
+ * header line it quotes loses its value — exactly as they would under a URL
+ * key or a header key.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactAttributes — URLs and header lines in free text', () => {
+  it('masks a query value quoted in an ordinary text attribute and reports the rule', () => {
+    const { attributes, report } = redactAttributesWithFindings(
+      {
+        note: 'Visited /reset?code=' + 'SHORT' + '42 before clicking',
+        'log.message': `mailing /notify?to=${CONTACT_ADDRESS}&lang=en`,
+      },
+      { kind: 'log' },
+    );
+
+    expect(attributes.note).toBe(`Visited /reset?code=${REDACTION_MASK} before clicking`);
+    expect(attributes['log.message']).toBe(
+      `mailing /notify?to=${REDACTION_MASK}&lang=${REDACTION_MASK}`,
+    );
+    expect(report.rules).toEqual(['url-query-value']);
+    expect(report.maskedValues).toBe(2);
+    expect(report.truncatedValues).toBe(0);
+  });
+
+  it('masks punctuation at the end of a query with the value it may be', () => {
+    const redacted = redactAttributes({
+      note: '/reset?code=!!!!',
+      dotted: '/reset?code=....',
+      closing: `see https://h.test/p?email=${CONTACT_ADDRESS}).`,
+    });
+
+    expect(redacted).toEqual({
+      note: `/reset?code=${REDACTION_MASK}`,
+      dotted: `/reset?code=${REDACTION_MASK}`,
+      closing: `see https://h.test/p?email=${REDACTION_MASK}`,
+    });
+  });
+
+  it('masks every URL shape page text quotes, and leaves text without a query alone', () => {
+    const redacted = redactAttributes(
+      {
+        'target.selector': 'a[href="/orders?id=' + 'W7' + '"]',
+        'error.message': `fetch https://h.test/a?email=${CONTACT_ADDRESS}#row failed`,
+        bare: 'p?id=' + 'Q9' + ' and ?id=' + 'Q9',
+        plain: 'clicked the Save button (twice)',
+      },
+      { kind: 'error' },
+    );
+
+    expect(redacted['target.selector']).toBe(`a[href="/orders?id=${REDACTION_MASK}"]`);
+    expect(redacted['error.message']).toBe(
+      `fetch https://h.test/a?email=${REDACTION_MASK}#${REDACTION_MASK} failed`,
+    );
+    expect(redacted.bare).toBe(`p?id=${REDACTION_MASK} and ?id=${REDACTION_MASK}`);
+    expect(redacted.plain).toBe('clicked the Save button (twice)');
+  });
+
+  it('masks a header line quoted under an ordinary key, however short its credential', () => {
+    const { attributes, report } = redactAttributesWithFindings({
+      note: 'Authorization: Bearer ' + SHORT_CREDENTIAL,
+      seen: 'Cookie: session=' + 'abc',
+      mixed: 'retrying with\nSet-Cookie: sid=' + 'abc; Path=/\nand no luck',
+    });
+
+    expect(attributes).toEqual({
+      note: `Authorization: ${REDACTION_MARKER}`,
+      seen: `Cookie: ${REDACTION_MARKER}`,
+      mixed: `retrying with\nSet-Cookie: ${REDACTION_MARKER}\nand no luck`,
+    });
+    expect(report.rules).toEqual(['sensitive-header']);
+    expect(report.maskedValues).toBe(3);
+    expect(JSON.stringify(attributes)).not.toContain(SHORT_CREDENTIAL);
+  });
+
+  it('never leaves the truncation suffix standing as a query value', () => {
+    // `' /reset?code='` is 13 code points, so 106 leading characters put the
+    // preview cut exactly after the `=`: the suffix would be the value.
+    const atValue = 'x'.repeat(106) + ' /reset?code=' + 'Q9' + ' before clicking';
+    const { attributes, report } = redactAttributesWithFindings({ note: atValue });
+
+    expect(attributes.note).toBe('x'.repeat(106) + ' /reset?code=' + REDACTION_MASK);
+    expect(report.truncatedValues).toBe(1);
+    expect(report.rules).toEqual(['url-query-value']);
+  });
+
+  it('stays idempotent and bounded wherever the preview cut lands in a masked query', () => {
+    const suffixAsValue = new RegExp(`=\\??${TRUNCATION_SUFFIX}`);
+
+    for (let lead = 90; lead <= MAX_PREVIEW_LENGTH + 5; lead += 1) {
+      const value =
+        'x'.repeat(lead) + ' /reset?code=' + 'Q9'.repeat(8) + '&next=' + 'W7'.repeat(8) + ' tail';
+      const once = redactEventWithFindings(eventOfKind('log', 'log', { note: value }));
+      const twice = redactEventWithFindings(once.event);
+      const note = attributesOf(once.event).note as string;
+
+      expect(twice.event, `lead ${String(lead)}`).toEqual(once.event);
+      expect(twice.report.maskedValues, `lead ${String(lead)}`).toBe(0);
+      expect(twice.report.truncatedValues, `lead ${String(lead)}`).toBe(0);
+      expect(Array.from(note).length, `lead ${String(lead)}`).toBeLessThanOrEqual(
+        MAX_PREVIEW_LENGTH,
+      );
+      expect(note, `lead ${String(lead)}`).not.toMatch(suffixAsValue);
+      expect(note, `lead ${String(lead)}`).not.toMatch(/Q9|W7/);
+    }
+  });
+
+  it('keeps a preview cut inside a redacted header line a fixed point', () => {
+    for (let lead = 100; lead <= MAX_PREVIEW_LENGTH + 2; lead += 1) {
+      const value = 'x'.repeat(lead) + ' Cookie: session=' + 'abc';
+      const once = redactAttributesWithFindings({ note: value });
+      const twice = redactAttributesWithFindings(once.attributes);
+
+      expect(twice.attributes, `lead ${String(lead)}`).toEqual(once.attributes);
+      expect(twice.report.maskedValues, `lead ${String(lead)}`).toBe(0);
+      expect(findDeniedRules(once.attributes.note as string), `lead ${String(lead)}`).toEqual([]);
+    }
   });
 });
 
@@ -1643,6 +1950,61 @@ describe('redactEventName', () => {
 
   it('never returns an empty name', () => {
     expect(redactEventName('log', PROVIDER_CREDENTIAL)).toBe(REDACTION_MARKER);
+  });
+
+  it('masks a URL embedded in any other span name and keeps its wording', () => {
+    expect(redactEventName('log', 'failed at /p?id=7 now')).toBe(
+      `failed at /p?id=${REDACTION_MASK} now`,
+    );
+    expect(redactEventName('error', 'TypeError: bad /p?id=7')).toBe(
+      `TypeError: bad /p?id=${REDACTION_MASK}`,
+    );
+    expect(redactEventName('server.error', 'refused /reset?code=!!!!')).toBe(
+      `refused /reset?code=${REDACTION_MASK}`,
+    );
+    expect(redactEventName('navigation', `/checkout?email=${CONTACT_ADDRESS}`)).toBe(
+      `/checkout?email=${REDACTION_MASK}`,
+    );
+    expect(redactEventName('log', 'Authorization: Bearer ' + SHORT_CREDENTIAL)).toBe(
+      `Authorization: ${REDACTION_MARKER}`,
+    );
+  });
+
+  it('leaves a statement-shaped database span name to the content rules', () => {
+    const statement = "SELECT id FROM items_t WHERE path = '/p?id=7' AND a=?";
+
+    expect(redactEventName('db.query', statement)).toBe(statement);
+    // The same text on a kind that is not a query is page or runtime text.
+    expect(redactEventName('log', statement)).toBe(
+      `SELECT id FROM items_t WHERE path = '/p?id=${REDACTION_MASK}' AND a=?`,
+    );
+  });
+
+  it('stays bounded, idempotent and free of findings for every kind, cuts included', () => {
+    const names = [
+      'failed at /p?id=7 now',
+      '/reset?code=!!!!',
+      'Cookie: ' + 'a',
+      'Cookie: ' + 'a\n/p?id=77',
+      'x Authorization: ' + SHORT_CREDENTIAL,
+      'GET /p?x=1 at http://h.test/',
+      'fetch GET http://svc:' + 'e5'.repeat(6) + '@127.0.0.1:20450/api/beta?q=1#frag',
+      'SELECT id FROM items_t WHERE id = ?',
+    ];
+
+    for (const kind of TELEMETRY_KINDS) {
+      for (const name of names) {
+        const once = redactEventName(kind, name);
+        const label = `${kind} ${JSON.stringify(name)}`;
+
+        expect(redactEventName(kind, once), label).toBe(once);
+        expect(Array.from(once).length, label).toBeLessThanOrEqual(
+          Math.max(Array.from(name).length, REDACTION_MARKER.length),
+        );
+        expect(findDeniedRules(once), label).toEqual([]);
+        expect(once.length, label).toBeGreaterThan(0);
+      }
+    }
   });
 
   it('is idempotent', () => {

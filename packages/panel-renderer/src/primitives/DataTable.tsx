@@ -1,14 +1,15 @@
 /*
- * DataTable - the tabular workhorse of @debuggen/panel-renderer (AAP 0.6.2).
+ * DataTable - the tabular workhorse of @debuggen/panel-renderer.
  *
- * AAP 0.6.4 permits no raw `<table>` above the primitives layer, so every grid of rows in the
- * product resolves to this one component: the slowest-operations table, the render statistics
- * table, the request table with its duplicate groups and the redacted query table of the node
- * catalog, plus the modification list of the editor webview. Those surfaces supply columns, rows,
- * a row key and - where they need one - an expansion renderer, and they re-implement nothing:
- * sorting, virtualization, selection, expansion and keyboard operation all live here.
+ * Library primitives replace raw `<table>` markup everywhere above the primitives layer, so every
+ * grid of rows in the product resolves to this one component: the slowest-operations table, the
+ * render statistics table, the request table with its duplicate groups and the redacted query
+ * table of the node catalog, plus the modification list of the editor webview. Those surfaces
+ * supply columns, rows, a row key and - where they need one - an expansion renderer, and they
+ * re-implement nothing: sorting, virtualization, selection, expansion and keyboard operation all
+ * live here.
  *
- * ## The four pillars of AAP 0.6.2, and how each is met
+ * ## The four pillars, and how each is met
  *
  *   Generic over a row type. {@link DataTable} is a generic function - not an `FC`, which cannot
  *   carry a call-site type parameter cleanly - so `Row` is inferred from `rows` and every
@@ -18,8 +19,8 @@
  *   Sortable, and CONTROLLED. Clicking a sortable header computes the next {@link DataTableSort}
  *   (same key flips the direction, a different key takes that column's
  *   {@link DataTableColumn.defaultSortDirection}) and raises `onSortChange`. It never sorts,
- *   re-orders, slices or pages `rows`. AAP 0.4.2 is the reason: `POST /sessions/:id/panel-data`
- *   applies `filter`, `sort` (with a stable secondary key) and `limit`/`offset` server-side and
+ *   re-orders, slices or pages `rows`, because `POST /sessions/:id/panel-data` applies
+ *   `filter`, `sort` (with a stable secondary key) and `limit`/`offset` server-side and
  *   answers with `total`/`nextOffset`, so the rows arrive already ordered and a page is a window
  *   onto a larger result. Sorting a page locally would silently re-order only the visible slice -
  *   a table that looks sorted and is not, which is worse than one that plainly is not. The current
@@ -35,9 +36,9 @@
  *   Virtualized with `@tanstack/react-virtual`. This is the only module in the package that
  *   imports it. Long lists render a window of rows inside the shared
  *   `dg-virtual-viewport`/`dg-virtual-canvas`/`dg-virtual-row` triplet, and real measured heights
- *   replace the estimate after first paint. A result is capped at 5 000 rows by AAP 0.4.2, which is
- *   both why virtualization here buys smoothness rather than survival and why the state before the
- *   first measurement is bounded rather than whole - see the section on it below.
+ *   replace the estimate after first paint. The panel-data route caps a result at 5 000 rows, which
+ *   is both why virtualization here buys smoothness rather than survival and why the state before
+ *   the first measurement is bounded rather than whole - see the section on it below.
  *
  *   Keyboard-navigable. A roving `tabIndex` makes the whole grid a single Tab stop - the active
  *   row - and the keyboard reaches everything else from there: Arrow keys, Home, End and
@@ -174,10 +175,10 @@
  * suite, failing the `pnpm test` gate for reasons that have nothing to do with the components under
  * test.
  *
- * How many rows render there is the part that is bounded. AAP 0.4.2 caps a result at 5 000 rows, and
- * creating 5 000 rows with all of their cells - only to replace them with a window of thirty on the
- * next commit - is a first paint the reader waits through. So the unmeasured state renders
- * {@link DEFAULT_UNMEASURED_WINDOW_ROWS} rows, or as many as
+ * How many rows render there is the part that is bounded. The panel-data route caps a result at
+ * 5 000 rows, and creating 5 000 rows with all of their cells - only to replace them with a window
+ * of thirty on the next commit - is a first paint the reader waits through. So the unmeasured
+ * state renders {@link DEFAULT_UNMEASURED_WINDOW_ROWS} rows, or as many as
  * {@link DataTableVirtualizeOptions.unmeasuredWindowRows} asks for, anchored on the active row
  * rather than pinned to row zero so that the roving tab stop is always one of them (see
  * `resolveFlowRowRange`), while the canvas still advertises the scroll range of the whole result
@@ -199,13 +200,13 @@
  *
  * ## Zero hardcoded CSS, and the geometry channel
  *
- * Not one colour, length, radius or font appears in this module. Appearance is class names, which
- * `../styles/components.css` resolves to `var(--dg-*)` tokens (AAP 0.6.3): surfaces from
- * `--dg-surface-base`/`--dg-surface-elevated`, rules from `--dg-border-subtle`/`--dg-border-strong`,
- * density from `--dg-space-*`, type from `--dg-text-sm`/`--dg-text-xs` and `--dg-font-mono` with
- * tabular figures for numeric columns, selection from `--dg-accent`/`--dg-accent-muted` and focus
- * from `--dg-focus-ring`. The class contract this file DECLARES, and that `components.css` must
- * implement:
+ * Every visual value resolves to a `--dg-*` token, so not one colour, length, radius or font
+ * appears in this module. Appearance is class names, which `../styles/components.css` resolves to
+ * `var(--dg-*)` tokens: surfaces from `--dg-surface-base`/`--dg-surface-elevated`, rules from
+ * `--dg-border-subtle`/`--dg-border-strong`, density from `--dg-space-*`, type from
+ * `--dg-text-sm`/`--dg-text-xs` and `--dg-font-mono` with tabular figures for numeric columns,
+ * selection from `--dg-accent`/`--dg-accent-muted` and focus from `--dg-focus-ring`. The class
+ * contract this file DECLARES, and that `components.css` must implement:
  *
  *   dg-data-table               the block
  *   dg-data-table--compact      the dense modifier
@@ -282,8 +283,8 @@
  *
  * Presentational. It raises `onSortChange`, `onRowActivate` and `onRowToggle` and renders what it
  * is given. It never fetches, never reaches a `DataProvider` and never opens a socket: data
- * arrives through the host's provider interface and interactions leave through `PanelActions`
- * (AAP 0.4.2).
+ * arrives through the host's provider interface and interactions leave through `PanelActions`, so
+ * no panel component touches a transport.
  *
  * ## Building on this
  *
@@ -401,7 +402,7 @@ export const DATA_TABLE_COLUMN_TRACKS: Readonly<
  * The two directions a column can be ordered in.
  *
  * Spelled the way the data layer spells them (`duration_desc`, `start_asc`, `count_desc` in
- * AAP 0.4.2's `DataQuery.sort`), so a caller translating between the two never has to remember a
+ * `DataQuery.sort`), so a caller translating between the two never has to remember a
  * second vocabulary. `aria-sort` receives the ARIA spelling (`ascending`/`descending`), which this
  * module derives.
  */
@@ -505,8 +506,8 @@ export interface DataTableColumn<Row> {
    * How the column's content aligns within its track. Defaults to `"start"`.
    *
    * Use `"end"` for every numeric, duration, count and size column: figures compare down a column
-   * only when their last digits line up (AAP 0.6.3, which pairs end alignment with
-   * `--dg-font-mono` and tabular figures). The value travels to `components.css` as `--dgc-align`
+   * only when their last digits line up, which is why the design system pairs end alignment with
+   * `--dg-font-mono` and tabular figures. The value travels to `components.css` as `--dgc-align`
    * and is a CSS alignment keyword, never a physical direction, so a right-to-left surface stays
    * correct.
    */
@@ -519,9 +520,10 @@ export interface DataTableColumn<Row> {
    * of the free space that never drops below the `--dg-column-min-standard` floor.
    *
    * A role, never a CSS value: a column cannot state `minmax(12ch, 2fr)` or `9ch`, because a
-   * number chosen here would be a visual value outside the token table (AAP 0.6.4). Choose the role
-   * by the column's CONTENT - the smallest role whose floor keeps that content readable - and the
-   * design system decides how wide that is, identically on every surface.
+   * number chosen here would be a visual value outside the token table, and every visual value
+   * resolves to a `--dg-*` token. Choose the role by the column's CONTENT - the smallest role whose
+   * floor keeps that content readable - and the design system decides how wide that is,
+   * identically on every surface.
    *
    * Every role has a non-zero floor, and the table sums the floors into its own minimum width
    * (`--dgc-min-inline`, see this module's header), so a surface narrower than the sum scrolls
@@ -565,8 +567,9 @@ export interface DataTableColumn<Row> {
    * Renders the cell for one row.
    *
    * Return a node built from this package's primitives (`Text`, `Code`, `Badge`, `DurationCell`,
-   * `SourceLink`, `Button`) rather than raw HTML (AAP 0.6.4). It is called during render, so it
-   * must be pure: no fetching, no state, no mutation of the row.
+   * `SourceLink`, `Button`) rather than raw HTML, since library primitives replace raw markup above
+   * the primitives layer. It is called during render, so it must be pure: no fetching, no state, no
+   * mutation of the row.
    *
    * EVERY FOCUSABLE CONTROL A CELL RENDERS CARRIES `tabIndex={-1}` - a `Button`, a `SourceLink`
    * (through its `tabIndex` prop), a `Tooltip` trigger, a focusable `Code` block. The grid body is
@@ -624,8 +627,9 @@ export interface DataTableVirtualizeOptions {
    * How many rows render while virtualization is ON but no viewport has been measured yet - the
    * first paint of a real browser, before the scroll element has been observed.
    *
-   * A COUNT of rows, never a length and never a style value (AAP 0.6.4): it decides how many rows
-   * exist in the DOM for one frame, and it reaches no class, custom property or declaration.
+   * A COUNT of rows, never a length and never a style value, since every visual value resolves to
+   * a token: it decides how many rows exist in the DOM for one frame, and it reaches no class,
+   * custom property or declaration.
    * Omitted, the table uses its own bound, which is the same count above which an unqualified
    * table virtualizes itself - so an unmeasured first paint never puts more rows in the DOM than
    * an unvirtualized table of this component would, and never fewer than the viewport can show.
@@ -635,9 +639,10 @@ export interface DataTableVirtualizeOptions {
    * and every `offsetHeight` answer zero, so the virtualizer can never measure a viewport and can
    * never produce a window, which is the state the component test suites of this package mount
    * these tables in. Pass it from a suite that must assert against every row; in a real browser it
-   * is the 5 000-row first paint this bound exists to prevent (AAP 0.4.2 caps a result at 5 000
-   * rows). {@link DataTableProps.virtualize} `= false` is the other way to get every row, and it
-   * is the right one whenever the rows are wanted permanently rather than only until measurement.
+   * is the 5 000-row first paint this bound exists to prevent (the panel-data route caps a result
+   * at 5 000 rows). {@link DataTableProps.virtualize} `= false` is the other way to get every row,
+   * and it is the right one whenever the rows are wanted permanently rather than only until
+   * measurement.
    */
   readonly unmeasuredWindowRows?: number | 'all' | undefined;
 }
@@ -651,9 +656,9 @@ export interface DataTableProps<Row> {
   /**
    * The rows to render, **in the order they are to be displayed**.
    *
-   * The data layer has already applied `filter`, `sort` and `limit`/`offset` (AAP 0.4.2), so this
-   * component renders the array as given: it never sorts, re-orders, slices or pages it, and it
-   * never mutates it.
+   * The data layer (`POST /sessions/:id/panel-data`) has already applied `filter`, `sort` and
+   * `limit`/`offset`, so this component renders the array as given: it never sorts, re-orders,
+   * slices or pages it, and it never mutates it.
    */
   rows: readonly Row[];
 
@@ -839,7 +844,7 @@ export interface DataTableProps<Row> {
  *
  * File-local and never exported: it is a spelling detail of this module, not vocabulary the design
  * system offers. Nothing but a `--dgc-*` value may appear in any object of this type - every
- * colour, length, radius and font lives in `../styles/components.css` (AAP 0.6.4).
+ * colour, length, radius and font lives in `../styles/components.css`, as a `--dg-*` token.
  */
 type CssVariableStyle = CSSProperties & Record<`--${string}`, string>;
 
@@ -902,9 +907,9 @@ const DEFAULT_OVERSCAN_ROWS = 8;
  *   It is the largest table this component is willing to render whole. Below that threshold an
  *   unqualified table does not virtualize at all, so bounding the unmeasured first paint here
  *   means a virtualized table never puts more rows in the DOM - not for one frame - than an
- *   unvirtualized one already does. That is what makes the bound safe to apply by default: AAP
- *   0.4.2 caps a result at 5 000 rows, and 5 000 rows with all their cells is a first paint the
- *   reader waits for.
+ *   unvirtualized one already does. That is what makes the bound safe to apply by default: the
+ *   panel-data route caps a result at 5 000 rows, and 5 000 rows with all their cells is a first
+ *   paint the reader waits for.
  *
  *   It comfortably exceeds the window the virtualizer settles on, so the bound never shows the
  *   reader fewer rows than the viewport can hold. `../styles/components.css` caps this table's
@@ -1548,9 +1553,9 @@ interface RowRange {
  * Virtualization on but nothing measured yet - the first paint of a real browser before the scroll
  * element has been observed, and any environment that can measure nothing at all: a WINDOW of
  * {@link ResolvedVirtualization.unmeasuredWindowRows} rows, unless that setting is `'all'`, which
- * is the explicit opt-in back to every row. AAP 0.4.2 caps a result at 5 000 rows, and creating
- * 5 000 rows with all their cells for one frame is a first paint the reader waits through, which is
- * the whole reason the bound exists.
+ * is the explicit opt-in back to every row. The panel-data route caps a result at 5 000 rows, and
+ * creating 5 000 rows with all their cells for one frame is a first paint the reader waits
+ * through, which is the whole reason the bound exists.
  *
  * The window is ANCHORED ON THE ACTIVE ROW rather than pinned to row zero, and that is a
  * correctness requirement rather than a nicety: a caller may arrive with `selectedRowKey` naming
@@ -1674,9 +1679,9 @@ function scrollStartOf(element: Element, viewport: HTMLElement): number {
 /**
  * The generic data grid of the design system.
  *
- * See this module's header for the four pillars of AAP 0.6.2, the exact ARIA structure, the class
- * and custom-property contract, what renders before anything has been measured and the boundaries
- * this primitive keeps; see {@link DataTableProps} and {@link DataTableColumn} for the props.
+ * See this module's header for the four pillars, the exact ARIA structure, the class and
+ * custom-property contract, what renders before anything has been measured and the boundaries this
+ * primitive keeps; see {@link DataTableProps} and {@link DataTableColumn} for the props.
  *
  * Written as a generic function rather than an `FC`, so `Row` is inferred from `rows` at every
  * call site and each {@link DataTableColumn.cell} receives the caller's own row type.
@@ -1810,7 +1815,8 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
 
   // The grid track template, inherited by every row through `--dgc-columns`, and the floor the grid
   // may not shrink below, `--dgc-min-inline`: the sum of every column's floor. Both are token
-  // references only: a column's `width` is a semantic role, never a CSS value (AAP 0.6.4).
+  // references only: a column's `width` is a semantic role, never a CSS value, because every
+  // visual value resolves to a `--dg-*` token.
   const { columnTemplate, minimumInlineSize } = useMemo(() => {
     const tracks = columns.map((column) => resolveColumnTrack(column.width));
 
@@ -1834,14 +1840,14 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   //
   // `react-hooks/incompatible-library` reports that this API returns functions the React Compiler
   // cannot memoize safely, so it skips auto-memoizing this component. That is suppressed rather
-  // than worked around, on two grounds. AAP 0.6.2 names `@tanstack/react-virtual` as the
-  // virtualization mechanism and this is the one module in the package permitted to use it, so
+  // than worked around, on two grounds. Long lists in the design system virtualize through
+  // `@tanstack/react-virtual`, and this is the one module in the package permitted to use it, so
   // there is no alternative API to reach for. And the consequence the rule warns about does not
   // arise here: like every other primitive in this package, this component re-renders with its
   // parent by design - the product reports on its own render behaviour rather than smoothing it
   // over - and nothing the virtualizer returns is handed to a memoized component. What leaves
   // this module is the caller's own rows, columns and callbacks.
-  // eslint-disable-next-line react-hooks/incompatible-library -- AAP 0.6.2 mandates this API here
+  // eslint-disable-next-line react-hooks/incompatible-library -- the design system's virtualizer
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: rowCount,
     getScrollElement: () => viewportRef.current,
@@ -1857,8 +1863,8 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
     // a deferred update rather than a synchronous flush. `false` makes the adapter call its own
     // `rerender` instead, which React batches with the rest of the commit - the window is one
     // render behind for a single frame, which is what the overscan above exists to cover. The two
-    // versions this reasoning is tied to are pinned by AAP 0.3.2: react/react-dom 19.3.0 and
-    // @tanstack/react-virtual 3.14.13.
+    // versions this reasoning is tied to are pinned in this package's manifest: react/react-dom
+    // 19.3.0 and @tanstack/react-virtual 3.14.13.
     useFlushSync: false,
     // Measurements follow the row's identity rather than its position, so a re-sort or a re-page
     // does not attribute one row's measured height to another.
@@ -1922,7 +1928,7 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
       }
 
       // The next sort is REPORTED, never applied: the rows keep the order the data layer gave them
-      // until the caller comes back with a new page (AAP 0.4.2).
+      // until the caller comes back with a new page from the panel-data route.
       onSortChange(nextSortFor(column, sort));
     },
     [onSortChange, sort],

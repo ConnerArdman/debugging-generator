@@ -27,8 +27,9 @@
  * state container; the worker's reload offer is read from `./state/connection`,
  * which holds it. The `useState` hooks below are presentation-only and
  * duplicate nothing — whether the developer dismissed the pairing dialog,
- * whether the live tail is collapsed, and whether the reload notice's own
- * consent is in flight.
+ * whether the live tail is collapsed, whether the reload notice's own consent
+ * is in flight, and where the selection on screen was raised (the store keeps
+ * the selection, not its origin; see {@link SelectionProvenance}).
  *
  * ## Layout (AAP 0.7.3)
  *
@@ -112,8 +113,9 @@
  * Anything a `CaptureControls` callback throws or rejects with anyway reaches
  * its required `onActionError` reporter, and `TargetPicker` hands a failure to
  * its `onActionError` sink; both route it into the same `lastError` notice, so
- * even an unexpected failure is presented rather than escaping as an
- * unhandled rejection.
+ * even an unexpected failure is presented — in fixed copy, never in its own
+ * words (see {@link failurePayload}) — rather than escaping as an unhandled
+ * rejection.
  *
  * ## "Use selected element" is bounded end to end
  *
@@ -147,7 +149,11 @@
  * section. Ancestors come from stored or streamed events only: the live tail,
  * then the event's stored trace, which the data provider's `resolveEvent`
  * pages within a budget per pass that the drawer can continue (see
- * {@link EventDrawer}).
+ * {@link EventDrawer}). Whose evidence a selection is follows from where it was
+ * raised: a selection raised by the rendered panel is read from the capture
+ * that panel was generated from, one raised by the live tail from the live
+ * capture ({@link drawerEvidencePanel}), and a chain is built only from events
+ * of the selected event's own capture.
  *
  * ## Boundaries
  *
@@ -186,7 +192,7 @@ import type {
   SessionStatus,
   TelemetryEvent,
 } from '@debuggen/protocol';
-import { DebuggenError, assertNever } from '@debuggen/shared';
+import { DebuggenError, assertNever, createConsoleLogger } from '@debuggen/shared';
 import type { CaptureId, DebuggenErrorCode, SessionId } from '@debuggen/shared';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactElement } from 'react';
@@ -325,6 +331,27 @@ const FAILURE_LEADS = Object.freeze({
   pick: 'Could not change picker mode',
   useSelected: 'Could not use the selected element',
   reloadPage: 'Could not reload the page',
+} as const);
+
+/**
+ * What follows a command's lead when its cause is not a typed product error
+ * (see {@link failurePayload}): an unexpected exception's own text can carry a
+ * file path, a query or a credential, so it is never shown, and this fixed
+ * reason and hint stand in for it.
+ */
+const UNEXPECTED_FAILURE = Object.freeze({
+  reason: 'an unexpected error stopped the request in the Debug Generator panel.',
+  hint: 'Try again; if it keeps failing, reopen Chrome DevTools.',
+} as const);
+
+/**
+ * The drawer's failure for a lookup that rejected with anything but a typed
+ * product error — fixed copy, for the reason {@link UNEXPECTED_FAILURE} gives.
+ */
+const EVENT_LOOKUP_UNEXPECTED = Object.freeze({
+  message:
+    'The selected event could not be looked up: an unexpected error stopped the lookup in the Debug Generator panel.',
+  hint: 'Retry; if it keeps failing, reopen Chrome DevTools.',
 } as const);
 
 /**
@@ -541,6 +568,14 @@ const DESCRIBE_SELECTION_EXPRESSION = [
  * ===========================================================================
  */
 
+/**
+ * The panel's diagnostics, at `warn` and above. It records that an unexpected
+ * failure was presented as fixed copy, by the closed code that failure was
+ * given and nothing else: never the cause's message, name or stack, which are
+ * as private in the console as on screen.
+ */
+const panelLogger = createConsoleLogger({ name: 'panel', level: 'warn' });
+
 /** Whether a value is a non-null, non-array object whose members can be read. */
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -567,16 +602,22 @@ function isDevtoolsAvailable(): boolean {
 
 /**
  * The store record of a failed command: the command's lead, then the cause as
- * the layer that observed it stated it, with its hint when it had one.
+ * presentable copy.
  *
- * A rejection from the panel connection is already a `DebuggenError` and keeps
- * its code, message, hint and correlation `ref`; anything else is classified by
- * `fallbackCode`. Nothing private reaches the record: the connection's errors
- * carry no payload, token or URL query value (AAP 0.5.2).
+ * Only a **typed product error** — a value `DebuggenError.is` accepts — is
+ * presented in its own words: its code, message, hint and correlation `ref`
+ * are kept. Those are the panel connection's rejections (whose `refused` form
+ * carries the worker's schema-validated protocol error, worded by the service
+ * without payloads, tokens or URL query values, AAP 0.5.2) and the panel's own
+ * fixed-copy errors. Anything else — a plain `Error`, a thrown string, or a
+ * value that only claims the error brand — is an unexpected exception whose
+ * text could carry a file path, a SQL statement or a credential, so none of it
+ * is copied: the record states {@link UNEXPECTED_FAILURE} under
+ * `fallbackCode`, and the panel's log records that code alone.
  *
  * @param lead What the command was trying to do, as a sentence fragment.
  * @param cause What the command's request rejected with, or threw.
- * @param fallbackCode The code for a cause that carries none of its own.
+ * @param fallbackCode The code for a cause that is not a typed product error.
  * @returns A frozen `ErrorPayload` for `setLastError`.
  */
 function failurePayload(
@@ -584,17 +625,25 @@ function failurePayload(
   cause: unknown,
   fallbackCode: DebuggenErrorCode,
 ): ErrorPayload {
-  const error = DebuggenError.from(cause, fallbackCode);
-  const hint = error.hint;
+  if (!DebuggenError.is(cause)) {
+    panelLogger.warn('A panel command failed unexpectedly; its failure is shown as fixed copy.', {
+      code: fallbackCode,
+    });
+    return Object.freeze({
+      code: fallbackCode,
+      message: `${lead}: ${UNEXPECTED_FAILURE.reason} ${UNEXPECTED_FAILURE.hint}`,
+    });
+  }
+  const hint = cause.hint;
   const message =
     hint === undefined || hint.trim() === ''
-      ? `${lead}: ${error.message}`
-      : `${lead}: ${error.message} ${hint}`;
-  const ref = error.details?.ref;
+      ? `${lead}: ${cause.message}`
+      : `${lead}: ${cause.message} ${hint}`;
+  const ref = cause.details?.ref;
   return Object.freeze(
     typeof ref === 'string' && ref !== ''
-      ? { code: error.code, message, ref }
-      : { code: error.code, message },
+      ? { code: cause.code, message, ref }
+      : { code: cause.code, message },
   );
 }
 
@@ -1001,7 +1050,16 @@ function describeSelectedElement(): Promise<DescriptionOutcome> {
         },
       );
     } catch (cause: unknown) {
-      settle({ kind: 'failed', error: DebuggenError.from(cause, 'AGENT_NOT_READY') });
+      // DevTools threw instead of evaluating. Its text is the host's, not
+      // product copy, so the failure is stated in the panel's own words and
+      // only its closed code is logged; the cause stays attached, never shown.
+      panelLogger.warn('Describing the selected element failed unexpectedly.', {
+        code: 'AGENT_NOT_READY',
+      });
+      settle({
+        kind: 'failed',
+        error: new DebuggenError('AGENT_NOT_READY', SELECTION_NOT_DESCRIBED, { cause }),
+      });
     }
   });
 }
@@ -1554,8 +1612,9 @@ function dismissLastError(): void {
  *
  * Module-level, so its identity is stable and the provider reads the store at
  * call time: a new capture changes this without changing the session, and the
- * provider keys every request and every cached trace by it, so a query under
- * a new capture never joins, and is never answered by, one of the old.
+ * provider keys every request and every live lookup's cached trace by it, so a
+ * query under a new capture never joins, and a live lookup is never answered
+ * by, one of the old. A panel-bound lookup's traces are keyed by its panel.
  */
 function readCaptureId(): CaptureId | undefined {
   return getPanelSnapshot().capture.captureId;
@@ -1615,6 +1674,32 @@ function searchExhaustedError(resolution: ExhaustedResolution): EventDetailsErro
   });
 }
 
+/**
+ * The drawer's failure for a rejected stored lookup, as presentable copy.
+ *
+ * A typed product error is kept as it is: the data provider rejects with
+ * nothing else, its own messages name only the requested source and paging,
+ * and a worker's refusal carries the service's schema-validated wording.
+ * Anything else is an unexpected exception whose text could carry a file path,
+ * a SQL statement or a credential, so it becomes {@link EVENT_LOOKUP_UNEXPECTED}
+ * under `INTERNAL`, the cause kept attached but never shown, and only that
+ * closed code is logged.
+ *
+ * @param cause What `resolveEvent` rejected with.
+ */
+function presentableLookupError(cause: unknown): DebuggenError {
+  if (DebuggenError.is(cause)) {
+    return cause;
+  }
+  panelLogger.warn('An event lookup failed unexpectedly; its failure is shown as fixed copy.', {
+    code: 'INTERNAL',
+  });
+  return new DebuggenError('INTERNAL', EVENT_LOOKUP_UNEXPECTED.message, {
+    hint: EVENT_LOOKUP_UNEXPECTED.hint,
+    cause,
+  });
+}
+
 /** The control that continues a stopped ancestry search from where it stopped. */
 const CHAIN_CONTINUE_LABEL = 'Continue the ancestry search';
 
@@ -1637,6 +1722,102 @@ export interface EventDrawerProps {
    * which case a stored lookup rejects with `TAB_NOT_BOUND`.
    */
   readonly sessionId: string | undefined;
+  /**
+   * The panel whose evidence the selection is — a `PanelSpec`'s own `id` — or
+   * `undefined` for live evidence. Decided by the composition root from where
+   * the selection was raised ({@link drawerEvidencePanel}), never re-derived
+   * here: an event id that also appears in the live tail does not turn a
+   * panel-bound lookup into a live one. Bound, every page of the stored lookup
+   * names this panel, so it reads the capture that panel was generated from.
+   */
+  readonly panelId: string | undefined;
+}
+
+/**
+ * Where the selection on screen was raised — which is whose evidence it is.
+ *
+ * The store keeps the selection itself, an `EventRef`, and not where it came
+ * from, so the composition root records this as each control raises a
+ * selection (see {@link recordingSelections}):
+ *
+ * - `panel` — a view, table or evidence chip of the rendered panel raised it;
+ *   `panelId` is that panel's own `id`, so the selection stays that panel's
+ *   evidence whatever captures or panel versions follow.
+ * - `live` — the live tail raised it; `captureId` is the capture the tail was
+ *   streaming at that moment (the store's `capture.captureId`).
+ *
+ * An ancestor selected in the drawer inherits the provenance of the selection
+ * it is an ancestor of. Exported, like {@link drawerEvidencePanel}, for the
+ * unit suite.
+ */
+export type SelectionProvenance =
+  | { readonly eventId: string; readonly origin: 'panel'; readonly panelId: string }
+  | {
+      readonly eventId: string;
+      readonly origin: 'live';
+      readonly captureId: CaptureId | undefined;
+    };
+
+/**
+ * The panel a selection's stored lookup is bound to, or `undefined` for a
+ * live read — the service answers a named panel from the capture that panel
+ * was generated from, and an unnamed one from the open capture, else the most
+ * recent (AAP §0.4.2).
+ *
+ * - **Raised by a panel** → that panel, always. A panel's evidence is never
+ *   read live, whatever the live tail holds.
+ * - **Raised by the live tail** → a live read while the capture it was raised
+ *   from is still the store's current one, whatever panel is rendered: an
+ *   older panel is never named for evidence the tail is still streaming. Once
+ *   the store shows another capture, a live read would answer from that one
+ *   instead, so the lookup is bound to the rendered panel when there is one —
+ *   the panel generated when the tail's capture stopped, in the ordinary
+ *   course — and stays live only when there is none. A request names a panel,
+ *   never a capture, so this is the nearest scope the service can be asked
+ *   for; and since an event id is unique across captures, a panel whose
+ *   capture does not hold the event answers "not found" rather than another
+ *   capture's evidence.
+ * - **No provenance for this selection** → the rendered panel's evidence when
+ *   a panel is rendered, and an explicit live read when none is.
+ *
+ * @param eventId The selected event's id.
+ * @param provenance What the composition root recorded for the latest
+ * selection; it applies only when it names `eventId`.
+ * @param renderedPanelId The rendered `PanelSpec`'s own `id`, if any.
+ * @param liveCaptureId The store's current capture, if known.
+ * @returns The panel the lookup names, or `undefined` for a live read.
+ */
+export function drawerEvidencePanel(
+  eventId: string,
+  provenance: SelectionProvenance | undefined,
+  renderedPanelId: string | undefined,
+  liveCaptureId: CaptureId | undefined,
+): string | undefined {
+  if (provenance === undefined || provenance.eventId !== eventId) {
+    return renderedPanelId;
+  }
+  if (provenance.origin === 'panel') {
+    return provenance.panelId;
+  }
+  return provenance.captureId === liveCaptureId ? undefined : renderedPanelId;
+}
+
+/**
+ * The events of `pool` that belong to `captureId`: the only ones a lineage of
+ * an event of that capture may be built from. A trace and its span ids can
+ * reach across a capture boundary — a parent span that ends after the store
+ * moved to a newer capture is stored under that one — so the live tail is
+ * never merged into another capture's chain.
+ *
+ * @param pool The live tail, or any streamed events.
+ * @param captureId The capture of the event whose lineage is built.
+ * @returns The events of `pool` stamped with `captureId`, in `pool`'s order.
+ */
+function eventsOfCapture(
+  pool: readonly TelemetryEvent[],
+  captureId: CaptureId,
+): readonly TelemetryEvent[] {
+  return pool.filter((candidate) => candidate.captureId === captureId);
 }
 
 /**
@@ -1713,16 +1894,18 @@ type StoredView =
     };
 
 /**
- * The identity of one selection: the session, the event and the trace the
- * lookup is narrowed to. Compared only; it holds the session id, so it is
- * never shown or logged.
+ * The identity of one selection: the session, the event, the trace the lookup
+ * is narrowed to and the panel it is bound to (`undefined` for a live read).
+ * Compared only; it holds the session and panel ids, so it is never shown or
+ * logged.
  */
 function drawerSelectionKey(
   sessionId: string | undefined,
   eventId: string,
   traceId: string | undefined,
+  panelId: string | undefined,
 ): string {
-  return JSON.stringify([sessionId ?? null, eventId, traceId ?? null]);
+  return JSON.stringify([sessionId ?? null, eventId, traceId ?? null, panelId ?? null]);
 }
 
 /**
@@ -1746,17 +1929,22 @@ function nextAttempt(previous: DrawerAttempt | undefined, selection: string): nu
   return previous?.selection === selection ? previous.attempt + 1 : 1;
 }
 
-/** The provider options a lookup runs with: its signal, and the pass it resumes. */
+/**
+ * The provider options a lookup runs with: its signal, the panel it is bound
+ * to (no `panelId` key at all for a live read), and the pass it resumes.
+ */
 function resolveOptionsFor(
   resume: DrawerResume | undefined,
   signal: AbortSignal,
+  panelId: string | undefined,
 ): PanelEventResolveOptions {
+  const scope: PanelEventResolveOptions = panelId === undefined ? { signal } : { signal, panelId };
   if (resume === undefined) {
-    return { signal };
+    return scope;
   }
   return resume.kind === 'find'
-    ? { signal, resumeFrom: resume.from }
-    : { signal, resumeAncestry: { from: resume.from, trace: resume.trace } };
+    ? { ...scope, resumeFrom: resume.from }
+    : { ...scope, resumeAncestry: { from: resume.from, trace: resume.trace } };
 }
 
 /**
@@ -1800,9 +1988,12 @@ function lineageOf(
  * The drawer's reading of a settled lookup.
  *
  * A found event's lineage is walked over its stored trace pool together with
- * the live tail — both hold real, captured events of the trace, so an ancestor
- * the store has not been asked for yet but the tail already streamed completes
- * the chain ({@link lineageOf}). A chain the ancestry pass could not complete
+ * the live tail's events **of the found event's own capture** — both hold
+ * real, captured events of that capture, so an ancestor the store has not been
+ * asked for yet but the tail already streamed completes the chain
+ * ({@link lineageOf}), while a tail event of another capture that shares the
+ * trace and a span id never stands in for a missing ancestor
+ * ({@link eventsOfCapture}). A chain the ancestry pass could not complete
  * within its budget is stated as incomplete and carries the continuation
  * ({@link ChainGap}); one whose whole trace was read is stated as missing.
  *
@@ -1822,7 +2013,7 @@ function storedView(outcome: StoredLookupOutcome, liveTail: readonly TelemetryEv
           : undefined;
       const ancestry = lineageOf(
         resolution.event,
-        [resolution.trace, liveTail],
+        [resolution.trace, eventsOfCapture(liveTail, resolution.event.captureId)],
         stopped === undefined ? undefined : resolution.trace.length,
       );
       const gap: ChainGap | undefined =
@@ -1889,8 +2080,9 @@ function ChainContinueControl(props: ChainContinueControlProps): ReactElement {
  * belongs to — so the event is looked up in two places:
  *
  * 1. **The live tail**, which answers at once for an event that just streamed
- *    in. When the tail holds the event *and* its complete ancestry, the drawer
- *    is answered from it alone and the stored capture is not read at all.
+ *    in. When the tail holds the event *and* its complete ancestry among the
+ *    tail's events of the event's own capture, the drawer is answered from it
+ *    alone and the stored capture is not read at all.
  * 2. **The stored capture**, through the provider's `resolveEvent`, which
  *    pages the capture — narrowed to the event's trace when the selection or
  *    the tail knows it — however far into it the event and its ancestors lie:
@@ -1898,8 +2090,32 @@ function ChainContinueControl(props: ChainContinueControlProps): ReactElement {
  *    resumable from where it stopped. Repeated selections of one trace are
  *    answered from the provider's bounded, authorised cache. The lookup runs
  *    in an effect whose `AbortController` is aborted when the selection, the
- *    session, the attempt or the resumption changes and on unmount, and a
- *    settlement is rendered only for the request it answers.
+ *    session, the evidence scope, the attempt or the resumption changes and
+ *    on unmount, and a settlement is rendered only for the request it answers.
+ *
+ * ## Which capture a stored lookup reads
+ *
+ * A session holds several captures, and a panel on screen describes the one
+ * it was generated from — which is not the store's current capture once a
+ * newer one has started. So each lookup reads the evidence the selection
+ * belongs to, which the composition root decides from where the selection
+ * was raised ({@link drawerEvidencePanel}) and hands over as `panelId`:
+ *
+ * - **A panel's evidence** — `panelId` names the panel. Every page of the
+ *   lookup names it, so it is answered from the capture that panel was
+ *   generated from. That holds whatever the live tail shows: the drawer never
+ *   turns a panel-bound lookup into a live one because an event id matches.
+ * - **Live evidence** — `panelId` is `undefined`: an event raised from the
+ *   live tail while its capture is still the store's, or a selection with no
+ *   panel to name (none recorded and none rendered). The lookup names no
+ *   panel and is answered from the open capture, else the most recent one.
+ *
+ * Either way, a lineage is built only from events of the selected event's own
+ * capture: the tail's events of another capture never complete a chain
+ * ({@link eventsOfCapture}), though a trace and its span ids can reach across
+ * a capture boundary. The binding is part of the selection's identity, so
+ * changing it restarts the lookup, and a settlement for the other binding is
+ * never rendered.
  *
  * States: the event from the tail while the stored lookup runs; loading while
  * neither source has it; the lookup's typed failure; "not in the stored
@@ -1920,12 +2136,15 @@ function ChainContinueControl(props: ChainContinueControlProps): ReactElement {
  * @param props See {@link EventDrawerProps}.
  */
 export function EventDrawer(props: EventDrawerProps): ReactElement {
-  const { selected, liveTail, actions, dataProvider, sessionId } = props;
+  const { selected, liveTail, actions, dataProvider, sessionId, panelId } = props;
   const { eventId } = selected;
 
   const fromTail = useMemo(() => findEvent(liveTail, eventId), [liveTail, eventId]);
   const tailChain = useMemo(
-    () => (fromTail === undefined ? undefined : buildEventParentChain(fromTail, liveTail)),
+    () =>
+      fromTail === undefined
+        ? undefined
+        : buildEventParentChain(fromTail, eventsOfCapture(liveTail, fromTail.captureId)),
     [fromTail, liveTail],
   );
   // The tail holds the event and its complete ancestry: nothing to look up.
@@ -1933,8 +2152,11 @@ export function EventDrawer(props: EventDrawerProps): ReactElement {
   const traceId = selected.traceId ?? fromTail?.traceId;
 
   // Retries and continuations belong to the selection they were asked for; a
-  // new selection, session or trace starts over from the first stored event.
-  const selection = drawerSelectionKey(sessionId, eventId, traceId);
+  // new selection, session, trace or evidence binding starts over from the
+  // first stored event. `panelId` is the binding exactly as the composition
+  // root decided it (see the component documentation); nothing here
+  // re-derives it.
+  const selection = drawerSelectionKey(sessionId, eventId, traceId, panelId);
   const [attemptState, setAttemptState] = useState<DrawerAttempt | undefined>(undefined);
   const current = attemptState?.selection === selection ? attemptState : undefined;
   const attempt = current?.attempt ?? 0;
@@ -1966,7 +2188,8 @@ export function EventDrawer(props: EventDrawerProps): ReactElement {
     }
     const controller = new AbortController();
     const target = traceId === undefined ? { eventId } : { eventId, traceId };
-    dataProvider.resolveEvent(sessionId, target, resolveOptionsFor(resume, controller.signal)).then(
+    const options = resolveOptionsFor(resume, controller.signal, panelId);
+    dataProvider.resolveEvent(sessionId, target, options).then(
       (resolution) => {
         if (!controller.signal.aborted) {
           setLookup({ key, outcome: { kind: 'resolved', resolution } });
@@ -1974,24 +2197,18 @@ export function EventDrawer(props: EventDrawerProps): ReactElement {
       },
       (cause: unknown) => {
         if (!controller.signal.aborted) {
-          setLookup({
-            key,
-            outcome: {
-              kind: 'failed',
-              error: DebuggenError.from(cause, 'TRANSPORT_DISCONNECTED'),
-            },
-          });
+          setLookup({ key, outcome: { kind: 'failed', error: presentableLookupError(cause) } });
         }
       },
     );
     return () => {
       controller.abort();
     };
-  }, [dataProvider, sessionId, eventId, traceId, key, resume, tailSuffices]);
+  }, [dataProvider, sessionId, eventId, traceId, panelId, key, resume, tailSuffices]);
 
   // Only the settlement of the current request counts; an earlier one — for
-  // another selection, session, attempt or resumption — reads as "still
-  // resolving".
+  // another selection, session, evidence scope, attempt or resumption — reads
+  // as "still resolving".
   const outcome = lookup !== undefined && lookup.key === key ? lookup.outcome : undefined;
   const settled = useMemo(
     () => (outcome === undefined ? undefined : storedView(outcome, liveTail)),
@@ -2172,6 +2389,31 @@ function restoreFocus(opener: Element | null, fallback: HTMLElement | null): voi
 /** Why capture cannot be used right now, or `undefined` when it can. */
 function captureDisabledReason(status: PanelConnectionStatus): string | undefined {
   return status === 'connected' ? undefined : CAPTURE_NEEDS_CONNECTION;
+}
+
+/**
+ * `actions`, with `onSelectEvent` first handing the raised event's id to
+ * `record` — which notes where the selection came from — and then selecting
+ * it exactly as `actions` does. Every other member is `actions`' own, so the
+ * selection itself still lives in the store alone.
+ *
+ * @param actions The panel's one actions object.
+ * @param record Notes the provenance of a selection raised through the result.
+ * @returns A new, frozen actions object; memoize it, since `PanelHost` and the
+ * live tail key their memoized views on the actions' identity.
+ */
+function recordingSelections(
+  actions: DevtoolsPanelActions,
+  record: (eventId: string) => void,
+): DevtoolsPanelActions {
+  const { onSelectEvent } = actions;
+  return Object.freeze({
+    ...actions,
+    onSelectEvent: (ref: Parameters<DevtoolsPanelActions['onSelectEvent']>[0]): void => {
+      record(ref.eventId);
+      onSelectEvent(ref);
+    },
+  });
 }
 
 /**
@@ -2356,6 +2598,49 @@ export function App(props: AppProps): ReactElement {
   const querySessionId: string | undefined = spec?.sessionId ?? session?.id;
   const hasSession = session !== undefined || spec !== undefined;
 
+  // Where the selection on screen was raised (see `SelectionProvenance`): the
+  // store's selection does not carry it, and it decides whose evidence the
+  // drawer reads. Each control that raises a selection records it through
+  // actions of its own: the rendered panel's views as that panel's evidence,
+  // the live tail as evidence of the capture it streams, and the drawer's
+  // ancestors as evidence of the selection they are listed under.
+  const [provenance, setProvenance] = useState<SelectionProvenance | undefined>(undefined);
+  const renderedPanelId = spec?.id;
+  const panelActions = useMemo(
+    () =>
+      renderedPanelId === undefined
+        ? actions
+        : recordingSelections(actions, (eventId) => {
+            setProvenance({ eventId, origin: 'panel', panelId: renderedPanelId });
+          }),
+    [actions, renderedPanelId],
+  );
+  const liveTailActions = useMemo(
+    () =>
+      recordingSelections(actions, (eventId) => {
+        setProvenance({ eventId, origin: 'live', captureId: readCaptureId() });
+      }),
+    [actions],
+  );
+  const drawerActions = useMemo(
+    () =>
+      recordingSelections(actions, (eventId) => {
+        // Read before the selection moves on: the ancestor inherits the
+        // provenance of the selection it was listed under, and nothing else.
+        const listedUnder = getPanelSnapshot().selectedEvent?.eventId;
+        setProvenance((current) =>
+          current !== undefined && current.eventId === listedUnder
+            ? { ...current, eventId }
+            : undefined,
+        );
+      }),
+    [actions],
+  );
+  const drawerPanelId =
+    selectedEvent === undefined
+      ? undefined
+      : drawerEvidencePanel(selectedEvent.eventId, provenance, renderedPanelId, capture.captureId);
+
   // design-system gap: the drawer pane has no scroll region of its own. The
   // renderer sanctions exactly one `overflow` container (`PanelShell`, which
   // `PanelHost` already renders for the body), so a drawer taller than the
@@ -2375,9 +2660,10 @@ export function App(props: AppProps): ReactElement {
           <EventDrawer
             selected={selectedEvent}
             liveTail={liveTail}
-            actions={actions}
+            actions={drawerActions}
             dataProvider={dataProvider}
             sessionId={querySessionId}
+            panelId={drawerPanelId}
           />
         </Section>
       </aside>
@@ -2454,8 +2740,9 @@ export function App(props: AppProps): ReactElement {
 
             {hasSession ? (
               <>
-                {/* Above the summary: until the page is reloaded, nothing below
-                    can be observed on it. */}
+                {/* Above the summary, because new React activity on this
+                    document cannot be captured until it is reloaded; the
+                    stored session summary and panel below still render. */}
                 {reload.kind === 'not-needed' ? null : <PageReloadNotice reload={reload} />}
 
                 <SessionSummary
@@ -2484,7 +2771,7 @@ export function App(props: AppProps): ReactElement {
                 <PanelView
                   spec={spec}
                   dataProvider={dataProvider}
-                  actions={actions}
+                  actions={panelActions}
                   theme={theme}
                   status={viewStatus}
                   error={sessionFailure}
@@ -2508,7 +2795,7 @@ export function App(props: AppProps): ReactElement {
             capturing={capture.active}
             collapsed={tailCollapsed}
             onToggleCollapsed={toggleTail}
-            actions={actions}
+            actions={liveTailActions}
             selected={selectedEvent}
           />
         </section>

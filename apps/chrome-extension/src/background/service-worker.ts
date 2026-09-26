@@ -1,216 +1,70 @@
 /**
  * The Manifest V3 module service worker of the "Debug Generator" extension —
  * the manifest's `background.service_worker` entry and the extension's
- * composition root (AAP §0.7.1 Group 4).
+ * composition root.
  *
  * Every other module in this folder is a side-effect-free factory that cannot
  * see its siblings: `auth.ts` keeps the devtools credential, `ports.ts` routes
  * runtime ports, `tab-registry.ts` mirrors the tab ↔ session bindings,
  * `agent-control.ts` arms and disarms the page agent, and `ws-bridge.ts` owns
- * the authenticated socket and the HTTP calls. This file is the one place that
- * knows all of them: it constructs each exactly once, hands each the others'
- * capabilities as injected callbacks, attaches them to Chrome's event surface
- * and supplies the decisions that belong to no single module — which tab a
- * panel inspects, when DevTools closing means `session.unbind`, which browser
- * navigation is a committed one, and which service address is in force.
+ * the authenticated socket and the HTTP calls. This file constructs each once,
+ * wires them together through injected callbacks, attaches them to Chrome's
+ * events, and makes the decisions no single module owns: which tab a panel
+ * inspects, when DevTools closing means `session.unbind`, which navigation is
+ * committed, and which service address is in force — the stored setting, else
+ * the environment's or the default. Its first read gates every socket and
+ * HTTP call, and a failed first read puts a refusal in force, so the
+ * credential and a pairing code never reach an address no read established.
  *
- * That address is the setting the pairing dialog stores
- * (`SERVICE_ENDPOINT_STORAGE_KEY`, validated by `parseServiceEndpoint`), else
- * the environment's, else `DEFAULT_SERVICE_BASE_URL`. It is read at start-up
- * and again before every pairing redemption, followed through
- * `chrome.storage.local.onChanged`, and applied to both paths at once: the
- * shared `HttpClient` is rebuilt for it and the socket is moved with
- * `WsBridge.setServiceBaseUrl`. Until the first read of it succeeds the
- * bridge's gate holds every socket and HTTP call, and a failed first read puts
- * a refusal in force — fail closed: the devtools credential and a pairing code
- * never go to an address the setting did not establish. Every HTTP call that
- * names no deadline of its own is bounded by {@link SERVICE_REQUEST_TIMEOUT_MS};
- * a hydration whose reads fail transiently is surfaced to the panel and tried
- * again on {@link HYDRATION_RETRY_DELAYS_MS}.
+ * The invariants everything else depends on:
  *
- * ## Manifest V3 lifetime (get this wrong and nothing else matters)
- *
- * Chrome evicts an idle worker after roughly thirty seconds and re-evaluates
- * this module from scratch when the next event arrives. An event is delivered
- * only to listeners that exist by the end of that first evaluation, so:
- *
- * - {@link createWorker} registers every `chrome.*` listener synchronously —
- *   never behind an `await`, a promise continuation or a callback — and the
- *   module calls it synchronously at the bottom. Asynchronous start-up work
- *   (hydrating the bindings, reading the credential, opening the socket) is
- *   kicked off only after registration, and a handler that needs it awaits
- *   the module-scoped {@link DebugGeneratorWorker.ready} promise **inside**
- *   the handler.
- * - Every handler is written for a cold start: after a revival the in-memory
- *   maps here and in the siblings are empty, so handlers hydrate through the
- *   owning module (`registry.getBinding` reads `chrome.storage.session`, the
- *   credential store reads `chrome.storage.local` lazily) rather than assuming
- *   warm state.
- * - The synchronous section is cheap: construction only — no network, no
- *   storage scan.
- *
- * Two recovery mechanisms coexist and neither substitutes for the other: the
- * `chrome.alarms` keepalive (created only by `ws-bridge.ts` — by its
- * `connect()`, and re-created by its open-socket heartbeat every
- * `SOCKET_HEARTBEAT_INTERVAL_MS` — and ticked from {@link KEEPALIVE_ALARM_NAME}
- * here) covers worker suspension, and the socket client's backoff covers a
- * service restart; the heartbeat's health probe hands a socket whose service
- * stopped answering to that backoff. Both
- * end in a status snapshot pushed to every panel, so "Connected · ‹session›",
- * "Reconnecting…", "Not paired", "Service not running" and "Tab left ‹origin›"
- * are observable without the panel polling (AAP §0.5.5).
- *
- * ## Telemetry custody across a cold start
- *
- * The content bridge hands a batch over only once `port.postMessage` returns,
- * and the page agent forgets it then — so a batch this worker drops is gone.
- * A page load is what usually wakes the worker, and until `start()` has run
- * `wsBridge.connect()` the socket client is `closed` and refuses every frame.
- * The page agent's `agent.ready` and `telemetry.batch` frames therefore run
- * through one ordered lane per tab ({@link createWorker}'s `inTabOrder`),
- * each link waiting for {@link DebugGeneratorWorker.ready} and for the link
- * before it: they reach the socket client in arrival order — a batch only
- * once the service has confirmed its tab's route (see below). While start-up
- * is pending a tab may have at most {@link COLD_START_HELD_EVENTS_PER_TAB}
- * events waiting — the agent's own buffer bound — and events beyond it are
- * refused and counted.
- *
- * Telemetry the capture is missing is shown, not only logged: events the
- * worker could not hand to the service, and events the page reports it
- * dropped before the batch (`droppedCount`), reach the tab's panels as a
- * protocol `error` of fixed copy that names only a number
- * ({@link telemetryLossNotice}), at most once per kind per tab every
- * {@link TELEMETRY_LOSS_NOTICE_INTERVAL_MS} with the count accumulated in
- * between. That includes frames the socket client queued and later
- * discarded, which `ws-bridge.ts` reports by tab and event count. A notice
- * that reached no panel of the tab is not forgotten: it is shown again when
- * a panel is associated with the tab, or when an interval ends with one
- * connected. Log lines about such loss carry counts and the tab only.
- *
- * ## Where the inspected tab comes from
- *
- * A panel port's `sender` names no tab (it is an extension page). The tab is
- * known to the worker from two sources of the same trust — this extension's
- * own pages, the only senders `PORT_PANEL` and `PORT_DEVTOOLS` accept — both
- * reading `chrome.devtools.inspectedWindow.tabId`: the DevTools page's
- * `devtools.hello`, and the `inspectedTabId` a panel running inside DevTools
- * names in its `session.snapshot` request. A panel's tab is fixed for the life
- * of its port, and it is set as follows ({@link associatePanel}):
- *
- * - A panel that names its inspected tab is associated with exactly that tab.
- *   A name contradicting the port's existing association is refused and
- *   answered unbound; the other tab is never hydrated.
- * - A panel that names no tab (its page was opened outside DevTools) is
- *   associated only when exactly one DevTools tab awaits a panel; with
- *   several it stays unassociated, because nothing trustworthy says which.
- *   Such a panel, once it has asked, is adopted by a DevTools page announced
- *   later only when it is the one panel waiting and that page's tab the one
- *   tab awaiting ({@link adoptWaitingPanel}).
- * - The session a panel remembers and names in its snapshot request is
- *   information only: it never chooses or assigns a tab, and a claim whose
- *   session is bound elsewhere is logged and ignored.
- *
- * Every session-scoped panel request is then held to "the session bound to
- * this panel's tab" before the worker acts for it. The worker, not the panel,
- * sends the protocol's `session.bind` (AAP §0.2.3).
- *
- * ## Every session-scoped action names the tab it acts for
- *
- * One socket and one paired DevTools credential serve every inspected tab, so
- * the credential alone cannot tell the service whose session a request may
- * touch. AAP §0.5.6 allows a DevTools principal to bind, select targets,
- * capture, query panel data and open source "only for the session bound to
- * that tab", and the service enforces it by the **acting tab** each action
- * names — `x-debuggen-tab` on an HTTP request, the envelope's `tabId` on a
- * frame — checked against its live binding table. The tab is always Chrome's
- * attribution (a panel's associated tab, a bridge or DevTools port's sender),
- * never a page's or a panel's own claim:
- *
- * - a panel request resolves its acting tab in `checkPanelScope`, and a panel
- *   not yet associated with a tab is refused here rather than sent unscoped;
- * - frames sent for a tab carry it: `source.open`, `target.selected`, the
- *   binding frames and `agent.ready` (stamped from their payload's own tab by
- *   `sendActingForPayloadTab`), and telemetry;
- * - a telemetry batch is forwarded only for a tab whose binding the registry
- *   holds, with that binding's session, one tab's batches strictly in order and
- *   after the cold start has settled (`enqueueTelemetryBatch`) — and only once
- *   the service has confirmed that binding on the current connection
- *   (`wsBridge.awaitTabRoute`), so a batch is never queued into a socket that
- *   a restarted service would answer with `TAB_NOT_BOUND`. The session and
- *   capture the page agent stamped on a batch are pinned when it arrives and
- *   can only reject it: a batch produced for another session or capture than
- *   the tab's binding at send time is dropped, never relabelled.
- *
- * ## The consented reload and the capture conflict, over the panel port
- *
- * - **The one-click reload** (AAP §0.7.1 Group 2: readiness "asks for a
- *   one-click reload, which the SW performs via `chrome.tabs.reload` on
- *   consent and waits for the next `agent.ready`"). The panel's `page.reload`
- *   request **is** the developer's consent, and its handler here is the only
- *   caller of `agent-control.ts`'s `requestConsentedReload` — never a timer, a
- *   readiness report or a navigation. The handler fails closed: it reloads
- *   only the tab the consent names, and only when that tab is the requesting
- *   connection's associated tab and is bound to the named session at the
- *   moment of the reload — never a tab a stale or reconnecting panel was not
- *   shown the offer for — on an origin the content scripts match, and only
- *   while `agent.getReloadOffer`
- *   says a reload is offered: the hook arrived after React, or no agent runs
- *   in the tab at all (a page loaded before the extension). It answers once
- *   the new document's `agent.ready`
- *   arrives — or with a typed failure when the bounded wait expires — so the
- *   hub's request timeout is set above that wait
- *   ({@link WORKER_REQUEST_TIMEOUT_MS}). The offer itself reaches the panels
- *   as the `reload` push and the snapshot's `reload` field, refreshed whenever
- *   readiness, a reload, a content-script bridge or the tab's binding changes.
- * - **The capture-ownership conflict** (AAP §0.4.2: `capture.start` for a
- *   project another session already captures answers `409 { owningSessionId }`).
- *   The `capture.start` handler answers the bridge's failure unchanged, and
- *   `./messages`'s `portErr` projects it onto the port frame as
- *   `CAPTURE_ALREADY_ACTIVE` with the service's message **and** the owning
- *   session's id — the one `details` field a port failure may carry, admitted
- *   only on that answer and only once the protocol's own schema accepts it
- *   (`captureConflictOwningSessionId`) — so the panel can name the session
- *   that holds the capture. The same validated id is what this worker logs.
- * - `source.open` is a request-correlated round trip, not a fire-and-forget
- *   send ({@link forwardSourceOpen}): the frame goes out under a freshly minted
- *   id, and the panel's request is answered only by the service's
- *   `source.result` — or its `error` frame — whose `ref` is that id, or by the
- *   {@link SOURCE_OPEN_RESULT_TIMEOUT_MS} deadline. The port contract in
- *   `../shared/messages` still types the answer `{ forwarded: boolean }`, and
- *   its doc line there ("whether the socket took it") predates this; the
- *   meaning is now: `forwarded: true` — the editor confirmed it opened the
- *   location; `forwarded: false` — no VS Code window is connected, so the
- *   panel hands the location to the editor-open URI instead. A refusal, an
- *   editor failure and the deadline are typed failures. Because `portErr`
- *   drops every other `details` field (above), the request's `ref` is logged here and does not
- *   reach the panel, which mints its own reference for an unexpected failure.
- *   The service answers a `source.open` its handler refused with a `failed`
- *   `source.result`, which no panel receives; an `error` refusal made before
- *   the handler ran quotes nothing from the request and is still withheld
- *   from the relay to the panels ({@link isAnsweredSourceOpenRefusal}): the
- *   request carries it, and the panel's general error state never shows it.
- *   Withholding needs the request's id, so the worker never evicts an id
- *   whose answer can still arrive ({@link SourceOpenRefLedger}): past
- *   {@link SOURCE_OPEN_MAX_OUTSTANDING} unanswered requests a click is refused
- *   `RATE_LIMITED` before it is sent. Either answer reaches the requesting
- *   panel with its code and a fixed sentence, never the service's text.
- *
- * ## Privacy (AAP §0.5.2)
- *
- * Log lines carry lifecycle events, ids, counts, kinds and error codes only —
- * never a token, a pairing code, a URL (its path and query), a telemetry
- * attribute, a descriptor, a source location or a response body. URLs this
- * worker produces for the service (`session.bind`, `tab.navigated`) are
- * query-redacted first by {@link redactNavigationUrl}.
- *
- * A page agent frame is page-forgeable, so what it says is never logged or
- * shown as text: an `agent.error` is reduced to its closed-vocabulary kind and
- * that kind's fixed public sentence by {@link agentErrorReport}, and the
- * page-supplied document and producer ids that `agent-control.ts` and
- * `ws-bridge.ts` log are fingerprinted by `fingerprintPageId` first.
- *
- * Governed by AAP §0.7.1 Group 4, §0.2.3, §0.4.2, §0.5.5, §0.5.6 and §0.8.1
- * slices 4 and 6.
+ * - **Every listener is registered synchronously.** Chrome suspends an idle
+ *   worker and re-evaluates this module on the next event, which reaches only
+ *   the listeners that exist by the end of that evaluation. {@link createWorker}
+ *   registers every `chrome.*` listener synchronously and the module calls it
+ *   synchronously; the synchronous section only constructs. Start-up work
+ *   (bindings, credential, socket) starts after registration, and a handler
+ *   that needs it awaits {@link DebugGeneratorWorker.ready} inside itself.
+ *   Every handler is written for a cold start: it hydrates through the owning
+ *   module, never from memory a revival emptied.
+ * - **Recovery.** While the socket is open, `ws-bridge.ts`'s heartbeat
+ *   refreshes the worker's idle time and probes the service. The
+ *   `chrome.alarms` keepalive does not prevent suspension: it fires within one
+ *   period after the worker is suspended, and its tick
+ *   ({@link KEEPALIVE_ALARM_NAME}) revives the worker and reconnects. The
+ *   socket client's backoff covers a service restart. Both end in a status
+ *   snapshot pushed to every panel.
+ * - **A panel's tab comes only from Chrome.** It is fixed for the life of the
+ *   port and set from `chrome.devtools.inspectedWindow.tabId` as this
+ *   extension's own pages report it ({@link associatePanel}), never from the
+ *   session a panel remembers. The worker, not the panel, sends
+ *   `session.bind`. Every session-scoped action names its acting tab — a
+ *   panel's associated tab or a bridge or DevTools port's sender, never a
+ *   page's or panel's claim — which the service checks against its bindings:
+ *   panel requests through `checkPanelScope`, the modules' frames through
+ *   `sendActingForPayloadTab`.
+ * - **Telemetry travels only along a route the service confirmed.** One
+ *   ordered, bounded lane per tab carries `agent.ready` and the tab's batches
+ *   in arrival order across a cold start (`enqueueTelemetryBatch`, holding at
+ *   most {@link COLD_START_HELD_EVENTS_PER_TAB} events until start-up
+ *   settles). A batch is sent only for its tab's binding, once the service has
+ *   confirmed that binding on the current connection; the session and capture
+ *   the page stamped on it can only reject it, never be relabelled.
+ * - **Loss is shown and forwarded, never silent.** Events the worker could
+ *   not deliver and events the page dropped reach the tab's panels as a
+ *   fixed-copy notice naming only a count ({@link telemetryLossNotice}). The
+ *   service's producer-loss ledger learns both as `droppedCount`: the page's
+ *   on its batch, or on a loss-only frame when no event travels with it; the
+ *   worker's own — the cold-start hold, a full lane, an unconfirmed route, a
+ *   failed send, a frame the socket client discarded — held per tab and
+ *   capture context and carried by the next job of that context, or by a
+ *   loss-only frame once the service confirms the tab's route. A count is
+ *   never moved to another context ({@link MAX_PENDING_LOSS_CONTEXTS_PER_TAB}).
+ * - **Privacy.** Logs carry ids, counts, kinds and error codes only — never a
+ *   token, a pairing code, a URL's path or query, telemetry, a descriptor, a
+ *   source location or a response body; a URL sent to the service is
+ *   query-redacted ({@link redactNavigationUrl}), and page-forgeable text and
+ *   ids are reduced to fixed copy ({@link agentErrorReport}) or fingerprints.
  *
  * @module apps/chrome-extension/src/background/service-worker
  */
@@ -415,8 +269,9 @@ const SELECTION_UNSENT_HINT =
  * agent's picker, and no agent is connected for the inspected tab — with the
  * two routes that still lead to a target: a reload, which starts the agent, or
  * the explicit `$0` control. The recovery is part of the message itself
- * because a port failure frame carries `{ code, message }` only (see the
- * module notes), so a separate hint would never reach the panel.
+ * because a port failure frame carries `{ code, message }` only (`./messages`'s
+ * `portErr`; see {@link SourceOpenForwardResult}), so a separate hint would
+ * never reach the panel.
  */
 const PICKER_UNAVAILABLE_MESSAGE =
   'The Debug Generator page agent is not running on the inspected page, so picker mode is unavailable. Reload the application page, or select the element in the Elements panel and press "Use selected element".';
@@ -523,9 +378,27 @@ const WORKER_REQUEST_TIMEOUT_MS = Math.max(
  * revival receives from one tab is at most 25 batches. 64 covers that backlog
  * plus the flushes made while the cold start settles, and bounds what one tab
  * can make the worker hold. A batch beyond the bound is dropped and reported
- * — counted and logged — never silently lost.
+ * — counted, logged and held for the service's ledger — never silently lost.
  */
 const MAX_PENDING_TELEMETRY_BATCHES_PER_TAB = 64;
+
+/**
+ * The most capture contexts one tab may hold undelivered loss for: the
+ * worker's pending-loss accumulator (`holdPendingLoss` in {@link createWorker}).
+ *
+ * A context is the session and capture a lost batch was stamped with, or sent
+ * under. A tab moves to a new one only when its capture or session changes, so
+ * its loss normally waits under one or two contexts until the service next
+ * confirms the tab's route; eight covers several captures of one outage and
+ * bounds what one tab can make the worker keep. A context beyond the bound
+ * abandons the oldest one's count with a counts-only warning — never merged
+ * into another context, which would relabel loss into a capture it did not
+ * happen in. The loss-only reports the worker schedules for held loss are
+ * bounded by this too — at most this many on a tab's lane, one per context —
+ * rather than by {@link MAX_PENDING_TELEMETRY_BATCHES_PER_TAB}, so a lane full
+ * of the page's batches cannot hold them back.
+ */
+export const MAX_PENDING_LOSS_CONTEXTS_PER_TAB = 8;
 
 /**
  * How many times the lane hands one batch to the bridge: the send, and one
@@ -1111,7 +984,8 @@ export const TELEMETRY_LOSS_NOTICE_INTERVAL_MS = 5000;
  *   credential was removed (`WsBridgeDeps.onTelemetryDropped`).
  * - `dropped-in-page` — the batch's `droppedCount` reports events lost before
  *   the batch left the page: the agent's buffer overflowed, or the content
- *   bridge's rate budget refused them.
+ *   bridge's rate budget refused them. A loss-only report (no events) is such
+ *   a batch too.
  */
 export type TelemetryLossKind = 'undelivered' | 'dropped-in-page';
 
@@ -1270,17 +1144,58 @@ export interface SourceOpenForwardDeps {
   readonly tabId?: TabId | undefined;
 }
 
+/** A positive safe-integer count the bridge put in a failure's `details`, else `0`. */
+function detailCount(error: DebuggenError, key: string): number {
+  const value = error.details?.[key];
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
 /**
  * How many frames of an interrupted telemetry batch reached the socket — the
  * `framesWritten` plus `framesQueued` the bridge reports on the failure; `0`
  * for a failure that reports neither (the batch was refused before a frame).
  */
 function framesHandedOver(error: DebuggenError): number {
-  const count = (key: string): number => {
-    const value = error.details?.[key];
-    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0;
-  };
-  return count('framesWritten') + count('framesQueued');
+  return detailCount(error, 'framesWritten') + detailCount(error, 'framesQueued');
+}
+
+/**
+ * How many events of an interrupted telemetry batch the socket client took —
+ * `eventsWritten` to the socket plus `eventsQueued` in its queue, whose later
+ * discard the bridge reports itself (`WsBridgeDeps.onTelemetryFrameDiscarded`).
+ * The batch is sent from its first event on every attempt, so this is the
+ * length of the prefix one attempt handed over.
+ */
+function eventsHandedOver(error: DebuggenError): number {
+  return detailCount(error, 'eventsWritten') + detailCount(error, 'eventsQueued');
+}
+
+/** `a + b`, capped at the largest safe integer, so a growing count stays a valid `droppedCount`. */
+function addLossCounts(a: number, b: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, a + b);
+}
+
+/**
+ * The pending-loss accumulator's key for a context: its session and capture,
+ * an absent one included — so `{ ses, cap }`, `{ ses }` and `{}` are three
+ * contexts, and a count is only ever carried under the one it was held under.
+ */
+function telemetryLossKey(context: TelemetryBatchContext): string {
+  return JSON.stringify([context.sessionId ?? null, context.captureId ?? null]);
+}
+
+/**
+ * Whether a lane job is a loss-only report: no events, only a count — the
+ * page's `droppedCount` from the agent's terminal flush or the content bridge,
+ * or (with a zero `droppedCount`) a report the worker scheduled for loss it
+ * holds, whose count it takes from the accumulator when its turn comes. The
+ * bridge sends it as one event-less `telemetry.event` frame. It names no
+ * event, so nothing about it is ever shown as undelivered: the page's loss was
+ * shown as `dropped-in-page` when it arrived, and the worker's when it
+ * happened.
+ */
+function isLossReport(job: PendingTelemetryBatch): boolean {
+  return job.events.length === 0;
 }
 
 /**
@@ -1298,8 +1213,40 @@ interface TelemetryLane {
   links: number;
   /** Batches queued or being forwarded; bounded by `MAX_PENDING_TELEMETRY_BATCHES_PER_TAB`. */
   pending: number;
+  /**
+   * Loss-only reports the worker scheduled for held loss, queued or being
+   * forwarded; bounded by `MAX_PENDING_LOSS_CONTEXTS_PER_TAB`.
+   */
+  reports: number;
   /** Events of batches enqueued before start-up settled, not yet past it. */
   heldEvents: number;
+  /**
+   * Jobs queued or being forwarded — the page's batches and the worker's
+   * loss-only reports alike — per {@link telemetryLossKey} of their pinned
+   * context: a confirmed route schedules a loss-only report only for a
+   * context no job on the lane will carry.
+   */
+  readonly queued: Map<string, number>;
+}
+
+/**
+ * Where loss the service's ledger was not told of came from: the cold-start
+ * hold, a full lane, a route not confirmed in time, a failed send, or a frame
+ * the socket client queued and discarded. For the log line only.
+ */
+type PendingLossSource = 'cold-start-hold' | 'lane-full' | 'route' | 'send' | 'socket-queue';
+
+/**
+ * One tab's loss under one context that the service's producer-loss ledger
+ * has not been told of, waiting to be carried as `droppedCount` — on the next
+ * job of that context, or on a loss-only report once the service confirms
+ * the tab's route. Mutable: the worker's private accumulator.
+ */
+interface PendingLoss {
+  /** The session and capture the count belongs to, and the only ones it is sent under. */
+  readonly context: TelemetryBatchContext;
+  /** Events lost, capped at the largest safe integer. */
+  count: number;
 }
 
 /** Why a lane dropped a batch it had accepted, before any send was attempted. */
@@ -1355,20 +1302,29 @@ interface TelemetryDeadline {
 }
 
 /**
- * One telemetry batch waiting on its tab's lane, with everything pinned when
- * it **arrived**: its events, the page agent's own session and capture stamp,
- * and its deadline. Nothing here is re-read from the page later.
+ * One job waiting on its tab's lane — a page batch, or a loss-only report the
+ * worker scheduled for loss it holds — with everything pinned when it was
+ * **queued**: its events, its context and its deadline. Nothing here is
+ * re-read from the page later.
  */
 interface PendingTelemetryBatch {
   /** The tab the batch came from — the bridge port's sender. */
   readonly tabId: TabId;
-  /** The raw events, forwarded untouched. */
+  /** The raw events, forwarded untouched; empty for a loss-only report. */
   readonly events: PageTelemetryBatchPayload['events'];
-  /** Events the agent lost before this batch, for the log line after delivery. */
+  /**
+   * Events the page lost since its previous loss report — zero in a report
+   * the worker scheduled. Forwarded, with the held loss of the job's context
+   * the job takes over at its send, as the first frame's `droppedCount`, or —
+   * with no events — as the whole of a loss-only report ({@link isLossReport}).
+   */
   readonly droppedCount: number;
-  /** The page agent's session and capture stamp, pinned at arrival. */
+  /**
+   * The page agent's session and capture stamp, pinned at arrival; for a
+   * report the worker scheduled, the context of the loss it carries.
+   */
   readonly context: TelemetryBatchContext;
-  /** The batch's one overall deadline, started at arrival. */
+  /** The job's one overall deadline, started when it was queued. */
   readonly deadline: TelemetryDeadline;
 }
 
@@ -1632,6 +1588,11 @@ export function createSourceOpenRelayFilter(
  * `forwarded: true` — the editor confirmed it opened the location.
  * `forwarded: false` — no VS Code window is connected; the panel hands the
  * location to the editor-open URI instead.
+ *
+ * A refusal, an editor failure and the deadline are typed failures carrying
+ * the request's `ref` in `details`. `portErr` drops every `details` field but a
+ * capture conflict's owning session, so the `ref` is logged here and never
+ * reaches the panel, which mints its own reference for an unexpected failure.
  */
 export type SourceOpenForwardResult = Result<PortResponsePayloads['source.open'], DebuggenError>;
 
@@ -2083,12 +2044,22 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   const readinessInFlight = new Map<TabId, Promise<void>>();
   /** Per tab and loss kind: the burst being shown — see `recordTelemetryLoss`. */
   const lossEpisodes = new Map<TabId, Map<TelemetryLossKind, LossEpisode>>();
+  /**
+   * Per tab, per {@link telemetryLossKey}: loss the service's producer-loss
+   * ledger has not been told of — see `holdPendingLoss`. Oldest context first
+   * (insertion order), at most {@link MAX_PENDING_LOSS_CONTEXTS_PER_TAB} per
+   * tab. Worker-generation memory like the lanes, so it is carried at the
+   * first opportunity rather than kept.
+   */
+  const pendingLoss = new Map<TabId, Map<string, PendingLoss>>();
   /** Whether `ready` has settled; until then telemetry is held within a bound. */
   let coldStartSettled = false;
   /** Batches dropped since start because their tab's lane was full. */
   let telemetryOverflowCount = 0;
   /** Batches accepted onto a lane since start and then not delivered. */
   let telemetryLossCount = 0;
+  /** Held loss abandoned since start: too many contexts, a closed tab, or no route for its context. */
+  let abandonedLossCount = 0;
   /**
    * The checks of the selections held for an open socket, run on every status
    * the bridge publishes — the transport opening is always one of them.
@@ -2669,9 +2640,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         return scope;
       }
       // Forwarded unmodified, acting for the panel's tab, then answered by
-      // what the editor did: see
-      // `forwardSourceOpen` and the module's contract-gap notes for how the
-      // result maps onto `{ forwarded }`.
+      // what the editor did: see `forwardSourceOpen` for the round trip and
+      // `SourceOpenForwardResult` for how the result maps onto `{ forwarded }`.
       return forwardSourceOpen(
         {
           send: wsBridge.send,
@@ -2859,7 +2829,12 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       // unless that tab is this connection's associated tab (a fresh port not
       // yet associated, or a panel associated elsewhere, is refused) and is
       // bound to the named session right now (a session rebound to another
-      // tab since the offer was shown is refused). Nothing else is reloaded.
+      // tab since the offer was shown is refused). Nothing else is reloaded:
+      // this handler is the only caller of `agent.requestConsentedReload` —
+      // never a timer, a readiness report or a navigation. It answers once the
+      // new document's `agent.ready` arrives, or with a typed failure when
+      // that bounded wait expires, which the hub's request timeout outlasts
+      // (`WORKER_REQUEST_TIMEOUT_MS`).
       const tabId = payload.tabId;
       if (context.tabId === undefined || context.tabId !== tabId) {
         log.info('A page reload was refused: the panel does not inspect the tab it named.', {
@@ -3076,7 +3051,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   }
 
   // -------------------------------------------------------------------------
-  // Telemetry custody: the per-tab chain, the cold-start hold, loss notices
+  // Telemetry custody: the per-tab chain, the cold-start hold, held loss,
+  // loss notices
   // -------------------------------------------------------------------------
 
   /** A tab's lane, created when its first waiting frame arrives. */
@@ -3085,7 +3061,14 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     if (existing !== undefined) {
       return existing;
     }
-    const created: TelemetryLane = { tail: Promise.resolve(), links: 0, pending: 0, heldEvents: 0 };
+    const created: TelemetryLane = {
+      tail: Promise.resolve(),
+      links: 0,
+      pending: 0,
+      reports: 0,
+      heldEvents: 0,
+      queued: new Map(),
+    };
     telemetryLanes.set(tabId, created);
     return created;
   }
@@ -3141,13 +3124,15 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * wait for start-up. After start-up that is all of them, none waiting.
    * Before, the tab's waiting events stay within
    * {@link COLD_START_HELD_EVENTS_PER_TAB}: the oldest are kept — the order
-   * they are delivered in — and those beyond the bound are refused, counted
-   * and shown as undelivered, rather than held in unbounded memory.
+   * they are delivered in — and those beyond the bound are refused, counted,
+   * shown as undelivered and held for the service's ledger under the batch's
+   * pinned context, rather than held in unbounded memory.
    */
   function admitBatch(
     lane: TelemetryLane,
     tabId: TabId,
     events: BridgeTelemetryEvents,
+    context: TelemetryBatchContext,
   ): { readonly events: BridgeTelemetryEvents; readonly held: number } {
     if (coldStartSettled) {
       return { events, held: 0 };
@@ -3164,8 +3149,186 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         limit: COLD_START_HELD_EVENTS_PER_TAB,
       });
       recordTelemetryLoss(tabId, 'undelivered', refused);
+      holdPendingLoss(tabId, context, refused, 'cold-start-hold');
     }
     return { events: admitted, held: admitted.length };
+  }
+
+  // -------------------------------------------------------------------------
+  // Loss the service's producer-loss ledger was not told of
+  // -------------------------------------------------------------------------
+
+  /**
+   * Hold loss the worker caused for accepted page telemetry until it can reach
+   * the service's producer-loss ledger — the ledger that decides whether a
+   * capture's coverage is complete, and which the panels' loss notices are
+   * not. `source` names where it happened, for the log line only.
+   *
+   * The count is kept per tab under exactly `context` — the batch's pinned
+   * stamp when the loss happened before the lane read the tab's binding (the
+   * cold-start hold, a full lane), else the labels its frames were sent under
+   * (the verified session, the stamped capture). It leaves as `droppedCount`
+   * on the first job of that context the lane sends ({@link claimPendingLoss})
+   * or on a loss-only report once the service confirms the tab's route
+   * ({@link deliverPendingLoss}), and is never added to another context's: the
+   * service accounts it against the capture the frame is attributed to, and
+   * refuses a frame whose armed capture is not the tab's open one. A tab holds
+   * at most {@link MAX_PENDING_LOSS_CONTEXTS_PER_TAB} contexts; a new one
+   * beyond the bound abandons the oldest's count with a counts-only warning.
+   * Logs carry the tab and counts only — never the page-supplied ids.
+   */
+  function holdPendingLoss(
+    tabId: TabId,
+    context: TelemetryBatchContext,
+    count: number,
+    source: PendingLossSource,
+  ): void {
+    if (disposed || count <= 0) {
+      return;
+    }
+    let contexts = pendingLoss.get(tabId);
+    if (contexts === undefined) {
+      contexts = new Map();
+      pendingLoss.set(tabId, contexts);
+      // Loss can arrive for a tab that already closed — a job that waited out
+      // its deadline, a frame the socket client discarded later — and would
+      // wait for a route forever.
+      background(forgetPendingLossOfClosedTab(tabId), 'pending telemetry loss of a closed tab');
+    }
+    const key = telemetryLossKey(context);
+    let entry = contexts.get(key);
+    if (entry === undefined) {
+      if (contexts.size >= MAX_PENDING_LOSS_CONTEXTS_PER_TAB) {
+        for (const [oldestKey, oldest] of contexts) {
+          contexts.delete(oldestKey);
+          abandonedLossCount += 1;
+          log.warn(
+            'Telemetry loss the service was not told of was abandoned: its tab holds loss for too many capture contexts.',
+            {
+              tabId,
+              dropped: oldest.count,
+              limit: MAX_PENDING_LOSS_CONTEXTS_PER_TAB,
+              abandonedCount: abandonedLossCount,
+            },
+          );
+          break;
+        }
+      }
+      entry = { context, count: 0 };
+      contexts.set(key, entry);
+    }
+    entry.count = addLossCounts(entry.count, count);
+    log.debug('Telemetry loss is held until the service can be told.', {
+      tabId,
+      dropped: count,
+      pending: entry.count,
+      source,
+    });
+  }
+
+  /**
+   * Take over the loss held for `tabId` under any of `contexts` — removed from
+   * the accumulator, so it is carried once. The caller is the job about to
+   * send (its pinned and its verified context, which label its frames) or one
+   * that abandons a context with no route.
+   *
+   * @returns The count taken over; `0` when none was held.
+   */
+  function claimPendingLoss(tabId: TabId, contexts: readonly TelemetryBatchContext[]): number {
+    const held = pendingLoss.get(tabId);
+    if (held === undefined) {
+      return 0;
+    }
+    let claimed = 0;
+    for (const key of new Set(contexts.map(telemetryLossKey))) {
+      const entry = held.get(key);
+      if (entry !== undefined) {
+        held.delete(key);
+        claimed = addLossCounts(claimed, entry.count);
+      }
+    }
+    if (held.size === 0) {
+      pendingLoss.delete(tabId);
+    }
+    return claimed;
+  }
+
+  /**
+   * The service confirmed the tab's route on the current connection: queue
+   * one loss-only report for each context whose loss is held and that no job
+   * on the tab's lane will carry. Each report takes its context's count when
+   * its turn comes, and one that cannot deliver it puts the count back — to
+   * wait for the next job or confirmation, never retried in a loop. These
+   * reports are bounded by {@link MAX_PENDING_LOSS_CONTEXTS_PER_TAB} per lane
+   * (at most one per held context), not by the page's lane bound, so a lane
+   * full of the page's batches cannot hold them back.
+   */
+  function deliverPendingLoss(tabId: TabId): void {
+    const held = pendingLoss.get(tabId);
+    if (disposed || held === undefined) {
+      return;
+    }
+    for (const [key, entry] of held) {
+      const lane = telemetryLanes.get(tabId);
+      if ((lane?.reports ?? 0) >= MAX_PENDING_LOSS_CONTEXTS_PER_TAB) {
+        // The rest waits for the next job of its context or confirmation.
+        return;
+      }
+      if ((lane?.queued.get(key) ?? 0) > 0) {
+        continue;
+      }
+      log.debug('Telemetry loss held for the service is sent on its own.', {
+        tabId,
+        dropped: entry.count,
+      });
+      queueTelemetryJob(
+        laneFor(tabId),
+        {
+          tabId,
+          events: [],
+          droppedCount: 0,
+          context: entry.context,
+          deadline: startTelemetryDeadline(),
+        },
+        { held: 0, bounded: false },
+      );
+    }
+  }
+
+  /**
+   * Forget the loss held for a tab — it closed, so no route will carry it —
+   * with one counts-only warning when any was held.
+   */
+  function forgetPendingLoss(tabId: TabId): void {
+    const held = pendingLoss.get(tabId);
+    if (held === undefined) {
+      return;
+    }
+    pendingLoss.delete(tabId);
+    let dropped = 0;
+    for (const entry of held.values()) {
+      dropped = addLossCounts(dropped, entry.count);
+    }
+    abandonedLossCount += 1;
+    log.warn('Telemetry loss the service was not told of was abandoned: its tab closed.', {
+      tabId,
+      dropped,
+      contexts: held.size,
+      abandonedCount: abandonedLossCount,
+    });
+  }
+
+  /** Forget a tab's held loss when `tabs.get` cannot find the tab — it closed. */
+  async function forgetPendingLossOfClosedTab(tabId: TabId): Promise<void> {
+    const open = await Promise.resolve()
+      .then(() => tabs.get(tabId))
+      .then(
+        () => true,
+        () => false,
+      );
+    if (!open && !disposed) {
+      forgetPendingLoss(tabId);
+    }
   }
 
   /**
@@ -3375,11 +3538,16 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     }
   }
 
-  /** Cancel every pending loss notice; part of `dispose`. */
+  /**
+   * Cancel every pending loss notice and forget the loss held for the
+   * service; part of `dispose` — the worker going away, with no connection
+   * left to carry it.
+   */
   function releaseTelemetryCustody(): void {
     for (const tabId of [...lossEpisodes.keys()]) {
       forgetTelemetryLoss(tabId);
     }
+    pendingLoss.clear();
   }
 
   /**
@@ -3435,34 +3603,83 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   /**
    * Drop an accepted batch before any send: its tab has no binding, or the
    * batch was produced for another session or capture than the tab's binding.
-   * Counts, ids and the reason only — never an event.
+   * Counts, ids and the reason only — never an event. A loss-only report is
+   * logged as one, with its count.
+   *
+   * Such a drop names no capture the service could account the loss to, so
+   * it is not held for the ledger; the loss held under the job's own context
+   * has no route either, and is abandoned with it — logged in `dropped`
+   * together with what the job had taken over (`claimed`).
    */
-  function dropTelemetryBatch(job: PendingTelemetryBatch, reason: TelemetryDropReason): void {
+  function dropTelemetryBatch(
+    job: PendingTelemetryBatch,
+    reason: TelemetryDropReason,
+    claimed: number,
+  ): void {
+    const loss = addLossCounts(
+      addLossCounts(job.droppedCount, claimed),
+      claimPendingLoss(job.tabId, [job.context]),
+    );
+    const lossReport = isLossReport(job);
+    if (lossReport && loss === 0) {
+      // A report the worker scheduled whose count another job already carried.
+      log.debug('A held telemetry loss report had nothing left to drop.', { tabId: job.tabId });
+      return;
+    }
     telemetryLossCount += 1;
     const fields = {
       tabId: job.tabId,
-      events: job.events.length,
+      ...(lossReport ? {} : { events: job.events.length }),
+      ...(loss > 0 ? { dropped: loss } : {}),
       reason,
       lossCount: telemetryLossCount,
     };
     if (reason === 'unbound') {
-      log.debug('A telemetry batch from an unbound tab was dropped.', fields);
+      log.debug(
+        lossReport
+          ? 'A telemetry loss report from an unbound tab was dropped.'
+          : 'A telemetry batch from an unbound tab was dropped.',
+        fields,
+      );
       return;
     }
-    log.info('A telemetry batch produced for another session or capture was dropped.', fields);
+    log.info(
+      lossReport
+        ? 'A telemetry loss report produced for another session or capture was dropped.'
+        : 'A telemetry batch produced for another session or capture was dropped.',
+      fields,
+    );
   }
 
   /**
    * Report an accepted batch the service could not be reached for: its tab's
    * route was not confirmed in time or was lost, or the send failed.
+   *
+   * A loss-only report is logged with its count (`loss`, what it did not hand
+   * over) and shown nowhere: it names no undelivered event, and the loss it
+   * carried was shown on the tab's panels when it happened. The notice shows
+   * a batch's events whatever became of them — an upper bound, as its copy
+   * says; {@link holdUndeliveredLoss} holds the count for the ledger.
    */
   function reportTelemetryLoss(
     job: PendingTelemetryBatch,
     sessionId: SessionId,
     stage: 'route' | 'send',
     code: DebuggenErrorCode,
+    loss: number,
   ): void {
     telemetryLossCount += 1;
+    if (isLossReport(job)) {
+      log.warn('A telemetry loss report could not be delivered to the local service.', {
+        tabId: job.tabId,
+        sessionId,
+        dropped: loss,
+        stage,
+        errorCode: code,
+        lossCount: telemetryLossCount,
+      });
+      return;
+    }
     log.warn('A telemetry batch was dropped: it could not be delivered to the local service.', {
       tabId: job.tabId,
       sessionId,
@@ -3472,6 +3689,44 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       lossCount: telemetryLossCount,
     });
     recordTelemetryLoss(job.tabId, 'undelivered', job.events.length);
+  }
+
+  /**
+   * Hold what a job whose route or send failed did not hand to the socket
+   * client, for the service's ledger, under the labels its frames carry: the
+   * batch's events beyond the longest prefix an attempt handed over (a frame
+   * the client took and later discards is reported by the bridge itself), and
+   * its loss unless a frame carrying it was handed over. A failure the
+   * protocol would repeat on every retry (`PROTOCOL_INVALID_MESSAGE`) abandons
+   * the count with a counts-only warning instead of holding it.
+   *
+   * The resend after a queued frame is the whole batch (the queued copy may
+   * be refused when it is flushed ahead of the re-announced binding), so a
+   * batch whose writes threw twice is in the client's queue twice; should
+   * both copies be discarded, their events are counted twice — an upper
+   * bound, like the undelivered notice's, never an undercount.
+   */
+  function holdUndeliveredLoss(
+    job: PendingTelemetryBatch,
+    context: TelemetryBatchContext,
+    stage: 'route' | 'send',
+    code: DebuggenErrorCode,
+    undelivered: { readonly eventsHandedOver: number; readonly loss: number },
+  ): void {
+    const events = job.events.length - Math.min(job.events.length, undelivered.eventsHandedOver);
+    const lost = addLossCounts(events, undelivered.loss);
+    if (lost === 0) {
+      return;
+    }
+    if (code === 'PROTOCOL_INVALID_MESSAGE') {
+      abandonedLossCount += 1;
+      log.warn(
+        'Telemetry loss the service was not told of was abandoned: the protocol refuses its frame.',
+        { tabId: job.tabId, dropped: lost, stage, abandonedCount: abandonedLossCount },
+      );
+      return;
+    }
+    holdPendingLoss(job.tabId, context, lost, stage);
   }
 
   /**
@@ -3493,11 +3748,28 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * 3. Re-read the binding and check it still names the verified session (and
    *    capture): a tab re-bound while the batch waited must not receive it —
    *    a batch produced under one session is never sent as another's.
-   * 4. Send, scoped to the verified session. A route lost between the
-   *    confirmation and the write is awaited once more within the same
-   *    deadline; a second failure drops the batch and reports it.
+   * 4. Take over the loss held for the batch's pinned context and for the
+   *    labels its frames carry ({@link claimPendingLoss}), then send, scoped
+   *    to the verified session, with the page's `droppedCount` and that held
+   *    loss on the first frame. A route lost between the confirmation and the
+   *    write is awaited once more within the same deadline; a second failure
+   *    drops the batch and reports it.
    *
-   * @param job The batch and what was pinned when it arrived.
+   * What a dropped batch leaves undelivered is capture loss the service must
+   * still learn of: a failed route or send holds the events not handed over
+   * and the loss not handed over under the frames' labels
+   * ({@link holdUndeliveredLoss}). A drop for the binding (step 1 or 3) names
+   * no capture the service could account it to, and holds nothing.
+   *
+   * A loss-only report takes the same four steps, so its count reaches the
+   * service only along a confirmed route and after every batch of its tab
+   * queued before it; one the worker scheduled carries only the held loss it
+   * takes over, and sends nothing when an earlier job already carried it. Its
+   * loss is handed over at most once: a retry after a frame reached the
+   * socket client carries no `droppedCount`, which leaves a loss-only report
+   * nothing to resend — a discard of that frame is reported by the bridge.
+   *
+   * @param job The batch and what was pinned when it was queued.
    */
   async function forwardTelemetryBatch(job: PendingTelemetryBatch): Promise<void> {
     await ready;
@@ -3507,12 +3779,12 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     const { tabId } = job;
     const binding = await registry.getBinding(tabId);
     if (binding === undefined) {
-      dropTelemetryBatch(job, 'unbound');
+      dropTelemetryBatch(job, 'unbound', 0);
       return;
     }
     const conflict = telemetryContextConflict(job.context, binding);
     if (conflict !== undefined) {
-      dropTelemetryBatch(job, conflict);
+      dropTelemetryBatch(job, conflict, 0);
       return;
     }
     // What the tab's binding must still say at the write: the session verified
@@ -3521,10 +3793,25 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       sessionId: binding.sessionId,
       captureId: job.context.captureId ?? binding.captureId,
     };
-    // The agent's loss report rides on the batch's first frame. Once a failed
-    // attempt got a frame onto the socket (written, or taken into the client's
-    // queue), a resend must not report the same loss a second time.
+    // The labels every frame of the batch carries — the verified session and
+    // the capture the batch names — under which what it cannot hand over is
+    // held, exactly as the bridge reports a discarded frame of it.
+    const sendContext: TelemetryBatchContext = {
+      sessionId: binding.sessionId,
+      captureId: job.context.captureId,
+    };
+    // The loss rides on the batch's first frame: the page's report and the
+    // held loss this job took over. Once a failed attempt got a frame onto the
+    // socket (written, or taken into the client's queue), a resend must not
+    // report the same loss a second time.
     let lossHandedOver = false;
+    let claimed = 0;
+    // The longest prefix of the batch's events an attempt handed over.
+    let eventsHanded = 0;
+    const undelivered = (): { readonly eventsHandedOver: number; readonly loss: number } => ({
+      eventsHandedOver: eventsHanded,
+      loss: lossHandedOver ? 0 : addLossCounts(job.droppedCount, claimed),
+    });
     for (let attempt = 1; attempt <= TELEMETRY_SEND_ATTEMPTS; attempt += 1) {
       const route = await wsBridge.awaitTabRoute(tabId, binding.sessionId, {
         signal: job.deadline.signal,
@@ -3533,42 +3820,76 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         return;
       }
       if (!route.ok) {
-        reportTelemetryLoss(job, binding.sessionId, 'route', route.error.code);
+        const left = undelivered();
+        if (isLossReport(job) && left.loss === 0) {
+          // A report the worker scheduled has taken nothing over yet: the held
+          // count stays in the accumulator for the next job or confirmation.
+          log.debug('A held telemetry loss report found no route; its count stays held.', {
+            tabId,
+            errorCode: route.error.code,
+          });
+          return;
+        }
+        reportTelemetryLoss(job, binding.sessionId, 'route', route.error.code, left.loss);
+        holdUndeliveredLoss(job, sendContext, 'route', route.error.code, left);
         return;
       }
       const current = await registry.getBinding(tabId);
       if (current === undefined) {
-        dropTelemetryBatch(job, 'unbound');
+        dropTelemetryBatch(job, 'unbound', lossHandedOver ? 0 : claimed);
         return;
       }
       const changed = telemetryContextConflict(verified, current);
       if (changed !== undefined) {
-        dropTelemetryBatch(job, changed);
+        dropTelemetryBatch(job, changed, lossHandedOver ? 0 : claimed);
+        return;
+      }
+      if (!lossHandedOver) {
+        claimed = addLossCounts(claimed, claimPendingLoss(tabId, [job.context, sendContext]));
+      }
+      const loss = undelivered().loss;
+      if (isLossReport(job) && loss === 0) {
+        log.debug('A held telemetry loss report had nothing left to deliver.', { tabId });
         return;
       }
       // Where raw agent batches become protocol `telemetry.event` envelopes,
       // chunked to the protocol's per-frame bound by the bridge. The agent's
       // delivery context rides along: the capture it was armed for, which lets
       // the service refuse a late batch of an earlier capture instead of
-      // filing it under the open one, and the events its bounded buffer
-      // discarded, which the service adds to the capture summary's coverage.
-      // Only defined values are passed, so an absent field stays absent.
+      // filing it under the open one, and the events lost before it — in the
+      // page, and by this worker — which the service adds to the capture
+      // summary's coverage. Only defined values are passed, so an absent field
+      // stays absent. A loss-only report (no events) is one event-less frame
+      // carrying the count, so the loss reaches the service's ledger when no
+      // later batch will carry it.
       const sent = wsBridge.sendTelemetryBatch(tabId, job.events, binding.sessionId, {
         ...(job.context.captureId === undefined ? {} : { armedCaptureId: job.context.captureId }),
-        ...(job.droppedCount > 0 && !lossHandedOver ? { droppedCount: job.droppedCount } : {}),
+        ...(loss > 0 ? { droppedCount: loss } : {}),
       });
       if (sent.ok) {
-        if (job.droppedCount > 0) {
-          // The tab and the count only: the capture id is page-supplied and is
-          // never echoed into a log (AAP §0.5.2).
-          log.info('The page agent dropped events before this batch; the count was forwarded.', {
+        if (loss > 0) {
+          // The tab and the counts only: the capture id is page-supplied and
+          // is never echoed into a log (AAP §0.5.2).
+          log.info(forwardedLossMessage(job), {
             tabId,
-            dropped: job.droppedCount,
+            dropped: loss,
+            ...(claimed > 0 ? { held: claimed } : {}),
           });
         }
         return;
       }
+      eventsHanded = Math.max(eventsHanded, eventsHandedOver(sent.error));
       lossHandedOver ||= framesHandedOver(sent.error) > 0;
+      if (lossHandedOver && isLossReport(job)) {
+        // The report's one frame is in the socket client's hands already; a
+        // resend would carry no loss and so be nothing at all.
+        log.debug('A telemetry loss report was handed over before its write failed.', {
+          tabId,
+          dropped: loss,
+          errorCode: sent.error.code,
+        });
+        return;
+      }
       if (
         attempt < TELEMETRY_SEND_ATTEMPTS &&
         TELEMETRY_ROUTE_LOSS_CODES.includes(sent.error.code)
@@ -3580,9 +3901,21 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         });
         continue;
       }
-      reportTelemetryLoss(job, binding.sessionId, 'send', sent.error.code);
+      const left = undelivered();
+      reportTelemetryLoss(job, binding.sessionId, 'send', sent.error.code, left.loss);
+      holdUndeliveredLoss(job, sendContext, 'send', sent.error.code, left);
       return;
     }
+  }
+
+  /** The log line of a job whose first frame carried a loss to the service. */
+  function forwardedLossMessage(job: PendingTelemetryBatch): string {
+    if (job.droppedCount === 0) {
+      return 'Telemetry loss the service was not told of was forwarded.';
+    }
+    return isLossReport(job)
+      ? "The page's telemetry loss report was forwarded."
+      : 'The page agent dropped events before this batch; the count was forwarded.';
   }
 
   /**
@@ -3600,12 +3933,15 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * on each other.
    *
    * Two bounds hold what one tab can make the worker keep, and what either
-   * refuses is counted, logged and shown to the tab's panels as undelivered
-   * telemetry ({@link recordTelemetryLoss}), never silently lost:
+   * refuses is counted, logged, shown to the tab's panels as undelivered
+   * telemetry ({@link recordTelemetryLoss}) and held for the service's ledger
+   * under the batch's pinned context ({@link holdPendingLoss}), never
+   * silently lost:
    *
    * - {@link MAX_PENDING_TELEMETRY_BATCHES_PER_TAB} batches on the lane — a
    *   batch arriving at a full lane is dropped with a cumulative overflow
-   *   count;
+   *   count, its events and the page's `droppedCount` held; a loss-only
+   *   report arriving there has its count held;
    * - while start-up is pending, {@link COLD_START_HELD_EVENTS_PER_TAB} events
    *   ({@link admitBatch}): the oldest are kept, those beyond are refused.
    *
@@ -3615,6 +3951,14 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * the batch's turn comes, so a batch produced under one binding is never
    * relabelled with a later one.
    *
+   * The page's `droppedCount` travels on the lane even when no event does: a
+   * loss-only report (no events, a positive count) is a job like any batch,
+   * and so is the loss of a batch whose every event the cold-start hold
+   * refused — the refused events are shown as undelivered and held, and the
+   * page's own count still reaches the service, in order behind the batches
+   * before it. An empty batch that reports no loss says nothing and is not
+   * queued.
+   *
    * @param tabId The tab the batch came from — the bridge port's sender.
    * @param batch The page agent's batch, as the port hub validated it.
    */
@@ -3622,49 +3966,113 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     if (disposed) {
       return;
     }
+    if (batch.events.length === 0 && batch.droppedCount === 0) {
+      log.debug('An empty telemetry batch that reports no loss was ignored.', { tabId });
+      return;
+    }
+    const context: TelemetryBatchContext = {
+      sessionId: batch.sessionId,
+      captureId: batch.captureId,
+    };
     const waiting = telemetryLanes.get(tabId)?.pending ?? 0;
     if (waiting >= MAX_PENDING_TELEMETRY_BATCHES_PER_TAB) {
       telemetryOverflowCount += 1;
-      log.warn('A telemetry batch was dropped: too many batches are waiting for its tab.', {
+      if (batch.events.length === 0) {
+        // Its loss was shown on arrival; the service's ledger still misses it.
+        log.warn('A telemetry loss report found its tab’s lane full; its count is held.', {
+          tabId,
+          dropped: batch.droppedCount,
+          pending: waiting,
+          overflowCount: telemetryOverflowCount,
+        });
+      } else {
+        log.warn('A telemetry batch was dropped: too many batches are waiting for its tab.', {
+          tabId,
+          events: batch.events.length,
+          pending: waiting,
+          overflowCount: telemetryOverflowCount,
+        });
+        recordTelemetryLoss(tabId, 'undelivered', batch.events.length);
+      }
+      holdPendingLoss(
         tabId,
-        events: batch.events.length,
-        pending: waiting,
-        overflowCount: telemetryOverflowCount,
-      });
-      recordTelemetryLoss(tabId, 'undelivered', batch.events.length);
+        context,
+        addLossCounts(batch.events.length, batch.droppedCount),
+        'lane-full',
+      );
       return;
     }
     const lane = laneFor(tabId);
-    const { events, held } = admitBatch(lane, tabId, batch.events);
-    if (events.length === 0 && batch.events.length > 0) {
-      // Every event was beyond the cold-start hold: refused and shown already.
+    const { events, held } = admitBatch(lane, tabId, batch.events, context);
+    if (events.length === 0 && batch.events.length > 0 && batch.droppedCount === 0) {
+      // Every event was beyond the cold-start hold — refused, shown and held
+      // already — and the page reported no loss to forward in their place.
       if (lane.links === 0 && telemetryLanes.get(tabId) === lane) {
         telemetryLanes.delete(tabId);
       }
       return;
     }
-    lane.pending += 1;
-    const pending: PendingTelemetryBatch = {
-      tabId,
-      events,
-      droppedCount: batch.droppedCount,
-      context: { sessionId: batch.sessionId, captureId: batch.captureId },
-      deadline: startTelemetryDeadline(),
-    };
+    queueTelemetryJob(
+      lane,
+      {
+        tabId,
+        events,
+        droppedCount: batch.droppedCount,
+        context,
+        deadline: startTelemetryDeadline(),
+      },
+      { held, bounded: true },
+    );
+  }
+
+  /**
+   * Run one lane job ({@link forwardTelemetryBatch}) in its tab's order, and
+   * keep the lane's bookkeeping: `held` events leave the cold-start hold once
+   * start-up has settled, a `bounded` job (a page batch) counts against
+   * {@link MAX_PENDING_TELEMETRY_BATCHES_PER_TAB} while it waits — a loss-only
+   * report the worker scheduled counts against
+   * {@link MAX_PENDING_LOSS_CONTEXTS_PER_TAB} instead — and every job is
+   * counted under its pinned context in {@link TelemetryLane.queued}. The
+   * job's deadline is released however it settles; a job that throws is
+   * logged by name.
+   */
+  function queueTelemetryJob(
+    lane: TelemetryLane,
+    job: PendingTelemetryBatch,
+    options: { readonly held: number; readonly bounded: boolean },
+  ): void {
+    const { held, bounded } = options;
+    const key = telemetryLossKey(job.context);
+    if (bounded) {
+      lane.pending += 1;
+    } else {
+      lane.reports += 1;
+    }
+    lane.queued.set(key, (lane.queued.get(key) ?? 0) + 1);
     background(
-      inTabOrder(tabId, 'telemetry.batch', async () => {
+      inTabOrder(job.tabId, 'telemetry.batch', async () => {
         // Past `ready`: the events no longer count against the cold-start hold.
         lane.heldEvents -= held;
         try {
-          await forwardTelemetryBatch(pending);
+          await forwardTelemetryBatch(job);
         } catch (cause) {
           log.error('A telemetry batch could not be forwarded.', {
-            tabId,
+            tabId: job.tabId,
             error: errorName(cause),
           });
         } finally {
-          pending.deadline.release();
-          lane.pending -= 1;
+          job.deadline.release();
+          if (bounded) {
+            lane.pending -= 1;
+          } else {
+            lane.reports -= 1;
+          }
+          const left = (lane.queued.get(key) ?? 1) - 1;
+          if (left > 0) {
+            lane.queued.set(key, left);
+          } else {
+            lane.queued.delete(key);
+          }
         }
       }),
       'telemetry forwarding',
@@ -3710,12 +4118,15 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       }
       const { tabId } = context;
       // Loss inside the page — the agent's buffer, the bridge's rate budget —
-      // is already final: it is shown now, whatever becomes of the batch.
+      // is already final: it is shown now, whatever becomes of the batch. A
+      // loss-only report (no events) is shown here once, like any batch's.
       if (payload.droppedCount > 0) {
-        log.info('The page agent dropped events before this batch.', {
-          tabId,
-          dropped: payload.droppedCount,
-        });
+        log.info(
+          payload.events.length === 0
+            ? 'The page reported dropped events in a loss-only report.'
+            : 'The page agent dropped events before this batch.',
+          { tabId, dropped: payload.droppedCount },
+        );
         recordTelemetryLoss(tabId, 'dropped-in-page', payload.droppedCount);
       }
       // Like `agent.ready`, a batch routinely arrives while a woken worker is
@@ -3902,7 +4313,9 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * never moves it) and only from a trusted source — the panel's own
    * `inspectedTabId` (its `chrome.devtools.inspectedWindow.tabId`) or, for a
    * panel that names none, the DevTools page that announced the one tab
-   * awaiting a panel. Nothing else chooses it: not the announcement order,
+   * awaiting a panel. Both are this extension's own pages, the only senders
+   * `PORT_PANEL` and `PORT_DEVTOOLS` accept (a panel port's `sender` names no
+   * tab). Nothing else chooses it: not the announcement order,
    * and not the session the panel remembers (`request.sessionId`), which can
    * have been bound to another tab while the port was down.
    *
@@ -4359,7 +4772,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * observes), never for a bound page outside the origins the manifest's
    * content scripts match (no reload can bring the agent there, so an
    * `agent-missing` offer would only time out), and otherwise exactly what
-   * agent-control's consent rule says.
+   * agent-control's consent rule says. The panels receive it as the `reload`
+   * push and the snapshot's `reload` field, pushed again whenever the tab's
+   * readiness, a reload, a content-script bridge or the tab's binding changes
+   * ({@link refreshReloadOffer}).
    */
   async function reloadStateFor(tabId: TabId): Promise<PanelReloadState> {
     return reloadOfferFor(await registry.getBinding(tabId));
@@ -4626,6 +5042,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     // service address serves the bridge's very next call.
     httpClient: () => httpClient,
     tokenProvider: store.getToken,
+    // Every DevTools read carries the read proof pairing issued with the credential.
+    readProofProvider: store.getReadProof,
     onUnauthorized: store.handleUnauthorized,
     hasCredential: store.hasToken,
     alarms,
@@ -4644,6 +5062,17 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     // bridge member, by which time every map `recordTelemetryLoss` uses exists.
     onTelemetryDropped: (tabId, events) => {
       recordTelemetryLoss(tabId, 'undelivered', events);
+    },
+    // The same discards — loss-only frames included — as capture loss the
+    // service's ledger was not told of: the frame's events and the loss it
+    // carried, held under exactly the labels it was sent with.
+    onTelemetryFrameDiscarded: (frame) => {
+      holdPendingLoss(
+        frame.tabId,
+        { sessionId: frame.sessionId, captureId: frame.armedCaptureId },
+        addLossCounts(frame.events, frame.droppedCount),
+        'socket-queue',
+      );
     },
     logger: rootLogger,
   });
@@ -4914,6 +5343,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     }),
     wsBridge.subscribe(MESSAGE_TYPE.SESSION_BOUND, (message) => {
       // The authoritative binding write, the announced replacement included.
+      // A binding it records or keeps is also the tab's route, confirmed on
+      // this connection (the bridge applied the frame before this subscriber):
+      // once the registry holds it, the loss held for the tab can reach the
+      // service's ledger.
       background(
         registry.applyBound(message.payload).then((applied) => {
           log.debug('session.bound applied.', {
@@ -4921,6 +5354,12 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
             outcome: applied.ok ? applied.value.kind : undefined,
             errorCode: errorCode(applied),
           });
+          if (
+            applied.ok &&
+            (applied.value.kind === 'recorded' || applied.value.kind === 'updated')
+          ) {
+            deliverPendingLoss(applied.value.record.tabId);
+          }
         }),
         MESSAGE_TYPE.SESSION_BOUND,
       );
@@ -5029,8 +5468,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     // ends when the service withdraws it, or at its deadline); the entry
     // itself is released now.
     telemetryLanes.delete(tabId);
-    // A closed tab has no panel left to be told of its loss.
+    // A closed tab has no panel left to be told of its loss, and no route
+    // left to carry the loss held for the service.
     forgetTelemetryLoss(tabId);
+    forgetPendingLoss(tabId);
     agent.clear(tabId);
     background(
       registry.unbind(tabId, 'tab-closed').then((removed) => {
@@ -5049,7 +5490,9 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     listen(storage.local.onChanged, handleServiceEndpointChange);
   }
 
-  // The keepalive tick; every other alarm belongs to no module here.
+  // The keepalive tick. The alarm does not keep the worker from being
+  // suspended: firing after a suspension revives it, and the tick reconnects.
+  // Every other alarm belongs to no module here.
   listen(alarms.onAlarm, (alarm) => {
     if (alarm.name !== KEEPALIVE_ALARM_NAME) {
       return;

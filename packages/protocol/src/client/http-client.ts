@@ -3,17 +3,16 @@
  * routes `../http.ts` declares, with the bearer credential applied and every
  * reply parsed by the route's own schema before it reaches a caller.
  *
- * AAP §0.7.1 (Group 1) specifies exactly this — "`HttpClient` wrapping fetch
- * with the bearer token and schema-parsed responses" — and the wrapping is the
- * whole value. Three processes call the local service: the service's own tests,
- * the VS Code extension host (`apps/vscode-extension/src/service/*`) and the
- * Chrome MV3 service worker (`apps/chrome-extension/src/background/*`), which
- * also proxies the DevTools panel's panel-data queries. Each of them would
+ * `HttpClient` wraps `fetch` with the bearer token and schema-parsed responses,
+ * and the wrapping is the whole value. Three processes call the local service:
+ * the service's own tests, the VS Code extension host
+ * (`apps/vscode-extension/src/service/*`) and the Chrome MV3 service worker
+ * (`apps/chrome-extension/src/background/*`), which also proxies the DevTools
+ * panel's panel-data queries. Each of them would
  * otherwise spell out a path, a method, a header set and a response parse of its
  * own, and those four spellings are exactly what drift. Here they are read from
  * the route table, so a route change is a compile error in every caller at once
- * (AAP §0.1.2: "Share protocol schemas between components. Avoid duplicating
- * type definitions.").
+ * and no caller keeps its own copy of a route's types.
  *
  * ## Nothing in this file states a route
  *
@@ -21,7 +20,7 @@
  * from `HTTP_ROUTES[operation].method`, the path from {@link buildPath}, the
  * bodies from {@link parseHttpRequest} and {@link parseHttpResponse}, and the
  * credential requirement from {@link isAuthExemptOperation}. A literal here
- * would be the second definition AAP §0.9.1 forbids — and the one a reviewer
+ * would be a second definition of the route — and the one a reviewer
  * cannot see disagreeing with the first.
  *
  * ## Why `fetch` is injected
@@ -45,11 +44,11 @@
  * `./ws-client.ts` share — and reduced to a canonical {@link ServiceOrigin}. A
  * value that names any host other than this machine's loopback interface, or
  * that carries user information, a path, a query or a fragment, is refused: the
- * constructor still returns (AAP §0.5.5), with {@link HttpClient.baseUrl}
+ * constructor still returns, with {@link HttpClient.baseUrl}
  * `undefined` and {@link HttpClient.configurationError} naming the rule, and
  * every call — exempt ones included — answers `CONFIG_INVALID` **before** the
  * credential provider or the transport is touched. The refused value is not
- * kept, so no message, hint or `details` can quote it (AAP §0.5.2).
+ * kept, so no message, hint or `details` can quote it.
  *
  * ## Cancellation is established before the credential is resolved
  *
@@ -68,7 +67,7 @@
  * `Authorization: Bearer <token>` goes on every request except the two
  * operations `AUTH_EXEMPT_OPERATIONS` names — `health`, which has to answer
  * before a client holds a credential, and `pair.complete`, whose one-time code
- * *is* the capability being presented (AAP §0.5.6). The decision is delegated to
+ * *is* the capability being presented. The decision is delegated to
  * {@link isAuthExemptOperation} rather than made here, and it is made in both
  * directions: an exempt route is called with no `Authorization` header even when
  * a credential is available, and a protected route with no credential fails
@@ -78,7 +77,7 @@
  *
  * The Chrome service worker presents one paired DevTools credential for every
  * inspected tab, so the credential alone cannot tell the service which tab's
- * session a request may touch (AAP §0.5.6). A call's optional `tabId`
+ * session a request may touch. A call's optional `tabId`
  * ({@link HttpRequestArgs.tabId}, {@link HttpCallOptions.tabId}) is sent as
  * {@link ACTING_TAB_HEADER}, formatted by {@link formatActingTabHeader}, and the
  * service verifies it against its live binding table. No `tabId`, no header —
@@ -86,9 +85,22 @@
  * Chrome tab id, or one given for an auth-exempt operation, is refused locally
  * before the credential provider or the transport is reached.
  *
+ * ## A DevTools read carries the proof issued at pairing
+ *
+ * Chrome sends no `Origin` on the `GET`s an extension's service worker makes,
+ * and an `Origin` is only a claim any local process can write, so the service
+ * does not admit a DevTools credential's read on the credential alone.
+ * {@link HttpClient.pairComplete} returns a read proof with the credential; the
+ * worker stores it and passes it as a read's optional `readProof`
+ * ({@link HttpRequestArgs.readProof}), sent as {@link READ_PROOF_HEADER}. It is
+ * accepted only on an authenticated `GET`: a proof given for a write or for an
+ * auth-exempt operation, or one that is not a well-formed proof, is refused
+ * locally before the credential provider or the transport is reached, and the
+ * value is never quoted in a failure or a log record.
+ *
  * Nothing here sets `Origin`, `Cookie` or any `Access-Control-*` header, and
  * `credentials: 'omit'` goes on every call. The service answers no
- * `Access-Control-Allow-Origin` and refuses web origins outright (AAP §0.5.6);
+ * `Access-Control-Allow-Origin` and refuses web origins outright;
  * a client that tried to work around that would be defeating the boundary that
  * keeps a page on `localhost` from driving the developer's editor.
  *
@@ -97,12 +109,12 @@
  * Every method answers `Result<…, DebuggenError>` and
  * {@link HttpClient.request} **never rejects**: a service that is not running, a
  * refused credential, a malformed reply and a missing path parameter all arrive
- * as an `Err` a user interface can render, because AAP §0.5.5 makes "Service not
- * running" a first-class state rather than an exception. It matters most in the
+ * as an `Err` a user interface can render, because "Service not running" is a
+ * first-class state rather than an exception. It matters most in the
  * MV3 service worker, where an unhandled rejection takes the worker down and
  * with it the panel's connection.
  *
- * What a failure carries is bounded by AAP §0.5.2: the credential, the request
+ * What a failure carries is bounded: the credential, the request
  * body and the response body never appear in a message, a hint, `details` or a
  * log line. A schema rejection is rendered by `../version.ts`'s
  * `describeZodIssues` through the two parse helpers, which emit issue paths and
@@ -151,6 +163,7 @@ import {
   ACTING_TAB_HEADER,
   AUTHORIZATION_HEADER,
   HTTP_ROUTES,
+  READ_PROOF_HEADER,
   buildPath,
   captureStartConflictResponseSchema,
   formatActingTabHeader,
@@ -158,6 +171,7 @@ import {
   formatListPageQuery,
   httpErrorResponseSchema,
   isAuthExemptOperation,
+  isReadProof,
   parseHttpRequest,
   parseHttpResponse,
 } from '../http.js';
@@ -238,9 +252,9 @@ const UNAUTHORIZED_FAMILY_CODES: readonly DebuggenErrorCode[] = [
 
 /**
  * The error codes of a `403` that refuses an **accepted** credential for acting
- * outside its scope (AAP §0.5.6, "authorization by role and scope"): a DevTools
- * credential on a session its tab is not bound to (`TAB_NOT_BOUND`), or a path
- * outside the session's project (`PATH_OUTSIDE_PROJECT`).
+ * outside its scope: a DevTools credential on a session its tab is not bound to
+ * (`TAB_NOT_BOUND`), or a path outside the session's project
+ * (`PATH_OUTSIDE_PROJECT`).
  *
  * They are kept as the service sent them rather than flattened to
  * `UNAUTHORIZED`: the credential is valid, so a client that treats
@@ -270,15 +284,16 @@ const SERVER_FAILURE_HINT =
  * Keyed on the code rather than the status because one status covers refusals
  * with opposite remedies: a `403` is both a credential the service would not
  * accept, which pairing again or rotating fixes, and a request from a web origin
- * (`FORBIDDEN_ORIGIN`, AAP §0.5.6), which no credential fixes — advising a
+ * (`FORBIDDEN_ORIGIN`), which no credential fixes — advising a
  * re-pair there sends the developer round a loop that cannot succeed. Every
  * member of {@link UNAUTHORIZED_FAMILY_CODES} has an entry, and
  * `resolveRefusalCode` keeps every `401`/`403` inside that family, so an
  * authentication refusal always carries a hint.
  *
  * Each text is constant: none quotes the reply body, the credential or the base
- * URL, so a hint can be rendered and logged anywhere (AAP §0.5.2). The pairing
- * lifetime and lockout it names are the pairing rules of AAP §0.5.6.
+ * URL, so a hint can be rendered and logged anywhere. The pairing lifetime and
+ * lockout it names are the service's own pairing rules, which
+ * `docs/SECURITY.md` states under "The two unauthenticated operations".
  */
 const REFUSAL_CODE_HINTS: Readonly<Partial<Record<DebuggenErrorCode, string>>> = {
   FORBIDDEN_ORIGIN:
@@ -1066,8 +1081,8 @@ export interface HttpRequestArgs<O extends HttpOperation> {
    * The Chrome service worker presents one paired credential for every
    * inspected tab, so it sets this — from Chrome's port metadata, never from a
    * page — on every session-scoped request it makes for a tab, and the service
-   * holds the request to the session bound to that tab (AAP §0.5.6). Omitted
-   * (or `undefined`), no header is sent: the editor and the Node preload have no
+   * holds the request to the session bound to that tab. Omitted (or
+   * `undefined`), no header is sent: the editor and the Node preload have no
    * tab, and the service refuses the header from their credentials.
    *
    * Refused locally, before the credential provider or the transport is
@@ -1075,6 +1090,23 @@ export interface HttpRequestArgs<O extends HttpOperation> {
    * two auth-exempt ones — an unauthenticated call has no principal to act as.
    */
   readonly tabId?: number | undefined;
+
+  /**
+   * The DevTools read proof issued with the caller's credential by
+   * {@link HttpClient.pairComplete}, sent as {@link READ_PROOF_HEADER}.
+   *
+   * The service admits a DevTools credential's read — `Origin` or not — only
+   * when it carries the proof issued with that credential. Omitted (or
+   * `undefined`), no header is sent, and a DevTools read is refused by the
+   * service as `UNAUTHORIZED`: nothing but the Chrome service worker has a
+   * reason to send one.
+   *
+   * Refused locally, before the credential provider or the transport is
+   * reached, when it is not a well-formed proof (`readProofSchema`), when the
+   * operation is not a `GET`, or when it is one of the two auth-exempt ones.
+   * ⚠️ Secret: never quoted in a failure and never logged.
+   */
+  readonly readProof?: string | undefined;
 }
 
 /**
@@ -1383,8 +1415,9 @@ export class HttpClient {
    *
    * @typeParam O The operation, which fixes both the body and the result type.
    * @param operation The operation to call, keyed into the route table.
-   * @param args The path parameters, body, abort signal, timeout and acting
-   * tab for this call. Omitted entirely for a route that needs none of them.
+   * @param args The path parameters, body, abort signal, timeout, acting tab
+   * and read proof for this call. Omitted entirely for a route that needs none
+   * of them.
    * @returns `ok(body)` with the operation's parsed response, or `err(error)`
    * carrying a renderable code, a message naming the operation, and details
    * limited to the status, the operation and schema-validated payload fields.
@@ -1416,6 +1449,19 @@ export class HttpClient {
 
     if (isErr(actingTab)) {
       return err(actingTab.error);
+    }
+
+    // Settled at the same point and for the same reason: a proof on a call that
+    // may not carry one is refused before anything is resolved or sent.
+    const readProof = readProofHeaderValue(
+      operation,
+      prepared.value.method,
+      prepared.value.authExempt,
+      args?.readProof,
+    );
+
+    if (isErr(readProof)) {
+      return err(readProof.error);
     }
 
     // The outbound body is validated by the same helper the service validates
@@ -1463,6 +1509,10 @@ export class HttpClient {
     // at all rather than an empty one, which the service would refuse.
     if (actingTab.value !== undefined) {
       headers[ACTING_TAB_HEADER] = actingTab.value;
+    }
+
+    if (readProof.value !== undefined) {
+      headers[READ_PROOF_HEADER] = readProof.value;
     }
 
     const fetchImpl = this.fetchImpl ?? resolveGlobalFetch();
@@ -1600,14 +1650,17 @@ export class HttpClient {
    * it cannot reach a message, a hint or `details` — a rejected body is reported
    * by issue path and code only, and a refusal by status and operation only.
    *
-   * The caller stores the returned token — `apps/chrome-extension/src/background/auth.ts`
-   * puts it in `chrome.storage.local` — and hands it to
-   * {@link HttpClient.setToken}.
+   * The caller stores the returned token and read proof together —
+   * `apps/chrome-extension/src/background/auth.ts` puts them in
+   * `chrome.storage.local` — hands the token to {@link HttpClient.setToken} and
+   * passes the proof as {@link HttpRequestArgs.readProof} on each DevTools read.
+   * The proof is as secret as the token and is returned only this once.
    *
    * @param code The code the developer read from the editor.
    * @param options An abort signal and a timeout for this call. A `tabId` is
    * forwarded and refused locally, as for {@link HttpClient.health}.
-   * @returns The credential scoped to this client's origin, or a failure.
+   * @returns The credential scoped to this client's origin and the read proof
+   * issued with it, or a failure.
    */
   pairComplete(
     code: string,
@@ -1936,7 +1989,7 @@ function prepareRoute<O extends HttpOperation>(
  *
  * Both refusals are `PROTOCOL_INVALID_MESSAGE` with a constant message naming
  * the operation and `details: { operation, header }`; the tab id is never
- * quoted (AAP §0.5.2).
+ * quoted.
  *
  * @param operation The operation being called.
  * @param authExempt Whether the operation is called without a credential.
@@ -1983,6 +2036,72 @@ function actingTabHeaderValue(
   }
 
   return ok(formatted.value);
+}
+
+/**
+ * Settles the {@link READ_PROOF_HEADER} value for one call, before the body is
+ * validated or the credential resolved.
+ *
+ * - no `readProof` — no header;
+ * - a `readProof` on one of the two auth-exempt operations — refused: there is
+ *   no credential for the proof to accompany;
+ * - a `readProof` on a request that is not a `GET` — refused: the service
+ *   consults a proof only on the origin-less reads Chrome sends, and refuses
+ *   one anywhere else, so sending it would be a request the service refuses;
+ * - a `readProof` that is not exactly `READ_PROOF_LENGTH` base64url characters
+ *   ({@link isReadProof}) — refused.
+ *
+ * Every refusal is `PROTOCOL_INVALID_MESSAGE` with a constant message naming
+ * the operation and `details: { operation, header }`; the proof is never
+ * quoted.
+ *
+ * @param operation The operation being called.
+ * @param method The route's method, from the route table.
+ * @param authExempt Whether the operation is called without a credential.
+ * @param readProof The read proof the caller supplied, if any.
+ * @returns `ok(value)` with the header value, `ok(undefined)` for none, or the
+ * refusal.
+ */
+function readProofHeaderValue(
+  operation: HttpOperation,
+  method: string,
+  authExempt: boolean,
+  readProof: string | undefined,
+): Result<string | undefined, DebuggenError> {
+  if (readProof === undefined) {
+    return ok(undefined);
+  }
+
+  const refusal = (message: string, hint: string): Result<never, DebuggenError> =>
+    err(
+      new DebuggenError('PROTOCOL_INVALID_MESSAGE', `Cannot call ${operation}: ${message}`, {
+        hint,
+        details: { operation, header: READ_PROOF_HEADER },
+      }),
+    );
+
+  if (authExempt) {
+    return refusal(
+      'a read proof was given for an operation that carries no credential',
+      'Omit readProof on health and pair.complete; a read proof accompanies a DevTools credential, and these two operations present none.',
+    );
+  }
+
+  if (method !== 'GET') {
+    return refusal(
+      'a read proof was given for a request that is not a read',
+      'Pass readProof only on the GET operations a DevTools credential calls; a write is bound to the extension by its Origin instead.',
+    );
+  }
+
+  if (!isReadProof(readProof)) {
+    return refusal(
+      'readProof is not a well-formed read proof',
+      'Pass the readProof pairComplete returned with the credential, exactly as returned: 43 base64url characters without padding.',
+    );
+  }
+
+  return ok(readProof);
 }
 
 /**

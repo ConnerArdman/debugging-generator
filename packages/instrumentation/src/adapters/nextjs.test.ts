@@ -10,34 +10,36 @@
  *    per-method locations; a server function is selected from a
  *    `server-function` node reached along the graph's own call edges. No route
  *    path, handler name or service-function name is written here as an
- *    expectation — every one is computed from the graph a case indexed
- *    (AAP §0.5.4), which is why the scratch corpus below carries deliberately
+ *    expectation — every one is computed from the graph a case indexed,
+ *    because the product may know nothing of a particular application's names
+ *    or routes. That is also why the scratch corpus below carries deliberately
  *    meaningless identifiers this product has never seen.
  * 2. **Every action is `patch`-mode, and a generator is never proposed.**
  *    `../installer.ts` reads the mode to install every runtime-mode group
  *    before any patch-mode group, so a wrong mode would silently change
  *    install ordering rather than fail; and a generator has no function-timing
  *    template, so proposing one would put a target in the plan a developer
- *    reads that the patcher is going to refuse (AAP §0.5.1).
+ *    reads that the patcher is going to refuse.
  * 3. **With no preload attached, not one byte is written.** A file
  *    modification that cannot produce a span is pure risk to a developer's
  *    working tree, so the install applies nothing, journals nothing, and
- *    reports the gap with the exact relaunch command (AAP §0.5.5) — naming the
- *    project root once, inside the command, whenever it fits the hint bound,
- *    and never cut short however deep the root is. The cases that assert this
- *    run against a *copy* of the corpus with a real backup store, so a
- *    violation is detectable rather than merely improbable.
+ *    reports the gap with the exact relaunch command — naming the project root
+ *    once, inside the command, whenever it fits the hint bound, and never cut
+ *    short however deep the root is. The cases that assert this run against a
+ *    *copy* of the corpus with a real backup store, so a violation is
+ *    detectable rather than merely improbable.
  * 4. **With a preload attached, the real patcher does the writing.** The
  *    records that come back are the ones the journal received, in the order
  *    that makes crash reconciliation decidable — a `pending` row carrying both
  *    hashes while the file still holds the original, then the transition to
  *    `applied` once it holds the patched bytes — and they land in
  *    `InstallResult.applied`, which is exactly what lets `../installer.ts`
- *    reverse-restore a failed plan (AAP §0.4.2). A target that cannot be
- *    completed stops the install there and is reported through the fatal
- *    channel, `InstallResult.failure`, with the record journaled for its
- *    attempt; the real `installPlan` is then shown to leave a failed follow-up
- *    delta's files byte-identical to what the previous plan version left.
+ *    reverse-restore a failed plan, so a follow-up delta is all-or-nothing. A
+ *    target that cannot be completed stops the install there and is reported
+ *    through the fatal channel, `InstallResult.failure`, with the record
+ *    journaled for its attempt; the real `installPlan` is then shown to leave a
+ *    failed follow-up delta's files byte-identical to what the previous plan
+ *    version left.
  * 5. **The adapter restores nothing and invents nothing.** `remove` leaves
  *    every patched file patched (restoration is `../cleanup.ts`'s, chain-aware
  *    and in strict reverse order), no record in `applied` is hand-built, and
@@ -68,7 +70,7 @@
  *   (one with two method exports) and a three-hop call chain the committed
  *   corpus cannot express — which is what makes the reachability depth bound
  *   and URL narrowing observable — with arbitrary identifiers that double as
- *   the behavioural half of AAP §0.5.4's no-hardcoding rule.
+ *   the behavioural half of the product's no-hardcoding rule.
  * - **Hand-authored `CodeIndex` values** for the two capability edges: a
  *   project with no server tier at all, and one with server functions but no
  *   routes. Neither is expressible as a source tree without inventing a
@@ -76,8 +78,8 @@
  *
  * ## One reconciliation, recorded rather than worked around
  *
- * This file's brief speaks of the `routes-to` edge from a route into the
- * service layer. The vocabulary `@debuggen/code-analysis` owns says something
+ * The name `routes-to` reads like the edge from a route into the service
+ * layer. The vocabulary `@debuggen/code-analysis` owns says something
  * different and is followed: `CODE_EDGE_KINDS` fixes `routes-to` as `api-call`
  * → `api-route`, and `extractors/server-functions.ts` states that the
  * route-to-service linkage is a **`calls`** edge from the `api-route` node.
@@ -516,10 +518,11 @@ const scratchRoots: string[] = [];
  * Writes a source tree into its own `mkdtemp` directory and indexes it.
  *
  * A `package.json` is included because `ProjectSummary` reads the package
- * manager from it, which is what the relaunch hint of AAP §0.5.5 is composed
- * from; a `tsconfig.json` because a target project's configuration is what
- * `openProject` takes its compiler options from; and a `next.config.mjs`
- * because the router style is detected from the project's own shape.
+ * manager from it, which is what the relaunch hint for an unavailable server
+ * signal is composed from; a `tsconfig.json` because a target project's
+ * configuration is what `openProject` takes its compiler options from; and a
+ * `next.config.mjs` because the router style is detected from the project's
+ * own shape.
  *
  * @param label A short, human-readable name for the temporary directory.
  * @param files Project-relative POSIX paths mapped to file contents.
@@ -633,8 +636,8 @@ interface RecordingJournal extends ModificationJournal {
  * Recording instead of throwing is deliberate: a throwing journal proves only
  * that the adapter did not crash into it, while a recorder lets a case assert
  * the *stronger* statement — that `append` was never called, because there was
- * no modification to record (AAP §0.5.1) — and lets the write-order case above
- * read the disk at each call.
+ * no modification to record — and lets the write-order case above read the
+ * disk at each call.
  *
  * @param projectRoot The absolute project root a record's file is resolved
  * against, for the on-disk witness. Omitted for a context with no real tree.
@@ -1252,12 +1255,12 @@ function occurrencesOf(text: string, needle: string): number {
  * Asserts how a hint names the project it is about, for a root of any length.
  *
  * At most once, because the root is actionable in exactly one place — as the
- * directory of the hand-typed command — and naming it twice is what used to push
- * that command past the bound. Exactly once whenever the root is no longer than
- * half the hint bound: everything else these hints carry sits well inside the
- * other half, so such a root always fits. A longer root may legitimately be
- * dropped in favour of the command, which is what keeps this assertion true for
- * a sandbox under any `TMPDIR` rather than only under a short one.
+ * directory of the hand-typed command — and every repetition spends hint budget
+ * the command needs. Exactly once whenever the root is no longer than half the
+ * hint bound: everything else these hints carry sits well inside the other
+ * half, so such a root always fits. A longer root may legitimately be dropped
+ * in favour of the command, which is what keeps this assertion true for a
+ * sandbox under any `TMPDIR` rather than only under a short one.
  *
  * @param hint The hint.
  * @param projectRoot The root of the project the hint is about.
@@ -1289,10 +1292,10 @@ interface RelaunchExpectation {
 }
 
 /**
- * Asserts everything AAP §0.5.5 asks of a relaunch hint, for a root of any
- * length: one whole line within the hint bound, the preload assignment and the
- * exact command, every environment variable name, and the project root named
- * at most once — as the directory of that command whenever it is named.
+ * Asserts everything a relaunch hint must carry, for a root of any length: one
+ * whole line within the hint bound, the preload assignment and the exact
+ * command, every environment variable name, and the project root named at most
+ * once — as the directory of that command whenever it is named.
  *
  * @param hint The hint.
  * @param projectRoot The root of the project the hint is about.
@@ -1746,7 +1749,8 @@ describe('canHandle', () => {
     for (const [name, readiness] of presetEntries(fixture.root)) {
       // Capability is not readiness. Conflating them would make this adapter
       // invisible exactly when its relaunch hint is the thing a developer
-      // needs (AAP §0.5.5).
+      // needs: an unavailable signal is reported with the command that
+      // restores it, and only an adapter that claims the project reports it.
       expect(
         adapter.canHandle(contextFor({ project: fixture, readiness })),
         `canHandle must not depend on the '${name}' preload state`,
@@ -1925,7 +1929,7 @@ describe('createPlan', () => {
         // module's whole symbol list is resolved from the graph rather than
         // named here. A generator has no function-timing template, so the
         // refusal belongs in the proposal — `../feasibility.ts` and the
-        // patcher are a second line of defence, not a substitute (AAP §0.5.1).
+        // patcher are a second line of defence, not a substitute.
         expect(
           actions.map((action) => `${action.file}#${action.symbol}`),
           `${file}#${name} is a generator and must never be proposed`,
@@ -2138,7 +2142,7 @@ describe('install with no preload attached', () => {
     expect(result.serverSignals).toBeUndefined();
 
     // A file modification that cannot produce a span is pure risk to a
-    // developer's working tree (AAP §0.5.1), so the evidence is the disk.
+    // developer's working tree, so the evidence is the disk.
     expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).toEqual([]);
     expect(journal.events).toEqual([]);
     expect(backupEntries(world)).toEqual([]);
@@ -2230,8 +2234,9 @@ describe('install with no preload attached', () => {
 
     for (const gap of result.unavailable) {
       // Names only, never values: the ingest URL and the per-launch
-      // credential are minted by the launcher (AAP §0.5.6), and a hint that
-      // quoted one would be a credential in a user interface.
+      // credential are minted by the launcher (docs/SECURITY.md, "The launched
+      // dev server"), and a hint that quoted one would be a credential in a
+      // user interface.
       expectRelaunchHint(
         gap.hint,
         world.projectRoot,
@@ -2395,7 +2400,8 @@ describe('install with the preload attached', () => {
 
       // The ordering that makes crash reconciliation decidable: the row knows
       // the expected post-write hash before anything is written, so a file
-      // found at either hash has an unambiguous verdict (AAP §0.5.1).
+      // found at either hash has an unambiguous verdict (docs/ARCHITECTURE.md,
+      // "The crash-safe write sequence").
       // Failure injection is `patch/patcher.test.ts`'s territory; what this
       // suite pins is that the adapter drives the sequence rather than
       // reporting a record the store never saw.
@@ -3057,7 +3063,7 @@ describe('readiness', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Relaunch hints at any project-root depth (AAP §0.5.5)
+ * Relaunch hints at any project-root depth
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -3383,7 +3389,7 @@ describe('remove', () => {
     // Restoration is `../cleanup.ts`'s: it holds the chain it intends to
     // unwind, walks it in strict reverse and verifies each file against its
     // record's `instrumentedHash` first, so a developer's later edit survives.
-    // Writing here would race that walk (AAP §0.5.1).
+    // Writing here would race that walk.
     expect(result.restored).toEqual([]);
     expect(result.conflicts).toEqual([]);
     expect(result.adapterId).toBe(NEXTJS_ADAPTER_ID);
@@ -3574,7 +3580,7 @@ describe('the import boundary', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * No route, no name and no knowledge of its own (AAP §0.5.4)
+ * No route, no name and no knowledge of its own
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -3736,7 +3742,7 @@ describe('the committed corpus', () => {
     // dirty the repository — it drives the real patcher — so the claim that
     // every write went to a copy is asserted rather than assumed, and it is
     // what keeps `git status --porcelain packages/instrumentation/test/fixtures`
-    // empty after `pnpm test` (AAP §0.5.1, §0.8.4 acceptance test 3).
+    // empty after `pnpm test`.
     expect(treeSnapshot(FIXTURE_ROOT)).toEqual(fixtureSnapshotBefore);
   });
 });

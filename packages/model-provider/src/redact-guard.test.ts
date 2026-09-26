@@ -10,7 +10,10 @@
  *    all five provider credential prefixes. A rule that recognised five of six
  *    names would otherwise pass a suite built from one case per class.
  *    `high-entropy-secret`, which is the one class defined by a measurement,
- *    additionally pins both of its thresholds from above and below.
+ *    additionally pins both of its thresholds from above and below. The two
+ *    position-driven classes are also pinned in their text forms — a URL
+ *    embedded in prose and a header line inside text — against the
+ *    redactor's compliant output and against ordinary source code.
  * 2. **The compliant output of the first checkpoint passes.** A denied header
  *    carrying `[redacted]`, a `?`-masked URL, parameterised SQL and a React
  *    prop preview truncated to 120 characters are what the ingest checkpoint
@@ -57,8 +60,11 @@ import {
   DENIED_HEADER_NAMES,
   ENTROPY_MIN_BITS_PER_CHAR,
   ENTROPY_MIN_LENGTH,
+  FRAME_CONTEXT_MAX_LENGTH,
   KEY_LIKE_NAME_TERMS,
+  MASKED_QUERY_VALUES,
   MAX_SUPPORTED_DEPTH,
+  MAX_URL_RUNS_PER_STRING,
   PATH_SEGMENT_MAX_LENGTH,
   PATH_SEGMENT_TRUNCATION_MARKER,
   REDACTION_MARKER,
@@ -68,6 +74,7 @@ import {
   SCAN_WINDOW_LENGTH,
   SCAN_WINDOW_OVERLAP,
   SUMMARY_MAX_PATHS_PER_RULE,
+  TEXT_TRUNCATION_MARKER,
   URL_PARSE_MAX_LENGTH,
   URL_QUERY_MASK,
   assertOutboundSafe,
@@ -441,6 +448,16 @@ describe('the deny-list vocabulary', () => {
     expect(URL_QUERY_MASK).toHaveLength(1);
   });
 
+  it('counts a query value as masked only in the four forms the first checkpoint writes', () => {
+    // The empty value, the mask, and each of them cut short by the truncation
+    // marker every bounded preview appends. Pinned as a list: a fifth form
+    // would let page bytes through, and a missing one would refuse the
+    // redactor's own output.
+    expect(TEXT_TRUNCATION_MARKER).toBe('\u2026');
+    expect([...MASKED_QUERY_VALUES]).toEqual(['', '?', '\u2026', '?\u2026']);
+    expect(Object.isFrozen(MASKED_QUERY_VALUES)).toBe(true);
+  });
+
   it('mirrors the six denied header names verbatim', () => {
     expect([...DENIED_HEADER_NAMES]).toEqual([
       'authorization',
@@ -467,9 +484,13 @@ describe('the deny-list vocabulary', () => {
       'max-depth',
       'max-nodes',
       'max-string-length',
+      'max-url-runs',
+      'max-url-length',
       'max-findings',
       'inspection-error',
     ]);
+    expect(MAX_URL_RUNS_PER_STRING).toBeGreaterThan(0);
+    expect(FRAME_CONTEXT_MAX_LENGTH).toBeGreaterThan(0);
     expect(DEFAULT_MAX_DEPTH).toBeGreaterThan(0);
     expect(DEFAULT_MAX_NODES).toBeGreaterThan(0);
     expect(DEFAULT_MAX_STRING_LENGTH).toBeGreaterThan(SCAN_WINDOW_LENGTH);
@@ -1193,6 +1214,511 @@ describe('a payload the ingest checkpoint already redacted passes', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * URLs embedded in prose
+ *
+ * A developer's question, a rendered prompt, a captured label and an error
+ * message all quote URLs inside sentences, so `url-query-value` reads every
+ * string for embedded runs as well as for whole-field URLs. The cases below pin
+ * both directions of the contract with the first checkpoint: every value the
+ * telemetry layer would have masked and did not is refused, and every form it
+ * writes — and every ordinary line of source code — passes.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A short query value a page wrote, kept out of the source as one literal. */
+const SHORT_QUERY_VALUE = assemble('ZIP', '42');
+
+/** The `url-query-value` findings of one string, read under `input.note`. */
+function urlFindings(text: string): readonly RedactGuardFinding[] {
+  return inspectPayload({ note: text }, { rules: ['url-query-value'] });
+}
+
+/** Where a finding for parameter `name` of `input.note` is reported. */
+function notePath(name: string): string {
+  return `${DEFAULT_ROOT_PATH}.note${URL_QUERY_MASK}${name}`;
+}
+
+/** Asserts that one string yields exactly one finding, for `name`. */
+function expectUnmaskedParameter(text: string, name: string): void {
+  const findings = urlFindings(text);
+  expect(findings, text).toHaveLength(1);
+  expect(findings[0]?.ruleId, text).toBe('url-query-value');
+  expect(findings[0]?.path, text).toBe(notePath(name));
+  expect(findings[0]?.reason, text).toBe(REDACTION_RULE_REASONS['url-query-value']);
+}
+
+describe('a URL embedded in prose is inspected', () => {
+  it('refuses a question that quotes an unmasked query value, naming only the parameter', () => {
+    // The finding the whitespace shortcut used to let through: the rendered
+    // prompt carries the question, and the value reached the provider.
+    const question = `Why is /reset?code=${SHORT_QUERY_VALUE} slow?`;
+    const result = assertOutboundSafe(makeRequest({ prompt: question }));
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.details?.ruleIds).toEqual(['url-query-value']);
+    expect(result.error.details?.paths).toEqual([`prompt${URL_QUERY_MASK}code`]);
+    const printed = [
+      result.error.message,
+      result.error.hint ?? '',
+      JSON.stringify(result.error.details),
+      JSON.stringify(result.error.toPayload()),
+    ].join('\n');
+    expect(printed).not.toContain(SHORT_QUERY_VALUE);
+  });
+
+  it('reads every prose half of a request and every string of the structured context', () => {
+    const run = `/reset?code=${SHORT_QUERY_VALUE}`;
+    const result = assertOutboundSafe(
+      makeRequest({
+        system: `Never repeat ${run} to the developer.`,
+        prompt: `${CLEAN_PROMPT} The page linked ${run} twice.`,
+        messages: [
+          { role: 'user', content: 'Why did this take so long?' },
+          { role: 'assistant', content: `The slow request was ${run} after the click.` },
+        ],
+        input: { requests: [{ note: `Visited ${run} before clicking` }] },
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.details?.paths).toEqual([
+      `system${URL_QUERY_MASK}code`,
+      `prompt${URL_QUERY_MASK}code`,
+      `messages[1].content${URL_QUERY_MASK}code`,
+      `${DEFAULT_ROOT_PATH}.requests[0].note${URL_QUERY_MASK}code`,
+    ]);
+    expect(JSON.stringify(result.error.details)).not.toContain(SHORT_QUERY_VALUE);
+  });
+
+  it('reports punctuation a page wrote as a value, not as the end of a sentence', () => {
+    // Legal query characters. Whether they close the sentence or belong to the
+    // value is the ambiguity the first checkpoint resolves by masking them, so
+    // any that survive here were never masked — a mask followed by a full stop
+    // included.
+    expectUnmaskedParameter('Open /reset?code=!!!! to reproduce', 'code');
+    expectUnmaskedParameter('Open /reset?code=.... to reproduce', 'code');
+    expectUnmaskedParameter('See /p?id=?. for the list', 'id');
+    for (const value of ['!!!!', '....', '?.']) {
+      expect(serialise(urlFindings(`Open /reset?code=${value} now`))).not.toContain(value);
+    }
+  });
+
+  it('reads an absolute URL anywhere in a sentence, and a relative one after a space or a bracket', () => {
+    expectUnmaskedParameter('see https://x.test/a?b=1 now', 'b');
+    expectUnmaskedParameter('see HTTP://x.test/a?b=1 now', 'b');
+    expectUnmaskedParameter('(see /p?id=7)', 'id');
+    expectUnmaskedParameter('/p?id=7 was the first request', 'id');
+    expectUnmaskedParameter('then\n/p?id=7 again', 'id');
+  });
+
+  it('names the first unmasked parameter of a run, and each name once per field', () => {
+    expectUnmaskedParameter('see /p?page=?&cursor=abc&sort=desc now', 'cursor');
+    const repeated = urlFindings('first /p?cursor=abc then /q?cursor=def');
+    expect(repeated.map((finding) => finding.path)).toEqual([notePath('cursor')]);
+    const distinct = urlFindings('first /p?cursor=abc then /q?sort=desc');
+    expect(distinct.map((finding) => finding.path)).toEqual([notePath('cursor'), notePath('sort')]);
+  });
+
+  it('passes every masked form the first checkpoint writes', () => {
+    for (const text of [
+      'Why is /reset?code=? slow?',
+      'see https://x.test/a?b=?#? now',
+      'see /p?id=\u2026',
+      'see /p?id=?\u2026',
+      'see /p?id=?&flag&empty= and /q?x=?&[redacted] now',
+      'Why? It is slow.',
+    ]) {
+      const report = inspectPayloadReport({ note: text });
+      expect(report.findings, text).toEqual([]);
+      expect(report.complete, text).toBe(true);
+    }
+    expect(assertOutboundSafe(makeRequest({ prompt: 'Why is /reset?code=? slow?' })).ok).toBe(true);
+  });
+
+  it('accepts the position a stack frame keeps after its masked query, and only in a frame', () => {
+    // The redactor re-attaches a frame's runtime-appended position after it
+    // masks the URL, because the source-map route needs it; the parser reads
+    // that position as part of the last value. Outside a frame nothing licenses
+    // that reading, so the same run is a finding.
+    const frame = '    at fn (http://127.0.0.1:3000/app.js?v=?:10:5)';
+    expect(urlFindings(frame)).toEqual([]);
+    expect(
+      urlFindings(`Error: boom\n${frame}\n    at run (http://127.0.0.1:3000/app.js?v=?:2:1)`),
+    ).toEqual([]);
+    expect(urlFindings('fn@http://127.0.0.1:3000/app.js?v=?:10:5')).toEqual([]);
+    expect(urlFindings('    at http://127.0.0.1:3000/app.js?v=&t=?:10:5')).toEqual([]);
+    expect(urlFindings('    at fn (http://127.0.0.1:3000/app.js?v=?:10:\u2026')).toEqual([]);
+
+    expectUnmaskedParameter('    at fn (http://127.0.0.1:3000/app.js?v=1:10:5)', 'v');
+    expectUnmaskedParameter('loaded http://x/app.js?v=?:10:5', 'v');
+    expectUnmaskedParameter('    at fn (/app.js?v=?:10:5)', 'v');
+  });
+
+  it('reads a frame marker only from the run line, and only within the look-back bound', () => {
+    // Another line's `at` is not this frame's.
+    expectUnmaskedParameter('    at fn (x)\nloaded http://x/app.js?v=?:10:5', 'v');
+    // A marker further back than the bound is not read, which is the strict
+    // direction: the position is reported rather than accepted.
+    const far = `    at fn (${'w'.repeat(FRAME_CONTEXT_MAX_LENGTH)}http://x/app.js?v=?:10:5)`;
+    expectUnmaskedParameter(far, 'v');
+    // A look-back cut just before an `at` inside a word must not read as the
+    // start of a line.
+    const cut = `zzzzzat ${'w'.repeat(FRAME_CONTEXT_MAX_LENGTH - 3)}http://x/app.js?v=?:10:5`;
+    expectUnmaskedParameter(cut, 'v');
+  });
+
+  it('leaves ordinary source code alone', () => {
+    // A refusal fails a whole pipeline stage, and bounded source excerpts are
+    // an ordinary part of a payload, so code that merely writes a path, a
+    // ternary or a regular expression must never match.
+    const excerpts = [
+      'const RE = /^(?=\\S+$)(?:\\S*[0-9]\\S*|[^a-z]+)$/;',
+      'const response = await fetch(`/api/x?a=${id}`);',
+      "const url = '/api/x?limit=20';",
+      'const url = "/api/x?limit=20";',
+      'const size = y ? 1 : 2;',
+      'x = y ? 1 : 2',
+      'router.get("/api/items/:id", handler); // GET /api/items/:id',
+      'const next = page ? `/catalog?page=${page}` : "/catalog";',
+    ];
+    const excerpt = excerpts.join('\n');
+    expect(inspectPayloadReport({ excerpt }).findings).toEqual([]);
+    for (const line of excerpts) {
+      expect(inspectPayload({ excerpt: line }), line).toEqual([]);
+    }
+    expect(assertOutboundSafe(makeRequest({ prompt: `${CLEAN_PROMPT}\n${excerpt}` })).ok).toBe(
+      true,
+    );
+  });
+
+  it('ends a run at a JSON escape, so a masked URL rendered into a JSON section passes', () => {
+    // A stage renders its structured context into the prompt with
+    // JSON.stringify: the line break or quote the raw run stopped at arrives
+    // as a two-character escape directly after the masked value.
+    const masked = [
+      '// GET /api/x?page=?\nconst next = 1;',
+      'see "https://x.test/docs?tab=?" for details',
+      'Error: boom\n    at fn (http://127.0.0.1:3000/app.js?v=?:10:5)\n    at g (x)',
+      // An initiator stack starts with its first frame, which JSON rendering
+      // puts directly after the string's opening quote.
+      'at send (http://127.0.0.1:3000/app.js?v=?:18:3)\n    at flush (http://127.0.0.1:3000/b.js?v=?:2:1)',
+      'first line\t/p?id=?\tsecond',
+      'see /p?id=?\fnext and https://x.test/a?b=?\u000bnext',
+    ];
+    for (const text of masked) {
+      const rendered = JSON.stringify({ excerpt: text });
+      const report = inspectPayloadReport({ note: rendered });
+      expect(report.findings, rendered).toEqual([]);
+      expect(assertOutboundSafe(makeRequest({ prompt: `${CLEAN_PROMPT}\n${rendered}` })).ok).toBe(
+        true,
+      );
+    }
+    // An unmasked value before the escape is still read, whole.
+    for (const [text, name] of [
+      [`// GET /api/x?page=${SHORT_QUERY_VALUE}\nconst next = 1;`, 'page'],
+      [`see "https://x.test/docs?tab=${SHORT_QUERY_VALUE}" now`, 'tab'],
+      ['    at fn (http://127.0.0.1:3000/app.js?v=1:10:5)\n    at g (x)', 'v'],
+    ] as const) {
+      const rendered = JSON.stringify({ excerpt: text });
+      expectUnmaskedParameter(rendered, name);
+      expect(serialise(urlFindings(rendered))).not.toContain(SHORT_QUERY_VALUE);
+    }
+    // A backslash that opens no whitespace or quote escape belongs to the
+    // value: an escaped backslash, `\b`, and a `\u` escape of anything but a
+    // vertical tab, which is how `?code=?\u005a` would hide a value.
+    expectUnmaskedParameter('see /p?id=\\ZIP now', 'id');
+    expectUnmaskedParameter('see https://x.test/a?b=?\\x now', 'b');
+    expectUnmaskedParameter('see /p?code=?\\u005a now', 'code');
+    expectUnmaskedParameter('see https://x.test/a?b=?\\\\ now', 'b');
+    expectUnmaskedParameter('see /p?id=?\\b now', 'id');
+    expectUnmaskedParameter(JSON.stringify({ note: 'see /p?id=?\u0001 now' }), 'id');
+  });
+
+  it('anchors a relative run after a written whitespace escape, as the masker does', () => {
+    // A prompt-only JSON section: the run starts a line of the raw string, so
+    // the escape's `n` stands before it in the rendered text.
+    for (const escape of ['\n', '\t', '\r', '\f', '\u000b']) {
+      const rendered = JSON.stringify({ note: `first${escape}/reset?code=${SHORT_QUERY_VALUE}` });
+      expectUnmaskedParameter(rendered, 'code');
+      expect(
+        assertOutboundSafe(makeRequest({ prompt: `${CLEAN_PROMPT}\n${rendered}`, input: {} })).ok,
+        escape,
+      ).toBe(false);
+      const masked = JSON.stringify({ note: `first${escape}/reset?code=?` });
+      expect(urlFindings(masked), escape).toEqual([]);
+    }
+    // A literal backslash-n in raw text anchors too; the masker masks it.
+    expectUnmaskedParameter('const s = "a\\n/p?id=7";', 'id');
+    expect(urlFindings('const s = "a\\n/p?id=?";')).toEqual([]);
+  });
+
+  it('skips a run the parser rejects without throwing', () => {
+    // Not a URL, so not this rule's to judge; the first checkpoint masks the
+    // query of any text shaped like one regardless.
+    let report: RedactGuardReport | undefined;
+    expect(() => {
+      report = inspectPayloadReport({ note: 'see http://[not-an-address/p?x=1 now' });
+    }).not.toThrow();
+    expect(report?.complete).toBe(true);
+  });
+
+  it('bounds the runs parsed per string, and refuses a string with more of them', () => {
+    // Only a run that can carry a value is parsed and counted; the bound is
+    // generous for a real prompt and fails closed on a hostile one.
+    const run = '/a?b=? ';
+    const atBound = inspectPayloadReport({ note: run.repeat(MAX_URL_RUNS_PER_STRING) });
+    expect(atBound.findings).toEqual([]);
+    expect(atBound.complete).toBe(true);
+
+    const pastBound = { note: run.repeat(MAX_URL_RUNS_PER_STRING + 1) };
+    const report = inspectPayloadReport(pastBound);
+    expect(report.findings).toEqual([]);
+    expect(report.complete).toBe(false);
+    expect(report.limitsReached).toEqual(['max-url-runs']);
+    expect(assertOutboundSafe(makeRequest({ input: pastBound })).ok).toBe(false);
+
+    const flags = inspectPayloadReport({ note: '/a?b '.repeat(MAX_URL_RUNS_PER_STRING + 16) });
+    expect(flags.complete).toBe(true);
+  });
+
+  it('reads nothing past the string bound', () => {
+    // The embedded scan reads the same code units as the windowed patterns, so
+    // a run past the bound is not read — and the string bound is recorded.
+    const beyond = `${padding(2_048 + SCAN_WINDOW_OVERLAP + 16)}/p?id=${SHORT_QUERY_VALUE}`;
+    const report = inspectPayloadReport(
+      { note: beyond },
+      { maxStringLength: 2_048, rules: ['url-query-value'] },
+    );
+    expect(report.findings).toEqual([]);
+    expect(report.limitsReached).toEqual(['max-string-length']);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Header lines inside text
+ *
+ * A header travels as a field under its name, which the key rule checks, and
+ * as a line of text — a question that pastes a request, a log message, an
+ * attribute rendered into a prompt as JSON. The line form carries no length a
+ * rule could lean on (a short credential is still a credential) and a cookie
+ * line has no scheme word at all, so it is recognised by its header name. The
+ * cases pin both directions: every line that still carries a value is
+ * refused, and the compliant output and ordinary code pass.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A credential shorter than the bearer rule's minimum, from fragments. */
+const SHORT_CREDENTIAL = assemble('S3', 'CRET');
+
+/** A short cookie value, from fragments. */
+const COOKIE_VALUE = assemble('q7', 'Zr');
+
+/** A short API key, from fragments. */
+const API_KEY_VALUE = assemble('k9', 'Xw2');
+
+/** The `sensitive-header` findings of one string, read under `input.note`. */
+function headerFindings(text: string): readonly RedactGuardFinding[] {
+  return inspectPayload({ note: text }, { rules: ['sensitive-header'] });
+}
+
+describe('a header line inside text is inspected', () => {
+  it('reports a header line that still carries its value, in each of the three value shapes', () => {
+    const lines = [
+      `Authorization: Bearer ${SHORT_CREDENTIAL}`,
+      `authorization:bearer ${SHORT_CREDENTIAL}`,
+      `AUTHORIZATION :\tBEARER\t${SHORT_CREDENTIAL}`,
+      `Proxy-Authorization: Basic ${SHORT_CREDENTIAL}`,
+      `Authorization: Digest username="${SHORT_CREDENTIAL}"`,
+      `Authorization: NTLM ${SHORT_CREDENTIAL}`,
+      `Authorization: Bearer ${SHORT_CREDENTIAL}_${COOKIE_VALUE}`,
+      `http.request.header.authorization: Negotiate ${SHORT_CREDENTIAL}`,
+      `Cookie: session=${COOKIE_VALUE}`,
+      `Cookie: theme=dark; session=${COOKIE_VALUE}`,
+      'Set-Cookie: sid=1',
+      `X-Api-Key: ${API_KEY_VALUE}`,
+      `X-Api-Key: live_${API_KEY_VALUE}`,
+      `x-auth-token: ${API_KEY_VALUE}`,
+      `curl -H "Authorization: Bearer ${SHORT_CREDENTIAL}" http://127.0.0.1:3000/api`,
+    ];
+    for (const line of lines) {
+      for (const text of [line, `The request sent ${line} before it failed.`]) {
+        const findings = headerFindings(text);
+        expect(findings, text).toHaveLength(1);
+        expect(findings[0]?.ruleId, text).toBe('sensitive-header');
+        expect(findings[0]?.path, text).toBe(`${DEFAULT_ROOT_PATH}.note`);
+        expect(findings[0]?.reason, text).toBe(REDACTION_RULE_REASONS['sensitive-header']);
+        const printed = serialise(inspectPayload({ note: text }));
+        for (const value of [SHORT_CREDENTIAL, COOKIE_VALUE, API_KEY_VALUE]) {
+          expect(printed, text).not.toContain(value);
+        }
+      }
+    }
+  });
+
+  it('reads a quoted cookie value, a later cookie pair, and a header line after a written escape', () => {
+    for (const text of [
+      `Cookie: session="${COOKIE_VALUE}"`,
+      `Set-Cookie: sid="${COOKIE_VALUE}"; Path=/`,
+      `Cookie: session=; theme=${COOKIE_VALUE}`,
+      `Cookie: a=; b=""; session="${COOKIE_VALUE}"`,
+      `// Cookie: session="${COOKIE_VALUE}"`,
+      JSON.stringify({ note: `first\nAuthorization: Bearer ${SHORT_CREDENTIAL}` }),
+      JSON.stringify({ note: `first\r\nCookie: session=${COOKIE_VALUE}` }),
+    ]) {
+      expect(ruleIdsOf(headerFindings(text)), text).toEqual(['sensitive-header']);
+      expect(serialise(headerFindings(text)), text).not.toContain(COOKIE_VALUE);
+    }
+    // A source excerpt the context builder sends unscrubbed, in the prompt
+    // and in the structured input alike.
+    const excerpt = `// Cookie: session="${COOKIE_VALUE}"\nconst next = 1;`;
+    expect(
+      assertOutboundSafe(
+        makeRequest({ prompt: `${CLEAN_PROMPT}\n${excerpt}`, input: { excerpts: [excerpt] } }),
+      ).ok,
+    ).toBe(false);
+  });
+
+  it('leaves a Set-Cookie attribute, a code template and the compliant forms alone', () => {
+    for (const text of [
+      '// Set-Cookie: sid=<id>; Path=/; HttpOnly',
+      'Set-Cookie: sid=; Path=/; Max-Age=3600',
+      'Cookie: session="${id}"',
+      'Cookie: session=""',
+      `Cookie: ${REDACTION_MARKER}`,
+      JSON.stringify({ note: `first\nCookie: ${REDACTION_MARKER}` }),
+      JSON.stringify({ code: 'const s = "a\\\\cookie: x";' }),
+    ]) {
+      expect(headerFindings(text), text).toEqual([]);
+    }
+  });
+
+  it('catches the short credential the length-bound bearer rule cannot', () => {
+    const line = `Authorization: Bearer ${SHORT_CREDENTIAL}`;
+    expect(inspectPayload({ note: line }, { rules: ['bearer-token'] })).toEqual([]);
+    expect(ruleIdsOf(inspectPayload({ note: line }))).toEqual(['sensitive-header']);
+    // A credential long enough for both is reported by both, once each.
+    expect(ruleIdsOf(inspectPayload({ note: `Authorization: ${BEARER_CREDENTIAL}` }))).toEqual([
+      'sensitive-header',
+      'bearer-token',
+    ]);
+  });
+
+  it('refuses a question, a message and a JSON-rendered attribute carrying a header line', () => {
+    const rendered = JSON.stringify({
+      note: `Authorization: Bearer ${SHORT_CREDENTIAL}`,
+      log: `Cookie: session=${COOKIE_VALUE}\nnext line`,
+      trace: `Authorization: Bearer ${SHORT_CREDENTIAL}\nat handler`,
+    });
+    const result = assertOutboundSafe(
+      makeRequest({
+        system: `Never repeat X-Api-Key: ${API_KEY_VALUE} to anyone.`,
+        prompt: `Why does the call with Authorization: Bearer ${SHORT_CREDENTIAL} fail?`,
+        messages: [
+          { role: 'user', content: 'Why did this take so long?' },
+          { role: 'assistant', content: rendered },
+        ],
+        input: { requests: [{ note: `Set-Cookie: sid=${COOKIE_VALUE}; Path=/` }] },
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.details?.ruleIds).toEqual(['sensitive-header']);
+    expect(result.error.details?.paths).toEqual([
+      'system',
+      'prompt',
+      'messages[1].content',
+      `${DEFAULT_ROOT_PATH}.requests[0].note`,
+    ]);
+    const printed = [
+      result.error.message,
+      result.error.hint ?? '',
+      JSON.stringify(result.error.details),
+      JSON.stringify(result.error.toPayload()),
+    ].join('\n');
+    for (const value of [SHORT_CREDENTIAL, COOKIE_VALUE, API_KEY_VALUE]) {
+      expect(printed).not.toContain(value);
+    }
+  });
+
+  it('reports a header line under a denied key once, at the key', () => {
+    const findings = inspectPayload(
+      { headers: { authorization: `Authorization: Bearer ${SHORT_CREDENTIAL}` } },
+      { rules: ['sensitive-header'] },
+    );
+    expect(findings.map((finding) => finding.path)).toEqual([
+      `${DEFAULT_ROOT_PATH}.headers.authorization`,
+    ]);
+  });
+
+  it('passes the compliant output of the first checkpoint', () => {
+    for (const text of [
+      `Authorization: ${REDACTION_MARKER}`,
+      `Proxy-Authorization: ${assemble('Bea', 'rer ')}${REDACTION_MARKER}`,
+      `Cookie: ${REDACTION_MARKER}`,
+      `Set-Cookie: sid=${REDACTION_MARKER}`,
+      `X-Api-Key: ${REDACTION_MARKER}`,
+      `x-auth-token:${REDACTION_MARKER}`,
+      'Authorization:',
+      'Cookie: ',
+      JSON.stringify({ note: `Authorization: ${REDACTION_MARKER}` }),
+    ]) {
+      const report = inspectPayloadReport({ note: text });
+      expect(report.findings, text).toEqual([]);
+      expect(report.complete, text).toBe(true);
+    }
+  });
+
+  it('leaves code that merely writes a header alone', () => {
+    // A refusal fails a whole pipeline stage, so an excerpt that builds a
+    // header from a variable, declares its type or reads it must never match.
+    const excerpts = [
+      'const init = { headers: { Authorization: `Bearer ${token}` } };',
+      'interface Headers { authorization: string; }',
+      'const schema = z.object({ authorization: z.string() });',
+      'const cookie = { cookie: req.headers.cookie };',
+      "const headers = { 'x-api-key': apiKey };",
+      "const headers = { Authorization: 'Bearer ' + token };",
+      'const headers = { Authorization: await getToken() };',
+      'const headers = { Authorization: Basic btoa(credentials) };',
+      '// Send Authorization: Bearer <token> with every call.',
+      'const header = `Cookie: session=${sessionId}`;',
+      'const header = { cookie: `session=${sessionId}` };',
+      'const header = { cookie: (value) => value.trim() };',
+      'const parse = { cookie: x=>x, check: a==b };',
+      'const authorizationHeader: string = header;',
+      'const scheme = { authorization: bearer ? token : undefined };',
+      'Authorization: bearer',
+    ];
+    const excerpt = excerpts.join('\n');
+    expect(inspectPayloadReport({ excerpt }).findings).toEqual([]);
+    for (const line of excerpts) {
+      expect(inspectPayload({ excerpt: line }), line).toEqual([]);
+    }
+    expect(assertOutboundSafe(makeRequest({ prompt: `${CLEAN_PROMPT}\n${excerpt}` })).ok).toBe(
+      true,
+    );
+  });
+
+  it('does not match a header name inside a longer word', () => {
+    for (const text of [
+      `preauthorization: Bearer ${SHORT_CREDENTIAL}`,
+      `my_cookie: session=${COOKIE_VALUE}`,
+      `x-api-key-hint: ${API_KEY_VALUE}`,
+    ]) {
+      expect(headerFindings(text), text).toEqual([]);
+    }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * Adversarial input: nothing throws, nothing loops
  * ---------------------------------------------------------------------------
  */
@@ -1699,12 +2225,39 @@ describe('bounds, paths and the two inspection views', () => {
     expect(limits).toContain('max-depth');
   });
 
-  it('does not hand a pathologically long string to the URL parser', () => {
-    // A documented bound: a request target is not a document, so past the
-    // parse bound the rule declines to look rather than parsing megabytes on
-    // the off-chance the value is a link.
-    const enormous = `/reports/summary?cursor=${'b'.repeat(URL_PARSE_MAX_LENGTH)}`;
-    expect(inspectPayload({ url: enormous }, { rules: ['url-query-value'] })).toEqual([]);
+  it('does not hand a pathologically long whole-field URL to the URL parser', () => {
+    // A documented bound of the whole-field half: a request target is not a
+    // document, so past the parse bound that half declines to look rather than
+    // parsing megabytes on the off-chance the value is a link. A scheme the
+    // embedded scan does not read isolates the half under test.
+    const enormous = `ws://warehouse.internal.test/feed?cursor=${'b'.repeat(URL_PARSE_MAX_LENGTH)}`;
+    const report = inspectPayloadReport({ url: enormous }, { rules: ['url-query-value'] });
+    expect(report.findings).toEqual([]);
+    expect(report.complete).toBe(true);
+  });
+
+  it('parses an over-long embedded run only up to the bound, and refuses the rest', () => {
+    // The embedded half parses the first URL_PARSE_MAX_LENGTH code units, so a
+    // value inside them is still named; the remainder was never parsed, so the
+    // run is recorded as uninspected and the payload is refused even when the
+    // prefix is clean.
+    const longValue = 'b'.repeat(URL_PARSE_MAX_LENGTH);
+    const leading = inspectPayloadReport(
+      { url: `/reports/summary?cursor=${QUERY_VALUE}&pad=${longValue}` },
+      { rules: ['url-query-value'] },
+    );
+    expect(leading.findings.map((finding) => finding.path)).toEqual([
+      `${DEFAULT_ROOT_PATH}.url${URL_QUERY_MASK}cursor`,
+    ]);
+    expect(leading.limitsReached).toEqual(['max-url-length']);
+    expectNoValueLeak(serialise(leading.findings), QUERY_VALUE);
+
+    const masked = { note: `see /reports/summary?cursor=?&${longValue}=? for the history` };
+    const clean = inspectPayloadReport(masked, { rules: ['url-query-value'] });
+    expect(clean.findings).toEqual([]);
+    expect(clean.complete).toBe(false);
+    expect(clean.limitsReached).toEqual(['max-url-length']);
+    expect(assertOutboundSafe(makeRequest({ input: masked })).ok).toBe(false);
   });
 
   it('shortens an over-long path segment and marks the cut', () => {

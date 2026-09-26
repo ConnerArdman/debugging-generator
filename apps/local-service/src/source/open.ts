@@ -17,11 +17,13 @@
  *   → a runtime port to apps/chrome-extension/src/background/service-worker.ts
  *   → WebSocket `source.open { sessionId, location }` to this service
  *   → THIS MODULE: validate → look the session up → authorize → contain → forward
- *   → WebSocket `source.open` to the session's VS Code client(s), a fresh
- *     envelope whose `id` (the "forwarded id") this module keeps
- *   → apps/vscode-extension/src/source/open-location.ts, which opens the document
- *     with `window.showTextDocument` and a selection at the location's 1-based
- *     line and column, then flashes a transient highlight
+ *   → WebSocket `source.open { sessionId, location, pinned }` to the session's
+ *     VS Code client(s), a fresh envelope whose `id` (the "forwarded id") this
+ *     module keeps
+ *   → apps/vscode-extension/src/source/open-location.ts, which resolves the
+ *     location again, refuses it unless it lands on the `pinned` file, then
+ *     opens the document with `window.showTextDocument` and a selection at the
+ *     location's 1-based line and column, and flashes a transient highlight
  *   → WebSocket `source.result { ref: <forwarded id>, status }` from the editor
  *   → THIS MODULE: {@link SourceOpenHandler.acceptEditorResult} settles the
  *     forward's pending entry
@@ -32,9 +34,10 @@
  * The location arrives already resolved and stamped (`resolvedBy`,
  * `confidence`) by whichever route produced it — patch metadata, the code
  * graph, a source map, the route map or the React owner chain. Resolution is
- * `./resolve.ts`'s job and this module deliberately does not import it: what it
- * forwards is the validated location exactly as the panel sent it, never
- * normalised, re-stamped or re-resolved.
+ * `./resolve.ts`'s job and this module deliberately does not import it: the
+ * location it forwards is the validated location exactly as the panel sent it,
+ * never normalised, re-stamped or re-resolved. Beside it travels `pinned`, the
+ * canonical file and identity containment proved (see "Pinning the target").
  *
  * ## Containment first, and why
  *
@@ -46,8 +49,9 @@
  *
  * 1. **Validate the frame.** `parseSourceOpenPayload` (and, for a raw frame,
  *    `decodeMessage`/`parseMessage` first), then `parseSourceLocation` again as
- *    defence in depth. A rejection is described by issue paths and codes only;
- *    the rejected value is never echoed.
+ *    defence in depth. A frame that already carries `pinned` is refused: only
+ *    this service mints a pin. A rejection is described by issue paths and codes
+ *    only; the rejected value is never echoed.
  * 2. **Look the session up** through the injected store port. The project root
  *    is taken from the stored `SessionRecord`, never from the message, so a
  *    client cannot name its own root.
@@ -64,13 +68,25 @@
  *    and the canonical pair is re-checked with `isWithin`, so a symbolic link
  *    *inside* the project whose target lies outside it is refused. Optionally
  *    (on by default) a non-following `lstat` then confirms the canonical target
- *    is a regular file.
- * 6. **Forward** — `createEnvelope('source.open', …)` to the session's `vscode`
- *    clients through the injected client port.
+ *    is a regular file and reads its device and inode.
+ * 6. **Forward** — `createEnvelope('source.open', { sessionId, location, pinned })`
+ *    to the session's `vscode` clients through the injected client port.
  *
  * Only after step 5 has succeeded is anything sent, and the only filesystem
  * operations this module ever performs are `realpath` and `lstat`: it writes
  * nothing, reads no file content and opens no database.
+ *
+ * ## Pinning the target
+ *
+ * Step 5 proves where the location leads at one instant, and the editor acts on
+ * the frame only after a socket hop, so a link re-pointed in between would make
+ * the editor open a file this handler never checked (CWE-367). The forwarded
+ * frame therefore carries `pinned: { file, dev, ino }`: the target's path
+ * relative to the canonical root with every link resolved, and the `st_dev` and
+ * `st_ino` of the `bigint` `lstat` of that canonical path, in canonical decimal
+ * (a `number` would round an inode above 2^53). The editor resolves the
+ * location itself and opens nothing unless its own canonical path and identity
+ * equal the pin, so a substitution in flight is refused rather than opened.
  *
  * ## Three independent enforcement points
  *
@@ -80,10 +96,12 @@
  * 1. **This handler**, which holds the session's project root and the service's
  *    view of the filesystem.
  * 2. **The editor**: `apps/vscode-extension/src/source/open-location.ts` for a
- *    forwarded message, and the `vscode://debuggen.debug-generator/open` URI
- *    handler in `apps/vscode-extension/src/uri-handler.ts`, which performs its
- *    own `fs.realpath` plus workspace-folder containment and asks the developer
- *    to confirm, because any web page can trigger such a URI.
+ *    forwarded message, which re-derives containment against the session's
+ *    project root and requires the pin, and the
+ *    `vscode://debuggen.debug-generator/open` URI handler in
+ *    `apps/vscode-extension/src/uri-handler.ts`, which performs its own
+ *    `fs.realpath` plus workspace-folder containment and asks the developer to
+ *    confirm, because any web page can trigger such a URI.
  * 3. **The shared pure-string path layer** in `@debuggen/shared`
  *    (`isSafeRelativePath`, `resolveWithinProject`, `isWithin`), which is the
  *    single containment predicate the other two apply. A bare `startsWith` is
@@ -145,8 +163,8 @@
  *
  * - `src/main.ts` constructs the handler with {@link createSourceOpenHandler},
  *   injecting the session store, the client registry, the service logger and,
- *   by default, `node:fs/promises` `realpath`, the global timers and the
- *   protocol's editor deadline.
+ *   by default, `node:fs/promises` `realpath` and `lstat`, the global timers and
+ *   the protocol's editor deadline — so every forward it makes is pinned.
  * - `src/server/ws.ts` routes each inbound `source.open` frame to
  *   {@link SourceOpenHandler.handle} together with the connection's
  *   {@link SourceOpenPrincipal}, and maps an `Err` onto the protocol `error`
@@ -182,9 +200,10 @@
  * @module
  */
 
-import { lstat, realpath as realpathAsync } from 'node:fs/promises';
+import { lstat as lstatAsync, realpath as realpathAsync } from 'node:fs/promises';
 
 import {
+  MESSAGE_TYPE,
   SOURCE_OPEN_EDITOR_TIMEOUT_MS,
   clientKindSchema,
   createEnvelope,
@@ -255,7 +274,7 @@ export type MaybePromise<T> = T | Promise<T>;
  *
  * | Rejection | Error code | Meaning |
  * | --- | --- | --- |
- * | `invalid-payload` | `PROTOCOL_INVALID_MESSAGE` | the frame is not a well-formed `source.open` |
+ * | `invalid-payload` | `PROTOCOL_INVALID_MESSAGE` | the frame is not a well-formed `source.open`, or carries the `pinned` only this service sets |
  * | `session-not-found` | `SESSION_NOT_FOUND` | the named session does not exist |
  * | `not-authorized` | `UNAUTHORIZED` or `TAB_NOT_BOUND` | the connection may not act on this session |
  * | `outside-project` | `PATH_OUTSIDE_PROJECT` | the path, as written, escapes the project root |
@@ -408,6 +427,38 @@ export interface SourceOpenClientPort {
 export type SourceOpenRealPath = (path: string) => MaybePromise<string>;
 
 /**
+ * What the regular-file check reads of the canonical target: the subset of
+ * `node:fs` `BigIntStats` it uses. `dev` and `ino` are `bigint` so that an
+ * inode above 2^53 is pinned exactly rather than rounded.
+ */
+export interface SourceOpenFileStats {
+  /** The device the entry lives on (`st_dev`). */
+  readonly dev: bigint;
+  /** The entry's inode number (`st_ino`). */
+  readonly ino: bigint;
+  /** Whether the entry is a regular file. */
+  isFile(): boolean;
+  /** Whether the entry is itself a symbolic link. */
+  isSymbolicLink(): boolean;
+}
+
+/**
+ * The non-following inspector the regular-file check and the pin use.
+ *
+ * The shape of `node:fs/promises` `lstat` called with `{ bigint: true }`: it
+ * reports the entry at the path itself — a link as a link, never its target —
+ * and throws (or rejects) with the platform error when there is none.
+ */
+export type SourceOpenLstat = (path: string) => MaybePromise<SourceOpenFileStats>;
+
+/**
+ * The `pinned` member of a forwarded `source.open` payload: the canonical
+ * project-relative `file` and the decimal `dev` and `ino` of the target this
+ * handler proved. See "Pinning the target" in the module header.
+ */
+export type SourceOpenPin = NonNullable<SourceOpenPayload['pinned']>;
+
+/**
  * The timer functions the editor deadline runs on: the shape of the globals.
  *
  * Injectable so a test drives the deadline with a fake clock. The handle is
@@ -473,14 +524,24 @@ export interface SourceOpenDeps {
    */
   readonly realpath?: SourceOpenRealPath | undefined;
   /**
+   * The non-following inspector of the canonical target. Defaults to
+   * `node:fs/promises` `lstat` with `{ bigint: true }`; tests inject one to
+   * report identities a real filesystem cannot stage on demand.
+   */
+  readonly lstat?: SourceOpenLstat | undefined;
+  /**
    * Whether to confirm, with a non-following `lstat` of the canonical target,
-   * that it is a regular file before forwarding. Defaults to `true`.
+   * that it is a regular file, and to pin its identity on the forwarded frame.
+   * Defaults to `true`, which is what `src/main.ts` runs with, so every forward
+   * the service makes is pinned.
    *
    * Containment itself never depends on this flag: both halves run on every
    * request, and the canonicalisation of the filesystem half already fails for
-   * a path that does not exist. Turning it off skips only the regular-file
-   * check, which is what a caller that injects a table-based `realpath` over a
-   * filesystem that does not hold the files needs.
+   * a path that does not exist. Turning it off skips the `lstat`, so no identity
+   * exists and the frame is forwarded **without** `pinned` — which the editor,
+   * requiring the pin on a forwarded frame, refuses to open. It exists only for
+   * a caller that injects a table-based `realpath` over a filesystem that does
+   * not hold the files and exercises the service's own half.
    */
   readonly verifyExists?: boolean | undefined;
   /**
@@ -515,9 +576,10 @@ export interface SourceOpenDelivered {
   /** The validated location, exactly as it was forwarded. */
   readonly location: SourceLocation;
   /**
-   * The canonical project-relative path containment proved — the file the
-   * editor will open. Equal to `location.file` unless the file was reached
-   * through a symbolic link that stays inside the project.
+   * The canonical project-relative path containment proved, which the
+   * forwarded frame carries as `pinned.file` — the only file the editor will
+   * open. Equal to `location.file` unless the file was reached through a
+   * symbolic link that stays inside the project.
    */
   readonly file: string;
   /**
@@ -584,9 +646,10 @@ export interface SourceOpenHandler {
    * @param input The request, in any of three forms, each validated in full: a
    * parsed `source.open` envelope (`MessageByType<'source.open'>`), a raw
    * frame (a JSON string, or an unparsed envelope object), or the bare
-   * `{ sessionId, location }` payload.
+   * `{ sessionId, location }` payload. One that carries `pinned` is refused.
    * @param principal The connection's resolved identity.
-   * @returns The delivery outcome, or the refusal or failure.
+   * @returns The delivery outcome, or the refusal or failure. A delivered
+   * forward was sent as `{ sessionId, location, pinned }`.
    */
   handle(
     input: unknown,
@@ -634,10 +697,10 @@ export interface SourceOpenHandler {
 const SOURCE_SUBSYSTEM = 'source';
 
 /** The message this module handles and the message it forwards. */
-const SOURCE_OPEN_TYPE = 'source.open';
+const SOURCE_OPEN_TYPE = MESSAGE_TYPE.SOURCE_OPEN;
 
 /** The message an editor answers a forwarded `source.open` with. */
-const SOURCE_RESULT_TYPE = 'source.result';
+const SOURCE_RESULT_TYPE = MESSAGE_TYPE.SOURCE_RESULT;
 
 /**
  * The default bound on forwards awaiting an editor's answer at once.
@@ -714,7 +777,8 @@ type UnsafePathReason =
   | 'resolved-path-not-absolute'
   | 'symlink-escapes-project-root'
   | 'unsafe-canonical-path'
-  | 'changed-after-resolution';
+  | 'changed-after-resolution'
+  | 'identity-unavailable';
 
 /** Why the filesystem half found nothing openable. */
 type FileMissingReason = 'project-root-missing' | 'not-found' | 'not-a-file';
@@ -723,6 +787,8 @@ type FileMissingReason = 'project-root-missing' | 'not-found' | 'not-a-file';
 const HINTS = Object.freeze({
   invalidPayload:
     'A source.open request carries the session id and a source location with a project-relative file, 1-based line and column, a resolver and a confidence.',
+  pinNotPermitted:
+    'Send source.open with the session id and the source location only; the service pins the file itself when it forwards the request to VS Code.',
   sessionNotFound:
     'Reopen the session from the Debug Generator view in VS Code, or start a new one, then click the source link again.',
   roleNotPermitted:
@@ -794,6 +860,22 @@ function notSourceOpen(type: string): DebuggenError {
     `Expected a ${SOURCE_OPEN_TYPE} message; received a ${type} message.`,
     HINTS.invalidPayload,
     { receivedType: type },
+  );
+}
+
+/**
+ * A request that arrived already carrying `pinned`. Only this service mints a
+ * pin — it is the proof its own containment check produced — so a sender that
+ * supplies one is trying to nominate the file it wants trusted. A constant
+ * sentence: none of the supplied values is quoted.
+ */
+function pinNotPermitted(): DebuggenError {
+  return refusal(
+    'PROTOCOL_INVALID_MESSAGE',
+    'invalid-payload',
+    `A ${SOURCE_OPEN_TYPE} request may not carry pinned: only the Debug Generator service sets it, on the frame it forwards to the editor.`,
+    HINTS.pinNotPermitted,
+    { reason: 'pin-not-permitted' },
   );
 }
 
@@ -914,6 +996,8 @@ function unsafePathMessage(reason: UnsafePathReason, quoted: string): string {
       return `${quoted} resolves to a path inside the project that this service cannot vouch for, so it was not opened.`;
     case 'changed-after-resolution':
       return `${quoted} was replaced by a symbolic link while it was being checked, so it was not opened.`;
+    case 'identity-unavailable':
+      return `${quoted} could not be identified on disk, so it could not be pinned for the editor and was not opened.`;
   }
 }
 
@@ -1199,8 +1283,10 @@ export function assertLocationWithinProject(
  * developer-facing situations, and neither error quotes an absolute path, a
  * link target or the platform's own message.
  *
- * Canonicalisation is a check at a moment, not a lock; the editor re-derives the
- * same answer independently before it opens anything.
+ * Canonicalisation is a check at a moment, not a lock: the handler pins the
+ * `relativePath` proved here, with the target's identity, on the forwarded
+ * frame, and the editor re-derives the same answer independently and opens
+ * nothing that does not match the pin.
  *
  * @param projectRoot The session's absolute project root.
  * @param absolutePath The candidate, as {@link assertLocationWithinProject}
@@ -1300,17 +1386,55 @@ async function canonicalise(realpath: SourceOpenRealPath, path: string): Promise
   return { ok: true, value: normalizeToPosix(value) };
 }
 
+/** The device and inode of a proved target, in the canonical decimal a pin carries. */
+interface FileIdentity {
+  readonly dev: string;
+  readonly ino: string;
+}
+
+/**
+ * The largest device or inode number accepted: `st_dev` and `st_ino` are
+ * unsigned 64-bit on every platform Node supports, so anything larger is an
+ * inspector answering nonsense.
+ */
+const MAX_FILE_ID = 0xffff_ffff_ffff_ffffn;
+
+/** Whether an inspector's answer offers the two type tests the check calls. */
+function isFileStats(value: unknown): value is SourceOpenFileStats {
+  return (
+    isPlainRecord(value) &&
+    typeof value['isFile'] === 'function' &&
+    typeof value['isSymbolicLink'] === 'function'
+  );
+}
+
+/** Whether a reported device or inode number is a usable, exact identity. */
+function isFileId(value: unknown): value is bigint {
+  return typeof value === 'bigint' && value >= 0n && value <= MAX_FILE_ID;
+}
+
 /**
  * Confirms, without following a link at the final component, that the
- * canonical target is a regular file.
+ * canonical target is a regular file, and reads the identity the forwarded
+ * frame pins.
  *
  * The target is canonical, so a symbolic link here means the entry was replaced
  * between canonicalisation and this check: refused as unsafe. A directory, FIFO,
  * socket or device is `file-missing` (`not-a-file`), since there is no source
- * file to open. Reads metadata only — never content.
+ * file to open. An answer without an exact `bigint` device and inode is refused
+ * as `identity-unavailable`: a forward the editor could not match is never
+ * sent. Reads metadata only — never content.
+ *
+ * @returns The target's `dev` and `ino` as canonical decimal strings —
+ * `String` of a `bigint` has no sign, no leading zero and no rounding, which is
+ * exactly the form the protocol's pin schema compares as written.
  */
-async function verifyRegularFile(realPath: string, file: string): Promise<Result<void>> {
-  const inspected = await settle(() => lstat(realPath), 'FS_UNSAFE_PATH');
+async function inspectRegularFile(
+  realPath: string,
+  file: string,
+  inspect: SourceOpenLstat,
+): Promise<Result<FileIdentity>> {
+  const inspected = await settle<unknown>(() => inspect(realPath), 'FS_UNSAFE_PATH');
   if (!inspected.ok) {
     const errno = errnoOf(inspected.error);
     return err(
@@ -1321,6 +1445,10 @@ async function verifyRegularFile(realPath: string, file: string): Promise<Result
   }
 
   const stats = inspected.value;
+  if (!isFileStats(stats)) {
+    return err(unsafePath('identity-unavailable', file));
+  }
+
   if (stats.isSymbolicLink()) {
     return err(unsafePath('changed-after-resolution', file));
   }
@@ -1329,7 +1457,12 @@ async function verifyRegularFile(realPath: string, file: string): Promise<Result
     return err(fileMissing('not-a-file', file));
   }
 
-  return ok(undefined);
+  const { dev, ino } = stats;
+  if (!isFileId(dev) || !isFileId(ino)) {
+    return err(unsafePath('identity-unavailable', file));
+  }
+
+  return ok({ dev: dev.toString(), ino: ino.toString() });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1351,6 +1484,13 @@ function looksLikeEnvelope(value: unknown): boolean {
  * the bare payload. In every case the payload is then validated with
  * `parseSourceOpenPayload` and its location once more with
  * `parseSourceLocation`.
+ *
+ * A payload that carries `pinned` at all is refused (`invalid-payload`, reason
+ * `pin-not-permitted`). The shared schema accepts the key because the frame this
+ * service forwards carries it, and `src/server/ws.ts` hands the parsed frame
+ * over unchanged, so this is the one gate that keeps a sender from nominating
+ * the file it wants trusted. What is returned never has a pin: only the
+ * handler's own containment proof becomes one.
  */
 function decodeSourceOpenInput(input: unknown): Result<SourceOpenPayload> {
   let payload: unknown = input;
@@ -1370,6 +1510,11 @@ function decodeSourceOpenInput(input: unknown): Result<SourceOpenPayload> {
   const parsed = parseSourceOpenPayload(payload);
   if (!parsed.ok) {
     return err(invalidPayload(parsed.error));
+  }
+
+  // By presence, not by value: an explicitly undefined pin is refused as well.
+  if (isPlainRecord(payload) && Object.hasOwn(payload, 'pinned')) {
+    return err(pinNotPermitted());
   }
 
   const location = parseSourceLocation(parsed.value.location);
@@ -1566,8 +1711,9 @@ function authorize(
  * `createEnvelope` — which mints the id, stamps `ts` and lifts the payload's
  * `sessionId` into the routing key — and validates the finished frame with
  * `parseMessage` before it is handed to anyone, so a frame the receiver would
- * refuse is never sent. The frame built, not the parser's copy, is returned: the
- * location travels exactly as it was validated.
+ * refuse is never sent — the pin's decimal `dev` and `ino` included. The frame
+ * built, not the parser's copy, is returned: the location travels exactly as it
+ * was validated.
  */
 function buildSourceOpenEnvelope(
   payload: SourceOpenPayload,
@@ -1994,6 +2140,8 @@ export function createSourceOpenHandler(deps: SourceOpenDeps): SourceOpenHandler
   const derived = tryCatch(() => subsystemLogger(deps.logger ?? noopLogger, SOURCE_SUBSYSTEM));
   const log = derived.ok ? derived.value : noopLogger;
   const realpath: SourceOpenRealPath = deps.realpath ?? ((path: string) => realpathAsync(path));
+  const inspect: SourceOpenLstat =
+    deps.lstat ?? ((path: string) => lstatAsync(path, { bigint: true }));
   const verifyExists = deps.verifyExists ?? true;
   const now = deps.now;
   const { sessions, clients } = deps;
@@ -2130,17 +2278,33 @@ export function createSourceOpenHandler(deps: SourceOpenDeps): SourceOpenHandler
     if (!contained.ok) {
       return refuse(contained.error, context);
     }
+    // The pin: the canonical file just proved and the identity the inspection
+    // read of it. With `verifyExists` off nothing is inspected, so no identity
+    // exists and the frame goes unpinned, which the editor refuses to open.
+    let pinned: SourceOpenPin | undefined;
     if (verifyExists) {
-      const regular = await verifyRegularFile(contained.value.realPath, displayFile(location.file));
-      if (!regular.ok) {
-        return refuse(regular.error, context);
+      const identity = await inspectRegularFile(
+        contained.value.realPath,
+        displayFile(location.file),
+        inspect,
+      );
+      if (!identity.ok) {
+        return refuse(identity.error, context);
       }
+      pinned = {
+        file: contained.value.relativePath,
+        dev: identity.value.dev,
+        ino: identity.value.ino,
+      };
     }
 
-    // Step 6 — forward the validated location, unchanged, to the editor. The
-    // answer's pending entry is registered first, keyed by the forwarded frame's
-    // id, so an editor that answers within the send itself cannot race it.
-    const envelope = buildSourceOpenEnvelope({ sessionId, location }, now);
+    // Step 6 — forward the validated location, unchanged, to the editor, with the
+    // pin beside it. The answer's pending entry is registered first, keyed by the
+    // forwarded frame's id, so an editor that answers within the send itself
+    // cannot race it.
+    const payload: SourceOpenPayload =
+      pinned === undefined ? { sessionId, location } : { sessionId, location, pinned };
+    const envelope = buildSourceOpenEnvelope(payload, now);
     if (!envelope.ok) {
       return refuse(envelope.error, context);
     }

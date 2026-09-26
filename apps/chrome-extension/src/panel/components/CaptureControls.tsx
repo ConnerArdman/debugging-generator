@@ -121,13 +121,9 @@
  * renderer's global `dg-visually-hidden` utility (`base.css`), exactly as `Header` and
  * `TargetPicker` do; it is absolutely positioned, so it takes no gap in the row.
  *
- * BLITZY [DESIGN_SYSTEM_GAP]: the renderer's single disabled treatment is keyed on the native
- * `disabled` attribute and the class `Button` adds for it; it has no treatment for
- * `aria-disabled`. An unavailable-but-focusable control therefore keeps its variant's appearance.
- * Per the design-system rules the look is not faked with a class or a variant swap, and the
- * renderer's internals are not overridden; the missing state is flagged here instead. The
- * unavailability is conveyed by `aria-disabled`, the tooltip reason, the progress label while a
- * request is pending, and the session status badge the header renders beside these controls.
+ * The renderer draws its disabled treatment for the native `disabled` attribute or `Button`'s
+ * `dg-is-disabled` state class, never for `aria-disabled` alone, so an unavailable control
+ * composes `dg-is-disabled` beside `aria-disabled`: it looks unavailable and stays focusable.
  *
  * ## Boundaries
  *

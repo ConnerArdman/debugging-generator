@@ -292,6 +292,14 @@ export interface WebviewState {
   relevantFiles: readonly RelevantFile[];
   /** Every file modification the session made, in the order applied. */
   modifications: readonly ModificationRecord[];
+  /**
+   * The journal's length as the service last counted it — the `total` of the
+   * host's latest read of `GET /sessions/:id/modifications` — a non-negative
+   * safe integer; absent until a read reported one. A value above
+   * `modifications.length` means records the host has not received, which
+   * `ModificationsList` states rather than presenting the list as whole.
+   */
+  modificationsTotal?: number;
   /** The latest validated analysis; absent until one exists. */
   analysis?: AnalysisResult;
   /** The latest generated panel's identity; absent until one exists. */
@@ -566,6 +574,12 @@ interface WebviewToHostPayloads {
    * name of at most {@link MAX_RETRY_STAGE_LENGTH} characters.
    */
   retryStage: RequestPayload & { stage: string };
+  /**
+   * Reads the active session's whole modification journal from the service
+   * that owns it (`debuggen.showModifications`), so a list the snapshot's
+   * `modificationsTotal` shows to be incomplete receives the records it lacks.
+   */
+  loadModifications: RequestPayload;
 }
 
 /** The webview-to-host members whose payload carries a `requestId`, derived from the payloads. */
@@ -591,6 +605,7 @@ export const WEBVIEW_REQUEST_TYPES = [
   'dismissPairing',
   'launchDevServer',
   'retryStage',
+  'loadModifications',
 ] as const satisfies readonly RequestCarryingType[];
 
 /** One of {@link WEBVIEW_REQUEST_TYPES}: a webview-to-host member that carries a `requestId`. */
@@ -618,6 +633,7 @@ const REQUEST_TYPE_MEMBERSHIP: {
   dismissPairing: true,
   launchDevServer: true,
   retryStage: true,
+  loadModifications: true,
 };
 
 /** Every webview-to-host discriminant, as the tuple the parser checks. */
@@ -634,6 +650,7 @@ export const WEBVIEW_TO_HOST_MESSAGE_TYPES = [
   'dismissPairing',
   'launchDevServer',
   'retryStage',
+  'loadModifications',
 ] as const satisfies readonly (keyof WebviewToHostPayloads)[];
 
 /** One of {@link WEBVIEW_TO_HOST_MESSAGE_TYPES}. */
@@ -647,7 +664,7 @@ export type WebviewToHostMessageType = (typeof WEBVIEW_TO_HOST_MESSAGE_TYPES)[nu
  * - `{ type: 'askQuestion'; requestId: string; question: string }`,
  *   `{ type: 'askFollowUp'; requestId: string; question: string }`
  * - `{ type: 'startCapture'; requestId: string }`, and likewise `stopCapture`, `endSession`,
- *   `requestTarget`, `pairChrome`, `dismissPairing` and `launchDevServer`
+ *   `requestTarget`, `pairChrome`, `dismissPairing`, `launchDevServer` and `loadModifications`
  * - `{ type: 'openFile'; location: SourceLocation }`
  * - `{ type: 'retryStage'; requestId: string; stage: string }`
  */
@@ -1273,6 +1290,7 @@ const WEBVIEW_STATE_RULES: FieldRules<WebviewState> = {
   progress: checkProgress,
   relevantFiles: checkRelevantFiles,
   modifications: checkModifications,
+  modificationsTotal: { optional: checkNonNegativeInteger },
   analysis: { optional: checkAnalysis },
   latestPanel: { optional: checkPanelSummary },
   target: { optional: checkSelectedTarget },
@@ -1369,4 +1387,6 @@ const WEBVIEW_TO_HOST_VALIDATORS: MessageValidators<WebviewToHostMessage> = {
     withType('launchDevServer', validateFields(record, REQUEST_PAYLOAD_RULES, 'type')),
   retryStage: (record) =>
     withType('retryStage', validateFields(record, RETRY_STAGE_PAYLOAD_RULES, 'type')),
+  loadModifications: (record) =>
+    withType('loadModifications', validateFields(record, REQUEST_PAYLOAD_RULES, 'type')),
 };

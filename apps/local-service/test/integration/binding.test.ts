@@ -57,6 +57,21 @@
  * installer out of a suite about routing. Every test binds its own fresh tab
  * ids on its own DevTools connections, so no test depends on another's order.
  *
+ * ## Restoration racing `session.end`
+ *
+ * One block builds `createBindingRoutes` directly, because the interleaving it
+ * proves cannot be timed through a live socket: a drop suspended on its record
+ * mirror while `SessionManager.end` commits. Each case gets a store of its own
+ * in an `fs.mkdtemp` directory, with the real sessions and panels
+ * repositories, session manager, progress emitter, reopener and client
+ * registry over it and one registered DevTools connection; only the route's
+ * manager port is the test's, forwarding `setBoundTab` to the real manager
+ * unless the test holds the next call open and answers it by hand. An end
+ * that committed while the mirror was held must stand — no row, no live
+ * binding, no announcement, the drop answered as ignored — and the same
+ * refused mirror on an open session must restore both stores exactly and
+ * return the refusal.
+ *
  * ## Vocabulary
  *
  * No binding reason, client kind or message type is spelled here: reasons and
@@ -67,9 +82,14 @@
  * appears in this file and `process.env` is never touched.
  */
 
+import { randomBytes } from 'node:crypto';
+import { realpathSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   DORMANT_AGENT_HOOK_CONFIG,
@@ -91,6 +111,7 @@ import {
   PROGRESS_STATUSES,
   agentConfigPayloadSchema,
   createAnalysisResult,
+  decodeMessage,
   errorCodeSchema,
   isMessageOfType,
   progressStageSchema,
@@ -104,6 +125,7 @@ import {
 import type {
   AgentConfigPayload,
   AnalysisResult,
+  BoundTab,
   CreateEnvelopeOptions,
   ErrorPayload,
   HttpOperationId,
@@ -115,13 +137,24 @@ import type {
   SessionRecord,
   SessionStatus,
 } from '@debuggen/protocol';
-import { isErr, newPanelId, newSessionId } from '@debuggen/shared';
-import type { CaptureId, DebuggenError, Result, SessionId } from '@debuggen/shared';
+import { DebuggenError, err, isErr, newPanelId, newSessionId } from '@debuggen/shared';
+import type { CaptureId, Result, SessionId } from '@debuggen/shared';
 import { REDACTION_MARKER, computeCaptureSummary, scrub } from '@debuggen/telemetry';
 
-import { redactSelectedTarget } from '../../src/server/routes/binding.js';
-import { REPLAY_MESSAGE_ORDER } from '../../src/sessions/reopen.js';
-import type { ProgressEntry, TabBinding } from '../../src/store/sessions-repo.js';
+import type { DevtoolsPrincipal } from '../../src/server/auth.js';
+import { SOCKET_READY_STATE_OPEN, createClientRegistry } from '../../src/server/clients.js';
+import type { ClientRegistry, ClientSocket, TabBindingView } from '../../src/server/clients.js';
+import { createBindingRoutes, redactSelectedTarget } from '../../src/server/routes/binding.js';
+import type { BindingConnection, BindingRoutes } from '../../src/server/routes/binding.js';
+import { createSessionManager } from '../../src/sessions/manager.js';
+import type { SessionManager } from '../../src/sessions/manager.js';
+import { createSessionProgress } from '../../src/sessions/progress.js';
+import { REPLAY_MESSAGE_ORDER, createSessionReopener } from '../../src/sessions/reopen.js';
+import { openStore } from '../../src/store/db.js';
+import type { Store } from '../../src/store/db.js';
+import { createPanelsRepo } from '../../src/store/panels-repo.js';
+import { createSessionsRepo } from '../../src/store/sessions-repo.js';
+import type { ProgressEntry, SessionsRepo, TabBinding } from '../../src/store/sessions-repo.js';
 import {
   randomSecretLike,
   readFixtureJson,
@@ -131,6 +164,7 @@ import {
   waitUntil,
 } from './harness.js';
 import type {
+  CapturedLogRecord,
   DevtoolsConnection,
   DevtoolsCredential,
   FixtureProjectCopy,
@@ -2102,6 +2136,76 @@ describe(TAB_NAVIGATED, () => {
     );
   });
 
+  it('refuses an origin change whose record will not clear its bound tab, keeping the binding routed, stored and recorded and announcing nothing, and drops it on the next navigation', async () => {
+    const { capturing, created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(capturing, '/reports');
+    const away = pageOf(created, '/dashboard');
+
+    const bound = await bind(client, { tabId, url });
+    expectEstablished(client, bound, capturing.sessionId, tabId);
+    await waitForArming(client, capturing, bound.mark);
+    const rowsBefore = bindingRows();
+    const storedBefore = storedBindingOfTab(tabId);
+    const recordBefore = storedRecordJson(capturing.sessionId);
+    const statusBefore = recordOf(capturing.sessionId).status;
+    const editorMark = capturing.editor.received.length;
+    const logMark = service().logger.records.length;
+
+    // The navigation leaves the session's origin; clearing the record's tab is refused.
+    const refused = await withRecordWritesRefused(capturing.sessionId, () =>
+      sendSettled(client, TAB_NAVIGATED, tabNavigatedPayloadSchema.parse({ tabId, url: away })),
+    );
+    expectNoUrlIn(expectRefused(refused, CODES.STORE_ERROR), away);
+    await settleAll(capturing.editor);
+    expectCleanCompensation(logMark);
+
+    // No surface heard of a drop the record does not show.
+    expect(announcementsSince(client, refused.mark)).toEqual([]);
+    expect(announcementsSince(capturing.editor, editorMark)).toEqual([]);
+    expect(framesSince(client, AGENT_CONFIG, refused.mark)).toEqual([]);
+
+    // The row — its bound-at stamp included — and the record document are
+    // exactly as they were, and the tab was not bound to the new origin's session.
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
+    expect(storedRecordJson(capturing.sessionId)).toBe(recordBefore);
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url });
+    expect(storedBindingOfSession(created.sessionId)?.tab.tabId).not.toBe(tabId);
+
+    // The live binding still routes the session's fan-out to the tab.
+    const later = client.received.length;
+    unwrap(
+      await service().manager.patch(capturing.sessionId, { target: targetOn(url) }),
+      'Patching the session',
+    );
+    await waitFor(client, REPLAY_SESSION_UPDATED, (_message, index) => index >= later);
+
+    // The next navigation finds the binding and completes the drop everywhere.
+    const retryMark = capturing.editor.received.length;
+    const left = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: away }),
+    );
+    expect(left.errors).toEqual([]);
+    const dropped = {
+      sessionId: capturing.sessionId,
+      tabId,
+      url: away,
+      reason: REASON_ORIGIN_CHANGED,
+    };
+    expect(announcementsSince(client, left.mark)).toEqual([dropped]);
+    await settleAll(capturing.editor);
+    expect(announcementsSince(capturing.editor, retryMark)).toEqual([dropped]);
+    expect(rowsFor({ tabId })).toEqual([]);
+    expect(storedBindingOfSession(capturing.sessionId)).toBeUndefined();
+    expect(recordOf(capturing.sessionId).boundTab).toBeUndefined();
+    expect(recordOf(capturing.sessionId).status).toBe(statusBefore);
+    expect(openCaptureId(capturing.sessionId)).toBe(capturing.captureId);
+  });
+
   it.each(NEAR_MISSES)('treats $label as a different origin', async (nearMiss) => {
     const { capturing } = suite();
     const tabId = freshTab();
@@ -2325,6 +2429,625 @@ describe(SESSION_UNBIND, () => {
     expect(announcementsSince(second.client, mark)).toEqual([]);
     expect(bindingRows()).toEqual(rowsBefore);
   });
+
+  it('refuses an unbind whose record will not clear its bound tab, keeping the binding routed, stored and recorded and announcing nothing, and drops it on retry', async () => {
+    const { capturing } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(capturing, '/reports');
+
+    const bound = await bind(client, { tabId, url });
+    expectEstablished(client, bound, capturing.sessionId, tabId);
+    await waitForArming(client, capturing, bound.mark);
+    const rowsBefore = bindingRows();
+    const storedBefore = storedBindingOfTab(tabId);
+    const recordBefore = storedRecordJson(capturing.sessionId);
+    const statusBefore = recordOf(capturing.sessionId).status;
+    const editorMark = capturing.editor.received.length;
+    const logMark = service().logger.records.length;
+
+    // The unbind reaches the record mirror, which the store refuses.
+    const refused = await withRecordWritesRefused(capturing.sessionId, () =>
+      sendSettled(client, SESSION_UNBIND, sessionUnbindPayloadSchema.parse({ tabId })),
+    );
+    expectNoUrlIn(expectRefused(refused, CODES.STORE_ERROR), url);
+    await settleAll(capturing.editor);
+    expectCleanCompensation(logMark);
+
+    // Nothing was announced: neither the panel nor the editor heard of a drop.
+    expect(announcementsSince(client, refused.mark)).toEqual([]);
+    expect(announcementsSince(capturing.editor, editorMark)).toEqual([]);
+
+    // The row — its bound-at stamp included — and the record document are exactly as they were.
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
+    expect(storedRecordJson(capturing.sessionId)).toBe(recordBefore);
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url });
+
+    // The live binding still routes: the session's fan-out reaches the tab …
+    const later = client.received.length;
+    unwrap(
+      await service().manager.patch(capturing.sessionId, { target: targetOn(url) }),
+      'Patching the session',
+    );
+    await waitFor(client, REPLAY_SESSION_UPDATED, (_message, index) => index >= later);
+
+    // … and the tab's credential still owns it: a reload is kept and re-arms
+    // the open capture there.
+    const reloaded = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url }),
+    );
+    expect(reloaded.errors).toEqual([]);
+    expect(announcementsSince(client, reloaded.mark)).toEqual([
+      { sessionId: capturing.sessionId, tabId, url, reason: REASON_NAVIGATED },
+    ]);
+    expectArmedFor((await waitForArming(client, capturing, reloaded.mark)).payload, capturing);
+
+    // The retried unbind finds the binding and drops it from every store.
+    await settleAll(capturing.editor);
+    const retryMark = capturing.editor.received.length;
+    const retried = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(retried.errors).toEqual([]);
+    const ended = { sessionId: capturing.sessionId, tabId, url, reason: REASON_UNBOUND };
+    expect(announcementsSince(client, retried.mark)).toEqual([ended]);
+    await settleAll(capturing.editor);
+    expect(announcementsSince(capturing.editor, retryMark)).toEqual([ended]);
+    expect(storedBindingOfTab(tabId)).toBeUndefined();
+    expect(storedBindingOfSession(capturing.sessionId)).toBeUndefined();
+    expect(rowsFor({ tabId })).toEqual([]);
+    expect(recordOf(capturing.sessionId).boundTab).toBeUndefined();
+    expect(recordOf(capturing.sessionId).status).toBe(statusBefore);
+    expect(openCaptureId(capturing.sessionId)).toBe(capturing.captureId);
+  });
+
+  it('drops the binding of a session whose record has vanished, since there is no bound tab left to clear', async () => {
+    const { created } = suite();
+    const running = service();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(created, '/orders');
+
+    // A disposable session on the same dev server, bound by id so no other
+    // test's origin matching is affected, whose record is then purged the way
+    // retention deletes a row while a panel still holds its live binding.
+    const disposable = unwrap(
+      await running.manager.create({
+        projectRoot: created.project.root,
+        question: 'Why does this list flicker on load?',
+        devServerUrl: created.devServerUrl,
+      }),
+      'Creating a disposable session',
+    );
+    const bound = await bind(client, { tabId, url, sessionId: disposable.id });
+    expectEstablished(client, bound, disposable.id, tabId);
+    running.store.statement('DELETE FROM sessions WHERE id = ?').run(disposable.id);
+    expect(
+      unwrap(running.manager.get(disposable.id), 'Reading the purged session'),
+    ).toBeUndefined();
+    expect(rowsFor({ tabId })).toEqual([]);
+
+    const unbound = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+    expect(announcementsSince(client, unbound.mark)).toEqual([
+      { sessionId: disposable.id, tabId, url, reason: REASON_UNBOUND },
+    ]);
+    expect(rowsFor({ tabId, sessionId: disposable.id })).toEqual([]);
+
+    // The live binding is gone too: a second unbind has nothing left to drop.
+    const twice = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(twice.errors).toEqual([]);
+    expect(announcementsSince(client, twice.mark)).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Restoration racing session.end
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The prefix of each race case's own `fs.mkdtemp` directory. */
+const RACE_RIG_PREFIX = 'debuggen-binding-race-';
+
+/** WHATWG `WebSocket.CLOSED`: the ready state the rig's socket reports once the registry closed it. */
+const SOCKET_READY_STATE_CLOSED = 3;
+
+/** The byte length of a SHA-256 digest: what a credential's `tokenHash` is the hex form of. */
+const TOKEN_HASH_BYTES = 32;
+
+/** The Chrome extension the rig's DevTools credential was paired with: 32 letters from Chrome's `a`–`p` id alphabet. */
+const RACE_EXTENSION_ID = 'abcdefghijklmnopabcdefghijklmnop';
+
+/** A promise the test settles by hand. */
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+}
+
+/** A {@link Deferred}. A promise executor runs synchronously, so its resolver is captured before this returns. */
+function deferred<T>(): Deferred<T> {
+  const resolvers: ((value: T) => void)[] = [];
+  const promise = new Promise<T>((resolve) => {
+    resolvers.push(resolve);
+  });
+  const [resolve] = resolvers;
+  if (resolve === undefined) {
+    throw new Error('Unreachable: a promise executor runs synchronously.');
+  }
+  return { promise, resolve };
+}
+
+/** The `setBoundTab` call the rig held: which session record the route asked to show which tab. */
+interface MirrorCall {
+  readonly sessionId: SessionId;
+  readonly boundTab: BoundTab | undefined;
+}
+
+/** A record mirror the rig holds open until the test answers it. */
+interface HeldMirror {
+  /** Settles with the call once the route has made it and is awaiting its answer. */
+  readonly reached: Promise<MirrorCall>;
+  /** Answers the held call: the route resumes with exactly this result. */
+  readonly answer: (result: Result<SessionRecord, DebuggenError>) => void;
+}
+
+/** The binding routes over a store of their own (see the module overview, "Restoration racing `session.end`"). */
+interface RaceRig {
+  /** The `fs.mkdtemp` directory holding the rig's store; removed after the case. */
+  readonly directory: string;
+  readonly store: Store;
+  readonly sessions: SessionsRepo;
+  /** The real manager: the route's mirrors reach it unless held, and the test ends sessions through it. */
+  readonly manager: SessionManager;
+  readonly clients: ClientRegistry;
+  readonly routes: BindingRoutes;
+  /** The registered panel's credential. */
+  readonly principal: DevtoolsPrincipal;
+  /** The registered panel's connection, as `src/server/ws.ts` hands it to the routes. */
+  readonly connection: BindingConnection;
+  /** Every frame the registry wrote to the panel's socket, raw, in send order. */
+  readonly sent: readonly string[];
+  /** Every session the routes asked to re-arm. The rig opens no capture, so none may be. */
+  readonly armRequests: readonly string[];
+  /** Holds the route's next `setBoundTab` open until the test answers it. */
+  holdNextMirror(): HeldMirror;
+}
+
+/**
+ * Builds a {@link RaceRig}: a fresh store in its own `fs.mkdtemp` directory;
+ * the real sessions and panels repositories, progress emitter, session manager
+ * (configured as the service under test is), reopener and client registry over
+ * it, all logging to the harness's capturing logger; and one registered
+ * DevTools connection. Whatever was acquired is released should a step refuse.
+ */
+async function openRaceRig(): Promise<RaceRig> {
+  const running = service();
+  const logger = running.logger.root;
+  const directory = await mkdtemp(join(realpathSync(tmpdir()), RACE_RIG_PREFIX));
+  let store: Store | undefined;
+  try {
+    const opened = unwrap(
+      openStore({ databasePath: join(directory, 'sessions.sqlite'), logger }),
+      'Opening the race rig store',
+    );
+    store = opened;
+    const sessions = createSessionsRepo({ store: opened, logger });
+    const clients = createClientRegistry({ logger });
+    const progress = createSessionProgress({ sessions, broadcaster: clients, logger });
+    const manager = createSessionManager({
+      sessions,
+      broadcaster: clients,
+      progress,
+      config: running.config,
+      logger,
+    });
+    const reopener = createSessionReopener({
+      sessions,
+      panels: createPanelsRepo({ store: opened, logger }),
+      broadcaster: clients,
+      logger,
+    });
+
+    let held:
+      | {
+          readonly reached: Deferred<MirrorCall>;
+          readonly answer: Deferred<Result<SessionRecord, DebuggenError>>;
+        }
+      | undefined;
+    const armRequests: string[] = [];
+    const routes = createBindingRoutes({
+      clients,
+      sessions,
+      manager: {
+        setBoundTab: (sessionId, boundTab) => {
+          const next = held;
+          if (next === undefined) {
+            return manager.setBoundTab(sessionId, boundTab);
+          }
+          held = undefined;
+          next.reached.resolve({ sessionId, boundTab });
+          return next.answer.promise;
+        },
+      },
+      reopener,
+      arming: {
+        armCapture: (request) => {
+          armRequests.push(request.sessionId);
+          return err(
+            new DebuggenError(
+              CODES.INTERNAL,
+              'The race rig opens no capture, so nothing may be armed.',
+            ),
+          );
+        },
+      },
+      progress,
+      logger,
+    });
+
+    const sent: string[] = [];
+    let socketOpen = true;
+    const socket: ClientSocket = {
+      send: (data) => {
+        sent.push(data);
+      },
+      close: () => {
+        socketOpen = false;
+      },
+      get readyState() {
+        return socketOpen ? SOCKET_READY_STATE_OPEN : SOCKET_READY_STATE_CLOSED;
+      },
+    };
+    const principal: DevtoolsPrincipal = {
+      role: CLIENT_DEVTOOLS,
+      tokenHash: randomBytes(TOKEN_HASH_BYTES).toString('hex'),
+      issuedAt: running.now(),
+      scope: { kind: 'extension', extensionId: RACE_EXTENSION_ID },
+    };
+    const panel = unwrap(
+      clients.register({ kind: CLIENT_DEVTOOLS, principal, socket }),
+      'Registering the race rig panel',
+    );
+
+    return {
+      directory,
+      store: opened,
+      sessions,
+      manager,
+      clients,
+      routes,
+      principal,
+      connection: { principal, clientId: panel.id },
+      sent,
+      armRequests,
+      holdNextMirror: () => {
+        if (held !== undefined) {
+          throw new Error("The route's next record mirror is already held.");
+        }
+        const next = {
+          reached: deferred<MirrorCall>(),
+          answer: deferred<Result<SessionRecord, DebuggenError>>(),
+        };
+        held = next;
+        return { reached: next.reached.promise, answer: next.answer.resolve };
+      },
+    };
+  } catch (cause) {
+    if (store !== undefined && !store.isClosed) {
+      store.close();
+    }
+    await rm(directory, { recursive: true, force: true });
+    throw cause;
+  }
+}
+
+/** Releases a {@link RaceRig}: its connection, its store and its directory. */
+async function closeRaceRig(rig: RaceRig): Promise<void> {
+  rig.clients.closeAll();
+  if (!rig.store.isClosed) {
+    rig.store.close();
+  }
+  await rm(rig.directory, { recursive: true, force: true });
+}
+
+/** A session record of the rig, as its manager holds it. */
+function rigRecordOf(rig: RaceRig, sessionId: SessionId): SessionRecord {
+  const record = unwrap(rig.manager.get(sessionId), 'Reading a race rig session');
+  if (record === undefined) {
+    throw new Error(`Race rig session ${sessionId} does not exist.`);
+  }
+  return record;
+}
+
+/** One raw row of the rig's `bindings` table, bound-at stamp included. */
+interface StampedBindingRow extends BindingRow {
+  readonly boundAt: number;
+}
+
+/** The rig's whole `bindings` table, read raw and ordered by tab. */
+function rigBindingRows(rig: RaceRig): StampedBindingRow[] {
+  const rows = rig.store
+    .statement('SELECT tab_id, session_id, url, bound_at FROM bindings ORDER BY tab_id')
+    .all();
+  return rows.map((row) => {
+    const tabId = row['tab_id'];
+    const sessionId = row['session_id'];
+    const url = row['url'];
+    const boundAt = row['bound_at'];
+    if (
+      typeof tabId !== 'number' ||
+      typeof sessionId !== 'string' ||
+      typeof url !== 'string' ||
+      typeof boundAt !== 'number'
+    ) {
+      throw new Error('A bindings row does not have the shape the schema declares.');
+    }
+    return { tabId, sessionId, url, boundAt };
+  });
+}
+
+/** The `session.bound` announcements the rig's panel received at or after `from`, each schema-validated. */
+function rigAnnouncementsSince(rig: RaceRig, from: number): SessionBoundPayload[] {
+  return rig.sent.slice(from).flatMap((raw) => {
+    const message = unwrap(decodeMessage(raw), 'Decoding a frame the race rig panel received');
+    return isMessageOfType(message, SESSION_BOUND)
+      ? [sessionBoundPayloadSchema.parse(message.payload)]
+      : [];
+  });
+}
+
+/** The binding route's records in the harness's capturing log at or after index `from`. */
+function bindingLogSince(from: number): CapturedLogRecord[] {
+  return service()
+    .logger.records.slice(from)
+    .filter((record) => record.fields['subsystem'] === 'binding');
+}
+
+/** The refusal of a result expected to be refused. @throws Error When it succeeded. */
+function refusalOf<T>(result: Result<T, DebuggenError>, step: string): DebuggenError {
+  if (!isErr(result)) {
+    throw new Error(`${step} was expected to be refused, and succeeded.`);
+  }
+  return result.error;
+}
+
+/** A tab the rig bound to an open session, as both routing stores held it after the bind. */
+interface RigBinding {
+  readonly sessionId: SessionId;
+  readonly tabId: number;
+  readonly url: string;
+  readonly row: TabBinding;
+  readonly live: TabBindingView;
+}
+
+/**
+ * Creates an open session on the `created` project's dev server in the rig's
+ * store and binds a fresh tab to it by id, through the unheld routes: the row,
+ * the live binding and the record's bound tab all stand afterwards.
+ */
+async function bindRigSession(rig: RaceRig): Promise<RigBinding> {
+  const { created } = suite();
+  const session = unwrap(
+    await rig.manager.create({
+      projectRoot: created.project.root,
+      question: 'Why does the order list stall after a filter change?',
+      devServerUrl: created.devServerUrl,
+    }),
+    'Creating a race rig session',
+  );
+  const tabId = freshTab();
+  const url = pageOf(created, '/orders');
+  const bound = unwrap(
+    await rig.routes.handleSessionBind(
+      sessionBindPayloadSchema.parse({ tabId, url, origin: created.origin, sessionId: session.id }),
+      rig.connection,
+    ),
+    'Binding the race rig tab',
+  );
+  expect(bound).toMatchObject({ sessionId: session.id, tabId, url });
+  const row = unwrap(rig.sessions.getBindingByTab(tabId), 'Reading the bound row');
+  const live = rig.clients.bindingForTab(tabId);
+  if (row === undefined || live === undefined) {
+    throw new Error('The bind left the tab without its row or its live binding.');
+  }
+  expect(rigRecordOf(rig, session.id).boundTab).toEqual({ tabId, url });
+  return { sessionId: session.id, tabId, url, row, live };
+}
+
+/** One way a binding ends, driven through the rig's routes. */
+interface DropKind {
+  readonly label: string;
+  /** The reason a drop that stands is announced with. */
+  readonly reason: SessionBoundPayload['reason'];
+  /** Sends the frame that ends the tab's binding and answers the handler's outcome. */
+  readonly drop: (
+    rig: RaceRig,
+    tabId: number,
+  ) => Promise<Result<{ readonly kind: string }, DebuggenError>>;
+}
+
+/** The two frames that end a binding: an unbind, and a navigation to another origin. */
+const DROP_KINDS: readonly DropKind[] = [
+  {
+    label: SESSION_UNBIND,
+    reason: REASON_UNBOUND,
+    drop: (rig, tabId) =>
+      rig.routes.handleSessionUnbind(sessionUnbindPayloadSchema.parse({ tabId }), rig.connection),
+  },
+  {
+    label: `a cross-origin ${TAB_NAVIGATED}`,
+    reason: REASON_ORIGIN_CHANGED,
+    drop: (rig, tabId) =>
+      rig.routes.handleTabNavigated(
+        tabNavigatedPayloadSchema.parse({ tabId, url: pageOf(suite().capturing, '/reports') }),
+        rig.connection,
+      ),
+  },
+];
+
+/** The record mirror refusal every race case answers the held call with. */
+function refusedMirror(): Result<SessionRecord, DebuggenError> {
+  return err(new DebuggenError(CODES.STORE_ERROR, 'The race rig refused the record mirror.'));
+}
+
+describe('binding restoration racing session.end', () => {
+  let rig: RaceRig | undefined;
+
+  beforeEach(async () => {
+    rig = await openRaceRig();
+  });
+
+  afterEach(async () => {
+    const current = rig;
+    rig = undefined;
+    if (current !== undefined) {
+      await closeRaceRig(current);
+    }
+  });
+
+  /** The current case's rig. @throws Error When `beforeEach` did not build it. */
+  function currentRig(): RaceRig {
+    if (rig === undefined) {
+      throw new Error('The race case did not build its rig.');
+    }
+    return rig;
+  }
+
+  for (const kind of DROP_KINDS) {
+    it(`lets a session.end that commits while ${kind.label} awaits its record mirror stand once the mirror is refused: nothing is restored or announced and the drop answers ignored`, async () => {
+      const current = currentRig();
+      const bound = await bindRigSession(current);
+      const sentMark = current.sent.length;
+      const logMark = service().logger.records.length;
+      const held = current.holdNextMirror();
+
+      // The drop removes the row, releases the live binding and then awaits
+      // the record mirror, which the rig holds open.
+      const dropping = kind.drop(current, bound.tabId);
+      expect(await held.reached).toEqual({ sessionId: bound.sessionId, boundTab: undefined });
+      expect(rigBindingRows(current)).toEqual([]);
+      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+
+      // Meanwhile the real session.end commits `ended` without a bound tab,
+      // removing the session's binding rows in the same store transaction.
+      const ended = unwrap(await current.manager.end(bound.sessionId), 'Ending the session');
+      expect(ended.session.status).toBe('ended');
+      expect(ended.session.boundTab).toBeUndefined();
+
+      // Only now is the record mirror refused.
+      held.answer(refusedMirror());
+      expect(unwrap(await dropping, `Answering ${kind.label}`)).toEqual({ kind: 'ignored' });
+
+      // The end's outcome stands in both routing stores and on the record.
+      expect(
+        unwrap(current.sessions.getBindingByTab(bound.tabId), 'Reading the tab row'),
+      ).toBeUndefined();
+      expect(
+        unwrap(current.sessions.getBindingBySession(bound.sessionId), 'Reading the session row'),
+      ).toBeUndefined();
+      expect(rigBindingRows(current)).toEqual([]);
+      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+      const record = rigRecordOf(current, bound.sessionId);
+      expect(record.status).toBe('ended');
+      expect(record.boundTab).toBeUndefined();
+
+      // Nobody is told of a drop the end already made; the route logged the
+      // outcome at info, by ids alone.
+      expect(rigAnnouncementsSince(current, sentMark)).toEqual([]);
+      const logged = bindingLogSince(logMark);
+      expect(logged.filter((entry) => entry.level === 'error')).toEqual([]);
+      expect(
+        logged.filter(
+          (entry) =>
+            entry.level === 'info' &&
+            entry.message.includes('ended while its binding was being dropped'),
+        ),
+      ).toHaveLength(1);
+      const { capturing, created } = suite();
+      for (const entry of logged) {
+        expect(entry.line).not.toContain(created.origin);
+        expect(entry.line).not.toContain(capturing.origin);
+      }
+
+      // The tab is unbound for good: a second unbind has nothing left to drop.
+      expect(
+        unwrap(
+          await current.routes.handleSessionUnbind(
+            sessionUnbindPayloadSchema.parse({ tabId: bound.tabId }),
+            current.connection,
+          ),
+          'Unbinding again',
+        ),
+      ).toEqual({ kind: 'ignored' });
+      expect(rigAnnouncementsSince(current, sentMark)).toEqual([]);
+      expect(current.armRequests).toEqual([]);
+    });
+
+    it(`restores the row, its bound-at stamp and the live binding when ${kind.label} has its record mirror refused on a session that stays open, returns the refusal and drops the binding on retry`, async () => {
+      const current = currentRig();
+      const bound = await bindRigSession(current);
+      const recordBefore = rigRecordOf(current, bound.sessionId);
+      const rowsBefore = rigBindingRows(current);
+      const sentMark = current.sent.length;
+      const held = current.holdNextMirror();
+
+      const dropping = kind.drop(current, bound.tabId);
+      expect(await held.reached).toEqual({ sessionId: bound.sessionId, boundTab: undefined });
+      expect(rigBindingRows(current)).toEqual([]);
+      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+
+      // The session is still open when the record mirror is refused.
+      held.answer(refusedMirror());
+      expect(refusalOf(await dropping, kind.label).code).toBe(CODES.STORE_ERROR);
+
+      // Both routing stores are exactly as before the drop, the record never
+      // changed, and nothing was announced.
+      expect(unwrap(current.sessions.getBindingByTab(bound.tabId), 'Reading the tab row')).toEqual(
+        bound.row,
+      );
+      expect(rigBindingRows(current)).toEqual(rowsBefore);
+      expect(current.clients.bindingForTab(bound.tabId)).toMatchObject({
+        tabId: bound.tabId,
+        sessionId: bound.sessionId,
+        url: bound.url,
+        boundBy: current.principal.tokenHash,
+        boundAt: bound.live.boundAt,
+      });
+      expect(rigRecordOf(current, bound.sessionId)).toEqual(recordBefore);
+      expect(rigAnnouncementsSince(current, sentMark)).toEqual([]);
+
+      // The retried drop finds the binding, and this time the record takes it.
+      const retryMark = current.sent.length;
+      expect(unwrap(await kind.drop(current, bound.tabId), `Retrying ${kind.label}`)).toMatchObject(
+        { kind: 'dropped' },
+      );
+      expect(rigBindingRows(current)).toEqual([]);
+      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+      const record = rigRecordOf(current, bound.sessionId);
+      expect(record.boundTab).toBeUndefined();
+      expect(record.status).toBe(recordBefore.status);
+      expect(
+        rigAnnouncementsSince(current, retryMark).map((payload) => ({
+          sessionId: payload.sessionId,
+          tabId: payload.tabId,
+          reason: payload.reason,
+        })),
+      ).toEqual([{ sessionId: bound.sessionId, tabId: bound.tabId, reason: kind.reason }]);
+      expect(current.armRequests).toEqual([]);
+    });
+  }
 });
 
 /* -------------------------------------------------------------------------------------------------

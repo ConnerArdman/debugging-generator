@@ -1,7 +1,6 @@
 /**
  * Tests for `../http.ts`, the service's HTTP route surface, in the directory
- * `packages/protocol/tsconfig.json` names for this package's suites
- * (AAP §0.8.3).
+ * `packages/protocol/tsconfig.json` names for this package's suites.
  *
  * What is on trial is the **route contract**, not the schema library. Three
  * processes agree on nothing except what that module declares — the service
@@ -25,15 +24,15 @@
  *   member union, that `HttpOperation` is the same type, that the package
  *   barrel publishes both names, and that a handler map missing one operation —
  *   or naming one the table does not hold — does not type-check.
- * - **The authentication exemption.** AAP §0.5.6 makes exactly two routes
- *   reachable without a bearer credential. The module states that twice — as a
+ * - **The authentication exemption.** Exactly two routes are reachable
+ *   without a bearer credential. The module states that twice — as a
  *   tuple and as a per-route flag — and although a compile-time proof ties them
  *   together, the cases here assert the agreement from both directions at run
  *   time as well, because a widened exemption is the one defect in this file
  *   that is a security bug rather than a bug.
  * - **The acting-tab header.** One paired DevTools credential serves every
  *   inspected tab, so `x-debuggen-tab` is what lets the service hold a DevTools
- *   request to the session bound to its tab (AAP §0.5.6). The cases pin its
+ *   request to the session bound to its tab. The cases pin its
  *   lowercase name, accept only one tab id in canonical decimal — refusing an
  *   empty value, a sign, a leading zero, whitespace, a joined duplicate and the
  *   first unsafe integer, each without quoting it — and prove the formatter
@@ -47,8 +46,9 @@
  *   that package's entries export it — the browser-safe `./schema` entry this
  *   package imports and the root the local service imports — which is what
  *   proves the two entries share one module rather than each carrying a copy.
- *   A structural comparison would pass for a hand-written copy, which is the
- *   duplicate definition AAP §0.9.1 forbids, so these are `toBe` assertions.
+ *   A structural comparison would pass for a hand-written copy, which is a
+ *   second definition free to drift from the first, so these are `toBe`
+ *   assertions.
  * - **The `DataResult` union.** `DATA_QUERY_SOURCES` states that its ten members
  *   are "exactly the discriminants" of this union; the cases check that as a set,
  *   in order, with one member each, and then parse a real aggregate for every
@@ -78,7 +78,7 @@
  *   into someone else's capture.
  * - **Leak freedom.** A rejected body is unvalidated data from another process
  *   and holds project paths, the developer's question, redacted URLs and
- *   parameterized SQL. AAP §0.5.2 keeps all of it out of the error, and the
+ *   parameterized SQL. None of it may appear in the error, and the
  *   sentinel cases check the message, the hint, the details and the wire payload.
  * - **JSON survival.** Every response body is built, parsed, serialised,
  *   deserialised and parsed again, because `undefined` does not survive a round
@@ -153,6 +153,7 @@ import {
   isAuthExemptOperation,
   modificationsPath,
   pairCompletePath,
+  READ_PROOF_LENGTH,
   pairCompleteResponseSchema,
   pairStartPath,
   pairStartResponseSchema,
@@ -495,6 +496,9 @@ const CONFLICTED_SESSION_ID = 'ses_9w3e5r7t1y2u4i6o';
 /** The server-agent credential `devServer.credential` hands over; low-entropy on purpose. */
 const SERVER_AGENT_TOKEN = 'server-agent-credential-placeholder';
 
+/** The read proof `pair.complete` hands over beside the credential; low-entropy on purpose. */
+const READ_PROOF_PLACEHOLDER = 'r'.repeat(READ_PROOF_LENGTH);
+
 /**
  * Distinct session ids of the product's shape, for the purge report's bound.
  *
@@ -605,7 +609,7 @@ const VALID_RESPONSES: { readonly [O in HttpOperationId]: HttpResponseBody<O> } 
   'devServer.credential': { token: SERVER_AGENT_TOKEN, expiresAt: START_TIME + 43_200_000 },
   health: { version: '0.1.0', protocolVersion: '1.0.0', pairingAvailable: true },
   'pair.start': { code: 'PAIR2X7Q', expiresAt: START_TIME + 300_000 },
-  'pair.complete': { token: 'devtools-credential-placeholder' },
+  'pair.complete': { token: 'devtools-credential-placeholder', readProof: READ_PROOF_PLACEHOLDER },
   'credentials.rotate': { credentialsDeleted: 3, socketsClosed: 2 },
 };
 
@@ -1016,9 +1020,8 @@ describe('the Authorization header', () => {
 
 // One paired DevTools credential is presented for every inspected tab, so a
 // DevTools request says which tab it acts for in this header, and the service
-// verifies it against its live binding table (AAP §0.5.6). The value is
-// unvalidated data from another process until it parses, so no rejection may
-// quote it (AAP §0.5.2).
+// verifies it against its live binding table. The value is unvalidated data
+// from another process until it parses, so no rejection may quote it.
 describe('the acting-tab header', () => {
   /**
    * The strings of a rejection that could carry a value: message, hint,
@@ -2153,15 +2156,26 @@ describe('the dev-server, health and pairing bodies', () => {
     );
 
     expect(
-      pairCompleteResponseSchema.safeParse({ token: 'devtools-credential-placeholder' }).success,
+      pairCompleteResponseSchema.safeParse({
+        token: 'devtools-credential-placeholder',
+        readProof: READ_PROOF_PLACEHOLDER,
+      }).success,
     ).toBe(true);
     expect(pairCompleteResponseSchema.safeParse({}).success).toBe(false);
-    expect(pairCompleteResponseSchema.safeParse({ token: '' }).success).toBe(false);
-    // Nothing rides along with the credential: a role or a scope echoed here
-    // would be a client's word for what it was granted.
+    expect(
+      pairCompleteResponseSchema.safeParse({ token: '', readProof: READ_PROOF_PLACEHOLDER })
+        .success,
+    ).toBe(false);
+    // The read proof is issued with the credential, never optional.
+    expect(
+      pairCompleteResponseSchema.safeParse({ token: 'devtools-credential-placeholder' }).success,
+    ).toBe(false);
+    // Nothing else rides along with the credential: a role or a scope echoed
+    // here would be a client's word for what it was granted.
     expect(
       pairCompleteResponseSchema.safeParse({
         token: 'devtools-credential-placeholder',
+        readProof: READ_PROOF_PLACEHOLDER,
         role: 'devtools',
       }).success,
     ).toBe(false);

@@ -1,47 +1,13 @@
 /**
  * `GET /api/orders`: one page of a customer's order history.
  *
- * The handler does three things in a fixed order - parse the query, hand it to
- * the order service, answer with what came back - and deliberately nothing
- * else. There is no SQL here, no paging arithmetic, no money arithmetic and no
- * second copy of the query rules: the schema lives in
- * `@/server/validation/orders`, the work lives in
- * `@/server/services/order.service`, and this module is where the two meet.
- * That is what keeps one listing answering the storefront's own order-history
- * page and anything else speaking HTTP.
- *
- * Four decisions are worth stating because a reader would otherwise reasonably
- * expect the opposite:
- *
- * 1. **The query is parsed with the throwing `parse`, never with its
- *    non-throwing counterpart.** A rejection is left to propagate as the
- *    `ZodError` it is, so the single mapper in `@/server/errors` answers 400
- *    with the field paths it rejected. An endpoint that quietly substituted
- *    defaults for a malformed value would answer somebody else's question,
- *    whereas a page rendering a listing is better off degrading to its first
- *    page than failing - which is why the two read a query differently. A
- *    request naming no customer is therefore a 400 rather than an empty page,
- *    because `customerId` is the one parameter with no sensible default.
- * 2. **Nothing is cached.** An order's status moves while the customer is
- *    watching - paid, then fulfilled - and a history served from a cache would
- *    be quietly out of date. The segment is dynamic, the response says
- *    `no-store`, and nothing is memoized at module scope, so every request is
- *    answered from the database as it stands.
- * 3. **The payload is passed through untouched.** The service already stated
- *    the page in the shapes of `@/lib/types` - integer cents in `*Cents`
- *    fields, an ISO-8601 UTC string for the instant an order was placed - so
- *    re-labelling or re-rounding anything here could only introduce a
- *    disagreement between this endpoint and the components that read it.
- * 4. **CONSUMER CLASSIFICATION: this endpoint answers the order-history page
- *    itself.** `app/orders/page.tsx` parses its own address and then reads this
- *    endpoint through `loadOrderHistory` in `@/lib/api-client`, so the listing a
- *    customer sees and the listing an outside caller receives are the same
- *    answer to the same request. The list component on that surface renders its
- *    props and issues nothing of its own, so no request for this endpoint is
- *    made from the browser - but the handler is validated and bounded by
- *    `ordersQuerySchema` whoever sent it, because an endpoint reachable over
- *    HTTP is reachable by anyone: a caller inside this application relaxes
- *    nothing about how a request is parsed.
+ * `ordersQuerySchema` in `@/server/validation/orders` declares and bounds every
+ * parameter and defaults the page window. `customerId` alone is required,
+ * because it has no sensible default: a request naming no customer is a 400
+ * rather than an empty page. The `PagedList<OrderSummary>` from
+ * `@/server/services/order.service` is returned as it stands. An order's status
+ * moves while the customer is watching, so the segment is dynamic, every
+ * response is `no-store` and nothing is memoized at module scope.
  */
 
 import type { OrderSummary, PagedList } from '@/lib/types';
@@ -60,9 +26,7 @@ export const dynamic = 'force-dynamic';
  * Reads one page of a customer's orders, most recently placed first.
  *
  * @param request The incoming request. Its query string carries the customer
- * whose orders these are, the page window, and an optional status to narrow to;
- * `ordersQuerySchema` owns which of those are required and what they default
- * to.
+ * whose orders these are, the page window, and an optional status to narrow to.
  * @returns 200 with a `PagedList<OrderSummary>` - the page's orders, the number
  * of orders the filter matched, and the page number and size the answer was
  * built with. Any failure is answered by `storefrontErrorResponse` in the one

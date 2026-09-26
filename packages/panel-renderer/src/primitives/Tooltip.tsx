@@ -7,10 +7,10 @@
  * for it, so this primitive is the one sanctioned way to attach that sentence - to a table cell, a
  * chart bar, a metric card, a graph node or a control in either consumer surface.
  *
- * ## The four accessibility clauses of AAP 0.6.2, and how each is met
+ * ## The four accessibility guarantees, and how each is met
  *
  * These describe the default, UNCONTROLLED tooltip. A tooltip whose owner holds it open (`open`,
- * below) hands the first and third clauses to that owner; the second (subject to
+ * below) hands the first and third guarantees to that owner; the second (subject to
  * `describesTrigger`) and the fourth hold either way.
  *
  *   - Hover AND keyboard focus. `onPointerEnter` opens after `openDelayMs`; React's `onFocus`
@@ -112,32 +112,33 @@
  *
  * ## No portal, no positioning library - but measured, fixed placement
  *
- * The bubble renders inside the panel's own DOM ("positioned within the panel", AAP 0.6.2), which
- * keeps it inside the theme root the layout shell establishes, so it inherits the active
- * `data-theme` token set with no extra wiring; a portal to the document body would leave that root
- * and need a second theme carrier to get it back. It also keeps the bubble a descendant of its
- * trigger's wrapper, which is what lets a surface find the description of one row inside that row.
- * The package's dependency set is fixed by AAP 0.3.2 and contains no positioning library.
+ * The bubble renders inside the panel's own DOM, positioned within the panel, which keeps it
+ * inside the theme root the layout shell establishes, so it inherits the active `data-theme` token
+ * set with no extra wiring; a portal to the document body would leave that root and need a second
+ * theme carrier to get it back. It also keeps the bubble a descendant of its trigger's wrapper,
+ * which is what lets a surface find the description of one row inside that row. The package ships
+ * no positioning library: its third-party dependencies are `clsx`, `lucide-react` and
+ * `@tanstack/react-virtual`.
  *
- * Staying in place used to mean staying CLIPPED: the bubble was absolutely positioned inside its
- * wrapper, so every `overflow` between the trigger and the panel - a table cell, a table's scroll
- * viewport, the shell's own scroll area - cut it off, and the description of the first row of a
- * table was drawn under that table's header. An open bubble is therefore `position: fixed`, which
- * lays it out against the browser viewport and outside every scroll container, while leaving it
- * exactly where it is in the DOM and in the theme cascade. A fixed box needs coordinates, and those
- * are the one thing this file computes (`positionBubble`, below): the trigger's rect, the bubble's
- * size and the viewport's size, measured in a layout effect before the bubble is painted and again
- * on every scroll and resize while it stays open. From them it takes the requested side, flips to
- * the opposite side when the requested one would leave the viewport and the opposite one would
- * not, and clamps the result inside the viewport.
+ * An open bubble is `position: fixed`, which is what lets it stay in place without being clipped.
+ * Every `overflow` between the trigger and the panel - a table cell, a table's scroll viewport, the
+ * shell's own scroll area - clips the boxes laid out inside it, but a fixed box is laid out against
+ * the browser viewport rather than against any of those scroll containers, so none of their
+ * overflow clips applies to it and the description of a table's first row is drawn over that
+ * table's header. The bubble still sits exactly where it is in the DOM and in the theme cascade. A
+ * fixed box needs coordinates, and those are the one thing this file computes (`positionBubble`,
+ * below): the trigger's rect, the bubble's size and the viewport's size, measured in a layout
+ * effect before the bubble is painted and again on every scroll and resize while it stays open.
+ * From them it takes the requested side, flips to the opposite side when the requested one would
+ * leave the viewport and the opposite one would not, and clamps the result inside the viewport.
  *
- * This is a deliberate, documented departure from the v1 rule "no measured coordinates, no inline
- * style" that this file was first written against, and it is kept as narrow as the problem: the
- * coordinates are two UNITLESS `--dgc-*` numbers written on the bubble's own style - the same
- * sanctioned channel `./DataTable` uses for its geometry, consumed by `../styles/components.css`
- * through the unit bridge, which takes the unit from the `--dg-pixel-unit` token - and nothing
- * else is. No colour, length, gap or stacking value is written here: the gap to the trigger is the
- * placement variant's margin in the stylesheet, which this file reads back rather than restates.
+ * This is a deliberate exception to the package's rule of no measured coordinates and no inline
+ * style, kept as narrow as the problem: the coordinates are two UNITLESS `--dgc-*` numbers written
+ * on the bubble's own style - the same sanctioned channel `./DataTable` uses for its geometry,
+ * consumed by `../styles/components.css` through the unit bridge, which takes the unit from the
+ * `--dg-pixel-unit` token - and nothing else is. No colour, length, gap or stacking value is
+ * written here: the gap to the trigger is the placement variant's margin in the stylesheet, which
+ * this file reads back rather than restates.
  *
  * ## The styling contract this file declares for ../styles/components.css
  *
@@ -322,6 +323,15 @@ const PLACEMENT_CLASS: Record<TooltipPlacement, string> = {
   end: 'dg-tooltip--end',
 };
 
+/**
+ * The inputs of one tooltip: a single trigger element (`children`) and the inert description it
+ * reveals (`content`), which never holds anything focusable.
+ *
+ * Visibility is uncontrolled by default - hover after `openDelayMs` and focus open the bubble,
+ * leave, blur and Escape close it, and `disabled` keeps it shut. Passing a boolean `open` makes it
+ * controlled: that value alone decides, and the owner answers Escape. `describesTrigger`, `id`,
+ * `placement` and `className` apply in both modes.
+ */
 export interface TooltipProps {
   /**
    * The description. Text, a number, a formatted value or an inert element - never a button, a

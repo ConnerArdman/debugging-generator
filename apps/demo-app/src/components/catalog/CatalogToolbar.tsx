@@ -33,11 +33,6 @@
  * is the address the grid would have written. The grid derives those pairs from the same builder it
  * navigates with, which is why this file knows none of their names.
  *
- * NAMED `CatalogToolbar`. Not `Toolbar`: `packages/panel-renderer` publishes a layout primitive of
- * that name, and this workspace's multi-token identifiers are harvested into
- * `scripts/no-hardcoding.policy.json`, so a bare `Toolbar` here would put a name into circulation
- * that the product library already owns.
- *
  * DIVISION OF LABOUR, as everywhere in this storefront's forms:
  *
  *   * `@/components/ui/FormField` owns each field's `<label htmlFor>`, its hint paragraph and the
@@ -53,9 +48,10 @@
  *     the variant for a toolbar row; one left at the default `'md'` beside the other at `'sm'`
  *     would stand a few pixels taller than its neighbour on the line. The submit control is the
  *     exception and is deliberately `size="md"`: it is the same "Search" action the site header
- *     offers at that step, and one screen showing that action at two heights read as two different
- *     controls. The row absorbs the taller control without moving anything: it aligns its items on
- *     their bottom edge, and each field's own label already makes its wrapper the taller element.
+ *     offers at that step, and one screen showing that action at two heights would read as two
+ *     different controls. The row absorbs the taller control without moving anything: it aligns
+ *     its items on their bottom edge, and each field's own label already makes its wrapper the
+ *     taller element.
  *
  * THE FIELD IDS ARE LITERAL, AND `useId` IS DELIBERATELY NOT USED. `FormField` takes the id from
  * its caller precisely so a form can render from a server component, and a literal id is identical

@@ -11,8 +11,8 @@
  *   `pnpm demo:migrate` and `pnpm demo:seed` by name, once per process, with a
  *   heartbeat so the ≈200 000-row seed never looks like a hang. The `e2e`
  *   project is the acceptance tier, so both steps run on every run, local or
- *   CI (AAP §0.8.3), and there is no opt-out: a set {@link SKIP_SEED_ENV} is
- *   refused before anything runs. The handle's `ensureDatabase()` applies
+ *   CI, and there is no opt-out: a set {@link SKIP_SEED_ENV} is refused
+ *   before anything runs. The handle's `ensureDatabase()` applies
  *   {@link assertDemoDatabaseReady}, so a caller that ignores the returned
  *   state still cannot proceed unless this process migrated and seeded.
  * - **The dev server** — {@link startDemoApp} / {@link stopDemoApp} go through
@@ -22,12 +22,14 @@
  *   `DEBUGGEN_PROJECT_ROOT`; it is part of what the specs exist to prove.
  *   {@link expectPreloadAttached} turns the one confusing failure — a server
  *   someone else started still holding the demo URL — into an exact diagnosis.
- * - **Serving probes** — {@link isServing} / {@link expectServing}, the AAP
- *   §0.5.1 "the application keeps serving" check.
+ * - **Serving probes** — {@link isServing} / {@link expectServing}, the check
+ *   that the application keeps serving once a session has ended and its
+ *   instrumentation is removed (`docs/SECURITY.md`, "The guarantees").
  * - **The restoration contract** — {@link snapshotTrackedFiles},
  *   {@link verifyRestored} and {@link diffSnapshots}: the SHA-256 of the raw
  *   bytes of every file git tracks under `apps/demo-app`, taken before a
- *   session and compared after it (AAP §0.8.3, §0.8.4 acceptance test 3).
+ *   session and compared after it, which is how `cleanup.spec.ts` proves every
+ *   instrumented file byte-identical to its pre-session content.
  * - **The residual-instrumentation guard, in process** — {@link findMarkers},
  *   {@link worktreeDirty}, {@link runResidualCheck} and
  *   {@link expectNoResidualInstrumentation} load
@@ -44,11 +46,11 @@
  *
  * ## What this module never does
  *
- * 1. **It never writes under `apps/demo-app`** (AAP §0.5.1: helpers read, the
- *    product writes). Instrumentation is installed only by the real installer
- *    and removed only by the real cleanup; this file opens demo files for
- *    reading and hashing and nothing else. The clean-`git status` guarantee
- *    of acceptance test 3 depends on that.
+ * 1. **It never writes under `apps/demo-app`** (helpers read, the product
+ *    writes). Instrumentation is installed only by the real installer and
+ *    removed only by the real cleanup; this file opens demo files for
+ *    reading and hashing and nothing else. The clean-`git status` assertion
+ *    of `cleanup.spec.ts` depends on that.
  * 2. **It never starts `next dev` itself and never signals a process.** A
  *    hand-spawned dev server has no server-agent connection, so a session
  *    over it collects no server or database spans, and the failure would look
@@ -142,7 +144,7 @@ export const DATABASE_URL_ENV = 'DATABASE_URL';
 /**
  * A former opt-out from `pnpm demo:seed`, now **refused**. The `e2e`
  * Playwright project (`pnpm test:e2e`) is the acceptance tier, and it migrates
- * and seeds the demo database on every run, local or CI (AAP §0.8.3); a run
+ * and seeds the demo database on every run, local or CI; a run
  * on whatever rows an earlier seed left could pass while the current seed is
  * broken, so there is no way to skip either step.
  *
@@ -494,7 +496,7 @@ export interface EnsureDemoDatabaseOptions {
 /**
  * A successful acceptance preparation, the only thing {@link ensureDemoDatabase}
  * resolves with: `pnpm demo:migrate` and then `pnpm demo:seed` both ran and
- * succeeded in this process (AAP §0.8.3). A preparation that cannot do both
+ * succeeded in this process. A preparation that cannot do both
  * rejects instead, so there is no partial or skipped shape; `migrated` and
  * `seeded` are the literal `true` and exist for callers and reports to read.
  *
@@ -551,7 +553,7 @@ let databaseReady: Promise<DemoDatabaseState> | undefined;
  * truncates all twelve tables before loading, so repeating it is safe.
  *
  * Both are mandatory on every run of the `e2e` project, which is the
- * acceptance tier, locally and in CI alike (AAP §0.8.3); there is no opt-out.
+ * acceptance tier, locally and in CI alike; there is no opt-out.
  * {@link SKIP_SEED_ENV} is checked first, each time a preparation starts: while
  * it holds any non-empty value the preparation rejects before the
  * prerequisites are checked or any script runs, and — being a failure — is not
@@ -588,7 +590,7 @@ export function ensureDemoDatabase(
 /**
  * Refuse any database state but a real acceptance preparation, so a caller
  * that ignores what {@link ensureDemoDatabase} returned still cannot proceed
- * unless this process migrated **and** seeded the demo database (AAP §0.8.3).
+ * unless this process migrated **and** seeded the demo database.
  *
  * A state is ready only when all of these hold:
  *
@@ -728,7 +730,7 @@ function refuseSeedOptOut(): void {
   }
   throw new DemoAppError(
     'database',
-    `${SKIP_SEED_ENV} is set, but the e2e Playwright project (\`pnpm test:e2e\`) is the acceptance tier, which always runs \`pnpm demo:migrate\` and \`pnpm demo:seed\` before any spec (AAP §0.8.3), locally and in CI alike. There is no opt-out from either step, so neither ran: unset ${SKIP_SEED_ENV} (in your shell or the CI job's environment) and run again.`,
+    `${SKIP_SEED_ENV} is set, but the e2e Playwright project (\`pnpm test:e2e\`) is the acceptance tier, which always runs \`pnpm demo:migrate\` and \`pnpm demo:seed\` before any spec, locally and in CI alike. There is no opt-out from either step, so neither ran: unset ${SKIP_SEED_ENV} (in your shell or the CI job's environment) and run again.`,
   );
 }
 
@@ -975,9 +977,9 @@ export function describeProbe(result: ServingProbeResult | undefined): string {
 }
 
 /**
- * Whether the demo answers a GET with a status below 500 — the AAP §0.5.1
- * "the application keeps serving" probe. `cleanup.spec.ts` calls it after
- * `session.end` and before {@link stopDemoApp}: the inert preload is still
+ * Whether the demo answers a GET with a status below 500 — the probe that the
+ * application keeps serving after its session ends. `cleanup.spec.ts` calls
+ * it after `session.end` and before {@link stopDemoApp}: the inert preload is still
  * loaded then, and serving is the expected outcome, not a sign of residue.
  */
 export async function isServing(options: ServingProbeOptions = {}): Promise<boolean> {
@@ -1600,8 +1602,8 @@ export interface VerifyRestoredOptions {
 
 /**
  * Recompute the snapshot of `relDir` and require it to equal `snapshot`
- * exactly — the acceptance assertion of AAP §0.8.4 test 3. Three properties
- * are asserted separately, so the failure names the actual problem: the
+ * exactly — the byte-identical restoration `cleanup.spec.ts` asserts. Three
+ * properties are asserted separately, so the failure names the actual problem: the
  * tracked **file set** is unchanged (added / removed paths), every **digest**
  * matches (changed paths), and the **count** matches. The failure lists paths
  * only — never contents, never a diff.

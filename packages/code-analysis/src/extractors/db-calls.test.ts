@@ -1292,6 +1292,8 @@ let corpusSnapshot: readonly string[] | undefined;
 /** The scratch directory's shape before any extraction ran over it. */
 let scratchSnapshot: readonly string[] | undefined;
 
+// A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+// machine can push past the 10 s hook default and so fail every case below.
 beforeAll(async () => {
   // Taken first, so the comparison at the end of this file covers every read
   // this suite performs, the index build included.
@@ -1336,7 +1338,7 @@ beforeAll(async () => {
 
   scratch = createScratchProject();
   scratchSnapshot = directorySnapshot(scratch.root);
-});
+}, 30_000);
 
 afterAll(() => {
   if (scratch !== undefined) {
@@ -2615,6 +2617,8 @@ describe('dbCallsExtractor: owners across export forms and module kinds', () => 
   /** The assembled graph over the whole scratch project, for resolving edge origins. */
   let scratchGraph: CodeGraph | undefined;
 
+  // A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+  // machine can push past the 10 s hook default and so fail every case below.
   beforeAll(async () => {
     const built = await buildIndex(openedScratch().project, { logger: noopLogger });
 
@@ -2623,7 +2627,7 @@ describe('dbCallsExtractor: owners across export forms and module kinds', () => 
     }
 
     scratchGraph = CodeGraph.fromIndex(built.value, { logger: noopLogger });
-  });
+  }, 30_000);
 
   /**
    * The assembled graph, or a failure naming the missing `beforeAll`.

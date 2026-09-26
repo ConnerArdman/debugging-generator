@@ -33,11 +33,11 @@
  *    `$DEBUGGEN_HOME/auth.json` at run time and handed to the protocol clients
  *    through a lazy provider held in a module-private closure. No token,
  *    bearer string or connection string appears in this file, and no error
- *    message, log line or return value built here carries one (AAP §0.5.6).
+ *    message, log line or return value built here carries one.
  *    {@link ServiceHandle.pairComplete} returns the devtools credential to its
  *    caller only because that is the operation's whole answer.
  * 3. **It never writes.** It reads `auth.json` and nothing else — not even
- *    into `$DEBUGGEN_HOME` (AAP §0.5.1: helpers read, the product writes).
+ *    into `$DEBUGGEN_HOME` (helpers read, the product writes).
  * 4. **It never sleeps.** Waits are event-driven on recorded protocol messages
  *    (bounded by a deadline timer) or `expect.poll`; there is no
  *    `waitForTimeout`-style pause anywhere.
@@ -568,10 +568,11 @@ export class ServiceCallError extends Error {
 
 /**
  * `capture.start` refused because another session already holds the capture
- * for the same project (AAP §0.4.2: at most one capture per project; the
- * service answers `409 { owningSessionId }`). Thrown by
- * {@link ServiceHandle.startCapture} so a spec fails fast naming the owner
- * instead of waiting on a `capture.started` that will never come.
+ * for the same project (at most one capture per project, as
+ * `docs/ARCHITECTURE.md` "Capture exclusivity" states; the service answers
+ * `409 { owningSessionId }`). Thrown by {@link ServiceHandle.startCapture} so
+ * a spec fails fast naming the owner instead of waiting on a
+ * `capture.started` that will never come.
  */
 export class CaptureConflictError extends ServiceCallError {
   /** The session that holds the project's capture. */

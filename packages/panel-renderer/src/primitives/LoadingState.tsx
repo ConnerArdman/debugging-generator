@@ -4,13 +4,13 @@
  * ## Why this primitive is structural, not decorative
  *
  * Every catalogued visualization component in this package has exactly three
- * structural states, and AAP 0.6.2 names the renderer of each one: empty
- * (`EmptyState`), loading (`LoadingState` — "skeleton while `DataProvider`
- * resolves") and error (`ErrorState`). The loading state is not an edge case
- * here: a node reaches its data by resolving its `DataQuery` through
- * `host/useQuery` against a `DataProvider` that crosses a process boundary, so
- * every panel node is unresolved for a moment on the normal path and something
- * has to occupy its box while it is.
+ * structural states, each with its own renderer: empty (`EmptyState`), loading
+ * (`LoadingState`, a skeleton while the `DataProvider` resolves) and error
+ * (`ErrorState`). The loading state is not an edge case here: a node reaches
+ * its data by resolving its `DataQuery` through `host/useQuery` against a
+ * `DataProvider` that crosses a process boundary, so every panel node is
+ * unresolved for a moment on the normal path and something has to occupy its
+ * box while it is.
  *
  * The failure mode this component exists to prevent is layout thrash. A
  * generated panel is a layout of independent nodes, each with its own query; if
@@ -77,7 +77,7 @@
  * one sanctioned `!important`. So this module declares no duration, starts no
  * animation, reads no media query and branches on no motion preference:
  * honouring the preference is a cascade fact, and a JavaScript gate here would
- * be a second, weaker copy of a rule that already holds (AAP 0.6.3, 0.6.4).
+ * be a second, weaker copy of a rule that already holds.
  *
  * ## Two things this component deliberately does not do
  *
@@ -92,12 +92,13 @@
  * 2. **No geometry.** No width, height, minimum height, aspect ratio or inline
  *    style is written in this file. "Sized to its container" is achieved by the
  *    component layer filling the available box with relational values, never by
- *    measuring anything at render time (AAP 0.6.4).
+ *    measuring anything at render time.
  *
- * ## Class-name contract declared by this file (AAP 0.6.3, 0.6.4)
+ * ## Class-name contract declared by this file
  *
- * The rules behind these names are implemented in `../styles/components.css`;
- * this file contributes class names and nothing else.
+ * The rules behind these names are implemented in `../styles/components.css`,
+ * where every visual value resolves to a `--dg-*` token; this file contributes
+ * class names and nothing else.
  *
  * | Class                       | Role                                        |
  * | --------------------------- | ------------------------------------------- |
@@ -210,11 +211,10 @@ const TRAILING_FULL_STOPS = /\.+$/u;
  * The label as it is announced: trimmed, and ending in exactly one `…`.
  *
  * Every busy region in a panel says it is busy the same way, whoever wrote its
- * label (B2-F14): before this, some components wrote "Loading requests…" and
- * others "Loading captured database queries", so two regions in the same
- * state announced themselves as if they were in two different ones. The
- * convention is applied here rather than asked of each caller, because a
- * convention every caller has to remember is one that some caller forgets.
+ * label, so two regions in the same state never announce themselves as if
+ * they were in two different ones. The convention is applied here rather than
+ * asked of each caller, because a convention every caller has to remember is
+ * one that some caller forgets.
  *
  * A label already ending in `…` is kept as written; a trailing run of full
  * stops — the ASCII `"..."` or a lone `"."` — is replaced by the one ellipsis;

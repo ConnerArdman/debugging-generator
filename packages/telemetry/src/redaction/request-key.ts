@@ -241,7 +241,7 @@ const MESSAGE_PART_DELIMITER = '\n';
  *   it, which is what makes the message's four-part arity an invariant rather
  *   than a hope.
  *
- * @param part - A method, a path, or the sorted pair list. Never logged: this
+ * @param part A method, a path, or the sorted pair list. Never logged: this
  * is pre-redaction material.
  * @returns The part as a JSON value, ready to be joined into the message.
  */
@@ -350,7 +350,7 @@ function encodeCanonicalPart(part: string | readonly CanonicalPair[]): string {
  * accepts every string, and nothing here allocates more than the capped pair
  * list. No input throws.
  *
- * @param input - The request's method and its **unredacted** URL, absolute or
+ * @param input The request's method and its **unredacted** URL, absolute or
  * origin-relative. Ingress validation upstream guarantees both are strings.
  * @returns The canonical message, ready to be authenticated.
  */
@@ -690,9 +690,9 @@ function validateHmacKeyHex(keyHex: string): Result<Uint8Array<ArrayBuffer>, Deb
  * before use, so the Node helper has to be handed those decoded bytes (a
  * `Uint8Array`), not the hex text, which it would encode as UTF-8 instead.
  *
- * @param keyHex - Key material as hex, either case, even length, non-empty.
+ * @param keyHex Key material as hex, either case, even length, non-empty.
  * Never logged.
- * @param message - The text to authenticate, encoded as UTF-8. Never logged.
+ * @param message The text to authenticate, encoded as UTF-8. Never logged.
  * @returns `Ok` with 64 lowercase hex characters, or `Err` when the key is
  * malformed or the host has no usable Web Crypto. Never rejects.
  */
@@ -725,9 +725,9 @@ export interface RequestKeyHasher {
   /**
    * The `request_key` for one request, computed from its **unredacted** URL.
    *
-   * @param method - HTTP method; trimmed and upper-cased, so `get` and `GET`
+   * @param method HTTP method; trimmed and upper-cased, so `get` and `GET`
    * produce one key.
-   * @param url - The request URL as the producer reported it, absolute or
+   * @param url The request URL as the producer reported it, absolute or
    * origin-relative, before redaction.
    * @returns `Ok` with 64 lowercase hex characters, or `Err` when the host has
    * no usable Web Crypto. Never rejects: one unkeyable event must not cost a
@@ -751,7 +751,7 @@ export interface RequestKeyHasher {
  * would replay one transient failure — and re-importing on the next call costs
  * a fraction of a millisecond against that.
  *
- * @param sessionKey - The session's key, 64 lowercase hex characters from
+ * @param sessionKey The session's key, 64 lowercase hex characters from
  * {@link createRequestKeySessionKey}. Never logged, and never echoed by the
  * rejection when it is malformed.
  * @returns `Ok` with the hasher, or `Err` when `sessionKey` does not match
@@ -802,7 +802,7 @@ export function createRequestKeyHasher(
  * success case returns the hasher's promise unchanged, adding no microtask tick
  * of its own.
  *
- * @param input - The session key, the HTTP method and the **unredacted** URL.
+ * @param input The session key, the HTTP method and the **unredacted** URL.
  * @returns `Ok` with 64 lowercase hex characters, or `Err` when the session key
  * is malformed or the host has no usable Web Crypto. Never rejects.
  */

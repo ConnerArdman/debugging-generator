@@ -49,10 +49,11 @@
  *    `InstrumentationService.disarmCapture` (the dormant page configuration and
  *    the capture-less preload configuration: disabled, not idled).
  * 2. **The stop barrier.** The window stays open — ingest keeps attributing to
- *    it — while the capture's ingest watermark is polled until it stands still
- *    for a quiet period, bounded by {@link CAPTURE_DRAIN_DEFAULTS}: the batches
- *    the producers flush on disarm, and any already in flight, then belong to
- *    the capture that recorded them rather than arriving after it closed.
+ *    it — while the capture's ingest watermark and producer-loss total are
+ *    polled until both stand still for a quiet period, bounded by
+ *    {@link CAPTURE_DRAIN_DEFAULTS}: the batches the producers flush on disarm,
+ *    loss-only reports included, and any already in flight, then belong to the
+ *    capture that recorded them rather than arriving after it closed.
  * 3. Produces the {@link CaptureSummary}: the stored one when the capture row
  *    already holds it, otherwise `computeCaptureSummary` from
  *    `@debuggen/telemetry` over the capture's persisted, already-redacted
@@ -586,12 +587,13 @@ export function classifyCaptureEmptiness(
  * span and gives one ingest request 5 000 ms). Those batches are still on
  * their way when the stop request arrives, so the stage keeps the capture
  * window open — ingest keeps attributing to it — and polls the window's ingest
- * watermark until it stands still:
+ * watermark and producer-loss total until both stand still (a producer's last
+ * word may be a loss-only report, which stores no row):
  *
- * - `pollIntervalMs` — **100**: how often the watermark is read (an in-memory
- *   lookup of the arrivals ingest committed, never a statement, so a poll costs
- *   the same however much the capture holds).
- * - `quietPeriodMs` — **600**: how long the watermark must stand still when
+ * - `pollIntervalMs` — **100**: how often both are read (two in-memory lookups
+ *   — the arrivals ingest committed and the loss ledger's total — never a
+ *   statement, so a poll costs the same however much the capture holds).
+ * - `quietPeriodMs` — **600**: how long both must stand still when
  *   both producers were told to disarm — more than two page-agent flush
  *   intervals, and the flush-on-disarm batches go out immediately.
  * - `unreachableQuietPeriodMs` — **1 500**: the quiet period when a producer
@@ -600,9 +602,9 @@ export function classifyCaptureEmptiness(
  *   flushing on its own timer, so the barrier outlasts one whole preload flush
  *   interval with margin.
  * - `maxDrainMs` — **5 000**: the hard ceiling, the preload's own ingest
- *   request timeout. A watermark still moving then ends the barrier as
- *   `'deadline'`, and the summary's coverage says the window may be missing
- *   its last events.
+ *   request timeout. A watermark or loss total still moving then ends the
+ *   barrier as `'deadline'`, and the summary's coverage says the window may be
+ *   missing its last events.
  */
 export const CAPTURE_DRAIN_DEFAULTS = Object.freeze({
   pollIntervalMs: 100,
@@ -630,9 +632,9 @@ export interface CaptureDrainTiming {
   readonly sleep: (ms: number, signal: AbortSignal | undefined) => Promise<void>;
   /** A monotonic millisecond clock. Defaults to `performance.now()`. */
   readonly monotonicNow: () => number;
-  /** How often the watermark is read; see {@link CAPTURE_DRAIN_DEFAULTS}. Positive. */
+  /** How often the watermark and loss total are read ({@link CAPTURE_DRAIN_DEFAULTS}). Positive. */
   readonly pollIntervalMs: number;
-  /** How long the watermark must stand still when every producer was told to disarm. */
+  /** How long both must stand still when every producer was told to disarm. */
   readonly quietPeriodMs: number;
   /** How long it must stand still when a producer could not be told. */
   readonly unreachableQuietPeriodMs: number;
@@ -702,6 +704,10 @@ interface CaptureDrainReport {
   readonly polls: number;
   /** How many of those reads saw the watermark move. */
   readonly changes: number;
+  /** How many polls saw the capture's producer-loss total change: loss reports that arrived. */
+  readonly lossChanges: number;
+  /** How many polls could not read the producer-loss total; none of them ended the barrier. */
+  readonly lossReadFailures: number;
   /** How long the barrier ran on the monotonic clock, `0` when it could not be read. */
   readonly waitedMs: number;
   /** The quiet period the barrier waited for. */
@@ -1035,8 +1041,9 @@ export interface CaptureStageDeps {
    * with each page's stored size — to summarise them, counted per kind when the
    * summary is capped, and watched through the ingest watermark by the stop
    * barrier. Beside the events, the in-process producer-loss ledger: begun when
-   * the window opens, read for the total the summary's coverage reports, and
-   * released once the window is closed.
+   * the window opens, watched by the stop barrier for loss reports, read for
+   * the total the summary's coverage reports, and released once the window is
+   * closed.
    */
   readonly telemetry: Pick<
     TelemetryRepo,
@@ -2158,14 +2165,30 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
    *
    * The window stays open throughout, so ingest keeps attributing late batches
    * to the capture that recorded them instead of discarding them once the
-   * window has closed. The capture's ingest watermark is read every
-   * `pollIntervalMs`; the barrier ends:
+   * window has closed. The capture's ingest watermark and its producer-loss
+   * total are read every `pollIntervalMs`, and a change in either restarts the
+   * quiet period.
    *
-   * - `'quiescent'` once the watermark has stood still for the quiet period
+   * **Why the loss total too.** The watermark moves only when rows are
+   * committed, and a producer's last frame may be a loss-only report — no
+   * events, a positive `droppedCount` — which ingest records in the loss
+   * ledger and stores no row for. Watched through the watermark alone, such a
+   * report arriving during the drain would not extend it and could land after
+   * the coverage was read, leaving a lossy capture reported complete. Both
+   * reads are in-memory lookups on the one telemetry repository ingest writes
+   * through, so the store's interface is unchanged. A failed loss read is
+   * counted and changes nothing — it never ends the barrier by itself, since
+   * `coverageOf` reads the ledger again and reports an unreadable one as not
+   * complete — and the next successful read is compared with the last
+   * successful one.
+   *
+   * The barrier ends:
+   *
+   * - `'quiescent'` once both have stood still for the quiet period
    *   ({@link CaptureDrainTiming.unreachableQuietPeriodMs} when a producer
    *   could not be told to disarm, {@link CaptureDrainTiming.quietPeriodMs}
    *   otherwise);
-   * - `'deadline'` when the watermark is still moving at `maxDrainMs` (or, as a
+   * - `'deadline'` when either is still moving at `maxDrainMs` (or, as a
    *   guard against a clock that does not advance, after twice the polls that
    *   ceiling allows);
    * - `'unverified'` when the watermark or the monotonic clock could not be
@@ -2192,10 +2215,34 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
     const maxPolls = 2 * Math.ceil(drainTiming.maxDrainMs / drainTiming.pollIntervalMs) + 2;
     let polls = 0;
     let changes = 0;
+    let lossChanges = 0;
+    let lossReadFailures = 0;
+    /** The last loss total read; `undefined` until a read succeeds. */
+    let lossTotal: number | undefined;
 
     const readWatermark = (): Result<CaptureIngestWatermark, DebuggenError> => {
       polls += 1;
       return attempt(() => deps.telemetry.captureWatermark(sessionId, captureId), 'STORE_ERROR');
+    };
+
+    /**
+     * Reads the capture's producer-loss total and answers whether it changed
+     * since the last total read — a loss report arrived. The first successful
+     * read sets the baseline and a failed one is counted; neither is a change.
+     */
+    const lossReportArrived = (): boolean => {
+      const loss = attempt(() => deps.telemetry.producerLoss(sessionId, captureId), 'STORE_ERROR');
+      if (!loss.ok) {
+        lossReadFailures += 1;
+        return false;
+      }
+      const total = countOf(loss.value.droppedEvents);
+      const arrived = lossTotal !== undefined && total !== lossTotal;
+      lossTotal = total;
+      if (arrived) {
+        lossChanges += 1;
+      }
+      return arrived;
     };
 
     const finish = (
@@ -2211,6 +2258,8 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
         outcome,
         polls,
         changes,
+        lossChanges,
+        lossReadFailures,
         waitedMs,
         quietPeriodMs,
         ...(watermark !== undefined ? { watermark } : {}),
@@ -2219,6 +2268,8 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
         drain: outcome,
         polls,
         changes,
+        lossChanges,
+        lossReadFailures,
         waitedMs,
         quietPeriodMs,
         // Arrivals, not stored events: the watermark counts the rows ingest
@@ -2246,6 +2297,7 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
       return finish('unverified', startedAt, undefined, first.error.code);
     }
     let watermark = first.value;
+    lossReportArrived();
     let lastChangeAt = startedAt;
 
     for (;;) {
@@ -2287,12 +2339,17 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
       if (!next.ok) {
         return finish('unverified', startedAt, watermark, next.error.code);
       }
-      if (
+      const moved =
         next.value.eventCount !== watermark.eventCount ||
-        next.value.lastIngestSeq !== watermark.lastIngestSeq
-      ) {
+        next.value.lastIngestSeq !== watermark.lastIngestSeq;
+      if (moved) {
         watermark = next.value;
         changes += 1;
+      }
+      // Read on every poll, whether or not the watermark moved, so the loss
+      // baseline stays current.
+      const lossArrived = lossReportArrived();
+      if (moved || lossArrived) {
         lastChangeAt = readMonotonic() ?? now;
       }
     }

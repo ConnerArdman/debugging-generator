@@ -3,11 +3,11 @@
  * project, in reverse order, without ever overwriting an edit they made.
  *
  * `./patch/patcher.ts` is the only module that puts bytes into a working tree.
- * This one is its inverse, and it is where AAP §0.5.1's promise is either kept
- * or broken: *original content and hash recorded before any file edit, every
- * modification tracked and visible, cleanup reliable, and conflicting developer
- * edits detected rather than overwritten*. Four operations, each a different
- * question asked of the same journal:
+ * This one is its inverse, and it is where the reversibility promise is either
+ * kept or broken: *original content and hash recorded before any file edit,
+ * every modification tracked and visible, cleanup reliable, and conflicting
+ * developer edits detected rather than overwritten*. Four operations, each a
+ * different question asked of the same journal:
  *
  * | Operation | Asked by | Question |
  * | --- | --- | --- |
@@ -43,7 +43,7 @@
  * failure. Step 7 after step 5 is the other half: a backup deleted before the
  * restored content verified would leave a file nobody can prove is original.
  *
- * ## Chains across plan versions (AAP §0.4.2)
+ * ## Chains across plan versions
  *
  * A follow-up question can produce plan version *n + 1* whose delta patches a
  * file version *n* had already patched. The later record's `originalHash` is
@@ -126,7 +126,7 @@
  * at the first unhappy one. Only a broken invariant throws, through
  * `assertNever`. Nothing here writes to the console; every line goes through
  * `context.logger` and carries ids, paths, digests, counts and enumerated
- * reasons — never a byte of a developer's file (AAP §0.5.2).
+ * reasons — never a byte of a developer's file.
  *
  * ## Consumers
  *
@@ -139,8 +139,8 @@
  *   one {@link restoreModification} per record in reverse.
  * - `src/cleanup.test.ts`, `apps/local-service/test/integration/cleanup-conflict.test.ts`
  *   and `tests/e2e/cleanup.spec.ts` — the unit, integration and end-to-end
- *   proofs of acceptance test 3 (AAP §0.8.4): files byte-identical, no residual
- *   marker in the demo's tracked source, and the demo still serving.
+ *   proofs of the cleanup guarantee: files byte-identical, no residual marker
+ *   in the demo's tracked source, and the demo still serving.
  */
 
 import { realpathSync } from 'node:fs';
@@ -260,9 +260,9 @@ export type BackupDisposition = (typeof BACKUP_DISPOSITIONS)[number];
  *   renewed a conflict report, refused a file whose records do not form one
  *   chain, or left open a record whose status is `conflict`. A file was edited
  *   (or otherwise diverged) while instrumented, the tool refused to overwrite
- *   it, and its original stays in the backup directory — AAP §0.5.5's "record
- *   becomes `conflict`; cleanup leaves the file; `cleanup.status` becomes
- *   `conflict`".
+ *   it, and its original stays in the backup directory: the record becomes
+ *   `conflict`, cleanup leaves the file, and `cleanup.status` becomes
+ *   `conflict`.
  * - `partial` — something is outstanding and none of it is a conflict: a record
  *   the pass could not attempt or could not finish (a failure, an abort, a
  *   record it could not place), which a later pass can settle.
@@ -272,9 +272,9 @@ export type BackupDisposition = (typeof BACKUP_DISPOSITIONS)[number];
  * answer, so a second pass over identical state reports exactly what the first
  * one did.
  *
- * The session record's `cleanup.status` of AAP §0.5.5 adds a fourth value,
- * `pending`, for the state *before* a pass has run; this module never produces
- * it, because a pass that has finished has one of the three answers above.
+ * The session record's `cleanup.status` adds a fourth value, `pending`, for
+ * the state *before* a pass has run; this module never produces it, because a
+ * pass that has finished has one of the three answers above.
  */
 export const CLEANUP_STATUSES = Object.freeze(['clean', 'partial', 'conflict'] as const);
 
@@ -392,8 +392,9 @@ export const RECONCILE_DISPOSITIONS = Object.freeze([
 export type ReconcileDisposition = (typeof RECONCILE_DISPOSITIONS)[number];
 
 /**
- * The reconciliation table of AAP §0.5.1, as a total function on the record
- * status union.
+ * The reconciliation table — one verdict per record status and file state —
+ * as a total function on the record status union. `docs/ARCHITECTURE.md`
+ * states the same table under "Reconciliation on service start".
  *
  * ```text
  * pending | failed   hash === originalHash      → close the record (nothing was written)
@@ -440,7 +441,7 @@ export function reconcileDispositionFor(status: ModificationStatus): ReconcileDi
     default:
       return assertNever(
         status,
-        'A modification status reached cleanup that the reconciliation table of AAP 0.5.1 does not cover. Add the case to reconcileDispositionFor() in packages/instrumentation/src/cleanup.ts.',
+        'A modification status reached cleanup that the reconciliation table does not cover. Add the case to reconcileDispositionFor() in packages/instrumentation/src/cleanup.ts.',
       );
   }
 }
@@ -525,9 +526,9 @@ export interface CleanupFileSystem extends ConflictFileReader {
    *
    * The contract is `atomicCreateFileNoClobber`'s, and it is used for exactly
    * one case: a target that is **no longer there**. A deleted file with an
-   * intact backup is recoverable — AAP §0.5.1's guarantee is about the bytes,
-   * not about the inode — so the file is recreated from the backup and the
-   * outcome says so ({@link RestoreOutcome.recreated}). But "absent" is an
+   * intact backup is recoverable — the reversibility guarantee is about the
+   * bytes, not about the inode — so the file is recreated from the backup and
+   * the outcome says so ({@link RestoreOutcome.recreated}). But "absent" is an
    * observation, and a developer can recreate the file between it and the
    * write; an unconditional create-or-rename would then discard what they wrote
    * with no trace (CWE-367). The bytes are therefore staged in a sibling and
@@ -653,7 +654,7 @@ export interface CleanupContext {
 
   /**
    * Where to log. Ids, paths, digests, counts and enumerated reasons only —
-   * never a byte of a developer's file (AAP §0.5.2).
+   * never a byte of a developer's file.
    *
    * Optional here, and required on `InstrumentationContext`, which satisfies
    * this either way. Absent means `noopLogger`.
@@ -929,10 +930,10 @@ export interface CleanupSessionOptions {
  * What cleaning up one session did — the value the service maps onto the
  * session record's `cleanup` field and broadcasts as `cleanup.completed`.
  *
- * `status` becomes `cleanup.status` (AAP §0.5.5), whose fourth value `pending`
- * is the state before this pass ran, `conflicts` becomes `cleanup.conflicts`
- * and travels verbatim inside `cleanup.completed { sessionId, status, conflicts }`,
- * and `completedAt` becomes `cleanup.completedAt`.
+ * `status` becomes `cleanup.status`, whose fourth value `pending` is the state
+ * before this pass ran, `conflicts` becomes `cleanup.conflicts` and travels
+ * verbatim inside `cleanup.completed { sessionId, status, conflicts }`, and
+ * `completedAt` becomes `cleanup.completedAt`.
  */
 export interface CleanupOutcome {
   /** The session that was cleaned up. */
@@ -1163,11 +1164,11 @@ export async function restoreModification(
  *
  * A follow-up plan version that patches an already-patched file produces a
  * record whose `originalHash` is the previous record's `instrumentedHash` and
- * whose `previousRecordId` names it (AAP §0.4.2), so the records form a chain
- * and the only sound way to unwind it is backwards. Restoring version 1 first
- * would write the pristine bytes over the doubly-patched file, leave version
- * 2's record pointing at content that no longer exists, and — worse — succeed,
- * because the write itself has no way to know it was out of order.
+ * whose `previousRecordId` names it, so the records form a chain and the only
+ * sound way to unwind it is backwards. Restoring version 1 first would write
+ * the pristine bytes over the doubly-patched file, leave version 2's record
+ * pointing at content that no longer exists, and — worse — succeed, because
+ * the write itself has no way to know it was out of order.
  *
  * The order is total and deterministic even where the links are not:
  *
@@ -1313,8 +1314,8 @@ export async function restoreChain(
 }
 
 /**
- * Reverts everything one session instrumented — the end-of-session guarantee of
- * AAP §0.5.1.
+ * Reverts everything one session instrumented — the end-of-session guarantee
+ * that every file it patched is restored, or reported where it cannot be.
  *
  * Every record of the session that is not already `reverted` is loaded from the
  * journal, grouped by file, and unwound per file in strict reverse order
@@ -1481,7 +1482,7 @@ export async function cleanupSession(
 
 /**
  * Reconciles every open record in the journal, whatever state its session is
- * in — the service-start half of AAP §0.5.1.
+ * in — the service-start half of the end-of-session guarantee.
  *
  * `ModificationJournal.listOpen` returns every record that is not `reverted`,
  * across all sessions, and each is dispatched by **its own status** through
@@ -1934,15 +1935,15 @@ async function restoreFileChain(
  * Structural only — nothing is read from disk, and the `chain_fork` flag the
  * service's store may carry is neither visible nor needed here: the shape of
  * the records is the evidence. Only **live** records are judged: a `reverted`
- * record is finished history that no pass acts on, and the installer's delta
- * rollback (AAP 0.4.2) legitimately leaves one beside a later layer on the same
- * parent — the parent stays `applied`, the rolled-back delta is `reverted`, and
- * the next follow-up is layered on the parent again. The store's single-child
- * index draws the same line. A set of live records is a single chain exactly
- * when no two of them name the same `previousRecordId` and exactly one starts
- * a chain within the set. A record starts one when it has no
- * `previousRecordId` or names a record that is not live in the set — an earlier
- * plan version already reverted — which is the same reading
+ * record is finished history that no pass acts on, and the installer's
+ * rollback of a failed follow-up delta legitimately leaves one beside a later
+ * layer on the same parent — the parent stays `applied`, the rolled-back delta
+ * is `reverted`, and the next follow-up is layered on the parent again. The
+ * store's single-child index draws the same line. A set of live records is a
+ * single chain exactly when no two of them name the same `previousRecordId`
+ * and exactly one starts a chain within the set. A record starts one when it
+ * has no `previousRecordId` or names a record that is not live in the set —
+ * an earlier plan version already reverted — which is the same reading
  * {@link orderRestorationChain} takes. Two siblings of a parent outside the set
  * are therefore both a shared parent and two roots, and are refused on either
  * count.
@@ -2578,12 +2579,13 @@ async function closeRecord(
 /**
  * Re-reports a record that is already in conflict, without touching anything.
  *
- * AAP §0.5.1's `conflict` row: retained, backup kept, re-reported on every pass
- * until the developer resolves it. The report is recomposed from the file as it
- * stands now rather than cached, so the diff the developer is offered describes
- * the divergence that exists today; where the file has since come back to
- * either recorded digest, the report says so and the record still stays open,
- * because closing a conflict is the developer's decision and not this module's.
+ * The reconciliation table's `conflict` row: retained, backup kept and
+ * re-reported on every pass until the developer resolves it. The report is
+ * recomposed from the file as it stands now rather than cached, so the diff the
+ * developer is offered describes the divergence that exists today; where the
+ * file has since come back to either recorded digest, the report says so and
+ * the record still stays open, because closing a conflict is the developer's
+ * decision and not this module's.
  */
 async function retainRecord(
   record: ModificationRecord,
@@ -3514,11 +3516,11 @@ function detailsReasonOf(error: DebuggenError): string | undefined {
 // The failures this module reports.
 //
 // What goes into a message, a hint or a `details` here: a project-relative
-// file, a backup path (the value AAP 0.5.5 shows the developer verbatim), a
-// digest, an id, a count, an enumerated reason or an errno. What never does: a
-// byte of the content that was read or written, in whole or in part - these
-// values are logged, persisted with a session and rendered in two user
-// interfaces (AAP 0.5.2).
+// file, a backup path (the value a conflict message shows the developer
+// verbatim), a digest, an id, a count, an enumerated reason or an errno. What
+// never does: a byte of the content that was read or written, in whole or in
+// part - these values are logged, persisted with a session and rendered in two
+// user interfaces.
 // ---------------------------------------------------------------------------
 
 /**
@@ -3716,11 +3718,12 @@ function filesystemFailure(
 // The developer-facing wording.
 //
 // Every message names the file, what was observed and where the original is,
-// in the voice of AAP 0.5.5: "<file> was edited while instrumented. Debug
-// Generator will not overwrite it. Original saved at <backup path>." The
-// detector composes that one; these cover the situations only a restore
-// reaches. A caller with more context - the service, which knows the session
-// and the action to offer - overrides them through `conflictMessage`.
+// in the voice of the edited-file conflict message: "<file> was edited while
+// instrumented. Debug Generator will not overwrite it. Original saved at
+// <backup path>." The detector composes that one; these cover the situations
+// only a restore reaches. A caller with more context - the service, which
+// knows the session and the action to offer - overrides them through
+// `conflictMessage`.
 // ---------------------------------------------------------------------------
 
 /** A file that already holds the recorded original, for a record that was applied. */

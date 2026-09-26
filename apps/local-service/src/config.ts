@@ -24,7 +24,7 @@
  * | `DEBUGGEN_MODEL` | non-empty string | **none, never defaulted** — required alongside the credential |
  * | `DEBUGGEN_HOST` | a loopback interface, without whitespace | {@link DEFAULT_HOST} |
  * | `DEBUGGEN_PORT` | integer `0`–{@link MAX_PORT} | {@link DEFAULT_PORT} |
- * | `DEBUGGEN_HOME` | absolute path, `~` accepted | {@link DEFAULT_DEBUGGEN_HOME} |
+ * | `DEBUGGEN_HOME` | absolute path, `~` accepted; outside every project worked on | {@link DEFAULT_DEBUGGEN_HOME} |
  * | `DEBUGGEN_LOG_LEVEL` | one of {@link LOG_LEVEL_SETTINGS} | {@link DEFAULT_LOG_LEVEL} |
  * | `DEBUGGEN_RETENTION_DAYS` | integer of `0` or more | {@link DEFAULT_RETENTION_DAYS} |
  * | `DEBUGGEN_PROMPTS_DIR` | absolute path | derived from this module's own location |
@@ -64,7 +64,40 @@
  *
  * Every path this module produces is normalised POSIX, which is the one
  * spelling the rest of the product speaks; `@debuggen/shared`'s pure-string
- * path helpers do the work, so nothing here touches a filesystem.
+ * path helpers do the work, so {@link loadServiceConfig} touches no
+ * filesystem. The one filesystem read in this module is the explicit,
+ * asynchronous {@link canonicalizePath} described next.
+ *
+ * ## The state root stays outside every project
+ *
+ * AAP 0.4.2 keeps session data and file backups "outside the target project
+ * (under `~/.debuggen`) so a session never pollutes the developer's git
+ * status". A configured `DEBUGGEN_HOME` is an arbitrary absolute path, so that
+ * promise is enforced rather than assumed: a project root that **is** the state
+ * root, **contains** it (`DEBUGGEN_HOME=/work/shop/.state` with the project
+ * `/work/shop`) or **lies inside** it is refused, because the store, the editor
+ * credential and every pre-patch backup would otherwise land in — or be the
+ * parent of — a developer's working tree (CWE-200).
+ *
+ * The comparison is made between **canonical** paths: {@link canonicalizePath}
+ * resolves every symbolic link with `realpath`, so a project reached through a
+ * link into the state root is refused, and a sibling that merely shares a
+ * prefix (`/work/shop` and `/work/shop-state`) is not, because
+ * {@link pathsOverlap} compares whole segments through `@debuggen/shared`'s
+ * `isWithin`. A root that does not exist yet is resolved through its nearest
+ * existing ancestor. {@link requireProjectOutsideStateHome} is the check the
+ * service applies before a session is created or questioned and before a dev
+ * server is launched or credentialed, and that `src/instrumentation/service.ts`
+ * repeats before every install writes a backup or a patch; `src/main.ts`
+ * applies it at start-up to the project of every stored session, and refuses
+ * the start when one of them cannot be resolved at all. Its refusals are
+ * `FS_UNSAFE_PATH` errors whose message and hint are constant sentences that
+ * name no path.
+ *
+ * No start-up heuristic stands in for that check: a state root inside a
+ * repository is not refused for being there (the Playwright suites keep theirs
+ * in the gitignored `test-results/debuggen-home`), only one that overlaps the
+ * project actually worked on.
  *
  * ## Three schemas, one loader
  *
@@ -130,10 +163,13 @@
 import {
   DebuggenError,
   LOG_LEVELS,
+  basenamePosix,
+  dirnamePosix,
   err,
   isAbsolutePosix,
   isErr,
   isWindowsAbsolute,
+  isWithin,
   joinPosix,
   normalizePosix,
   ok,
@@ -154,6 +190,7 @@ import {
 } from '@debuggen/model-provider';
 import { z } from 'zod';
 
+import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -732,11 +769,21 @@ const RETENTION_HINT =
   'Set DEBUGGEN_RETENTION_DAYS to a whole number of days, 0 or more. Leave it unset for ' +
   `${DEFAULT_RETENTION_DAYS}; 0 purges every record the next sweep finds eligible.`;
 
-/** The next step for a state root that is not an absolute path. */
+/**
+ * The next step for a state root that is not an absolute path.
+ *
+ * It also states the placement rule the service enforces later, when a
+ * project is named (see "The state root stays outside every project" above):
+ * the rule is about projects, not repositories, because a state root inside
+ * some other repository — the Playwright suites' gitignored
+ * `test-results/debuggen-home` — is apart from the project it debugs.
+ */
 const HOME_HINT =
   `Set DEBUGGEN_HOME to an absolute directory path, or to a path starting with '${HOME_PREFIX}' ` +
   `to place it inside your home directory. Leave it unset for '${DEFAULT_DEBUGGEN_HOME}'. It must ` +
-  'be outside every checkout, so that a session never appears in a working tree.';
+  'lie outside every project Debug Generator works on, so that session data, file backups and ' +
+  'the editor credential never appear in a working tree: a project that contains it, or lies ' +
+  'inside it, is refused.';
 
 /** The next step for a prompt directory that cannot be used. */
 const PROMPTS_HINT =
@@ -2420,7 +2467,7 @@ export const serviceConfigSchema: ServiceConfigSchema = Object.freeze({
       secret: false,
       defaultValue: DEFAULT_DEBUGGEN_HOME,
       description:
-        'The state root holding the session database, the editor credential, the pre-patch file backups and the code-index cache. Outside every checkout, so a session never appears in a working tree.',
+        'The state root holding the session database, the editor credential, the pre-patch file backups and the code-index cache. It must lie outside every project Debug Generator works on, so a session never appears in a working tree: a project that contains it, or lies inside it, is refused, and so is one whose location on disk cannot be resolved.',
     }),
     DEBUGGEN_LOG_LEVEL: Object.freeze({
       key: 'DEBUGGEN_LOG_LEVEL',
@@ -2523,4 +2570,292 @@ export function describeServiceConfig(config: ServiceConfig): LogFields {
     authFilePath: config.authFilePath,
     promptsDir: config.promptsDir,
   };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The state root stays outside every project
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * How a project root and the state root overlap, recorded in a refusal's
+ * `details.relation`. The paths themselves are never recorded.
+ *
+ * - `same-directory` — the project root is the state root.
+ * - `home-inside-project` — the state root lies beneath the project root, so
+ *   the store, the editor credential and every backup are in its working tree.
+ * - `project-inside-home` — the project lies beneath the state root, so the
+ *   project's files and the service's private state share one tree.
+ */
+export type StateHomeOverlap = 'same-directory' | 'home-inside-project' | 'project-inside-home';
+
+/** The `details.reason` of the refusal of a project root that overlaps the state root. */
+export const STATE_HOME_OVERLAP_REASON = 'state-home-overlaps-project';
+
+/**
+ * The `details.reason` of the refusal of a project root whose canonical
+ * location could not be established, so no overlap check could be made.
+ */
+export const PROJECT_ROOT_UNRESOLVABLE_REASON = 'project-root-unresolvable';
+
+/** The `details.reason` of a path {@link canonicalizePath} could not resolve. */
+export const PATH_UNRESOLVABLE_REASON = 'path-unresolvable';
+
+/**
+ * The message of an overlap refusal: a constant, self-contained instruction,
+ * because an HTTP error body carries a message and no hint.
+ */
+export const STATE_HOME_OVERLAP_MESSAGE =
+  'Debug Generator will not work on a project that contains its state directory or lies inside it: set DEBUGGEN_HOME to a directory outside the project and restart the service.';
+
+/** The recovery instruction of an overlap refusal, for surfaces that show a hint. */
+export const STATE_HOME_OVERLAP_HINT =
+  'Session data, file backups and the editor credential live in DEBUGGEN_HOME (default ~/.debuggen) and must stay outside every project so they never reach its working tree. Set DEBUGGEN_HOME outside the project, or open a project that is not inside DEBUGGEN_HOME, then restart the service.';
+
+/** The message of the refusal of a project root whose canonical location is unknown. */
+export const PROJECT_ROOT_UNRESOLVABLE_MESSAGE =
+  'Debug Generator could not resolve the project folder on disk, so it cannot confirm that the folder and its state directory (DEBUGGEN_HOME) are kept apart.';
+
+/** The recovery instruction of that refusal. */
+export const PROJECT_ROOT_UNRESOLVABLE_HINT =
+  'Check that the project folder and every folder above it are readable by this account and that no symbolic link on the way loops, then try again.';
+
+/** The message of a path {@link canonicalizePath} could not resolve. */
+const PATH_UNRESOLVABLE_MESSAGE = 'A path could not be resolved to its location on disk.';
+
+/** The recovery instruction of that failure. */
+const PATH_UNRESOLVABLE_HINT =
+  'Check that the path and every directory above it are readable by this account and that no symbolic link on the way loops.';
+
+/**
+ * The `errno` codes that mean "this component does not exist (as a
+ * directory)", after which the next ancestor is resolved instead.
+ */
+const MISSING_PATH_ERRNO_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR']);
+
+/** The shape of an `errno` code: kept in `details` only when it matches. */
+const ERRNO_CODE_PATTERN = /^E[A-Z0-9]{1,31}$/;
+
+/**
+ * Resolves a path to its canonical absolute location, as `fs.realpath` would.
+ * Injectable so the resolution is testable without the host's filesystem.
+ */
+export type RealpathResolver = (path: string) => Promise<string>;
+
+/** Options of {@link canonicalizePath} and {@link requireProjectOutsideStateHome}. */
+export interface CanonicalPathOptions {
+  /** The resolver; defaults to `fs.promises.realpath`. */
+  readonly realpath?: RealpathResolver | undefined;
+}
+
+/** The `errno` code of a thrown filesystem error, when it has the expected shape. */
+function errnoCodeOf(cause: unknown): string | undefined {
+  if (typeof cause !== 'object' || cause === null || !('code' in cause)) {
+    return undefined;
+  }
+  const { code } = cause;
+  return typeof code === 'string' && ERRNO_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+/** Whether a path is absolute in either spelling the product accepts. */
+function isAbsolutePath(path: string): boolean {
+  return isAbsolutePosix(path) || isWindowsAbsolute(path);
+}
+
+/**
+ * Whether two **canonical** absolute paths overlap: they name the same
+ * directory, or one lies beneath the other.
+ *
+ * Pure string logic over whole path segments (`@debuggen/shared`'s
+ * `isWithin`), so `/work/shop` and `/work/shop-state` do not overlap while
+ * `/work/shop` and `/work/shop/.state` do. It sees no symbolic link: callers
+ * compare the results of {@link canonicalizePath}. A relative argument never
+ * overlaps an absolute one.
+ *
+ * @param left A canonical absolute path.
+ * @param right Another canonical absolute path.
+ * @returns `true` when either path is, or lies beneath, the other.
+ *
+ * @example
+ * ```ts
+ * pathsOverlap('/work/shop', '/work/shop/.debuggen'); // true
+ * pathsOverlap('/work/shop', '/work/shop-state'); // false
+ * ```
+ */
+export function pathsOverlap(left: string, right: string): boolean {
+  return isWithin(left, right) || isWithin(right, left);
+}
+
+/**
+ * How a canonical project root overlaps the canonical state root, if it does.
+ * Pure; the same segment-wise comparison as {@link pathsOverlap}.
+ *
+ * @param stateHome The canonical state root.
+ * @param projectRoot The canonical project root.
+ * @returns The relation, or `undefined` when the two are apart.
+ */
+export function stateHomeOverlap(
+  stateHome: string,
+  projectRoot: string,
+): StateHomeOverlap | undefined {
+  const homeInsideProject = isWithin(projectRoot, stateHome);
+  const projectInsideHome = isWithin(stateHome, projectRoot);
+  if (homeInsideProject && projectInsideHome) {
+    return 'same-directory';
+  }
+  if (homeInsideProject) {
+    return 'home-inside-project';
+  }
+  return projectInsideHome ? 'project-inside-home' : undefined;
+}
+
+/**
+ * The refusal of a project root that overlaps the state root: code
+ * `FS_UNSAFE_PATH` (answered `400`), the constant
+ * {@link STATE_HOME_OVERLAP_MESSAGE} and {@link STATE_HOME_OVERLAP_HINT}, and
+ * `details` naming the reason and the relation — never a path.
+ *
+ * @param relation How the two overlap.
+ * @returns The error.
+ */
+export function stateHomeOverlapError(relation: StateHomeOverlap): DebuggenError {
+  return new DebuggenError('FS_UNSAFE_PATH', STATE_HOME_OVERLAP_MESSAGE, {
+    hint: STATE_HOME_OVERLAP_HINT,
+    details: { subsystem: SUBSYSTEM, reason: STATE_HOME_OVERLAP_REASON, relation },
+  });
+}
+
+/**
+ * Resolves `path` to its canonical absolute location: every symbolic link
+ * resolved, `.` and repeated separators removed, normalised POSIX.
+ *
+ * A path that does not exist yet — a project folder about to be created, a
+ * stored session's project that was deleted — is resolved through its
+ * **nearest existing ancestor**: that ancestor is `realpath`ed and the
+ * missing components are re-appended unchanged, so a link anywhere in the
+ * existing part is still seen. Only "does not exist" (`ENOENT`) and "is not a
+ * directory" (`ENOTDIR`) move to the parent; any other failure — permission
+ * denied, a link loop — is returned, because an unresolved path cannot be
+ * compared safely.
+ *
+ * This is the only filesystem access in this module, and it only reads:
+ * `realpath` follows links and stats components, it creates and opens
+ * nothing.
+ *
+ * @param path An absolute path, POSIX or Windows spelling.
+ * @param options The resolver to use instead of `fs.promises.realpath`.
+ * @returns The canonical path, or an `FS_UNSAFE_PATH` error
+ *   ({@link PATH_UNRESOLVABLE_REASON}) whose message and details name no path.
+ *
+ * @example
+ * ```ts
+ * // /work/app is a link to /data/app, and /data/app/new does not exist yet
+ * await canonicalizePath('/work/app/new'); // ok('/data/app/new')
+ * ```
+ */
+export async function canonicalizePath(
+  path: string,
+  options: CanonicalPathOptions = {},
+): Promise<Result<string, DebuggenError>> {
+  const resolve = options.realpath ?? realpath;
+  const normalized = typeof path === 'string' ? normalizePosix(toPosix(path)) : '';
+  if (!isAbsolutePath(normalized)) {
+    return err(pathUnresolvable('not-absolute', undefined));
+  }
+
+  // The components below `current` that did not exist, innermost last.
+  const missing: string[] = [];
+  let current = normalized;
+  for (;;) {
+    let resolved: string;
+    try {
+      resolved = await resolve(current);
+    } catch (cause) {
+      const errno = errnoCodeOf(cause);
+      const parent = dirnamePosix(current);
+      if (
+        errno === undefined ||
+        !MISSING_PATH_ERRNO_CODES.has(errno) ||
+        parent === current ||
+        !isAbsolutePath(parent)
+      ) {
+        return err(pathUnresolvable('realpath-failed', errno));
+      }
+      missing.unshift(basenamePosix(current));
+      current = parent;
+      continue;
+    }
+    const canonical = normalizePosix(toPosix(resolved));
+    if (!isAbsolutePath(canonical)) {
+      return err(pathUnresolvable('resolved-not-absolute', undefined));
+    }
+    return ok(missing.length === 0 ? canonical : joinPosix(canonical, ...missing));
+  }
+}
+
+/**
+ * The failure of {@link canonicalizePath}. Constant text; `details` carry the
+ * stage and the `errno` code only, never the path or the thrown message.
+ */
+function pathUnresolvable(stage: string, errno: string | undefined): DebuggenError {
+  return new DebuggenError('FS_UNSAFE_PATH', PATH_UNRESOLVABLE_MESSAGE, {
+    hint: PATH_UNRESOLVABLE_HINT,
+    details: {
+      subsystem: SUBSYSTEM,
+      reason: PATH_UNRESOLVABLE_REASON,
+      stage,
+      ...(errno === undefined ? {} : { errno }),
+    },
+  });
+}
+
+/**
+ * Refuses a project root that overlaps the state root (AAP 0.4.2: session data
+ * and backups live outside the target project).
+ *
+ * The project root is canonicalised with {@link canonicalizePath} — so a
+ * project reached through a symbolic link into the state root is refused, and
+ * one that does not exist yet is judged by its nearest existing ancestor — and
+ * compared with `canonicalStateHome` by {@link stateHomeOverlap}.
+ * Fails closed: a root whose canonical location cannot be established is
+ * refused as well, because it could not be shown to be apart.
+ *
+ * @param canonicalStateHome The state root as {@link canonicalizePath}
+ *   resolved it — `src/main.ts` resolves it once, after creating it.
+ * @param projectRoot The absolute project root a request or a stored session
+ *   names.
+ * @param options The resolver to use instead of `fs.promises.realpath`.
+ * @returns The canonical project root; or an `FS_UNSAFE_PATH` error with
+ *   `details.reason` {@link STATE_HOME_OVERLAP_REASON} (and the
+ *   {@link StateHomeOverlap} relation) or
+ *   {@link PROJECT_ROOT_UNRESOLVABLE_REASON}. Every message and hint is a
+ *   constant sentence naming no path.
+ *
+ * @example
+ * ```ts
+ * const home = unwrap(await canonicalizePath(config.debuggenHome));
+ * await requireProjectOutsideStateHome(home, '/work/shop'); // ok('/work/shop')
+ * await requireProjectOutsideStateHome('/work/shop/.state', '/work/shop'); // err: home-inside-project
+ * ```
+ */
+export async function requireProjectOutsideStateHome(
+  canonicalStateHome: string,
+  projectRoot: string,
+  options: CanonicalPathOptions = {},
+): Promise<Result<string, DebuggenError>> {
+  const canonical = await canonicalizePath(projectRoot, options);
+  if (isErr(canonical)) {
+    const errno = canonical.error.details?.['errno'];
+    return err(
+      new DebuggenError('FS_UNSAFE_PATH', PROJECT_ROOT_UNRESOLVABLE_MESSAGE, {
+        hint: PROJECT_ROOT_UNRESOLVABLE_HINT,
+        details: {
+          subsystem: SUBSYSTEM,
+          reason: PROJECT_ROOT_UNRESOLVABLE_REASON,
+          ...(typeof errno === 'string' ? { errno } : {}),
+        },
+      }),
+    );
+  }
+  const relation = stateHomeOverlap(normalizePosix(canonicalStateHome), canonical.value);
+  return relation === undefined ? ok(canonical.value) : err(stateHomeOverlapError(relation));
 }

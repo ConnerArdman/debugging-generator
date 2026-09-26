@@ -19,13 +19,13 @@
  *  - It is `node <prisma>/build/index.js migrate diff ...` - the running Node
  *    binary (`process.execPath`) given the CLI entry point that `bin.prisma`
  *    names, resolved from this workspace's dependencies - and never a shell or
- *    the `node_modules/.bin/prisma` shim. A shell is what made the former
- *    `DATABASE_URL= prisma ... | tsx ...` script POSIX-only: `cmd.exe` rejects
- *    the `VAR= command` prefix, and on Windows the `.bin` shim is a `.cmd` file
- *    that cannot be spawned without one. Spawning Node directly behaves the same
- *    on every platform, and keeps the CLI's argv as `[node,
- *    .../prisma/build/index.js, 'migrate', 'diff', ...]`, the positional shape
- *    `invokedCommandName()` in prisma.config.ts reads.
+ *    the `node_modules/.bin/prisma` shim. Spawning through a shell would tie the
+ *    check to POSIX syntax: `cmd.exe` rejects the `VAR= command` prefix, and on
+ *    Windows the `.bin` shim is a `.cmd` file that cannot be spawned without
+ *    one. Spawning Node directly behaves the same on every platform, and keeps
+ *    the CLI's argv as `[node, .../prisma/build/index.js, 'migrate', 'diff',
+ *    ...]`, the positional shape `invokedCommandName()` in prisma.config.ts
+ *    reads.
  *  - Its environment is this one with `DATABASE_URL` present and empty. The
  *    rendering must never depend on a live database, and blanking the variable
  *    (rather than deleting it) is what guarantees that: prisma.config.ts loads
@@ -37,16 +37,15 @@
  * Prisma's own diagnostics reach the terminal unchanged: the child's standard
  * error is this process's standard error.
  *
- * **Why a reduction rather than a text comparison.** While the history was one
- * initial migration, that migration and the rendering were the same text, and
- * a line-by-line `diff` was the whole check. A later migration ends that: it
- * adds a column with `ALTER TABLE ... ADD COLUMN`, while the rendering from
- * nothing states the same column inside `CREATE TABLE`. So both sides are read
- * as facts - one per enum, per index, per foreign key, and one per column or
- * table constraint, filed under its table - and a column added later is the
- * same fact as the column created with its table. Column order is deliberately
- * not compared: Prisma addresses columns by name, and a column added by a later
- * migration sits last in the table whatever its place in the model.
+ * **Why a reduction rather than a text comparison.** A later migration adds a
+ * column with `ALTER TABLE ... ADD COLUMN`, while the rendering from nothing
+ * states the same column inside `CREATE TABLE`, so the two texts differ even
+ * when the schemas agree. Both sides are therefore read as facts - one per
+ * enum, per index, per foreign key, and one per column or table constraint,
+ * filed under its table - and a column added later is the same fact as the
+ * column created with its table. Column order is deliberately not compared:
+ * Prisma addresses columns by name, and a column added by a later migration
+ * sits last in the table whatever its place in the model.
  *
  * **What it replays, and what it refuses.** The statements Prisma writes when a
  * schema grows: `CREATE TYPE`, `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, and

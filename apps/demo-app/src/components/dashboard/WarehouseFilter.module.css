@@ -74,13 +74,11 @@
  * everything: the row keeps the controls and the Apply group together while the line measures at
  * least 3 x 15ch + 291.17px = 677.27px.
  *
- * Hence 15ch rather than the 20ch this rule carried before. At 768 the line is 704px and a 20ch
- * basis wanted 805.97px, so the group wrapped 41.50px below the controls it applies to - measured
- * 503.31px against 461.81px - while the line it had left was full to -0.01px. At 15ch the group
- * sits on that line with 26.73px still to spare and each column measures 137.61px; on the 1136px
- * line the page container caps at, all three still measure 281.61px, which is exactly what they
- * measured before this change, so 1280, 1440 and 1920 are untouched. Below 677.27px the row wraps
- * as it always did - at 375 into the same four lines, the narrowest control 128.69px wide.
+ * With a 15ch basis the controls and the Apply group share one line down to 677.27px. At 768 the
+ * line is 704px, so the group sits beside the controls it applies to with 26.73px to spare and
+ * each column measures 137.61px; on the 1136px line the page container caps at, each measures
+ * 281.61px. Below 677.27px the row wraps - at 375 into four lines, the narrowest control 128.69px
+ * wide.
  *
  * 15ch is also the narrowest a column can be and still say what it holds at rest. A `Select` at
  * the `sm` scale spends 32.5px of its width on two borders, its 8px inline-start padding and the

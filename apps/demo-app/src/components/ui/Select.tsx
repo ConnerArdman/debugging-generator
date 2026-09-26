@@ -14,9 +14,7 @@
  * drawer's stacking context. The native control gets all of that right for free, in every engine,
  * and `appearance: none` in the stylesheet restyles the closed control without touching the popup -
  * so the role, the keyboard behaviour and the assistive-technology semantics here are the
- * platform's, not this file's. It is also the only option available: this workspace is an
- * instrumentation target that depends on `clsx`, `next`, `react` and nothing else, and may add no
- * dependency.
+ * platform's, not this file's.
  *
  * DIVISION OF LABOUR. This component owns the control's own box and nothing around it.
  *
@@ -48,11 +46,8 @@ import styles from './Select.module.css';
  * `className` re-declared after being omitted because it composes with `.root` rather than
  * replacing it.
  *
- * Local, and deliberately not exported under any name. A `SelectProps` declared here would be demo
- * vocabulary that `scripts/check-no-hardcoding.mjs --update` harvests into
- * `scripts/no-hardcoding.policy.json`, after which no product file could contain that literal - and
- * `packages/panel-renderer` has a `Select` primitive of its own. A caller that needs this shape
- * writes `ComponentProps<typeof Select>`.
+ * Local, and deliberately not exported under any name: a caller that needs this shape writes
+ * `ComponentProps<typeof Select>`.
  */
 interface Props extends Omit<ComponentPropsWithRef<'select'>, 'className'> {
   /**

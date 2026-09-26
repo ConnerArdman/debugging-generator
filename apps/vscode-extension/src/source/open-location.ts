@@ -26,17 +26,59 @@
  *
  * - {@link revealLocationInEditor} is the editor primitive and has **no
  *   containment policy of its own**. It takes a `vscode.Uri` a caller has
- *   already decided to trust, and validates only the numeric contract. This is
+ *   already decided to trust, and validates only the numeric contract;
+ *   {@link revealDocumentInEditor} is the same primitive for a document the
+ *   caller already loaded and verified. This is
  *   what `src/uri-handler.ts` uses, because a `vscode://` URI can be triggered
  *   by any web page and is therefore validated against the **open workspace
  *   folders** with `fs.realpath` and a developer confirmation — a policy this
  *   module must not second-guess (AAP §0.2.3).
- * - {@link openSourceLocation} is the session-scoped opener used by
- *   `src/extension.ts` for every inbound `source.open` message and for the
- *   `debuggen.openSource` command. Its policy is the **session's
- *   `projectRoot`**, re-checked here even though `apps/local-service`'s
- *   `source/open.ts` already checked it: the location is untrusted at every
- *   hop, and defence in depth is the stated design (AAP §0.2.3).
+ * - {@link openSourceLocation} is the session-scoped opener, and the sink every
+ *   other editor open ends in: each inbound `source.open` message
+ *   (`src/extension.ts`), the `debuggen.openSource` command, and the session
+ *   view's `openFile` frame that dispatches to it. Its policy is the
+ *   **session's `projectRoot`**, proved here even though
+ *   `apps/local-service`'s `source/open.ts` already checked a forwarded frame:
+ *   the location is untrusted at every hop, and defence in depth is the stated
+ *   design (AAP §0.2.3).
+ *
+ * ## The canonical, identity-pinned gate
+ *
+ * A lexical check cannot see a symbolic link: `src/link/passwd` is inside the
+ * project as text when `src/link → /etc`. And a check made anywhere else — the
+ * service's `realpath` before it forwards a frame — is true only at the
+ * instant it was made, while the frame still has a socket to cross. So the
+ * session-scoped opener proves, itself and immediately before it shows
+ * anything, that the location names a regular file inside the canonical
+ * project root:
+ *
+ * - both the root and the candidate are resolved with `fs.realpath`, so every
+ *   link on the path counts, and the candidate must land strictly inside;
+ * - the canonical path must be a regular file under a non-following `lstat`,
+ *   whose device and inode become its identity;
+ * - a forwarded frame carries the service's pin — the canonical relative path,
+ *   device and inode it proved — and anything else resolved here is refused,
+ *   which is what defeats a link re-pointed while the frame was queued;
+ * - the canonical path is opened `O_NOFOLLOW` and the descriptor must still be
+ *   that inode;
+ * - holding that descriptor, the document is loaded without being shown, and
+ *   the path must *still* name the same inode afterwards, and the document's
+ *   text must equal the bytes read through the descriptor after the load;
+ * - only then is that same loaded document revealed — never the path reopened
+ *   — and the descriptor is released once the editor shows it.
+ *
+ * VS Code loads a document by path through its own file service, which offers
+ * no no-follow read, so the gate brackets that read instead of trusting it: a
+ * name re-pointed after the probe is caught by the identity check that follows
+ * the load, and one re-pointed and restored within it is caught by the text
+ * check unless the text it read is the proved file's own. What the editor
+ * shows is therefore the proved file's content, under a path proved after the
+ * load to name it. A load the gate refuses is never shown.
+ *
+ * It is the same sequence `src/uri-handler.ts` applies to a `vscode://` URI
+ * against the open workspace folders, applied here against the session's
+ * project root; the two policies stay separate because neither root subsumes
+ * the other.
  *
  * ## The answer the panel is waiting for
  *
@@ -81,26 +123,38 @@
  * Nothing here logs an absolute path, a `fsPath`, a resolved symlink target or
  * any document content (AAP §0.5.2). The primitive is handed a URI and no
  * project root, so it logs no path at all; the session-scoped opener logs and
- * displays the project-relative `file:line:column` only.
+ * displays the project-relative `file:line:column` only, and reduces every
+ * filesystem failure to its errno code, because a platform error message
+ * quotes the path it failed on.
  */
+
+import { constants, lstat, open, realpath, type FileHandle } from 'node:fs/promises';
+import { resolve as resolveFsPath } from 'node:path';
 
 import * as vscode from 'vscode';
 
 import { parseSourceResultPayload } from '@debuggen/protocol';
-import type { SourceResultPayload } from '@debuggen/protocol';
+import type { SourceOpenPayload, SourceResultPayload } from '@debuggen/protocol';
 import {
   DebuggenError,
   err,
   formatSourceLocation,
   fromPromise,
+  isSafeRelativePath,
   isWithin,
   ok,
   parseSourceLocation,
+  relativePosix,
   resolveWithinProject,
   toPosix,
   tryCatch,
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result, SourceLocation } from '@debuggen/shared';
+// The Node entry of `@debuggen/shared`: the extension host is a Node process.
+// The identity shape and its exact `bigint` comparison are `safe-fs`'s own, the
+// same ones `src/uri-handler.ts` uses, so "the same file" means one thing in
+// both of the editor's source-open gates.
+import { isSameFileIdentity, type FileIdentity } from '@debuggen/shared/node';
 
 /**
  * How long the transient line highlight stays on the revealed line, in
@@ -227,6 +281,18 @@ export interface RevealOutcome {
 }
 
 /**
+ * The canonical file and identity the service proved for a forwarded
+ * `source.open` — the `pinned` member of its payload.
+ *
+ * Derived from the protocol's payload type rather than restated, so the shape
+ * the service writes and the shape compared here cannot drift: `file` is the
+ * target's path relative to the canonical project root with every link
+ * resolved, final component included, and `dev`/`ino` are the canonical
+ * decimal strings of a `bigint` `lstat` of that canonical path.
+ */
+export type SourceOpenPin = NonNullable<SourceOpenPayload['pinned']>;
+
+/**
  * The session context {@link openSourceLocation} enforces its policy against.
  *
  * `projectRoot` is the **session's** project root, read from the stored
@@ -237,12 +303,27 @@ export interface RevealOutcome {
 export interface OpenSourceContext {
   /** The absolute path of the session's project root. */
   readonly projectRoot: string;
+
+  /**
+   * What the service proved about the location, when the location arrived in
+   * a forwarded `source.open`; see {@link SourceOpenPin}.
+   *
+   * When present, the file this function resolves for itself must be the same
+   * canonical project-relative path on the same device and inode, or nothing
+   * is opened: a link re-pointed or a file replaced while the frame crossed
+   * the socket is refused rather than followed. Absent for a location that
+   * never passed through the service — the `debuggen.openSource` command and
+   * the session view's `openFile` frame — which the rest of the canonical gate
+   * still covers in full. `src/extension.ts` refuses a forwarded frame that
+   * lacks it before calling here ({@link forwardedSourcePin}).
+   */
+  readonly pinned?: SourceOpenPin;
 }
 
 /**
  * Injectable collaborators for {@link openSourceLocation}.
  *
- * All three are optional and default to the production implementation. They
+ * All four are optional and default to the production implementation. They
  * exist so the containment verdict can be asserted without opening an editor
  * and without a toast appearing in a test run.
  */
@@ -252,9 +333,18 @@ export interface OpenSourceDeps {
 
   /**
    * The reveal primitive to delegate to. Defaults to
-   * {@link revealLocationInEditor}.
+   * {@link revealDocumentInEditor}. It receives the document the gate loaded
+   * and verified, never a path to open again.
    */
-  readonly reveal?: typeof revealLocationInEditor;
+  readonly reveal?: typeof revealDocumentInEditor;
+
+  /**
+   * How the gate loads the canonical document, unshown, while it holds the
+   * proved descriptor. Defaults to `vscode.workspace.openTextDocument`. The
+   * seam lets a test change the file between the identity probe and the
+   * editor's read of it — the interleaving the post-load checks exist for.
+   */
+  readonly loadDocument?: (uri: vscode.Uri) => Thenable<vscode.TextDocument>;
 
   /**
    * How a refusal is shown to the developer. Defaults to a thin, non-awaiting
@@ -842,6 +932,8 @@ export async function revealLocationInEditor(
   column: number,
   options?: RevealLocationOptions,
 ): Promise<Result<RevealOutcome, DebuggenError>> {
+  // Checked before the open as well as inside the document primitive, so a
+  // broken numeric contract never loads a document.
   const contractRejection = positionContractRejection(line, column);
   if (contractRejection !== undefined) {
     return err(contractRejection);
@@ -867,7 +959,41 @@ export async function revealLocationInEditor(
     );
   }
 
-  const document = opened.value;
+  return revealDocumentInEditor(opened.value, line, column, options);
+}
+
+/**
+ * Puts the cursor on a 1-based line and column of a document that is already
+ * loaded, with a brief highlight — {@link revealLocationInEditor} without the
+ * open.
+ *
+ * The document is shown as it is: no path is resolved again, so a caller that
+ * verified this document's content shows exactly what it verified. That is how
+ * {@link openSourceLocation} reveals the copy its canonical gate checked. Like
+ * {@link revealLocationInEditor} it enforces no containment policy, shows no
+ * user interface, clamps a position past the end of the document, and guards
+ * every editor call.
+ *
+ * @param document The loaded document to show. Already authorised by the caller.
+ * @param line The 1-based line to put the cursor on.
+ * @param column The 1-based column to put the cursor on.
+ * @param options Selection, editor and highlight refinements; see
+ * {@link RevealLocationOptions}.
+ * @returns `Ok` with the editor, the applied selection and the clamp flag, or
+ * `Err` when the numeric contract was broken, the position could not be
+ * resolved, or the editor could not be shown or scrolled to. Never throws, and
+ * never rejects.
+ */
+export async function revealDocumentInEditor(
+  document: vscode.TextDocument,
+  line: number,
+  column: number,
+  options?: RevealLocationOptions,
+): Promise<Result<RevealOutcome, DebuggenError>> {
+  const contractRejection = positionContractRejection(line, column);
+  if (contractRejection !== undefined) {
+    return err(contractRejection);
+  }
 
   // Derived under a guard: the document was open a moment ago, but the editor
   // may have closed it since, and `validatePosition`/`lineAt` throw for a
@@ -1015,32 +1141,678 @@ function refusalMessage(headline: string, error: DebuggenError): string {
   return hint === undefined ? headline : `${headline} ${hint}`;
 }
 
+// ---------------------------------------------------------------------------
+// The canonical gate of the session-scoped opener
+// ---------------------------------------------------------------------------
+
+/**
+ * Why the canonical gate refused, one value per distinct cause.
+ *
+ * The reason is logged and chooses the sentence the developer sees; only its
+ * {@link GateRefusalCopy.code} leaves the editor, in `source.result`. Every
+ * reason that concerns what lies *outside* the project shares one code and one
+ * sentence, `leaves-project`, so the answer never says whether an outside
+ * target exists.
+ */
+type GateRefusalReason =
+  | 'project-root-missing'
+  | 'project-root-unresolvable'
+  | 'missing'
+  | 'leaves-project'
+  | 'unresolvable'
+  | 'unsafe-canonical-path'
+  | 'not-a-file'
+  | 'pin-mismatch'
+  | 'changed'
+  | 'unreadable'
+  | 'editor-load-failed'
+  | 'decode-failed';
+
+/** One refusal of the canonical gate. */
+interface GateRefusal {
+  /** Why the gate refused. */
+  readonly reason: GateRefusalReason;
+
+  /**
+   * The errno of the filesystem call that failed, when one did — a code such
+   * as `ELOOP`, never the error's message, which quotes the absolute path.
+   */
+  readonly errno?: string;
+}
+
+/** The error code and the developer-facing sentences of one {@link GateRefusalReason}. */
+interface GateRefusalCopy {
+  /** A code from `DEBUGGEN_ERROR_CODES`; the only part of a refusal that leaves the editor. */
+  readonly code: DebuggenErrorCode;
+
+  /** The sentence naming the refused location by its project-relative `file:line:column`. */
+  readonly headline: (at: string) => string;
+
+  /** The next step. Constant, and discloses no filesystem layout. */
+  readonly hint: string;
+}
+
+/** The hint of every refusal that a fresh click can resolve once the disk has settled. */
+const CLICK_AGAIN_HINT = 'Click the source link again so the file is checked as it is on disk now.';
+
+/**
+ * The code and copy of every canonical-gate refusal.
+ *
+ * `FS_UNSAFE_PATH` is the code for every refusal where the filesystem leads
+ * somewhere the session's project cannot vouch for, or changed underneath the
+ * check — the code the service's `source/open.ts` reports for the same
+ * symbolic-link escape, so both hops name one failure alike. Absence inside
+ * the project is `PROJECT_NOT_FOUND`, as it is for the reveal primitive and the
+ * service. Nothing here quotes an absolute path or a link target (AAP §0.5.2).
+ */
+const GATE_REFUSALS: Readonly<Record<GateRefusalReason, GateRefusalCopy>> = Object.freeze({
+  'project-root-missing': {
+    code: 'PROJECT_NOT_FOUND',
+    headline: (at: string) =>
+      `The session's project folder is no longer on disk, so ${at} cannot be opened.`,
+    hint: 'Start a session again from the Debug Generator view for the project as it is now.',
+  },
+  'project-root-unresolvable': {
+    code: 'FS_UNSAFE_PATH',
+    headline: (at: string) =>
+      `The session's project folder cannot be resolved on disk, so ${at} cannot be checked against it.`,
+    hint: 'Check that the project folder exists and can be read, then start the session again.',
+  },
+  missing: {
+    code: 'PROJECT_NOT_FOUND',
+    headline: (at: string) => `${at} does not exist in the session's project.`,
+    hint: 'The file may have been moved, renamed or deleted since it was captured.',
+  },
+  'leaves-project': {
+    code: 'FS_UNSAFE_PATH',
+    headline: (at: string) =>
+      `${at} resolves outside the session's project, or through a link that cannot be followed; Debug Generator will not open it.`,
+    hint: 'A source location cannot follow a symbolic link out of the project the session was started for.',
+  },
+  unresolvable: {
+    code: 'FS_UNSAFE_PATH',
+    headline: (at: string) =>
+      `${at} cannot be resolved on disk, so Debug Generator cannot prove it is inside the session's project.`,
+    hint: 'A link loop, a directory that cannot be read or an over-long path prevents the check; fix the path in the project, then click the link again.',
+  },
+  'unsafe-canonical-path': {
+    code: 'FS_UNSAFE_PATH',
+    headline: (at: string) =>
+      `${at} resolves to a file whose name cannot be treated as project-relative; Debug Generator will not open it.`,
+    hint: 'Rename the file so its path holds no backslash or control character, then capture again.',
+  },
+  'not-a-file': {
+    code: 'PROJECT_NOT_FOUND',
+    headline: (at: string) => `${at} is not a regular file, so Debug Generator will not open it.`,
+    hint: 'A source location must name a source file, not a directory, a device or a pipe.',
+  },
+  'pin-mismatch': {
+    code: 'FS_UNSAFE_PATH',
+    headline: (at: string) =>
+      `${at} is no longer the file the Debug Generator service checked; nothing was opened.`,
+    hint: `The file, or a link on its path, changed after the click. ${CLICK_AGAIN_HINT}`,
+  },
+  changed: {
+    code: 'FS_UNSAFE_PATH',
+    headline: (at: string) =>
+      `${at} changed while Debug Generator was opening it; nothing was opened.`,
+    hint: CLICK_AGAIN_HINT,
+  },
+  unreadable: {
+    code: 'FS_UNSAFE_PATH',
+    headline: (at: string) =>
+      `${at} could not be read, so Debug Generator cannot verify the file it names.`,
+    hint: "Check the file's permissions, then click the link again.",
+  },
+  'editor-load-failed': {
+    code: 'PROJECT_NOT_FOUND',
+    headline: (at: string) => `The editor could not load ${at}.`,
+    hint: 'The file may be binary, too large for the editor, or removed since it was captured.',
+  },
+  'decode-failed': {
+    code: 'INTERNAL',
+    headline: (at: string) =>
+      `The editor could not decode ${at} to verify it against the file on disk.`,
+    hint: 'Try the location again; if it keeps failing, reload the window.',
+  },
+});
+
+/** Builds a {@link GateRefusal}, leaving `errno` absent rather than `undefined`. */
+function gateRefusal(reason: GateRefusalReason, errno?: string): GateRefusal {
+  return errno === undefined ? { reason } : { reason, errno };
+}
+
+/** The errno codes meaning "nothing is at this path", as opposed to "this path cannot be examined". */
+const MISSING_ERRNOS: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR']);
+
+/**
+ * The errno codes a no-follow open answers when the canonical path no longer
+ * binds to a file: removed (`ENOENT`, `ENOTDIR`), or replaced by a link at its
+ * final component (`ELOOP` on Linux and macOS, `EMLINK` on FreeBSD).
+ */
+const REBOUND_ERRNOS: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR', 'ELOOP', 'EMLINK']);
+
+/** The shape of a Node errno code; anything else a thrower put in `code` is not reported. */
+const ERRNO_PATTERN = /^E[A-Z0-9]{1,31}$/;
+
+/**
+ * The errno code of a failed filesystem call, or `undefined`.
+ *
+ * Only the code is kept: a Node filesystem error's `message` and `path` quote
+ * the absolute path the call was made with, and neither may reach a log line,
+ * an error's details or a notification (AAP §0.5.2).
+ */
+function errnoOf(caught: unknown): string | undefined {
+  if (typeof caught !== 'object' || caught === null || !('code' in caught)) {
+    return undefined;
+  }
+  const code: unknown = caught.code;
+  return typeof code === 'string' && ERRNO_PATTERN.test(code) ? code : undefined;
+}
+
+/** Whether an errno means that nothing is at the path. */
+function isMissing(errno: string | undefined): boolean {
+  return errno !== undefined && MISSING_ERRNOS.has(errno);
+}
+
+/** A filesystem call that failed, reduced to its errno. */
+interface FsFailure {
+  readonly errno: string | undefined;
+}
+
+/**
+ * Runs one filesystem call, turning a rejection into its errno.
+ *
+ * The gate's promise never to reject rests on this: every `realpath`, `lstat`,
+ * `open`, `stat` and read below goes through it, and what survives of a
+ * failure is the errno alone.
+ */
+async function settleFs<T>(call: () => Promise<T>): Promise<Result<T, FsFailure>> {
+  try {
+    return ok(await call());
+  } catch (caught) {
+    return err({ errno: errnoOf(caught) });
+  }
+}
+
+/** A file the canonical gate has proved: where it is, how the session names it, and which object it is. */
+interface CanonicalTarget {
+  /** The `realpath` of the candidate, exactly as it passed containment. The only path ever opened. */
+  readonly canonicalPath: string;
+
+  /**
+   * The canonical path relative to the canonical project root — what the
+   * service writes as `pinned.file`. Compared, never logged: through an
+   * in-project link it discloses where that link points.
+   */
+  readonly relativePath: string;
+
+  /**
+   * The device and inode a non-following `lstat` of the canonical path
+   * reported, as exact `bigint`s — see `FileIdentity` in `@debuggen/shared/node`.
+   */
+  readonly identity: FileIdentity;
+}
+
+/**
+ * Classifies a candidate that `realpath` reported missing, without disclosing
+ * whether anything exists outside the project.
+ *
+ * "Missing" alone would be an oracle: through `src/link → /etc`, the location
+ * `src/link/passwd` resolves (and is refused as outside) while
+ * `src/link/absent` fails with `ENOENT`, so answering the second
+ * `PROJECT_NOT_FOUND` would tell the sender which outside files exist. So the
+ * candidate's own ancestors are canonicalised from the deepest up, and the
+ * first one that resolves decides:
+ *
+ * - it resolves outside the canonical root — the path leads out of the project
+ *   whether or not the rest of it exists: `leaves-project`;
+ * - it is inside, and the next name below it is a link — one that cannot be
+ *   followed, wherever it points: `leaves-project`;
+ * - it is inside, and the next name below it does not exist: `missing`, the
+ *   only case that honestly is "not in the project".
+ *
+ * The walk is bounded by the location's segment count, which the location
+ * schema bounds in turn.
+ *
+ * @param projectRoot The session's project root, as validated lexically.
+ * @param lexicalTarget The lexical candidate `resolveWithinProject` produced.
+ * @param realRoot The canonical project root, POSIX-separated.
+ * @returns The refusal. Never throws.
+ */
+async function classifyMissingTarget(
+  projectRoot: string,
+  lexicalTarget: string,
+  realRoot: string,
+): Promise<GateRefusal> {
+  const segments = relativePosix(toPosix(projectRoot), toPosix(lexicalTarget)).split('/');
+
+  for (let depth = segments.length - 1; depth >= 0; depth -= 1) {
+    const ancestor = resolveFsPath(projectRoot, ...segments.slice(0, depth));
+    const resolved = await settleFs(() => realpath(ancestor));
+    if (!resolved.ok) {
+      if (isMissing(resolved.error.errno)) {
+        continue;
+      }
+      return gateRefusal('unresolvable', resolved.error.errno);
+    }
+
+    if (!isWithin(realRoot, toPosix(resolved.value))) {
+      return gateRefusal('leaves-project');
+    }
+
+    const next = resolveFsPath(projectRoot, ...segments.slice(0, depth + 1));
+    const entry = await settleFs(() => lstat(next));
+    if (entry.ok) {
+      // Something is at that name, yet its path did not resolve: a dangling
+      // link, or one into a chain that ends nowhere. Where it points is not
+      // asked — reading a link target is disclosing it.
+      return entry.value.isSymbolicLink() ? gateRefusal('leaves-project') : gateRefusal('missing');
+    }
+    return isMissing(entry.error.errno)
+      ? gateRefusal('missing')
+      : gateRefusal('unresolvable', entry.error.errno);
+  }
+
+  // Even the project root stopped resolving since it was canonicalised a
+  // moment ago; the root, not the location, is what is missing.
+  return gateRefusal('project-root-missing');
+}
+
+/**
+ * Canonical containment and identity: the steps that decide *which object*
+ * a lexically contained location names on disk.
+ *
+ * 1. The project root and the candidate are both canonicalised with
+ *    `realpath`, which resolves every link on the path, final component
+ *    included. A candidate that does not resolve is classified by
+ *    {@link classifyMissingTarget}; one that resolves outside the canonical
+ *    root is `leaves-project` — the symbolic-link escape a lexical check
+ *    cannot see (`src/link/passwd` under `src/link → /etc`).
+ * 2. The canonical candidate must be strictly below the canonical root, and
+ *    its path relative to that root must be a safe project-relative path.
+ * 3. A non-following `lstat` of the canonical path must report a regular file,
+ *    whose device and inode become the identity every later step compares
+ *    against. A link found there means the entry changed since `realpath`
+ *    resolved it; anything that is not a regular file — a directory, a FIFO
+ *    that would block the extension host, a device — is refused.
+ *
+ * @param projectRoot The session's project root, as validated lexically.
+ * @param lexicalTarget The lexical candidate `resolveWithinProject` produced.
+ * @returns The proved target, or the refusal. Never throws, never rejects.
+ */
+async function resolveCanonicalTarget(
+  projectRoot: string,
+  lexicalTarget: string,
+): Promise<Result<CanonicalTarget, GateRefusal>> {
+  const root = await settleFs(() => realpath(projectRoot));
+  if (!root.ok) {
+    const errno = root.error.errno;
+    return err(
+      gateRefusal(isMissing(errno) ? 'project-root-missing' : 'project-root-unresolvable', errno),
+    );
+  }
+  const realRoot = toPosix(root.value);
+
+  const target = await settleFs(() => realpath(lexicalTarget));
+  if (!target.ok) {
+    const errno = target.error.errno;
+    return err(
+      isMissing(errno)
+        ? await classifyMissingTarget(projectRoot, lexicalTarget, realRoot)
+        : gateRefusal('unresolvable', errno),
+    );
+  }
+  const canonicalPath = target.value;
+  const realTarget = toPosix(canonicalPath);
+
+  if (!isWithin(realRoot, realTarget)) {
+    return err(gateRefusal('leaves-project'));
+  }
+
+  // `'.'` is the root itself: contained, but not a file anything can open.
+  const relativePath = relativePosix(realRoot, realTarget);
+  if (relativePath === '.') {
+    return err(gateRefusal('not-a-file'));
+  }
+  if (!isSafeRelativePath(relativePath)) {
+    return err(gateRefusal('unsafe-canonical-path'));
+  }
+
+  const inspected = await settleFs(() => lstat(canonicalPath, { bigint: true }));
+  if (!inspected.ok) {
+    return err(gateRefusal('changed', inspected.error.errno));
+  }
+  const stats = inspected.value;
+  if (stats.isSymbolicLink()) {
+    return err(gateRefusal('changed'));
+  }
+  if (!stats.isFile()) {
+    return err(gateRefusal('not-a-file'));
+  }
+
+  return ok({ canonicalPath, relativePath, identity: { dev: stats.dev, ino: stats.ino } });
+}
+
+/**
+ * Whether the proved target is the one the service pinned: the same canonical
+ * project-relative path, on the same device, at the same inode.
+ *
+ * Plain string equality is exact because the protocol writes device and inode
+ * numbers in canonical decimal, and `String` of a `bigint` is canonical
+ * decimal. A pin whose members are not strings — a hand-built call — compares
+ * unequal and is refused.
+ */
+function matchesPin(target: CanonicalTarget, pinned: SourceOpenPin): boolean {
+  return (
+    target.relativePath === pinned.file &&
+    String(target.identity.dev) === pinned.dev &&
+    String(target.identity.ino) === pinned.ino
+  );
+}
+
+/**
+ * An `open` flag read through `unknown`, or `0` where the platform lacks it.
+ *
+ * The same capability detection as `src/uri-handler.ts` and `safe-fs` in
+ * `@debuggen/shared/node`: the type declarations describe the POSIX constant
+ * set, while on Windows `O_NOFOLLOW` and `O_NONBLOCK` are absent at runtime. A
+ * missing flag contributes nothing rather than a `NaN`, and the guarantee lost
+ * with it is covered by the `lstat` {@link holdsIdentity} runs regardless.
+ */
+function openFlag(flag: unknown): number {
+  return typeof flag === 'number' ? flag : 0;
+}
+
+/**
+ * The flags of the identity probe: read-only, refusing a link at the final
+ * component, and never blocking — a FIFO swapped in at the last moment would
+ * otherwise hang the extension host every other extension shares.
+ */
+function probeOpenFlags(): number {
+  return constants.O_RDONLY | openFlag(constants.O_NOFOLLOW) | openFlag(constants.O_NONBLOCK);
+}
+
+/**
+ * Proves that an open descriptor reached the proved inode, and that the
+ * canonical path still names it.
+ *
+ * The descriptor's own `stat` says what the open actually reached; a
+ * descriptor cannot be re-pointed. An `lstat` of the path, taken while that
+ * descriptor is held, proves the name still binds to that inode with no link
+ * at its final component — which is also what refuses a link where the
+ * platform has no `O_NOFOLLOW`.
+ *
+ * @returns `true` only when both observations are the proved regular file.
+ * Never throws.
+ */
+async function holdsIdentity(handle: FileHandle, target: CanonicalTarget): Promise<boolean> {
+  const held = await settleFs(() => handle.stat({ bigint: true }));
+  if (!held.ok || !held.value.isFile() || !isSameFileIdentity(target.identity, held.value)) {
+    return false;
+  }
+
+  const bound = await settleFs(() => lstat(target.canonicalPath, { bigint: true }));
+  return bound.ok && bound.value.isFile() && isSameFileIdentity(target.identity, bound.value);
+}
+
+/** A leading byte-order mark, which a decoder may or may not keep in the text it returns. */
+const BYTE_ORDER_MARK = '\uFEFF';
+
+/** Every line break the editor's text model recognises: `\r\n`, a lone `\r` and — untouched — `\n`. */
+const LINE_BREAKS = /\r\n?/g;
+
+/**
+ * The form in which the editor's text and the proved bytes are compared.
+ *
+ * Only the two differences that are the editor's representation rather than a
+ * different file are removed: the text model normalises line breaks, and
+ * whether one leading byte-order mark survives decoding depends on the
+ * encoding. Nothing else is folded, because anything else could make two
+ * different files compare equal.
+ */
+function comparableText(text: string): string {
+  const unmarked = text.startsWith(BYTE_ORDER_MARK) ? text.slice(BYTE_ORDER_MARK.length) : text;
+  return unmarked.replace(LINE_BREAKS, '\n');
+}
+
+/**
+ * Loads the canonical document without showing it and proves that what the
+ * editor now holds is the proved file, while the probe's descriptor is held.
+ *
+ * VS Code reads a document by path through its own file service, which has no
+ * no-follow read, so a name re-pointed after the identity probe is what the
+ * editor would read. The load is therefore bracketed rather than trusted:
+ *
+ * 1. after the load, {@link holdsIdentity} must hold again — the path still
+ *    names the proved inode with no link at its final component — so a name
+ *    re-pointed before the read and left that way is refused;
+ * 2. the proved bytes are then read through the descriptor — the one
+ *    reference to the proved inode no rename or link can re-point — decoded
+ *    in the document's own encoding with the editor's decoder, and must equal
+ *    the document's text in {@link comparableText} form, so a name re-pointed
+ *    and restored within the read is refused unless what the editor read is
+ *    the proved file's own content.
+ *
+ * A document with unsaved edits is accepted once the identity holds: a fresh
+ * load is never dirty, so it is the developer's own buffer, open before this
+ * call, and this load read nothing from disk.
+ *
+ * Every editor call and every read of the document is guarded: a document
+ * the editor closed between two awaits throws rather than rejects.
+ *
+ * @param handle The descriptor {@link holdsIdentity} verified. Not closed here.
+ * @param target The proved target.
+ * @param uri The canonical `file:` URI.
+ * @param load How the document is loaded; see {@link OpenSourceDeps.loadDocument}.
+ * @returns `Ok` with the verified document — the one the reveal must show —
+ * otherwise the refusal. Never throws, never rejects.
+ */
+async function loadVerifiedDocument(
+  handle: FileHandle,
+  target: CanonicalTarget,
+  uri: vscode.Uri,
+  load: (uri: vscode.Uri) => Thenable<vscode.TextDocument>,
+): Promise<Result<vscode.TextDocument, GateRefusal>> {
+  const loaded = await fromEditorCall(() => load(uri), 'PROJECT_NOT_FOUND');
+  if (!loaded.ok) {
+    return err(gateRefusal('editor-load-failed'));
+  }
+  const document = loaded.value;
+
+  if (!(await holdsIdentity(handle, target))) {
+    return err(gateRefusal('changed'));
+  }
+
+  const state = tryCatch(
+    () => ({ dirty: document.isDirty, encoding: document.encoding }),
+    'INTERNAL',
+  );
+  if (!state.ok) {
+    return err(gateRefusal('editor-load-failed'));
+  }
+  if (state.value.dirty) {
+    return ok(document);
+  }
+
+  const bytes = await settleFs(() => handle.readFile());
+  if (!bytes.ok) {
+    return err(gateRefusal('changed', bytes.error.errno));
+  }
+
+  const { encoding } = state.value;
+  const decoded = await fromEditorCall(
+    () => vscode.workspace.decode(bytes.value, { encoding }),
+    'INTERNAL',
+  );
+  if (!decoded.ok) {
+    return err(gateRefusal('decode-failed'));
+  }
+
+  const text = tryCatch(() => document.getText(), 'INTERNAL');
+  if (!text.ok) {
+    return err(gateRefusal('editor-load-failed'));
+  }
+
+  return comparableText(text.value) === comparableText(decoded.value)
+    ? ok(document)
+    : err(gateRefusal('changed'));
+}
+
+/**
+ * Closes the probe's descriptor on a path where the verdict is already known.
+ *
+ * A close that fails cannot change what was verified, so it is logged by errno
+ * and does not turn the verdict into a failure.
+ */
+async function closeDescriptor(handle: FileHandle, logger: Logger | undefined): Promise<void> {
+  try {
+    await handle.close();
+  } catch (caught) {
+    logger?.warn('Could not close the descriptor a source location was verified through', {
+      errno: errnoOf(caught),
+    });
+  }
+}
+
+/**
+ * Binds the canonical path to the proved inode at the moment of opening, binds
+ * the editor's copy to that same inode, and shows that copy — through one
+ * descriptor held from the probe until the editor has shown the document.
+ *
+ * The canonical path is opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`: a link at
+ * the final component fails the open, a FIFO cannot stall it. An open that
+ * fails because the path no longer binds to a file is `changed`; one that
+ * fails for any other reason — permissions withdrawn, above all — is
+ * `unreadable`. The document is then loaded and verified by
+ * {@link loadVerifiedDocument}, and `show` receives that verified document
+ * itself, so the reveal displays exactly the model that was checked instead of
+ * resolving the path a second time. The descriptor is closed on every path,
+ * once `show` has settled.
+ *
+ * @param target The proved target.
+ * @param uri The canonical `file:` URI.
+ * @param load How the document is loaded; see {@link OpenSourceDeps.loadDocument}.
+ * @param logger Where a failed close is reported.
+ * @param show The reveal, called with the verified document only.
+ * @returns `Ok` with what `show` returned, or the refusal — in which case
+ * `show` was never called and nothing was shown. Never throws, and never
+ * rejects unless `show` does.
+ */
+async function showThroughGate<T>(
+  target: CanonicalTarget,
+  uri: vscode.Uri,
+  load: (uri: vscode.Uri) => Thenable<vscode.TextDocument>,
+  logger: Logger | undefined,
+  show: (document: vscode.TextDocument) => Promise<T>,
+): Promise<Result<T, GateRefusal>> {
+  const opened = await settleFs(() => open(target.canonicalPath, probeOpenFlags()));
+  if (!opened.ok) {
+    const errno = opened.error.errno;
+    return err(
+      gateRefusal(
+        errno === undefined || REBOUND_ERRNOS.has(errno) ? 'changed' : 'unreadable',
+        errno,
+      ),
+    );
+  }
+
+  const handle = opened.value;
+  try {
+    if (!(await holdsIdentity(handle, target))) {
+      return err(gateRefusal('changed'));
+    }
+    const verified = await loadVerifiedDocument(handle, target, uri, load);
+    if (!verified.ok) {
+      return err(verified.error);
+    }
+    return ok(await show(verified.value));
+  } finally {
+    await closeDescriptor(handle, logger);
+  }
+}
+
+/**
+ * The pin a forwarded `source.open` must carry, or the refusal of a frame that
+ * carries none.
+ *
+ * The service pins the canonical file and identity it proved on every frame it
+ * forwards to an editor, and the pin is what lets {@link openSourceLocation}
+ * refuse a link re-pointed while the frame was in flight. A forwarded frame
+ * without one therefore cannot be held to that check and opens nothing:
+ * `src/extension.ts` calls this before any session lookup, filesystem or
+ * editor call, answers the refusal's code in `source.result`, and shows its
+ * message and hint once.
+ *
+ * @param pinned The frame's `pinned` member, as the protocol parsed it.
+ * @returns `Ok` with the pin, or `Err` with `FS_UNSAFE_PATH` and constant
+ * copy that repeats nothing from the frame. Never throws.
+ */
+export function forwardedSourcePin(
+  pinned: SourceOpenPin | undefined,
+): Result<SourceOpenPin, DebuggenError> {
+  if (pinned !== undefined) {
+    return ok(pinned);
+  }
+  return err(
+    new DebuggenError(
+      'FS_UNSAFE_PATH',
+      'Debug Generator did not open a source location the service forwarded without the file identity it checked.',
+      {
+        hint: 'Run the same version of the Debug Generator extension and service, then click the source link again.',
+        details: { reason: 'unpinned-forward' },
+      },
+    ),
+  );
+}
+
 /**
  * Opens a {@link SourceLocation} that belongs to a session, enforcing the
  * session's project root.
  *
- * This is what `src/extension.ts` calls for every inbound `source.open` message
- * and for the `debuggen.openSource` command, and it is the boundary that treats
- * the location as untrusted. `apps/local-service`'s `source/open.ts` has
- * already validated the payload, authorised the principal and checked
- * containment and `realpath` before forwarding — and this function checks
- * containment again anyway, because a click-to-source path that reads a file
- * outside the project on the strength of one process's verdict has no defence
- * in depth at all (AAP §0.2.3).
+ * This is the one sink every session-scoped editor open ends in: a forwarded
+ * `source.open` (`src/extension.ts`), the `debuggen.openSource` command, and
+ * the session view's `openFile` frame, which dispatches to that command. It is
+ * the boundary that treats the location as untrusted — a model-suggested
+ * location included. `apps/local-service`'s `source/open.ts` has already
+ * checked containment and `realpath` for a forwarded frame, and this function
+ * proves it all again anyway, because that verdict was true only at the
+ * instant it was computed and the frame then crossed a socket; and the command
+ * and the webview have no service verdict at all (AAP §0.2.3).
  *
- * The order is: shape, then project root, then containment, and only then any
- * editor call — so a refused location never opens anything at all, not even
- * briefly.
+ * The gate, in order, with no editor call before step 8 and nothing shown
+ * before step 9:
  *
- * What this function deliberately does **not** do is resolve symlinks.
- * Filesystem-level escape checking belongs to the two policies that own a
- * filesystem question: `src/uri-handler.ts`, which validates a web-triggerable
- * `vscode://` URI against the open workspace folders with `fs.realpath`, and
- * the service's `source/open.ts`, which does the same against the session's
- * project root before the message is ever sent. Adding a third, differently
- * scoped `realpath` here would blur which policy actually decided, and would
- * make this module's containment answer depend on the state of the disk rather
- * than on the session it was given.
+ * 1. **Shape** — `parseSourceLocation`, whatever validated it upstream.
+ * 2. **Project root** — present, from the session record.
+ * 3. **Lexical containment** — `resolveWithinProject`, then `isWithin`.
+ * 4. **Canonical containment** — `realpath` of the root and of the candidate,
+ *    the candidate strictly inside, its canonical relative path safe; a link
+ *    that leads out of the project, at any component, is refused here.
+ * 5. **Regular-file identity** — a non-following `lstat` of the canonical path
+ *    must be a regular file; its device and inode are recorded.
+ * 6. **The pin** — when {@link OpenSourceContext.pinned} is present, the
+ *    canonical relative path, device and inode must all equal it.
+ * 7. **Identity at opening** — the canonical path opened
+ *    `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, the descriptor's `fstat` and a
+ *    fresh `lstat` both the recorded inode; the descriptor stays open.
+ * 8. **The editor's copy** — the document loaded without being shown; after
+ *    the load the path must still name the recorded inode, and the document's
+ *    text must equal the bytes then read through that descriptor.
+ * 9. **The reveal** — of that same verified document, at the **canonical**
+ *    path, never the lexical one and never reopened by path; the descriptor
+ *    is released once the editor has shown it.
+ *
+ * Refusal codes: `PROTOCOL_INVALID_MESSAGE` (shape), `PATH_OUTSIDE_PROJECT`
+ * (steps 2–3), `FS_UNSAFE_PATH` (a path the filesystem leads out of the
+ * project, one that cannot be resolved or read, a pin that does not match, or
+ * a file that changed between steps — the service's code for the same escape),
+ * and `PROJECT_NOT_FOUND` (nothing to open inside the project). A location
+ * reached through a link out of the project is refused alike whether or not
+ * its outside target exists, so the answer is no filesystem oracle. No
+ * refusal's message, details or log line holds an absolute path or a link
+ * target: the project-relative `file:line:column` and an errno code are all
+ * that is reported (AAP §0.5.2).
  *
  * Every failure is reported exactly once, as a warning notification and as an
  * `Err`; nothing throws (AAP §0.5.5).
@@ -1048,12 +1820,11 @@ function refusalMessage(headline: string, error: DebuggenError): string {
  * @param location The location to open. Validated here, whatever validated it
  * upstream.
  * @param context The session's project root — from the stored session record,
- * never from the message that carried the location.
+ * never from the message that carried the location — and, for a forwarded
+ * frame, the service's pin.
  * @param deps Optional logger, reveal implementation and warning sink.
- * @returns `Ok` with the reveal outcome, or `Err` carrying
- * `PROTOCOL_INVALID_MESSAGE` for a malformed location, `PATH_OUTSIDE_PROJECT`
- * for one outside the session's project, or whatever the reveal itself
- * reported.
+ * @returns `Ok` with the reveal outcome, or `Err` carrying one of the refusal
+ * codes above, or whatever the reveal itself reported.
  */
 export async function openSourceLocation(
   location: SourceLocation,
@@ -1147,14 +1918,56 @@ export async function openSourceLocation(
       return err(error);
     }
 
-    // 4. The URI. `resolveWithinProject` returns a POSIX path, and
-    //    `Uri.file` accepts forward slashes on every platform including
-    //    Windows, so no separator surgery is needed here; a caller that ever
-    //    needs a platform-native path should use `node:path` rather than
-    //    rewriting the string.
-    const uri = vscode.Uri.file(absolutePath);
+    // Every refusal from here on is the canonical gate's: one log record by
+    // reason and code, one warning, one `Err` — and no absolute path, link
+    // target or platform message in any of them.
+    const refuseAtGate = (refusal: GateRefusal): Result<RevealOutcome, DebuggenError> => {
+      const copy = GATE_REFUSALS[refusal.reason];
+      const details: Record<string, unknown> = {
+        file: valid.file,
+        line: valid.line,
+        column: valid.column,
+        reason: refusal.reason,
+      };
+      if (refusal.errno !== undefined) {
+        details['errno'] = refusal.errno;
+      }
+      const error = new DebuggenError(copy.code, copy.headline(at), { hint: copy.hint, details });
+      logger?.warn('Refused a source location that failed the canonical check', {
+        file: valid.file,
+        reason: refusal.reason,
+        code: error.code,
+        errno: refusal.errno,
+      });
+      showWarning(refusalMessage(error.message, error));
+      return err(error);
+    };
 
-    const reveal = deps?.reveal ?? revealLocationInEditor;
+    // 4–5. Canonical containment and regular-file identity: which object the
+    //      location names on disk, with every link on its path resolved.
+    const canonical = await resolveCanonicalTarget(projectRoot, absolutePath);
+    if (!canonical.ok) {
+      return refuseAtGate(canonical.error);
+    }
+    const target = canonical.value;
+
+    // 6. The pin. Checked after this function's own resolution, never instead
+    //    of it: the pin says what the service proved, and a location whose
+    //    link was re-pointed or whose file was replaced since then resolves to
+    //    another path or another inode here.
+    const pinned = context.pinned;
+    if (pinned !== undefined && !matchesPin(target, pinned)) {
+      return refuseAtGate(gateRefusal('pin-mismatch'));
+    }
+
+    // 7–9. Identity at opening, the editor's unshown copy re-checked after its
+    //      load, then the reveal of that same copy — all through one held
+    //      no-follow descriptor. The URI is built from the canonical path,
+    //      which is the only path this function ever opens.
+    const uri = vscode.Uri.file(target.canonicalPath);
+    const load =
+      deps?.loadDocument ?? ((toLoad: vscode.Uri) => vscode.workspace.openTextDocument(toLoad));
+    const reveal = deps?.reveal ?? revealDocumentInEditor;
     // Built key by key: under `exactOptionalPropertyTypes` an absent `endLine`,
     // `symbol` or `logger` has to be an absent key, not one holding
     // `undefined`.
@@ -1170,8 +1983,15 @@ export async function openSourceLocation(
     }
 
     // The 1-based line and column pass through unchanged: the conversion to
-    // VS Code's 0-based positions happens only inside the primitive.
-    const outcome = await reveal(uri, valid.line, valid.column, revealOptions);
+    // VS Code's 0-based positions happens only inside the primitive, which
+    // receives the verified document rather than the URI.
+    const shown = await showThroughGate(target, uri, load, logger, (document) =>
+      reveal(document, valid.line, valid.column, revealOptions),
+    );
+    if (!shown.ok) {
+      return refuseAtGate(shown.error);
+    }
+    const outcome = shown.value;
     if (!outcome.ok) {
       const error = outcome.error;
       logger?.warn('Could not open a source location', {
@@ -1191,6 +2011,7 @@ export async function openSourceLocation(
       resolvedBy: valid.resolvedBy,
       confidence: valid.confidence,
       clamped: outcome.value.clamped,
+      pinned: pinned !== undefined,
     });
     return outcome;
   } catch (thrown) {
@@ -1284,6 +2105,11 @@ const NOT_OPENED_COPY: Readonly<Partial<Record<DebuggenErrorCode, SourceResultCo
       message: 'VS Code could not open the file this source link names.',
       hint: 'The file may have been moved, renamed or deleted since the capture.',
     },
+    FS_UNSAFE_PATH: {
+      message:
+        "VS Code refused the source location because the file it names could not be verified as the one inside the session's project.",
+      hint: 'A source link cannot follow a symbolic link out of the project or open a file that changed after the service checked it; click the link again.',
+    },
   });
 
 /** The answer for a failure whose code has no entry in {@link NOT_OPENED_COPY}. */
@@ -1322,7 +2148,10 @@ const UNEXPECTED_COPY: SourceResultCopy = Object.freeze({
  *
  * @example
  * ```ts
- * const opened = await openSourceLocation(payload.location, { projectRoot });
+ * const pin = forwardedSourcePin(payload.pinned);
+ * const opened = isOk(pin)
+ *   ? await openSourceLocation(payload.location, { projectRoot, pinned: pin.value })
+ *   : pin;
  * const answer = sourceResultFor(
  *   { sessionId: payload.sessionId, ref: message.id },
  *   isOk(opened) ? { kind: 'opened' } : { kind: 'not-opened', code: opened.error.code },

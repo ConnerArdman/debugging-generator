@@ -1,10 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
-  <!-- A hex nut face-on: a pointy-top hexagon of circumradius 8.5 about 12 12, closed with Z so
-       all six corners take the round join, and a bore of radius 3.2 on the same centre, 2.41
-       units clear of the rim so both survive a 16 px chip. Stroked and pointy-top, against the
-       filled flat-top hexagon of favicon.svg, so it cannot read as the brand mark. The root
-       strokes with the currentColor keyword over a slate root colour: fetched by its path the
-       file is its own document and resolves that keyword against itself, yet inherits inlined. -->
+  <!-- Hex nut category glyph, used as a CSS mask by the category glyph component, so its alpha is
+       the shape. Keep it fill-free at the family's 1.75 stroke and legible at 16 px. Viewed on its
+       own, currentColor resolves to the slate root colour. Stroked and pointy-top, so it never
+       reads as the filled flat-top brand mark. -->
   <path d="M12 3.5 L19.36 7.75 L19.36 16.25 L12 20.5 L4.64 16.25 L4.64 7.75 Z" />
   <circle cx="12" cy="12" r="3.2" />
 </svg>

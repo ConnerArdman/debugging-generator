@@ -1,8 +1,8 @@
 /**
  * `telemetry-capture` — the browser project's proof that the page agent observes one real
- * interaction end to end (AAP 0.8.3 "Browser": "agent injected before React; a click produces
- * interaction, render and fetch events with one `traceId`"), on a freshly loaded page and on a
- * page that was already open (AAP 0.7.1 Group 4, the reload path of AAP 0.5.5).
+ * interaction end to end — the agent is injected before React, and a click produces interaction,
+ * render and fetch events that share one `traceId` — on a freshly loaded page, across a reload
+ * during a capture, and on a page that was already open before the extension was enabled.
  *
  * ## What each test proves
  *
@@ -20,11 +20,14 @@
  *    tail is shown to stream them.
  * 3. **Reload during a capture.** The reloaded document is re-armed with the same `captureId`:
  *    every event of both documents is attributed to that one capture, whose summary names both
- *    producers, and the navigation the reload produced reaches the panel's live tail. The product
- *    defines no constant for a "page reloaded during capture" notice — the phrase exists only in
- *    comments (`routes/binding.ts`, `agent-control.test.ts`) — so rather than retype a literal the
- *    test asserts the reloaded document's own `navigation` event (`navigation.type` = `reload`),
- *    the entry the panel's event log actually shows for the reload.
+ *    producers, and the reload is visible where the developer watches the capture. The panel's
+ *    live tail shows the reloaded document's own `navigation` event (`navigation.type` =
+ *    `reload`) and, in its capture-notices list, a "Page reloaded during capture" entry: the
+ *    panel store records that notice when the service announces the kept binding as `navigated`
+ *    while the capture runs (`reduceSessionBound` in
+ *    `apps/chrome-extension/src/panel/state/session-store.ts`), and `LiveTail.tsx` words it
+ *    (`NOTICE_LABELS`). The list's name and that wording are module-private in a React component
+ *    module, so `fixtures.ts` types them and exposes the entries as `panel.pageReloadedNotices`.
  * 4. **A page that was open before the extension.** Such a page carries no agent, so readiness
  *    cannot be met; the service asks the developer to reload and the panel offers its own reload
  *    action, and nothing reloads the page — no document load, no `chrome.tabs.reload` from the
@@ -35,7 +38,7 @@
  *
  * ## Where every expectation comes from
  *
- * - **Fixture vocabulary only** (AAP 0.5.4). The widget's display name, its route and the route's
+ * - **Fixture vocabulary only.** The widget's display name, its route and the route's
  *   delay are read at run time from `tests/fixtures/sample-next-app` (the `export function`
  *   declaration, the `fetch('…')` literal and `DELAY_MS`), and the reply text from the running
  *   route itself, so this file names nothing of `apps/demo-app` and restates no fixture literal
@@ -56,15 +59,12 @@
  *
  * ## How the "already open" state of test 4 is provoked
  *
- * Three rungs were considered, highest fidelity first. (1) Overwriting the worker's recorded
- * readiness is unavailable: `agent-control.ts` keeps readiness in its closure, and only the tab
- * bindings persist in `chrome.storage.session` (`BINDING_STORAGE_KEY`). (2) Invoking the control's
- * readiness entry point is unavailable: the worker composes itself inside its module and exposes
- * nothing on the worker global, and an MV3 service worker cannot `import()` the module to reach
- * its export. (3) is used: the tab is opened while the extension is disabled (through
- * `chrome.management` on `chrome://extensions`, the browser's own control), which is precisely a
- * page loaded before the extension — Chrome injects no declared content script into a tab that is
- * already open when an extension is enabled.
+ * The tab is opened while the extension is disabled, through `chrome.management` on
+ * `chrome://extensions` (the browser's own control), and the extension is enabled afterwards.
+ * Chrome injects no declared content script into a tab that is already open when an extension is
+ * enabled, so the tab is precisely a page loaded before the extension: it carries neither agent
+ * nor bridge, and the worker judges its readiness from the same observations it makes for any such
+ * page.
  *
  * The consent is given the way a developer gives it, through the panel's own reload action. The
  * service's readiness gate surfaces the reload request as a `session.progress` row; the worker,
@@ -83,14 +83,14 @@
  *
  * ## Scope
  *
- * Browser-tier evidence only (AAP 0.9.2: deterministic provider, no PostgreSQL, localhost only).
+ * Browser-tier evidence only: deterministic provider, no PostgreSQL, localhost only.
  * No server-agent credential is minted or used by this file: whether a server preload is attached
  * depends solely on how `fixtures.ts` came to serve the app (`fixtureApp.servedBy`), and the
  * fixture app has no database, so server- and database-tier spans are neither required nor
  * asserted here — `tests/e2e/**` owns those tiers. Ordering is checked on browser-tier edges
  * only, because a server span's clock is the Node process's, not the page's.
  *
- * ## Shared state (AAP 0.8.3; `workers: 1`, `fullyParallel: false`)
+ * ## Shared state (`workers: 1`, `fullyParallel: false`)
  *
  * One Chromium context, one service and one `DEBUGGEN_HOME` serve the whole suite, so every query
  * and assertion is scoped to the test's own session and capture, every session is ended by the
@@ -220,7 +220,7 @@ const PING_RESULT_TEST_ID = 'ping-result';
 /**
  * The one generic question every session here asks. It names the interaction and the evidence
  * wanted in the product's generic signal vocabulary (click, slow, render, fetch) and nothing of any
- * application (AAP 0.5.4).
+ * application.
  */
 const QUESTION =
   'Why is it slow to see a result after I click this button, and what renders and fetches while it waits?';
@@ -702,7 +702,8 @@ async function waitForArmed(page: Page, expectedCaptureId?: string): Promise<str
 
 /**
  * Wait until the page's agent is back to dormant after leaving `leftCaptureId` — hooks disabled,
- * not idled (AAP 0.5.1): no flag enabled, `fetch`/XHR restored, no other capture named.
+ * not idled (docs/ARCHITECTURE.md, section 7.6): no flag enabled, `fetch`/XHR restored, no other
+ * capture named.
  */
 async function waitForDormant(page: Page, leftCaptureId: string): Promise<void> {
   await expect
@@ -830,7 +831,8 @@ interface ClickTrace {
  * Find and assert the trace of the one click made in `producerId`'s document: exactly one
  * interaction, and under its `traceId` the fixture route's request as its direct child, the click's
  * own commit, and the post-response commit attributed to the settled request by async-continuation
- * lineage, each with the widget's render inside it (AAP 0.4.2, 0.8.3).
+ * lineage, each with the widget's render inside it (docs/ARCHITECTURE.md, section 6 "Trace
+ * correlation").
  */
 function expectClickTrace(
   events: readonly TelemetryEvent[],
@@ -996,8 +998,9 @@ function expectTraceTree(tree: TraceTree, trace: ClickTrace): void {
 
 /**
  * Assert every stored event belongs to this session and capture, carries the core fields, and
- * obeys the time semantics of AAP 0.2.3: `startTime` in epoch milliseconds inside the test's own
- * wall-clock window, `duration` non-negative milliseconds, and a unique `(producerId, seq)`.
+ * obeys the product's time base (docs/ARCHITECTURE.md, section 5.2 "Time base"): `startTime` in
+ * epoch milliseconds inside the test's own wall-clock window, `duration` non-negative
+ * milliseconds, and a unique `(producerId, seq)`.
  */
 function expectAttributedAndTimed(
   events: readonly TelemetryEvent[],
@@ -1087,7 +1090,7 @@ function expectCaptureSummary(
 }
 
 // ---------------------------------------------------------------------------
-// Evidence: privacy at capture level (AAP 0.5.2)
+// Evidence: privacy at capture level (docs/SECURITY.md, section 3 "Redaction")
 // ---------------------------------------------------------------------------
 
 /** How deep the attribute walk descends; the redactor bounds attribute depth well inside this. */
@@ -1810,7 +1813,8 @@ test.describe('telemetry capture', () => {
       await runCheck(appPage, contract);
 
       // The reload is visible where the developer watches the capture: the navigation the reloaded
-      // document produced reaches the panel's live tail, under its stored name.
+      // document produced reaches the panel's live tail, under its stored name, and the tail lists
+      // the capture's "Page reloaded during capture" notice.
       const reloadNavigation = await waitForStoredEvent(
         service,
         session.id,
@@ -1822,6 +1826,10 @@ test.describe('telemetry capture', () => {
       );
       expect(reloadNavigation.captureId).toBe(during.captureId);
       await expectLiveTailShowsEvent(panel, reloadNavigation);
+      await expect(
+        panel.pageReloadedNotices.first(),
+        'the live tail lists a "Page reloaded during capture" notice for the running capture',
+      ).toBeVisible({ timeout: DEFAULT_WAIT_TIMEOUT_MS });
     });
     const secondDocument = during.secondDocument;
     if (secondDocument === undefined) {

@@ -106,6 +106,7 @@
  */
 
 import {
+  MESSAGE_TYPE,
   createEnvelope,
   parseSessionProgressPayload,
   type ClientKind,
@@ -1980,7 +1981,7 @@ export function createSessionProgress(deps: SessionProgressDeps): SessionProgres
       broadcaster.broadcastToKinds(
         payload.sessionId,
         PROGRESS_RECIPIENT_KINDS,
-        createEnvelope('session.progress', payload, { ts }),
+        createEnvelope(MESSAGE_TYPE.SESSION_PROGRESS, payload, { ts }),
       );
     } catch (thrown) {
       log.warn('a progress row could not be broadcast; connected clients will see it on replay', {

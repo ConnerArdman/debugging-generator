@@ -20,9 +20,15 @@
  * - **The trace tree.** `test/fixtures/panel-data-expected-trace-tree.json`
  *   holds the canonical pre-order, the nested shape and the flagged orphan.
  * - **Paging and ordering.** A multi-page walk over the 220-event volume batch
- *   under every `DataQuerySort`, the stable `id` tie-breaker over the batch's
- *   identical-`startTime`-and-`duration` block, the clamp at
- *   `DATA_QUERY_MAX_LIMIT`, and filters narrowing `total` itself.
+ *   under every `DataQuerySort` — `count_desc` included, ranked as the store
+ *   ranks it, by operation-name group — the stable `id` tie-breaker over the
+ *   batch's identical-`startTime`-and-`duration` block under the two sorts
+ *   that rank by those keys, the clamp at `DATA_QUERY_MAX_LIMIT`, and filters
+ *   narrowing `total` itself. Every named sort is answered in its own order,
+ *   never in the source default: the metric values under `duration_desc` and
+ *   `count_desc` and the state transitions under `count_desc` and
+ *   `duration_desc` are held to orders derived here from the unsorted answer
+ *   and from the ingested fixture.
  * - **Structural renderability.** Every entry's permitted source answers a
  *   real, non-empty `DataResult`; every field in the entry's `requiredReads` is
  *   carried by every record the component draws; the entry's `reads` is
@@ -79,6 +85,7 @@
  * at run time by the harness's `randomSecretLike`.
  */
 
+import { Buffer } from 'node:buffer';
 import { isDeepStrictEqual } from 'node:util';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -124,11 +131,13 @@ import {
   DEPENDENCY_NODE_KINDS,
   METRIC_IDS,
   ORPHAN_REASONS,
+  STATE_KINDS,
   flattenTrace,
   parseTelemetryEventIngress,
 } from '@debuggen/telemetry';
 import type {
   CaptureSummary,
+  MetricValue,
   TelemetryEvent,
   TelemetryEventIngress,
   TraceNode,
@@ -945,30 +954,50 @@ function matchesFilter(event: TelemetryEventIngress, filter: DataQueryFilter | u
 }
 
 /**
- * The sort a flat source is answered in: the requested one when it orders a
- * flat record list (`duration_desc`, `start_asc`), and the source's documented
- * default otherwise — `count_desc` counts groups, which a record list has none of.
+ * The sort a flat source is answered in: the requested one whenever a sort is
+ * named — every sort orders a flat record list — and the source's documented
+ * default when none is.
  */
 function appliedFlatSort(
   source: FlatEventSource,
   requested: DataQuerySort | undefined,
 ): DataQuerySort {
-  return requested === undefined || requested === 'count_desc'
-    ? DEFAULT_SORT_BY_SOURCE[source]
-    : requested;
+  return requested ?? DEFAULT_SORT_BY_SOURCE[source];
 }
 
-/** The comparator of a flat sort: its key, then `id` ascending as the stable secondary key. */
+/** UTF-8 byte order: how the store's `BINARY` collation compares an operation name. */
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+}
+
+/**
+ * The comparator of a flat sort over one filtered selection: its key, then
+ * `id` ascending as the stable secondary key. `count_desc` is the store's
+ * ranking under the `name` group key the resolver sends — the size of the
+ * record's operation-name group within the selection, largest first; then the
+ * name in UTF-8 byte order, which keeps one operation's records together; then
+ * the id.
+ */
 function flatComparator(
   sort: DataQuerySort,
+  selection: readonly TelemetryEventIngress[],
 ): (left: TelemetryEventIngress, right: TelemetryEventIngress) => number {
   switch (sort) {
     case 'duration_desc':
       return (left, right) => right.duration - left.duration || compareIds(left.id, right.id);
     case 'start_asc':
       return (left, right) => left.startTime - right.startTime || compareIds(left.id, right.id);
-    case 'count_desc':
-      throw new Error('count_desc does not order a flat record list.');
+    case 'count_desc': {
+      const sizes = new Map<string, number>();
+      for (const event of selection) {
+        sizes.set(event.name, (sizes.get(event.name) ?? 0) + 1);
+      }
+      const sizeOf = (event: TelemetryEventIngress): number => sizes.get(event.name) ?? 0;
+      return (left, right) =>
+        sizeOf(right) - sizeOf(left) ||
+        compareUtf8(left.name, right.name) ||
+        compareIds(left.id, right.id);
+    }
     default:
       return assertNever(sort, 'Unhandled data query sort');
   }
@@ -990,7 +1019,7 @@ function deriveFlatPage(
       (source === 'events' || SPAN_SOURCE_KINDS.includes(event.kind)) &&
       matchesFilter(event, query.filter),
   );
-  const ordered = [...selected].sort(flatComparator(appliedFlatSort(source, query.sort)));
+  const ordered = [...selected].sort(flatComparator(appliedFlatSort(source, query.sort), selected));
   const limit = Math.min(query.limit ?? DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT);
   const offset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
   const page = ordered.slice(offset, offset + limit);
@@ -1774,13 +1803,26 @@ describe('paging and ordering', () => {
     });
     expect(walk.ids).toEqual(derived.ids);
 
-    // Inside the tie block only the secondary key discriminates: contiguous, id ascending.
+    // Under the two sorts that rank by start time or duration, the block ties
+    // on the primary key, so only the secondary key discriminates: contiguous,
+    // id ascending. `count_desc` ranks by operation-name group instead, and
+    // the block's records carry distinct names, so the name — not the id —
+    // orders them there; the derivation above already pins that order.
     const block = tieBlockOf(group.events);
-    const positions = block.map((id) => walk.ids.indexOf(id));
-    const firstPosition = Math.min(...positions);
-    expect(walk.ids.slice(firstPosition, firstPosition + block.length)).toEqual(
-      [...block].sort(compareIds),
-    );
+    if (sort === 'count_desc') {
+      const blockNames = group.events
+        .filter((event) => block.includes(event.id))
+        .map((event) => event.name);
+      expect(new Set(blockNames).size, 'the block’s records carry distinct names').toBe(
+        block.length,
+      );
+    } else {
+      const positions = block.map((id) => walk.ids.indexOf(id));
+      const firstPosition = Math.min(...positions);
+      expect(walk.ids.slice(firstPosition, firstPosition + block.length)).toEqual(
+        [...block].sort(compareIds),
+      );
+    }
 
     // Deterministic: an identical walk answers identically.
     const again = await walkPages(group.sessionId, { source, sort });
@@ -1844,6 +1886,211 @@ describe('paging and ordering', () => {
     const direct = await resolver.resolve({ sessionId: group.sessionId }, query);
     expect(isErr(direct) ? direct.error.code : 'resolved').toBe(PAGING_REFUSAL_CODE);
   });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Named sorts on the sources that rank by a derived value: metrics and state transitions
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The metric values of a `metrics` result, in response order. */
+function metricValuesOf(result: DataResult, name: string): readonly MetricValue[] {
+  if (result.source !== 'metrics') {
+    throw new Error(`${name}: expected a metrics result, got ${result.source}.`);
+  }
+  return result.metrics;
+}
+
+/** The two measure sorts over the metric values, and the unit each ranks first. */
+const METRIC_MEASURE_SORTS = Object.freeze([
+  ['duration_desc', 'milliseconds'],
+  ['count_desc', 'count'],
+] as const);
+
+/**
+ * The order a measure sort must answer the metric values in, derived from the
+ * unsorted answer (which is `METRIC_IDS` order): the values the capture
+ * measured in the sort's unit, largest first and a tie by unsorted position;
+ * then every other value — another unit, or not measured — as it stood.
+ */
+function deriveMetricOrder(unsorted: readonly MetricValue[], unit: string): string[] {
+  const measured = unsorted
+    .map((metric, position) => ({ metric, position }))
+    .filter(
+      ({ metric }) => metric.available && metric.unit === unit && typeof metric.value === 'number',
+    )
+    .sort(
+      (left, right) =>
+        (right.metric.value ?? 0) - (left.metric.value ?? 0) || left.position - right.position,
+    )
+    .map(({ metric }) => metric);
+  const rest = unsorted.filter((metric) => !measured.includes(metric));
+  return [...measured, ...rest].map((metric) => metric.id);
+}
+
+/** One hook state transition as the ingested fixture describes it. */
+interface FixtureTransition {
+  readonly id: string;
+  readonly startTime: number;
+  readonly duration: number;
+  /** The component whose hook changed, when the event names one. */
+  readonly component: string | undefined;
+  /** The hook's position in the component's hook list, when the event names one. */
+  readonly hookIndex: number | undefined;
+}
+
+/** The state transitions of an ingest list, read off the events exactly as they were sent. */
+function fixtureTransitions(events: readonly TelemetryEventIngress[]): FixtureTransition[] {
+  return events
+    .filter((event) => STATE_KINDS.includes(event.kind))
+    .map((event) => {
+      const component = event.attributes['component'];
+      const hookIndex = event.attributes['hookIndex'];
+      return {
+        id: event.id,
+        startTime: event.startTime,
+        duration: event.duration,
+        component: typeof component === 'string' && component !== '' ? component : undefined,
+        hookIndex:
+          typeof hookIndex === 'number' && Number.isInteger(hookIndex) && hookIndex >= 0
+            ? hookIndex
+            : undefined,
+      };
+    });
+}
+
+/** Compares two optional values, a present one ahead of an absent one; `compare` orders two present ones. */
+function presentFirst<T>(
+  left: T | undefined,
+  right: T | undefined,
+  compare: (left: T, right: T) => number,
+): number {
+  if (left === undefined || right === undefined) {
+    if (left === right) {
+      return 0;
+    }
+    return left === undefined ? 1 : -1;
+  }
+  return compare(left, right);
+}
+
+/** Numeric order. */
+function compareNumbers(left: number, right: number): number {
+  return left - right;
+}
+
+/**
+ * The order the service must answer a capture's state transitions in under
+ * `sort`, derived from the fixture and the documented chains:
+ *
+ * - `start_asc` — start time, then id;
+ * - `count_desc` — how many transitions share the row's hook (component and
+ *   hook index), largest first, a row naming neither half after every hook;
+ *   then the component by code unit and the hook index, each present ahead of
+ *   absent; then start time and id;
+ * - `duration_desc` — the state event's duration, longest first; then start
+ *   time and id.
+ */
+function deriveTransitionOrder(
+  transitions: readonly FixtureTransition[],
+  sort: DataQuerySort,
+): string[] {
+  const chronological = (left: FixtureTransition, right: FixtureTransition): number =>
+    left.startTime - right.startTime || compareIds(left.id, right.id);
+  const hookSize = (row: FixtureTransition): number | undefined =>
+    row.component === undefined && row.hookIndex === undefined
+      ? undefined
+      : transitions.filter(
+          (other) => other.component === row.component && other.hookIndex === row.hookIndex,
+        ).length;
+  const comparators: Readonly<
+    Record<DataQuerySort, (left: FixtureTransition, right: FixtureTransition) => number>
+  > = {
+    start_asc: chronological,
+    count_desc: (left, right) =>
+      presentFirst(hookSize(left), hookSize(right), (a, b) => b - a) ||
+      presentFirst(left.component, right.component, compareIds) ||
+      presentFirst(left.hookIndex, right.hookIndex, compareNumbers) ||
+      chronological(left, right),
+    duration_desc: (left, right) => right.duration - left.duration || chronological(left, right),
+  };
+  return [...transitions].sort(comparators[sort]).map((row) => row.id);
+}
+
+describe('named sorts on the metric values and the state transitions', () => {
+  it('answers metrics under start_asc, where every value ties on the capture window, in METRIC_IDS order', async () => {
+    for (const group of groups.values()) {
+      const result = await panelData(group.sessionId, { source: 'metrics', sort: 'start_asc' });
+      expect(metricValuesOf(result, 'start_asc').map((metric) => metric.id)).toEqual([
+        ...METRIC_IDS,
+      ]);
+    }
+  });
+
+  it.each(METRIC_MEASURE_SORTS)(
+    'answers metrics under %s with the measured %s values first, exactly as derived from the unsorted answer',
+    async (sort, unit) => {
+      let reordered = 0;
+      for (const group of groups.values()) {
+        const unsorted = metricValuesOf(
+          await panelData(group.sessionId, { source: 'metrics' }),
+          'unsorted metrics',
+        );
+        expect(unsorted.map((metric) => metric.id)).toEqual([...METRIC_IDS]);
+        const expected = deriveMetricOrder(unsorted, unit);
+
+        const sorted = metricValuesOf(
+          await panelData(group.sessionId, { source: 'metrics', sort }),
+          sort,
+        );
+        expect(
+          sorted.map((metric) => metric.id),
+          `${sort} over ${group.key}`,
+        ).toEqual(expected);
+        // The same values, only reordered.
+        const byId = (left: MetricValue, right: MetricValue): number =>
+          compareIds(left.id, right.id);
+        expect([...sorted].sort(byId)).toEqual([...unsorted].sort(byId));
+        if (!isDeepStrictEqual(expected, [...METRIC_IDS])) {
+          reordered += 1;
+        }
+      }
+      // Not vacuous: the sort moves the values of at least one real capture
+      // away from the unsorted `METRIC_IDS` order.
+      expect(reordered, `${sort} reorders some capture's metric values`).toBeGreaterThan(0);
+    },
+  );
+
+  it.each(DATA_QUERY_SORTS.map((sort) => [sort] as const))(
+    'answers stateTransitions under %s in the order derived from the ingested fixture, page by page',
+    async (sort) => {
+      const group = groupHolding(RENDERS_FIXTURE);
+      const transitions = fixtureTransitions(group.events);
+      expect(transitions.length).toBeGreaterThan(2);
+      const expected = deriveTransitionOrder(transitions, sort);
+
+      const whole = await panelData(group.sessionId, {
+        source: 'stateTransitions',
+        sort,
+        limit: DATA_QUERY_MAX_LIMIT,
+      });
+      expect(idsOf(requireRows(whole, sort))).toEqual(expected);
+      const walk = await walkPages(group.sessionId, { source: 'stateTransitions', sort, limit: 2 });
+      expect(walk.ids).toEqual(expected);
+
+      const chronological = deriveTransitionOrder(transitions, 'start_asc');
+      if (sort === 'count_desc') {
+        // Every hook of the fixture changes once, so its hooks — not time —
+        // decide the order, which is not the chronological one.
+        expect(expected).not.toEqual(chronological);
+      }
+      if (sort === 'duration_desc') {
+        // The browser producer records every transition as an instant of
+        // duration 0, so the transitions tie and time breaks the tie.
+        expect(transitions.every((row) => row.duration === 0)).toBe(true);
+        expect(expected).toEqual(chronological);
+      }
+    },
+  );
 });
 
 /* -------------------------------------------------------------------------------------------------

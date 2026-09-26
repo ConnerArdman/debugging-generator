@@ -1,6 +1,16 @@
 /**
  * Tests for `./process.ts`: the embedded-service manager's log records carry
- * closed vocabularies and numbers only.
+ * closed vocabularies and numbers only, and the environment it starts the
+ * service with carries no model-SDK setting the service does not document.
+ *
+ * `buildServiceEnvironment` is exercised directly, on Linux and on Windows
+ * (where names compare case-insensitively): every inherited `ANTHROPIC_*`
+ * variable except `ANTHROPIC_API_KEY` is dropped — an inherited
+ * `ANTHROPIC_BASE_URL` would redirect the credential and the prompts
+ * (CWE-200/918), and `ANTHROPIC_LOG=debug` would print the model client's
+ * request and response diagnostics into the service output channel (CWE-532)
+ * — while the platform's variables pass through, the service's own settings
+ * are applied, and the parent environment object is left untouched.
  *
  * The manager's logger is the one `src/extension.ts` prints, unredacted, into
  * the "Debug Generator" output, so three kinds of content must never reach a
@@ -45,7 +55,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DebuggenError, createConsoleLogger, err, isErr, isOk, ok } from '@debuggen/shared';
 import type { LogRecord } from '@debuggen/shared';
 
-import { SERVICE_FAILURE_REASONS, createServiceProcess } from './process';
+import { SERVICE_FAILURE_REASONS, buildServiceEnvironment, createServiceProcess } from './process';
 import type {
   ChildProcessLike,
   PathKind,
@@ -416,6 +426,117 @@ describe('SERVICE_FAILURE_REASONS', () => {
       expect(reason).toMatch(/^[a-z]+(?:-[a-z]+)*$/u);
     }
     expect(SERVICE_FAILURE_REASONS).toContain('unexpected');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The environment the service child is started with
+// ---------------------------------------------------------------------------
+
+describe('buildServiceEnvironment and the model vendor kit variables', () => {
+  /** The service's model credential, assembled so no key shape is a tracked literal. */
+  const MODEL_CREDENTIAL = ['ut', 'model', 'credential', 'sentinel', '3d8f'].join('_');
+
+  /** The editor's `server-agent` credential copy, which the service never holds. */
+  const INHERITED_AGENT_TOKEN = ['agent', 'credential', 'sentinel', '9a41'].join('_');
+
+  /** What a hostile inherited `ANTHROPIC_BASE_URL` names. */
+  const HOSTILE_BASE_URL = 'http://attacker.test';
+
+  /** The state directory, address and prompt tree the manager resolved. */
+  const DEBUGGEN_HOME = path.join('/tmp', 'debuggen-process-test');
+  const ADDRESS = Object.freeze({ host: '127.0.0.1', port: 43117 });
+  const PROMPTS_DIR = PATHS.servicePromptsDir;
+
+  it('keeps the platform variables and the credential, applies the service settings and drops every other ANTHROPIC_ variable (linux)', () => {
+    const base: Readonly<Record<string, string | undefined>> = Object.freeze({
+      PATH: '/usr/local/bin:/usr/bin:/bin',
+      HOME: '/home/sentinel-dev',
+      DEBUGGEN_MODEL: 'model-under-test',
+      ANTHROPIC_API_KEY: MODEL_CREDENTIAL,
+      ANTHROPIC_BASE_URL: HOSTILE_BASE_URL,
+      ANTHROPIC_LOG: 'debug',
+      ANTHROPIC_CUSTOM_HEADERS: 'X-Relay: attacker.test',
+      ANTHROPIC_AUTH_TOKEN: ['auth', 'token', 'sentinel', '51c0'].join('_'),
+      ANTHROPIC_PROFILE: 'sentinel-profile',
+      DEBUGGEN_TOKEN: INHERITED_AGENT_TOKEN,
+      DEBUGGEN_HOME: path.join('/home', 'sentinel-dev', '.debuggen'),
+      UNSET_VARIABLE: undefined,
+    });
+    const snapshot = { ...base };
+
+    const env = buildServiceEnvironment({
+      base,
+      debuggenHome: DEBUGGEN_HOME,
+      address: ADDRESS,
+      promptsDir: PROMPTS_DIR,
+      provider: 'deterministic',
+      runAsNode: false,
+      platform: 'linux',
+    });
+
+    expect(env).toEqual({
+      PATH: '/usr/local/bin:/usr/bin:/bin',
+      HOME: '/home/sentinel-dev',
+      DEBUGGEN_MODEL: 'model-under-test',
+      ANTHROPIC_API_KEY: MODEL_CREDENTIAL,
+      DEBUGGEN_HOME,
+      DEBUGGEN_HOST: '127.0.0.1',
+      DEBUGGEN_PORT: '43117',
+      DEBUGGEN_PROMPTS_DIR: PROMPTS_DIR,
+      DEBUGGEN_PROVIDER: 'deterministic',
+    });
+    for (const dropped of [
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_LOG',
+      'ANTHROPIC_CUSTOM_HEADERS',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_PROFILE',
+      'DEBUGGEN_TOKEN',
+      'UNSET_VARIABLE',
+    ]) {
+      expect(Object.keys(env), dropped).not.toContain(dropped);
+    }
+    expect(Object.values(env)).not.toContain(HOSTILE_BASE_URL);
+    expect(Object.values(env)).not.toContain(INHERITED_AGENT_TOKEN);
+    // The parent's object is copied, never edited.
+    expect(base).toEqual(snapshot);
+  });
+
+  it('compares names case-insensitively on Windows: a mixed-case base URL and log level are dropped, a mixed-case credential kept', () => {
+    const mixedCaseCredential = 'anthropic_api_key';
+    const base: Readonly<Record<string, string | undefined>> = Object.freeze({
+      Path: 'C:\\Windows\\System32',
+      SystemRoot: 'C:\\Windows',
+      [mixedCaseCredential]: MODEL_CREDENTIAL,
+      Anthropic_Base_Url: HOSTILE_BASE_URL,
+      anthropic_log: 'debug',
+      Anthropic_Custom_Headers: 'X-Relay: attacker.test',
+      debuggen_token: INHERITED_AGENT_TOKEN,
+      electron_run_as_node: '0',
+    });
+    const snapshot = { ...base };
+
+    const env = buildServiceEnvironment({
+      base,
+      debuggenHome: DEBUGGEN_HOME,
+      address: ADDRESS,
+      runAsNode: true,
+      platform: 'win32',
+    });
+
+    expect(env).toEqual({
+      Path: 'C:\\Windows\\System32',
+      SystemRoot: 'C:\\Windows',
+      [mixedCaseCredential]: MODEL_CREDENTIAL,
+      DEBUGGEN_HOME,
+      DEBUGGEN_HOST: '127.0.0.1',
+      DEBUGGEN_PORT: '43117',
+      ELECTRON_RUN_AS_NODE: '1',
+    });
+    expect(Object.values(env)).not.toContain(HOSTILE_BASE_URL);
+    expect(Object.values(env)).not.toContain('debug');
+    expect(base).toEqual(snapshot);
   });
 });
 

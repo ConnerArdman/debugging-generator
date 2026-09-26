@@ -12,8 +12,9 @@
  *   node esbuild.node.mjs  -> dist/node/register.mjs        (Node --import preload)
  *
  * Only the first line is this file's responsibility, and it is exactly the `"."`
- * condition of the `exports` map (`types: ./dist/index.d.ts`,
- * `import: ./dist/index.js`). The `"./node/register"` condition is
+ * condition of the `exports` map (`import: ./dist/index.js`, plus
+ * `./dist/index.d.ts` as the packed-tarball entry of its source-first `types`
+ * array). The `"./node/register"` condition is
  * `esbuild.node.mjs`'s, and the agent bundle is not exported at all — it is
  * copied verbatim into `apps/chrome-extension/public/agent.iife.js` by
  * `scripts/copy-agent.mjs`.
@@ -121,10 +122,12 @@ export default defineConfig({
   platform: 'neutral',
 
   /**
-   * Declarations are non-negotiable: `dist/index.d.ts` is what every workspace
-   * above this one type-checks against, including the single `TelemetryEvent` /
+   * Declarations are non-negotiable: `dist/index.d.ts` is what a packed tarball
+   * of this package types against, including the single `TelemetryEvent` /
    * `TelemetryEventIngress` definition that `packages/protocol` embeds in its
-   * message schemas.
+   * message schemas. Workspaces inside the repository type-check against this
+   * project's `.tsbuild` declarations instead (root tsconfig.json,
+   * `"// no-aliases"`).
    *
    * The three overrides are required, not defensive. tsup's declaration step
    * builds its own TypeScript program from the `tsconfig` named at the bottom of
@@ -137,10 +140,10 @@ export default defineConfig({
    *   the file list of project" (TS6307). The options also bind the program to
    *   the build stamp and declaration directory of the typecheck gate
    *   (`.tsbuild/`), which is not where this build writes. Disabling them for
-   *   the declaration program alone leaves the gate untouched — and it does not
-   *   weaken the reference to `packages/shared`, whose `dist/index.d.ts` is
-   *   resolved through the pnpm workspace link and that package's `exports` map
-   *   exactly as the runtime resolves it.
+   *   the declaration program alone leaves the gate untouched. The program still
+   *   resolves `@debuggen/shared` through the pnpm workspace link and that
+   *   package's `exports` map, whose source-first `types` entry supplies its
+   *   current source, and the emitted declarations keep that import external.
    * - `ignoreDeprecations` answers tsup 8.5.1 setting `baseUrl` on that program
    *   unconditionally (`baseUrl: compilerOptions.baseUrl || '.'`) — a value this
    *   repository deliberately never declares. TypeScript 6.0.3 raises `baseUrl`

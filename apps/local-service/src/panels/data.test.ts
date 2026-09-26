@@ -10,14 +10,19 @@
  *    clamped, `total` is counted before paging, and `nextOffset` is a number
  *    only while rows remain and `null` on the last page — the exact field set
  *    protocol's `DataPage` declares.
- * 2. **Stable order.** Every chain ends in `id`, so a multi-page walk under each
- *    permitted sort of each sortable source visits every row exactly once, in
- *    the order of one unpaged read, even when many rows tie on the sort key; an
- *    inapplicable sort falls back to the source default, identically every time.
+ * 2. **Stable order.** Every chain ends in `id`, so a multi-page walk under
+ *    every sort of every paged source — `metrics` included — visits every row
+ *    exactly once, in the order of one unpaged read, even when many rows tie on
+ *    the sort key. Every named sort is the order answered, never replaced by
+ *    the source default; the derived keys (a record's name-group size, a
+ *    transition's hook-group size and event duration, a metric's measured
+ *    value and vocabulary position) are checked against derivations written
+ *    here from the fixtures, never by calling the resolver's own.
  * 3. **Shape.** Every one of the ten sources answers with the member of the
  *    protocol's `DataResult` union for its source — validated here with
  *    `parseDataResult` — the single-value sources carry no page, and `metrics`
- *    keeps `METRIC_IDS` order, including an unavailable value.
+ *    answers `METRIC_IDS` order when no sort is named, including an
+ *    unavailable value.
  * 4. **Push-down.** Every filter field reaches the store read itself, which the
  *    fake store records, so a resolver that loaded a capture whole and filtered
  *    it afterwards fails.
@@ -48,9 +53,11 @@
  * lookups and the summary load — so nothing here opens a database, a socket or
  * a timer. The
  * store fake orders rows by the store's documented panel orderings (duration
- * descending or start ascending, then the event id), written independently of
- * `SOURCE_SORT_KEYS`; one assertion ties the stated flat chains to the store's
- * own `ORDER BY` constants without opening it.
+ * descending, start ascending, or — for `count_desc` — the size of each row's
+ * group under the requested group key, the key in UTF-8 byte order, then the
+ * event id), written independently of `SOURCE_SORT_KEYS`; one assertion ties
+ * the stated flat chains to the store's own `ORDER BY` clauses without opening
+ * it.
  *
  * Identifiers are deterministic: minted from counters in the formats
  * `@debuggen/shared` mints (`ID_PREFIXES`, 32- and 16-character hex), with event
@@ -61,6 +68,8 @@
  * credential-shaped sentinel is assembled at run time from fragments, so the
  * tracked file holds no token literal (AAP §0.3.4).
  */
+
+import { Buffer } from 'node:buffer';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -117,6 +126,7 @@ import {
 } from '@debuggen/telemetry';
 import type {
   CaptureSummary,
+  StateTransition,
   TelemetryEvent,
   TelemetryKind,
   TelemetryTier,
@@ -126,7 +136,9 @@ import type {
 
 import {
   PANEL_DURATION_DESC_ORDER_BY,
+  PANEL_SECONDARY_ORDER_BY,
   PANEL_START_ASC_ORDER_BY,
+  TELEMETRY_DEFAULT_GROUP_KEY,
   TELEMETRY_QUERY_DEFAULT_LIMIT,
   TELEMETRY_QUERY_DEFAULT_OFFSET,
   TELEMETRY_QUERY_MAX_LIMIT,
@@ -135,6 +147,7 @@ import type { PanelCaptureLookup } from '../store/sessions-repo.js';
 import type {
   CaptureEventStamp,
   CaptureGeneration,
+  TelemetryGroupKey,
   TelemetryQuery,
   TelemetryScan,
   TelemetryScanFilter,
@@ -156,6 +169,7 @@ import {
 } from './data.js';
 import type {
   CaptureSummaryPort,
+  DerivedSortKeyName,
   PanelDataContext,
   PanelDataResolver,
   PanelDataResolverDeps,
@@ -512,15 +526,75 @@ function byStartThenId(left: TelemetryEvent, right: TelemetryEvent): number {
   return left.startTime - right.startTime || byCodeUnit(left.id, right.id);
 }
 
+/** UTF-8 byte order: how the store's `BINARY` collation compares a text key. */
+function byUtf8Bytes(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+}
+
+/** An attribute's value when it is text, and `undefined` otherwise. */
+function textAttribute(event: TelemetryEvent, key: string): string | undefined {
+  const value = event.attributes[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
 /**
- * The store's panel orderings, written independently of `SOURCE_SORT_KEYS`:
- * duration descending or start ascending, each broken by the event id.
+ * Each group key's value on one event, as the store evaluates it: the event's
+ * own column, or a text attribute, and `undefined` — SQL `NULL` — for an event
+ * that belongs to no group under the key.
+ */
+const GROUP_KEY_VALUE: Readonly<
+  Record<TelemetryGroupKey, (event: TelemetryEvent) => string | undefined>
+> = Object.freeze({
+  name: (event) => event.name,
+  kind: (event) => event.kind,
+  traceId: (event) => event.traceId,
+  requestKey: (event) => textAttribute(event, 'request_key'),
+  component: (event) => textAttribute(event, 'component'),
+});
+
+/**
+ * The store's panel orderings over one filtered selection, written
+ * independently of `SOURCE_SORT_KEYS`: duration descending or start ascending,
+ * each broken by the event id; and `count_desc` as the store's
+ * `COUNT(key) OVER (PARTITION BY key) DESC, key ASC, id ASC` under `groupBy` —
+ * the size of each row's group within the selection (zero for a row in no
+ * group, which therefore follows every group), the key in UTF-8 byte order
+ * (`NULL` first, as SQLite sorts it ascending), then the event id.
  */
 function storeOrder(
   sort: TelemetryQuery['sort'],
+  selection: readonly TelemetryEvent[],
+  groupBy: TelemetryGroupKey,
 ): (left: TelemetryEvent, right: TelemetryEvent) => number {
   if (sort === 'duration_desc') {
     return (left, right) => right.duration - left.duration || byCodeUnit(left.id, right.id);
+  }
+  if (sort === 'count_desc') {
+    const keyOf = GROUP_KEY_VALUE[groupBy];
+    const sizes = new Map<string, number>();
+    for (const event of selection) {
+      const key = keyOf(event);
+      if (key !== undefined) {
+        sizes.set(key, (sizes.get(key) ?? 0) + 1);
+      }
+    }
+    const sizeOf = (event: TelemetryEvent): number => {
+      const key = keyOf(event);
+      return key === undefined ? 0 : (sizes.get(key) ?? 0);
+    };
+    const byKey = (left: string | undefined, right: string | undefined): number => {
+      if (left === right) {
+        return 0;
+      }
+      if (left === undefined) {
+        return -1;
+      }
+      return right === undefined ? 1 : byUtf8Bytes(left, right);
+    };
+    return (left, right) =>
+      sizeOf(right) - sizeOf(left) ||
+      byKey(keyOf(left), keyOf(right)) ||
+      byCodeUnit(left.id, right.id);
   }
   return byStartThenId;
 }
@@ -597,10 +671,11 @@ function scanOf(selection: TelemetryEvent[], maxRows: number): TelemetryScan {
  * A store over an event list, read afresh on every call so a case may append
  * to it between two reads, as ingest would.
  *
- * It honours every narrowing field, both panel orderings, the store's own
- * default and ceiling for `limit`, and `offset`; its page omits `nextOffset`
- * on the last page, as the real store's does. It refuses a row read ordered by
- * `count_desc`, which the resolver must never send for a flat source. Its scan
+ * It honours every narrowing field, all three panel orderings — `count_desc`
+ * ranking rows by their group under `groupBy`, the store's default key
+ * (`TELEMETRY_DEFAULT_GROUP_KEY`) when none is named — the store's own default
+ * and ceiling for `limit`, and `offset`; its page omits `nextOffset` on the
+ * last page, as the real store's does. Its scan
  * is the whole selection in `start_time ASC, id ASC` order within the row
  * budget and nothing but the count past it. Its earliest trace is the trace of
  * the capture's earliest event, a tie at that instant going to the event that
@@ -642,17 +717,15 @@ function createFakeTelemetryRepo(events: readonly TelemetryEvent[]): FakeTelemet
     },
     query(query) {
       calls.push(Object.freeze({ ...query }));
-      if (query.sort === 'count_desc') {
-        return err(new DebuggenError('STORE_ERROR', 'The fake store orders rows by time only.'));
-      }
       const offset = query.offset ?? TELEMETRY_QUERY_DEFAULT_OFFSET;
       const limit = Math.min(
         query.limit ?? TELEMETRY_QUERY_DEFAULT_LIMIT,
         TELEMETRY_QUERY_MAX_LIMIT,
       );
-      const rows = events
-        .filter((event) => matchesQuery(event, query))
-        .sort(storeOrder(query.sort));
+      const selection = events.filter((event) => matchesQuery(event, query));
+      const rows = [...selection].sort(
+        storeOrder(query.sort, selection, query.groupBy ?? TELEMETRY_DEFAULT_GROUP_KEY),
+      );
       const page = rows.slice(offset, offset + limit);
       const following = offset + page.length;
       return ok({
@@ -996,6 +1069,14 @@ function rowIds(result: DataResult): string[] {
   return rowsOf(result).map((row) => row.id);
 }
 
+/** The values of a `metrics` result, in order; any other result is a test bug. */
+function metricsOf(result: DataResult): DataResultFor<'metrics'>['metrics'] {
+  if (result.source !== 'metrics') {
+    throw new Error(`expected a metrics result, got ${result.source}`);
+  }
+  return result.metrics;
+}
+
 /** What a page walk saw. */
 interface PageWalk {
   readonly ids: string[];
@@ -1070,17 +1151,33 @@ function expectNoLeak(text: string): void {
  * Ordering helpers, independent of `orderRows`
  * ---------------------------------------------------------------------------------------------- */
 
-/** A chain read generically: its fields and directions, whatever the row type. */
-type GenericChain = readonly { readonly field: string; readonly direction: 'asc' | 'desc' }[];
+/** How a key compares strings, as the resolver's chains declare it. */
+type Collation = 'utf16' | 'utf8';
 
-/** The declared chain of `sort` on `source`; throws when the sort does not apply. */
+/**
+ * One key of a chain read generically, whatever the row type: a field of the
+ * row, or a value derived for the sort, named from the resolver's closed
+ * vocabulary. The derivation itself is never read from the chain.
+ */
+type GenericKey =
+  | {
+      readonly field: string;
+      readonly direction: 'asc' | 'desc';
+      readonly collation?: Collation;
+    }
+  | {
+      readonly derived: DerivedSortKeyName;
+      readonly direction: 'asc' | 'desc';
+      readonly collation?: Collation;
+    };
+
+/** A chain read generically. */
+type GenericChain = readonly GenericKey[];
+
+/** The declared chain of `sort` on `source`: every source declares one for every sort. */
 function chainFor(source: SortedDataSource, sort: DataQuerySort): GenericChain {
-  const chains: Readonly<Partial<Record<DataQuerySort, GenericChain>>> = SOURCE_SORT_KEYS[source];
-  const chain = chains[sort];
-  if (chain === undefined) {
-    throw new Error(`no chain is declared for ${sort} on ${source}`);
-  }
-  return chain;
+  const chains: Readonly<Record<DataQuerySort, GenericChain>> = SOURCE_SORT_KEYS[source];
+  return chains[sort];
 }
 
 /** One field of a row, read by name. */
@@ -1088,8 +1185,11 @@ function fieldOf(row: object, field: string): unknown {
   return (row as Readonly<Record<string, unknown>>)[field];
 }
 
-/** Numbers numerically and strings by code unit; any other value is a fixture bug. */
-function compareField(left: unknown, right: unknown): number {
+/**
+ * Numbers numerically; strings by code unit, or by UTF-8 bytes under the
+ * `utf8` collation; any other value is a fixture bug.
+ */
+function compareField(left: unknown, right: unknown, collation: Collation = 'utf16'): number {
   if (typeof left === 'number' && typeof right === 'number') {
     if (left === right) {
       return 0;
@@ -1097,30 +1197,147 @@ function compareField(left: unknown, right: unknown): number {
     return left < right ? -1 : 1;
   }
   if (typeof left === 'string' && typeof right === 'string') {
-    return byCodeUnit(left, right);
+    return collation === 'utf8' ? byUtf8Bytes(left, right) : byCodeUnit(left, right);
   }
-  throw new Error('a chain field holds a value that is neither a number nor a string');
+  throw new Error('a chain key holds a value that is neither a number nor a string');
 }
 
-/** Lexicographic comparison of two rows under a chain. */
-function compareByChain(left: object, right: object, chain: GenericChain): number {
-  for (const key of chain) {
-    const order = compareField(fieldOf(left, key.field), fieldOf(right, key.field));
-    if (order !== 0) {
-      return key.direction === 'desc' ? -order : order;
+/** A derived value per row, or `undefined` where the row has none. */
+type DerivedValues = readonly (number | string | undefined)[];
+
+/** Whether two transition rows name the same hook: the same component and the same hook index. */
+function sameHook(left: object, right: object): boolean {
+  return (
+    fieldOf(left, 'component') === fieldOf(right, 'component') &&
+    fieldOf(left, 'hookIndex') === fieldOf(right, 'hookIndex')
+  );
+}
+
+/** Whether a transition row names neither half of a hook: it belongs to no hook group. */
+function namesNoHook(row: object): boolean {
+  return fieldOf(row, 'component') === undefined && fieldOf(row, 'hookIndex') === undefined;
+}
+
+/** A metric row's measured value when it is available in `unit`, and `undefined` otherwise. */
+function measuredValueIn(row: object, unit: string): number | undefined {
+  const value = fieldOf(row, 'value');
+  return fieldOf(row, 'available') === true &&
+    fieldOf(row, 'unit') === unit &&
+    typeof value === 'number'
+    ? value
+    : undefined;
+}
+
+/**
+ * Every derived key the resolver's chains may name, derived here from the
+ * rows of one whole answer and the events the case seeded — by counting,
+ * filtering and looking up in the fixture, never by calling the resolver's
+ * own derivations. The table is total over the resolver's vocabulary, so a
+ * derived key added there fails this file's compilation until it is derived
+ * here as well.
+ */
+const INDEPENDENT_DERIVATIONS: Readonly<
+  Record<
+    DerivedSortKeyName,
+    (rows: readonly object[], seeded: readonly TelemetryEvent[]) => DerivedValues
+  >
+> = Object.freeze({
+  nameGroupSize: (rows) =>
+    rows.map(
+      (row) => rows.filter((other) => fieldOf(other, 'name') === fieldOf(row, 'name')).length,
+    ),
+  hookGroupSize: (rows) =>
+    rows.map((row) =>
+      namesNoHook(row) ? undefined : rows.filter((other) => sameHook(other, row)).length,
+    ),
+  hookComponent: (rows) =>
+    rows.map((row) => {
+      const component = fieldOf(row, 'component');
+      return typeof component === 'string' ? component : undefined;
+    }),
+  hookIndex: (rows) =>
+    rows.map((row) => {
+      const hookIndex = fieldOf(row, 'hookIndex');
+      return typeof hookIndex === 'number' ? hookIndex : undefined;
+    }),
+  eventDuration: (rows, seeded) =>
+    rows.map((row) => seeded.find((event) => event.id === fieldOf(row, 'eventId'))?.duration),
+  metricPosition: (rows) =>
+    rows.map((row) => {
+      const position = METRIC_IDS.findIndex((id) => id === fieldOf(row, 'id'));
+      return position === -1 ? undefined : position;
+    }),
+  measuredMilliseconds: (rows) => rows.map((row) => measuredValueIn(row, 'milliseconds')),
+  measuredCount: (rows) => rows.map((row) => measuredValueIn(row, 'count')),
+});
+
+/**
+ * The comparison a chain states between two rows of one whole answer, by
+ * index: every derived key evaluated over all of `rows` by
+ * {@link INDEPENDENT_DERIVATIONS}, a row with a derived value ahead of every
+ * row without one in either direction, and a field key read off the row.
+ */
+function chainComparator(
+  rows: readonly object[],
+  chain: GenericChain,
+  seeded: readonly TelemetryEvent[],
+): (left: number, right: number) => number {
+  const derived = chain.map((key) =>
+    'derived' in key ? INDEPENDENT_DERIVATIONS[key.derived](rows, seeded) : [],
+  );
+  const rowAt = (index: number): object => {
+    const row = rows[index];
+    if (row === undefined) {
+      throw new Error(`no row at ${String(index)}`);
     }
+    return row;
+  };
+  return (left, right) => {
+    for (const [position, key] of chain.entries()) {
+      let order: number;
+      if ('derived' in key) {
+        const values = derived[position] ?? [];
+        const leftValue = values[left];
+        const rightValue = values[right];
+        if (leftValue === undefined || rightValue === undefined) {
+          order = leftValue === rightValue ? 0 : leftValue === undefined ? 1 : -1;
+        } else {
+          const compared = compareField(leftValue, rightValue, key.collation);
+          order = key.direction === 'desc' ? -compared : compared;
+        }
+      } else {
+        const compared = compareField(
+          fieldOf(rowAt(left), key.field),
+          fieldOf(rowAt(right), key.field),
+          key.collation,
+        );
+        order = key.direction === 'desc' ? -compared : compared;
+      }
+      if (order !== 0) {
+        return order;
+      }
+    }
+    return 0;
+  };
+}
+
+/**
+ * Asserts `rows` is in strict chain order: every adjacent pair compares below
+ * zero, so no two rows tie and every tie on the sort key was broken.
+ */
+function expectStrictChainOrder(
+  rows: readonly object[],
+  chain: GenericChain,
+  seeded: readonly TelemetryEvent[],
+): void {
+  const compare = chainComparator(rows, chain, seeded);
+  for (let index = 1; index < rows.length; index += 1) {
+    expect(compare(index - 1, index)).toBeLessThan(0);
   }
-  return 0;
 }
 
 /** The sortable sources, read off the default table so no source name is restated. */
 const SORTED_SOURCES = Object.keys(DEFAULT_SORT_BY_SOURCE) as SortedDataSource[];
-
-/** The sorts that apply to `source`, from its declared chains. */
-function sortsFor(source: SortedDataSource): DataQuerySort[] {
-  const chains: Readonly<Partial<Record<DataQuerySort, GenericChain>>> = SOURCE_SORT_KEYS[source];
-  return DATA_QUERY_SORTS.filter((sort) => chains[sort] !== undefined);
-}
 
 /** One query per source, carrying nothing but the source. */
 const QUERIES_BY_SOURCE: readonly DataQuery[] = DATA_QUERY_SOURCES.map((source) => ({ source }));
@@ -1345,17 +1562,28 @@ describe('the fixture builders', () => {
     expect([...ids].sort(byCodeUnit)).not.toStrictEqual(ids);
   });
 
-  it('build a tie fixture that ties on the primary key of every permitted sort', async () => {
-    const { resolver } = harness(tieFixture());
+  it('build a tie fixture that ties on the primary key of every sort of every sortable source', async () => {
+    const events = tieFixture();
+    const { resolver } = harness(events);
     for (const source of SORTED_SOURCES) {
-      for (const sort of sortsFor(source)) {
-        const whole = await resolved(resolver, { source, sort, limit: DATA_QUERY_MAX_LIMIT });
+      for (const sort of DATA_QUERY_SORTS) {
         const [primary] = chainFor(source, sort);
         if (primary === undefined) {
           throw new Error(`the chain of ${sort} on ${source} is empty`);
         }
-        expect(primary.field).not.toBe('id');
-        const values = rowsOf(whole).map((row) => fieldOf(row, primary.field));
+        expect('field' in primary && primary.field === 'id').toBe(false);
+        // A metric's vocabulary position is unique by construction: under
+        // `start_asc` every metric value ties on start and that position is
+        // the whole answer, so it leaves no tie for the id to break.
+        if ('derived' in primary && primary.derived === 'metricPosition') {
+          continue;
+        }
+        const whole = await resolved(resolver, { source, sort, limit: DATA_QUERY_MAX_LIMIT });
+        const rows = rowsOf(whole);
+        const values =
+          'derived' in primary
+            ? INDEPENDENT_DERIVATIONS[primary.derived](rows, events)
+            : rows.map((row) => fieldOf(row, primary.field));
         expect(new Set(values).size).toBeLessThan(values.length);
       }
     }
@@ -1451,63 +1679,128 @@ describe('buildDataPage and applyPage', () => {
 const STORE_COLUMN_BY_FIELD: Readonly<Record<string, string>> = Object.freeze({
   startTime: 'start_time',
   duration: 'duration',
+  name: 'name',
   id: 'id',
 });
 
-/** A chain rendered as the store's `ORDER BY` clause. */
+/**
+ * The store expression each derived key of a flat-source chain stands for:
+ * `nameGroupSize` is the occurrence count of the row's own `name` group, the
+ * window function the store's `count_desc` ranks by under the `name` key.
+ */
+const STORE_EXPRESSION_BY_DERIVED: Readonly<Partial<Record<DerivedSortKeyName, string>>> =
+  Object.freeze({ nameGroupSize: 'COUNT(name) OVER (PARTITION BY name)' });
+
+/** A chain rendered as the store's `ORDER BY` clause; a key the store has no expression for fails. */
 function orderByClause(chain: GenericChain): string {
   return chain
-    .map((key) => `${STORE_COLUMN_BY_FIELD[key.field] ?? key.field} ${key.direction.toUpperCase()}`)
+    .map((key) => {
+      const expression =
+        'derived' in key
+          ? STORE_EXPRESSION_BY_DERIVED[key.derived]
+          : STORE_COLUMN_BY_FIELD[key.field];
+      if (expression === undefined) {
+        throw new Error('the chain names a key the store does not order by');
+      }
+      return `${expression} ${key.direction.toUpperCase()}`;
+    })
     .join(', ');
 }
 
 describe('SOURCE_SORT_KEYS and DEFAULT_SORT_BY_SOURCE', () => {
-  it('covers exactly the paged sources whose order a query may choose', () => {
+  it('covers exactly the paged sources, metrics included', () => {
     expect([...SORTED_SOURCES].sort()).toStrictEqual(Object.keys(SOURCE_SORT_KEYS).sort());
     for (const source of SORTED_SOURCES) {
       expect(DATA_QUERY_SOURCES).toContain(source);
+    }
+    expect(SORTED_SOURCES).toContain('metrics');
+  });
+
+  it('declares a chain for every sort on every sortable source', () => {
+    for (const source of SORTED_SOURCES) {
+      expect(Object.keys(SOURCE_SORT_KEYS[source]).sort()).toStrictEqual(
+        [...DATA_QUERY_SORTS].sort(),
+      );
     }
   });
 
   it('ends every chain in id ascending', () => {
     for (const source of SORTED_SOURCES) {
-      for (const sort of sortsFor(source)) {
+      for (const sort of DATA_QUERY_SORTS) {
         expect(chainFor(source, sort).at(-1)).toStrictEqual({ field: 'id', direction: 'asc' });
       }
     }
   });
 
-  it('gives every source a default that has a chain', () => {
+  it('gives every source a default from the sort vocabulary, METRIC_IDS order for metrics', () => {
     for (const source of SORTED_SOURCES) {
-      expect(sortsFor(source)).toContain(DEFAULT_SORT_BY_SOURCE[source]);
+      expect(DATA_QUERY_SORTS).toContain(DEFAULT_SORT_BY_SOURCE[source]);
     }
+    expect(chainFor('metrics', DEFAULT_SORT_BY_SOURCE.metrics)).toStrictEqual([
+      expect.objectContaining({ derived: 'metricPosition', direction: 'asc' }),
+      { field: 'id', direction: 'asc' },
+    ]);
   });
 
   it('states for the flat sources exactly the orderings the store applies', () => {
-    const storeOrderBy: Readonly<Partial<Record<DataQuerySort, string>>> = {
+    // The store's `count_desc` row ordering under the `name` key, as
+    // `TelemetryRepo.query` documents it: group size, the key, then the id.
+    const storeOrderBy: Readonly<Record<DataQuerySort, string>> = {
       duration_desc: PANEL_DURATION_DESC_ORDER_BY,
       start_asc: PANEL_START_ASC_ORDER_BY,
+      count_desc: `COUNT(name) OVER (PARTITION BY name) DESC, name ASC, ${PANEL_SECONDARY_ORDER_BY}`,
     };
     for (const source of ['spans', 'events'] as const) {
-      for (const sort of sortsFor(source)) {
+      for (const sort of DATA_QUERY_SORTS) {
         expect(orderByClause(chainFor(source, sort))).toBe(storeOrderBy[sort]);
       }
+      // The key is compared as SQLite's `BINARY` collation compares it: by UTF-8 bytes.
+      expect(chainFor(source, 'count_desc')[1]).toStrictEqual({
+        field: 'name',
+        direction: 'asc',
+        collation: 'utf8',
+      });
     }
   });
 
-  it('keeps an applicable sort and falls back to the default for an inapplicable or absent one', () => {
+  it('answers every named sort on every sortable source in that sort’s own order, never the default’s', async () => {
+    const events = tieFixture();
+    const { resolver } = harness(events);
+    const reordered = new Set<string>();
     for (const source of SORTED_SOURCES) {
-      const applicable = sortsFor(source);
       expect(effectiveSort(source, undefined)).toBe(DEFAULT_SORT_BY_SOURCE[source]);
+      const byDefault = rowsOf(await resolved(resolver, { source, limit: DATA_QUERY_MAX_LIMIT }));
+      const defaultIds = byDefault.map((row) => row.id);
       for (const sort of DATA_QUERY_SORTS) {
-        const expected = applicable.includes(sort) ? sort : DEFAULT_SORT_BY_SOURCE[source];
-        expect(effectiveSort(source, sort)).toBe(expected);
+        expect(effectiveSort(source, sort)).toBe(sort);
+        const answered = await resolved(resolver, { source, sort, limit: DATA_QUERY_MAX_LIMIT });
+        // The same rows, put here into the named sort's order by an
+        // independent reading of its chain.
+        const compare = chainComparator(byDefault, chainFor(source, sort), events);
+        const expected = byDefault
+          .map((_, index) => index)
+          .sort(compare)
+          .map((index) => byDefault[index]?.id);
+        expect(rowIds(answered)).toStrictEqual(expected);
+        if (!expected.every((id, index) => id === defaultIds[index])) {
+          reordered.add(`${source} ${sort}`);
+        }
       }
     }
-    expect(effectiveSort('events', 'count_desc')).toBe(DEFAULT_SORT_BY_SOURCE.events);
-    expect(effectiveSort('stateTransitions', 'duration_desc')).toBe(
-      DEFAULT_SORT_BY_SOURCE.stateTransitions,
-    );
+    // Not vacuous: every pair a resolver substituting the source default would
+    // get wrong orders this fixture differently from that default, and was
+    // answered in its own order above. (`stateTransitions` under
+    // `duration_desc` ties every instant of this fixture; its own case below
+    // separates them.)
+    for (const pair of [
+      'spans count_desc',
+      'events count_desc',
+      'stateTransitions count_desc',
+      'metrics duration_desc',
+      'metrics count_desc',
+    ]) {
+      expect(reordered).toContain(pair);
+    }
   });
 
   it('orders by the chain into a fresh array, breaking every tie by id', () => {
@@ -1684,28 +1977,30 @@ describe('the paging contract', () => {
  * The multi-page walk: the strictest check in this file
  * ---------------------------------------------------------------------------------------------- */
 
-/** Every permitted (source, sort) pair, from the declared chains. */
+/** Every (sortable source, sort) pair: every sort orders every paged source, metrics included. */
 const WALK_CASES: readonly (readonly [SortedDataSource, DataQuerySort])[] = SORTED_SOURCES.flatMap(
-  (source) => sortsFor(source).map((sort) => [source, sort] as const),
+  (source) => DATA_QUERY_SORTS.map((sort) => [source, sort] as const),
 );
 
 /** Page sizes that split the fixture's tie groups at different points. */
 const WALK_PAGE_SIZES: readonly number[] = [1, 2, 3, 5];
 
 describe('the multi-page walk', () => {
-  it('covers every permitted sort of every sortable source', () => {
+  it('covers every sort of every sortable source', () => {
     for (const source of SORTED_SOURCES) {
       expect(WALK_CASES.filter(([walked]) => walked === source)).toHaveLength(
-        sortsFor(source).length,
+        DATA_QUERY_SORTS.length,
       );
     }
     expect(new Set(WALK_CASES.map(([source]) => source)).size).toBe(SORTED_SOURCES.length);
+    expect(WALK_CASES).toHaveLength(SORTED_SOURCES.length * DATA_QUERY_SORTS.length);
   });
 
   it.each(WALK_CASES)(
     '%s under %s: every walk visits each row exactly once, in the order of one unpaged read',
     async (source, sort) => {
-      const { resolver } = harness(tieFixture());
+      const events = tieFixture();
+      const { resolver } = harness(events);
       const chain = chainFor(source, sort);
 
       const whole = await resolved(resolver, { source, sort, limit: DATA_QUERY_MAX_LIMIT });
@@ -1719,14 +2014,10 @@ describe('the multi-page walk', () => {
       expect(new Set(wholeIds).size).toBe(wholeIds.length);
       expect(whole.total).toBeGreaterThan(Math.max(...WALK_PAGE_SIZES));
 
-      // The unpaged read is in strict chain order: no two rows compare equal,
-      // so every tie on the sort key was broken by the id.
-      rows.forEach((row, index) => {
-        const previous = rows[index - 1];
-        if (previous !== undefined) {
-          expect(compareByChain(previous, row, chain)).toBeLessThan(0);
-        }
-      });
+      // The unpaged read is in strict chain order — every derived key
+      // evaluated here from the fixture — so no two rows compare equal and
+      // every tie on the sort key was broken.
+      expectStrictChainOrder(rows, chain, events);
 
       for (const pageSize of WALK_PAGE_SIZES) {
         const walk = await walkAll(resolver, { source, sort }, pageSize);
@@ -1739,7 +2030,7 @@ describe('the multi-page walk', () => {
     },
   );
 
-  it('walks the fixed metrics order page by page to exactly METRIC_IDS', async () => {
+  it('walks the metrics answered without a sort page by page to exactly METRIC_IDS', async () => {
     const { resolver } = harness(tieFixture());
     for (const pageSize of WALK_PAGE_SIZES) {
       const walk = await walkAll(resolver, { source: 'metrics' }, pageSize);
@@ -1790,17 +2081,50 @@ describe('spans and events', () => {
     }
   });
 
-  it('reads every kind for events and answers an inapplicable sort in the source default', async () => {
-    const { resolver, store } = harness(flatFixture());
+  it('reads every kind for events and asks the store for count_desc grouped by the operation name', async () => {
+    const events = [
+      makeEvent({ kind: 'function', name: 'rare', startTime: at(1) }),
+      makeEvent({ kind: 'function', name: 'frequent', startTime: at(2) }),
+      makeEvent({ kind: 'state', name: 'frequent', startTime: at(3), duration: 0 }),
+      makeEvent({ kind: 'function', name: 'frequent', startTime: at(4) }),
+      makeEvent({ kind: 'error', name: 'equal', startTime: at(5), duration: 0 }),
+      makeEvent({ kind: 'function', name: 'equal', startTime: at(6) }),
+      makeEvent({ kind: 'function', name: 'frequent', captureId: CAPTURE_A2 }),
+    ];
+    const { resolver, store } = harness(events);
     const result = await resolved(resolver, { source: 'events', sort: 'count_desc' });
 
-    expect(store.calls[0]?.sort).toBe(DEFAULT_SORT_BY_SOURCE.events);
+    expect(store.calls).toHaveLength(1);
+    expect(store.calls[0]).toMatchObject({ sort: 'count_desc', groupBy: 'name' });
     expect(store.calls[0]?.kinds).toBeUndefined();
-    expect(result.source).toBe('events');
-    if (result.source === 'events') {
-      expect(result.total).toBe(14);
-      expect(result.events.every((event) => event.captureId === CAPTURE_A1)).toBe(true);
+    // Largest group of the capture first, a group's rows together; two equal
+    // groups by name in byte order; inside a group by id.
+    const inCapture = events.filter((event) => event.captureId === CAPTURE_A1);
+    const idsNamed = (name: string): string[] =>
+      inCapture
+        .filter((event) => event.name === name)
+        .map((event) => event.id)
+        .sort(byCodeUnit);
+    expect(rowIds(result)).toStrictEqual([
+      ...idsNamed('frequent'),
+      ...idsNamed('equal'),
+      ...idsNamed('rare'),
+    ]);
+    expect(result).toMatchObject({ source: 'events', total: inCapture.length, nextOffset: null });
+  });
+
+  it('asks the store for every sort exactly as named, on both flat sources', async () => {
+    const { resolver, store } = harness(flatFixture());
+    for (const source of ['spans', 'events'] as const) {
+      for (const sort of DATA_QUERY_SORTS) {
+        await resolved(resolver, { source, sort });
+      }
     }
+    expect(store.calls.map((call) => call.sort)).toStrictEqual([
+      ...DATA_QUERY_SORTS,
+      ...DATA_QUERY_SORTS,
+    ]);
+    expect(store.calls.every((call) => call.groupBy === 'name')).toBe(true);
   });
 
   it('pushes every filter field into the store, a kinds filter only narrowing the span kinds', async () => {
@@ -2040,18 +2364,117 @@ describe('stateTransitions', () => {
     expect(alpha.every((event) => STATE_KINDS.includes(event.kind))).toBe(true);
   });
 
-  it('answers an inapplicable sort chronologically and walks every transition once', async () => {
-    const { events } = transitionFixture();
+  it('answers duration_desc longest state event first, equal durations chronologically, and walks it once', async () => {
+    const timed = (component: string, offsetMs: number, duration: number): TelemetryEvent => ({
+      ...stateEvent(component, offsetMs),
+      duration,
+    });
+    const shortest = timed('Alpha', 5, 0.5);
+    const longest = timed('Beta', 7, 4);
+    const laterOfTwo = timed('Alpha', 9, 2);
+    const earlierOfTwo = timed('Gamma', 1, 2);
+    const firstInstant = timed('Beta', 3, 0);
+    const lastInstant = timed('Gamma', 11, 0);
+    const events = [shortest, longest, laterOfTwo, earlierOfTwo, firstInstant, lastInstant];
     const { resolver } = harness(events);
+
+    const expected = [longest, earlierOfTwo, laterOfTwo, shortest, firstInstant, lastInstant].map(
+      (event) => event.id,
+    );
     const byDuration = await resolved(resolver, {
       source: 'stateTransitions',
       sort: 'duration_desc',
     });
+    expect(rowIds(byDuration)).toStrictEqual(expected);
     const chronological = await resolved(resolver, { source: 'stateTransitions' });
-    expect(rowIds(byDuration)).toStrictEqual(rowIds(chronological));
-    const walk = await walkAll(resolver, { source: 'stateTransitions' }, 1);
-    expect(walk.ids).toStrictEqual(rowIds(chronological));
-    expect(walk.pages).toBe(4);
+    expect(rowIds(chronological)).not.toStrictEqual(expected);
+    for (const pageSize of [1, 4]) {
+      const walk = await walkAll(
+        resolver,
+        { source: 'stateTransitions', sort: 'duration_desc' },
+        pageSize,
+      );
+      expect(walk.ids).toStrictEqual(expected);
+    }
+  });
+
+  it('ranks a transition whose event duration is unknown after every one with a duration', () => {
+    const { events } = transitionFixture();
+    const rows = events
+      .filter((event) => STATE_KINDS.includes(event.kind))
+      .map((event): StateTransition => ({
+        id: event.id,
+        eventId: event.id,
+        spanId: event.spanId,
+        traceId: event.traceId,
+        startTime: event.startTime,
+        changed: true,
+      }));
+    const [unknown, ...measured] = rows;
+    if (unknown === undefined) {
+      throw new Error('the fixture holds no transition');
+    }
+    const durations = new Map(measured.map((row, index) => [row.eventId, index] as const));
+    const ordered = orderRows(rows, SOURCE_SORT_KEYS.stateTransitions.duration_desc, {
+      eventDurations: durations,
+    });
+    expect(ordered.at(-1)?.id).toBe(unknown.id);
+    expect(ordered.slice(0, -1).map((row) => row.id)).toStrictEqual(
+      [...measured].reverse().map((row) => row.id),
+    );
+  });
+
+  it('answers count_desc most frequently changing hook first, one hook’s rows together, ungrouped rows last', async () => {
+    /** A transition of hook `hookIndex` of `component`; either may be left out. */
+    const hookEvent = (offsetMs: number, component?: string, hookIndex?: number): TelemetryEvent =>
+      makeEvent({
+        kind: 'state',
+        name: 'state',
+        startTime: at(offsetMs),
+        duration: 0,
+        attributes: {
+          ...(component === undefined ? {} : { component }),
+          ...(hookIndex === undefined ? {} : { hookIndex }),
+          previousValue: { type: 'number', preview: '1', truncated: false },
+          nextValue: { type: 'number', preview: '2', truncated: false },
+        },
+      });
+    const upperFirst = [
+      hookEvent(5, 'Alpha', 0),
+      hookEvent(9, 'Alpha', 0),
+      hookEvent(13, 'Alpha', 0),
+    ];
+    // Two hooks of two transitions each: by code unit `Zeta` precedes
+    // `alpha`, where a locale comparison would put `alpha` first.
+    const lowerSecond = [hookEvent(2, 'alpha', 1), hookEvent(20, 'alpha', 1)];
+    const zeta = [hookEvent(3, 'Zeta', 0), hookEvent(4, 'Zeta', 0)];
+    const betaHook = hookEvent(1, 'Beta', 0);
+    // Same component, no hook index: a hook of its own, after `Beta`'s hook 0.
+    const betaUnindexed = hookEvent(6, 'Beta');
+    // Neither half of a hook, like the truncation sentinel: no group, even
+    // though two of them would outnumber a hook of one.
+    const ungrouped = [hookEvent(0), hookEvent(0.5)];
+    const events = [...ungrouped, betaHook, ...lowerSecond, ...zeta, ...upperFirst, betaUnindexed];
+    const { resolver } = harness(events);
+
+    const expected = [
+      ...upperFirst,
+      ...zeta,
+      ...lowerSecond,
+      betaHook,
+      betaUnindexed,
+      ...ungrouped,
+    ].map((event) => event.id);
+    const byCount = await resolved(resolver, { source: 'stateTransitions', sort: 'count_desc' });
+    expect(rowIds(byCount)).toStrictEqual(expected);
+    for (const pageSize of [1, 3]) {
+      const walk = await walkAll(
+        resolver,
+        { source: 'stateTransitions', sort: 'count_desc' },
+        pageSize,
+      );
+      expect(walk.ids).toStrictEqual(expected);
+    }
   });
 });
 
@@ -3280,7 +3703,7 @@ describe('metrics', () => {
     return { ...summary, metrics: [...summary.metrics].reverse() };
   }
 
-  it('returns every metric of the loaded summary in METRIC_IDS order, unavailable ones included', async () => {
+  it('returns every metric of the loaded summary in METRIC_IDS order when no sort is named, unavailable ones included', async () => {
     const events = metricFixture();
     let loads = 0;
     const summaries: CaptureSummaryPort = {
@@ -3291,7 +3714,7 @@ describe('metrics', () => {
       },
     };
     const { resolver } = harness(events, { summaries });
-    const result = await resolved(resolver, { source: 'metrics', sort: 'count_desc' });
+    const result = await resolved(resolver, { source: 'metrics' });
 
     expect(loads).toBe(1);
     expect(result.source).toBe('metrics');
@@ -3306,19 +3729,65 @@ describe('metrics', () => {
     }
   });
 
-  it('keeps the fixed order under every sort and an explicit window, which the protocol validates', async () => {
-    const events = metricFixture();
-    const { resolver } = harness(events);
-    for (const sort of DATA_QUERY_SORTS) {
+  it('answers start_asc, under which every value ties on the capture window, in METRIC_IDS order', async () => {
+    const { resolver } = harness(metricFixture());
+    const unsorted = await resolved(resolver, { source: 'metrics' });
+    const byStart = await resolved(resolver, { source: 'metrics', sort: 'start_asc' });
+    expect(rowIds(byStart)).toStrictEqual([...METRIC_IDS]);
+    expect(byStart).toStrictEqual(unsorted);
+  });
+
+  it.each([
+    ['duration_desc', 'milliseconds'],
+    ['count_desc', 'count'],
+  ] as const)(
+    'answers %s with the measured %s values first, largest first, and every other value after them in METRIC_IDS order',
+    async (sort, unit) => {
+      const { resolver } = harness(metricFixture());
+      const unsorted = metricsOf(await resolved(resolver, { source: 'metrics' }));
+      expect(unsorted.map((metric) => metric.id)).toStrictEqual([...METRIC_IDS]);
+
+      // Derived here from the unsorted answer: the values measured in the
+      // sort's unit, largest first and a tie by vocabulary position; then the
+      // rest — another unit, or not measured — as they were.
+      const measured = unsorted.filter(
+        (metric) => metric.available && metric.unit === unit && typeof metric.value === 'number',
+      );
+      expect(measured.length).toBeGreaterThan(1);
+      const expected = [
+        ...[...measured].sort(
+          (left, right) =>
+            (right.value ?? 0) - (left.value ?? 0) ||
+            METRIC_IDS.indexOf(left.id) - METRIC_IDS.indexOf(right.id),
+        ),
+        ...unsorted.filter((metric) => !measured.includes(metric)),
+      ];
+
       const sorted = await resolved(resolver, { source: 'metrics', sort });
-      expect(rowIds(sorted)).toStrictEqual([...METRIC_IDS]);
+      expect(sorted).toMatchObject({ total: METRIC_IDS.length, nextOffset: null });
+      expect(metricsOf(sorted)).toStrictEqual(expected);
+      expect(rowIds(sorted)).not.toStrictEqual([...METRIC_IDS]);
+      const unavailable = metricsOf(sorted).findIndex((metric) => !metric.available);
+      expect(unavailable).toBeGreaterThanOrEqual(measured.length);
+    },
+  );
+
+  it('honours an explicit window over the sorted order, which the protocol validates', async () => {
+    const { resolver } = harness(metricFixture());
+    for (const sort of [undefined, ...DATA_QUERY_SORTS]) {
+      const sortField = sort === undefined ? {} : { sort };
+      const whole = rowIds(await resolved(resolver, { source: 'metrics', ...sortField }));
+      const window = await resolved(resolver, {
+        source: 'metrics',
+        ...sortField,
+        limit: 3,
+        offset: 3,
+      });
+      expect(rowIds(window)).toStrictEqual(whole.slice(3, 6));
+      expect(window).toMatchObject({ total: METRIC_IDS.length, offset: 3, nextOffset: 6 });
     }
-    const window = await resolved(resolver, { source: 'metrics', limit: 3, offset: 3 });
-    expect(window.source).toBe('metrics');
-    if (window.source === 'metrics') {
-      expect(window.metrics.map((metric) => metric.id)).toStrictEqual(METRIC_IDS.slice(3, 6));
-      expect(window.nextOffset).toBe(6);
-    }
+    const unsorted = await resolved(resolver, { source: 'metrics', limit: 3, offset: 3 });
+    expect(rowIds(unsorted)).toStrictEqual(METRIC_IDS.slice(3, 6));
   });
 
   it('uses the capture’s stored summary when no summary port is supplied and it covers every event', async () => {
@@ -3661,14 +4130,6 @@ describe('capture scoping', () => {
  * Every source
  * ---------------------------------------------------------------------------------------------- */
 
-/** Every (sortable source, sort that does not apply to it) pair. */
-const INAPPLICABLE_CASES: readonly (readonly [SortedDataSource, DataQuerySort])[] =
-  SORTED_SOURCES.flatMap((source) =>
-    DATA_QUERY_SORTS.filter((sort) => !sortsFor(source).includes(sort)).map(
-      (sort) => [source, sort] as const,
-    ),
-  );
-
 describe('every source', () => {
   it.each(DATA_QUERY_SOURCES)(
     'answers %s with its own DataResult member',
@@ -3690,7 +4151,7 @@ describe('every source', () => {
         pagedSources.push(result.source);
       }
     }
-    expect(pagedSources.sort()).toStrictEqual([...SORTED_SOURCES, 'metrics'].sort());
+    expect(pagedSources.sort()).toStrictEqual([...SORTED_SOURCES].sort());
   });
 
   it('answers every source for a capture that holds no events with its empty value, as a success', async () => {
@@ -3721,30 +4182,22 @@ describe('every source', () => {
     }
   });
 
-  it('has sorts that do not apply to some source', () => {
-    expect(INAPPLICABLE_CASES.length).toBeGreaterThan(0);
-  });
-
-  it.each(INAPPLICABLE_CASES)(
-    'answers %s under the inapplicable %s in its default order, identically twice',
+  it.each(WALK_CASES)(
+    'answers %s under %s identically twice, and an omitted sort exactly as its default',
     async (source, sort) => {
       const { resolver, store } = harness(tieFixture());
       const first = await resolved(resolver, { source, sort, limit: DATA_QUERY_MAX_LIMIT });
       const second = await resolved(resolver, { source, sort, limit: DATA_QUERY_MAX_LIMIT });
-      const byDefault = await resolved(resolver, {
-        source,
-        sort: DEFAULT_SORT_BY_SOURCE[source],
-        limit: DATA_QUERY_MAX_LIMIT,
-      });
       expect(rowIds(first).length).toBeGreaterThan(1);
-      expect(rowIds(second)).toStrictEqual(rowIds(first));
-      expect(first).toStrictEqual(byDefault);
+      expect(second).toStrictEqual(first);
+      if (sort === DEFAULT_SORT_BY_SOURCE[source]) {
+        const omitted = await resolved(resolver, { source, limit: DATA_QUERY_MAX_LIMIT });
+        expect(omitted).toStrictEqual(first);
+      }
       if (source === 'spans' || source === 'events') {
-        // The flat sources are ordered by the store: the default, never the
-        // inapplicable sort, is what reaches it.
-        expect(store.calls.every((call) => call.sort === DEFAULT_SORT_BY_SOURCE[source])).toBe(
-          true,
-        );
+        // The flat sources are ordered by the store: the named sort — or the
+        // default where none was named — is exactly what reaches it.
+        expect(store.calls.every((call) => call.sort === sort)).toBe(true);
       }
     },
   );

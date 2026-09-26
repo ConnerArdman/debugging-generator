@@ -6,12 +6,13 @@
  * It pins what happens between "Stop capture" and the window closing:
  *
  * 1. **The stop barrier.** After both producers are disarmed the window stays
- *    open, and the capture's ingest watermark is polled until it stands still
- *    for a quiet period, bounded by a hard ceiling — so the batches the
- *    producers flush on disarm are attributed to the capture that recorded
- *    them. Every ending (`quiescent`, `deadline`, `unverified`,
- *    `not-applicable`) and the cancellation are driven here with an injected
- *    sleeper and monotonic clock, never with real time.
+ *    open, and the capture's ingest watermark and producer-loss total are
+ *    polled until both stand still for a quiet period, bounded by a hard
+ *    ceiling — so the batches the producers flush on disarm, loss-only reports
+ *    included, are attributed to the capture that recorded them. Every ending
+ *    (`quiescent`, `deadline`, `unverified`, `not-applicable`) and the
+ *    cancellation are driven here with an injected sleeper and monotonic
+ *    clock, never with real time.
  * 2. **The bounded summary.** The capture's events are read in small pages,
  *    yielding between them, and summarised up to an event ceiling and a
  *    stored-size ceiling; past either, the emptiness rule reads exact per-kind
@@ -247,6 +248,12 @@ interface Script {
   readonly countByKindFails: boolean;
   /** The producer-loss total the ledger answers. */
   readonly producerLoss: number;
+  /**
+   * What each ledger read answers, in order — the barrier's polls, then the
+   * coverage's read; past the end the last entry repeats. Absent, every read
+   * answers {@link producerLoss}.
+   */
+  readonly losses?: readonly (number | DebuggenError)[];
   /** Whether the ledger vouches for that total: it tracked the capture since its window opened. */
   readonly lossAccounted: boolean;
   /** What the disarm answers. */
@@ -356,6 +363,7 @@ function kindCountsOf(script: Script): Record<TelemetryKind, number> {
  */
 function telemetryDouble(script: Script, timeline: string[]) {
   let polls = 0;
+  let lossReads = 0;
   return {
     pageCaptureForSummary: vi.fn(
       (
@@ -400,9 +408,17 @@ function telemetryDouble(script: Script, timeline: string[]) {
       timeline.push('beginProducerLossAccounting');
       return ok(undefined);
     }),
-    producerLoss: vi.fn((): Result<ProducerLossTotal, DebuggenError> =>
-      ok({ droppedEvents: script.producerLoss, accounted: script.lossAccounted }),
-    ),
+    producerLoss: vi.fn((): Result<ProducerLossTotal, DebuggenError> => {
+      const scripted = script.losses;
+      const answer =
+        scripted === undefined || scripted.length === 0
+          ? script.producerLoss
+          : (scripted[Math.min(lossReads, scripted.length - 1)] ?? script.producerLoss);
+      lossReads += 1;
+      return answer instanceof DebuggenError
+        ? err(answer)
+        : ok({ droppedEvents: answer, accounted: script.lossAccounted });
+    }),
     releaseProducerLoss: vi.fn((): Result<void, DebuggenError> => {
       timeline.push('releaseProducerLoss');
       return ok(undefined);
@@ -625,6 +641,72 @@ describe('the stop barrier', () => {
     expect(quiet?.fields).toMatchObject({ drain: 'quiescent', changes: 1, arrivals: 5 });
     expect(quiet?.fields).not.toHaveProperty('storedEvents');
   });
+
+  it('restarts the quiet period when a loss-only report lands in it, and reports the loss', async () => {
+    // Nothing is stored after the stop: the producer's last word is a loss-only
+    // report, recorded in the ledger at 500 ms without moving the watermark.
+    const h = harness({ losses: [0, 0, 0, 0, 0, 7] });
+
+    const completed = await createCaptureStage(h.deps).complete(h.context);
+
+    expect(completed.ok).toBe(true);
+    expect(h.clock.elapsed()).toBe(500 + CAPTURE_DRAIN_DEFAULTS.quietPeriodMs);
+    // One ledger read beside every watermark read, then the coverage's own.
+    const watermarkReads = h.telemetry.captureWatermark.mock.calls.length;
+    expect(h.telemetry.producerLoss).toHaveBeenCalledTimes(watermarkReads + 1);
+    expect(h.telemetry.producerLoss).toHaveBeenCalledWith(SESSION_ID, CAPTURE_ID);
+    expect(stoppedSummary(h).coverage).toMatchObject({
+      producerDroppedEvents: 7,
+      drain: 'quiescent',
+      complete: false,
+    });
+    const quiet = h.records.find(
+      (record) => record.message === 'The capture window went quiet before it closed.',
+    );
+    expect(quiet?.fields).toMatchObject({ changes: 0, lossChanges: 1, lossReadFailures: 0 });
+    expect(h.progress[0]).toEqual({
+      method: 'finding',
+      stage: 'capture',
+      message:
+        'Capture evidence is incomplete. 7 events were discarded by a producer before delivery.',
+    });
+  });
+
+  it('ends at its ceiling when loss reports are still arriving', async () => {
+    const growing = Array.from({ length: 200 }, (_, index) => index);
+    const h = harness({ losses: growing });
+
+    const completed = await createCaptureStage(h.deps).complete(h.context);
+
+    expect(completed.ok).toBe(true);
+    expect(h.clock.elapsed()).toBe(CAPTURE_DRAIN_DEFAULTS.maxDrainMs);
+    expect(h.completedFields()).toMatchObject({ drain: 'deadline' });
+    expect(stoppedSummary(h).coverage).toMatchObject({ drain: 'deadline', complete: false });
+  });
+
+  it.each([
+    { when: 'on every read', losses: [storeFailure()], failures: 7 },
+    { when: 'between two equal totals', losses: [2, storeFailure(), 2], failures: 1 },
+    { when: 'before the first total', losses: [storeFailure(), 4], failures: 1 },
+  ])(
+    'never ends or extends the barrier on a loss read that fails $when',
+    async ({ losses, failures }) => {
+      const h = harness({ losses });
+
+      const completed = await createCaptureStage(h.deps).complete(h.context);
+
+      expect(completed.ok).toBe(true);
+      expect(h.clock.elapsed()).toBe(CAPTURE_DRAIN_DEFAULTS.quietPeriodMs);
+      const quiet = h.records.find(
+        (record) => record.message === 'The capture window went quiet before it closed.',
+      );
+      expect(quiet?.fields).toMatchObject({
+        drain: 'quiescent',
+        lossChanges: 0,
+        lossReadFailures: failures,
+      });
+    },
+  );
 
   it.each([
     {

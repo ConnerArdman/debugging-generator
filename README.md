@@ -188,7 +188,7 @@ scripts/              Guard scripts and the dev-instrumented launcher
 tests/                Playwright browser and end-to-end suites, generalization fixture app
 ```
 
-Workspaces are named `@debuggen/<directory>`, except the VS Code extension, whose package name is `debug-generator`. Cross-package imports resolve through each dependency's built `dist/`, so a workspace's dependencies must be built before it; `pnpm build` does this in order, and `pnpm --filter <package> build` rebuilds a single workspace.
+Workspaces are named `@debuggen/<directory>`, except the VS Code extension, whose package name is `debug-generator`. At runtime and in the bundlers, cross-package imports resolve through each dependency's built `dist/`, so a workspace's dependencies must be built before it; `pnpm build` does this in order, and `pnpm --filter <package> build` rebuilds a single workspace. Type-checking and lint read each dependency's source instead and need no prior build ([`docs/ARCHITECTURE.md` §3](docs/ARCHITECTURE.md#3-workspace-layout-and-dependency-layering)).
 
 ### Commands
 

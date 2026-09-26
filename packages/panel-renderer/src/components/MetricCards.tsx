@@ -1,16 +1,16 @@
 /**
  * `MetricCards` — the capture's headline numbers as a row of tiles, one per
- * requested metric id (AAP 0.6.2).
+ * requested metric id.
  *
  * This module is the component behind the node catalog's `metricCards` type. It
  * is one of only three components that recur across otherwise dissimilar panels
- * (AAP 0.6.5, with the summary header and the source-location chip): a
- * slow-interaction panel opens with the per-tier durations, a re-render panel
- * with the render counts, and a duplicate-request panel with the request
- * counts. **The same component draws all three.** Which numbers appear is the
- * node's `metrics` option and nothing else — there is no branch anywhere below
- * on a question, a wording, a panel, a component name or a route, which is the
- * property AAP 0.5.4 requires and `scripts/check-no-hardcoding.mjs` enforces.
+ * (with the summary header and the source-location chip): a slow-interaction
+ * panel opens with the per-tier durations, a re-render panel with the render
+ * counts, and a duplicate-request panel with the request counts. **The same
+ * component draws all three.** Which numbers appear is the node's `metrics`
+ * option and nothing else — there is no branch anywhere below on a question, a
+ * wording, a panel, a component name or a route: behaviour keyed to any of them
+ * is hardcoding, which `scripts/check-no-hardcoding.mjs` rejects.
  *
  * ## NOTHING HERE IS COMPUTED
  *
@@ -25,35 +25,38 @@
  * Two consequences worth stating, because both are easy to "tidy" away:
  *
  *   - `unchanged_render_count` and `render_trigger_unknown_count` are
- *     **separate metrics with separate meanings** (AAP 0.2.3): the first counts
- *     renders whose inputs were all provably stable, the second counts renders
- *     whose trigger could not be evaluated at all. They are never added,
- *     grouped, relabelled or presented as one another — an unevaluated render
- *     is not an unnecessary one.
+ *     **separate metrics with separate meanings**, as `docs/ARCHITECTURE.md`
+ *     ("Computed metrics") defines them: the first counts renders whose inputs
+ *     were all provably stable, the second counts renders whose trigger could
+ *     not be evaluated at all. They are never added, grouped, relabelled or
+ *     presented as one another — an unevaluated render is not an unnecessary
+ *     one.
  *   - the metric vocabulary is closed and owned upstream. This file names no id
  *     of it. Ordering, labelling and units all arrive with the data, so adding
  *     a metric upstream needs no change here.
  *
- * ## AN UNOBSERVABLE VALUE SAYS SO (AAP 0.6.6)
+ * ## AN UNOBSERVABLE VALUE SAYS SO
  *
  * A metric that the capture could not measure renders the package's single
  * spelling of absence — {@link NOT_AVAILABLE_LABEL} — under the
  * `dg-is-unavailable` state, muted, with no severity colour and no unit. Never
  * `0`, never a blank tile, never a dash, and never a hidden card. Muted is not
  * enough on its own to tell it apart: a measured fast duration is muted too,
- * because the fast-duration token IS the muted text colour (AAP 0.6.3). So the
- * state also changes the tile's shape — a dashed edge and an italic figure —
- * and a measured zero keeps the solid edge and upright figure of every other
- * measurement, which is never colour alone (AAP 0.6.4).
+ * because the fast-duration token IS the muted text colour. So the state also
+ * changes the tile's shape — a dashed edge and an italic figure — and a
+ * measured zero keeps the solid edge and upright figure of every other
+ * measurement, so the distinction never rests on colour alone.
  *
  * That is a correctness requirement rather than a cosmetic one. A transfer size
  * is exposed by the browser for same-origin responses only and by a server span
- * not at all, which AAP 0.6.6 records as a known gap; printing `0` there would
- * turn an absence into an observation, and a developer would read it as "nothing
- * was transferred". The same rule covers a requested id that the capture did not
- * compute at all: the tile is still drawn, still in the author's order, and says
- * that the value is not part of this capture — dropping it silently would leave
- * the reader to notice that a tile they asked for is missing.
+ * not at all, so it is often unobservable, and `docs/ARCHITECTURE.md`
+ * ("Computed metrics") defines it as unavailable, never `0`, when nothing
+ * reported one. Printing `0` there would turn an absence into an observation,
+ * and a developer would read it as "nothing was transferred". The same rule
+ * covers a requested id that the capture did not compute at all: the tile is
+ * still drawn, still in the author's order, and says that the value is not part
+ * of this capture — dropping it silently would leave the reader to notice that
+ * a tile they asked for is missing.
  *
  * ## NOT ON THE PAGES READ IS NOT THE SAME AS NOT COMPUTED
  *
@@ -132,17 +135,18 @@
  * Each page is resolved by its own module-private level ({@link MetricCardsPage}),
  * which calls the hook exactly once and then renders either the next level or the
  * settled read, so no component's hook count ever varies between renders. The
- * provider behind the hook is the host surface's (AAP 0.1.2) — there is no
- * `fetch`, no socket and no message port in this file, and `@debuggen/telemetry`
- * is imported for **types only**.
+ * provider behind the hook is the host surface's — there is no `fetch`, no
+ * socket and no message port in this file, and `@debuggen/telemetry` is
+ * imported for **types only**.
  *
- * All three states AAP 0.6.2 requires are rendered, in this precedence: a node
- * whose query names a source these tiles cannot draw (an error, reported rather
- * than silently mis-drawn), then loading — held until the last page the tiles
- * need has settled, so a partial read is never drawn as tiles and mislabelled —
- * then a failed query, reported with the query of the page that failed and a
- * retry that re-requests that page alone, then a capture that computed nothing,
- * then the tiles. Both failure states are worded by the host's one error-state
+ * Every query-backed view declares an empty, a loading and an error state, and
+ * all three are rendered here, in this precedence: a node whose query names a
+ * source these tiles cannot draw (an error, reported rather than silently
+ * mis-drawn), then loading — held until the last page the tiles need has
+ * settled, so a partial read is never drawn as tiles and mislabelled — then a
+ * failed query, reported with the query of the page that failed and a retry
+ * that re-requests that page alone, then a capture that computed nothing, then
+ * the tiles. Both failure states are worded by the host's one error-state
  * contract (`queryFailureProps` and `unsupportedQueryProps` in
  * `../host/useQuery`) rather than by copy of this file's own, so a failed tile
  * group reads exactly like every other failed node in the panel.
@@ -153,7 +157,7 @@
  * belongs to the host's node renderer where it is written once for all twelve
  * of them; drawing it here as well would give a titled node two headings.
  *
- * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE (AAP 0.6.4)
+ * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE
  *
  * This file declares class names and one CSS custom property. There is no
  * colour, length, font or other literal CSS value in it; every declaration
@@ -860,7 +864,7 @@ function MetricCardsPage(props: MetricCardsPageProps): ReactElement {
     // cause, its hint, its code, the query of the page that failed and a retry
     // that re-requests that page alone. The scope is the whole view even for a
     // follow-up page, because no tile is drawn from the pages that did arrive
-    // before it — a failure is never dressed up as a finding (AAP 0.5.5).
+    // before it — a failure is never dressed up as a finding.
     return stateFrame(
       'dg-metric-cards__error',
       className,

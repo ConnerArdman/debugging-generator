@@ -864,7 +864,7 @@ function assertPrefixIsSymlinkFree(deepestAbs: string): void {
  *   other access may already have been read, or had entries planted in it,
  *   while it was open; quietly tightening it would hide that from the one
  *   person who can judge what it now holds, so it is refused with its path and
- *   mode instead (AAP 0.4.2: "refuses to proceed otherwise").
+ *   mode instead: the write refuses to proceed.
  *
  * Because the walk runs outermost first and this triage happens before the
  * next component is created, the outermost failing directory is the one
@@ -1020,9 +1020,9 @@ function applySecureDirMode(componentAbs: string): void {
  *
  * ## Why an existing directory is refused rather than tightened
  *
- * AAP 0.4.2 states the rule: every parent is verified to be a real directory
- * owned by this account with mode `0700`, and the write **refuses to proceed
- * otherwise**. "Mode `0700`" is read here exactly as {@link assertSecureDir}
+ * The rule: every parent is verified to be a real directory owned by this
+ * account with mode `0700`, and the write **refuses to proceed otherwise**.
+ * "Mode `0700`" is read here exactly as {@link assertSecureDir}
  * reads it — no group or other permission bit set — so an owner-only directory
  * narrower than `0700` is accepted as it stands, and an operation it does not
  * permit fails later with the platform's own errno. A directory of the state

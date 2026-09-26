@@ -711,9 +711,9 @@ describe('the closed authoring vocabularies', () => {
   it.each(['gauge', 'scatterPlot'])(
     'tells the author the node types for the unknown type %s, and reports the catalog code',
     (type) => {
-      // The QA reproduction: the repair loop quotes the schema's message, so
-      // it must say the type is unknown and list the types there are; the
-      // parser reports the validator's code, with the vocabulary as `expected`.
+      // The repair loop quotes the schema's message, so it must say the type
+      // is unknown and list the types there are; the parser reports the
+      // validator's code, with the vocabulary as `expected`.
       const document = panelOf([{ type, source: 'spans' }]);
 
       expect(schemaMessages(document)).toEqual([
@@ -1156,9 +1156,9 @@ describe('the dual query form', () => {
   it.each(SOURCE_REQUIRED_TYPES)(
     'refuses a %s node that names no source, at step 1, with its sources and both spellings',
     (type) => {
-      // The QA reproduction: a repairable omission must fail the authoring
-      // schema — the step the repair loop re-prompts on — rather than pass it
-      // and fail the internal schema as a product bug (AAP 0.5.3).
+      // A repairable omission must fail the authoring schema — the step the
+      // repair loop re-prompts on — rather than pass it and fail the internal
+      // schema, where a failure is a product bug and is never retried.
       const document = panelOf([{ type }]);
       const listed = catalogSourcesOf(type);
 
@@ -1213,7 +1213,6 @@ describe('the dual query form', () => {
   });
 
   it('refuses a nested source the node type cannot read, at the path it was written', () => {
-    // The QA reproduction for the nested spelling.
     const document = panelOf([{ type: 'requestTable', query: { source: 'spans' } }]);
 
     expect(rejectionLocations(document)).toEqual(['layout.0.query.source: invalid_value']);

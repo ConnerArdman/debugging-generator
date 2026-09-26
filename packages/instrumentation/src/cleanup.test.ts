@@ -2,14 +2,13 @@
  * Tests for `./cleanup.ts`: the inverse of the only sequence in this product
  * that writes into a developer's working tree.
  *
- * This suite is the unit-level proof of acceptance test 3 (AAP §0.8.4), and the
- * claim it has to establish is narrow enough to state in one line: **a file
- * comes back byte-for-byte, and a developer's edit is never overwritten**.
- * Everything below is one of those two halves, or the bookkeeping that makes
- * them provable later — the per-status reconciliation table, the reverse-order
- * unwinding of a chain across plan versions, and the rule that a backup is
- * deleted only after the restored content verified against the digest it was
- * recorded under (AAP §0.5.1, §0.4.2, §0.8.3).
+ * This suite is the unit-level proof of the cleanup guarantee, and the claim it
+ * has to establish is narrow enough to state in one line: **a file comes back
+ * byte-for-byte, and a developer's edit is never overwritten**. Everything
+ * below is one of those two halves, or the bookkeeping that makes them provable
+ * later — the per-status reconciliation table, the reverse-order unwinding of a
+ * chain across plan versions, and the rule that a backup is deleted only after
+ * the restored content verified against the digest it was recorded under.
  *
  * ## Three habits, each load-bearing
  *
@@ -133,7 +132,7 @@ const TARGET_SYMBOL = 'planCycleSegments';
  *
  * What makes the chain case possible: a follow-up plan version patching this
  * symbol writes over content the first version produced, so its record's
- * `originalHash` is the first record's `instrumentedHash` (AAP §0.4.2).
+ * `originalHash` is the first record's `instrumentedHash`.
  */
 const SECOND_SYMBOL = 'estimateSoakMinutes';
 
@@ -211,7 +210,7 @@ const FIXED_NOW = 1_777_000_000_000;
 /**
  * Statuses an owning session may be in while its records are reconciled.
  *
- * AAP §0.5.1 requires a pass to act on an open record *whatever* state its
+ * A reconciliation pass must act on an open record *whatever* state its
  * session is in, and `./cleanup.ts` cannot even ask: `ModificationJournal`
  * exposes no session status. Each case therefore notes one of these on the
  * journal as metadata the port cannot reach, and asserts the pass acted anyway —
@@ -597,9 +596,9 @@ interface BackupRemoval {
    * SHA-256 of the watched file at the moment of the call, or `undefined` when
    * no file is watched or it is not there.
    *
-   * This is the ordering proof AAP §0.5.1 asks for: a backup may be deleted
-   * only *after* the restored content verified, so at the moment of the delete
-   * the file must already hold the recorded original.
+   * This is the proof of deletion order: a backup may be deleted only *after*
+   * the restored content verified, so at the moment of the delete the file must
+   * already hold the recorded original.
    */
   readonly watchedDigest: string | undefined;
 }
@@ -1070,7 +1069,7 @@ describe('applying a patch and reverting it', () => {
     expect(outcome.skipped).toEqual([]);
     expect(outcome.failures).toEqual([]);
 
-    // The claim of acceptance test 3, asserted on the bytes and on the digest.
+    // The cleanup guarantee, asserted on the bytes and on the digest.
     expectFileBytes(patched.path, patched.originalBytes);
     expect(digestOf(patched.path)).toBe(patched.record.originalHash);
 
@@ -1181,7 +1180,7 @@ describe('a developer edit on top of an instrumented file', () => {
     expect(conflict.backupPath).toBe(patched.record.backupPath);
     expect(conflict.message).toContain(TARGET_FILE);
 
-    // The three-way view of AAP 0.5.1: what the tool did, what the developer
+    // The three-way view of a conflict: what the tool did, what the developer
     // did on top of it, and the net divergence from the pristine file.
     expect(conflict.diffs?.originalToInstrumented).toBeTypeOf('string');
     expect(conflict.diffs?.instrumentedToCurrent).toContain(DEVELOPER_EDIT.trim());
@@ -1294,9 +1293,10 @@ describe('a chain of plan versions over one file', () => {
       planVersion: 2,
     });
 
-    // AAP 0.4.2: the delta's record replaced the earlier patch's output, so its
-    // `originalHash` is that output's digest and its backup holds the
-    // once-patched bytes rather than the pristine ones.
+    // A delta on an already-instrumented file chains onto the earlier record:
+    // it replaced the earlier patch's output, so its `originalHash` is that
+    // output's digest and its backup holds the once-patched bytes rather than
+    // the pristine ones.
     expect(second.record.previousRecordId).toBe(first.record.id);
     expect(second.record.originalHash).toBe(first.record.instrumentedHash);
     expect(second.record.planVersion).toBe(2);
@@ -1533,8 +1533,8 @@ describe('a chain of plan versions over one file', () => {
     const mark = world.mark();
     const outcome = await cleanupSession(world.sessionId, world.context);
 
-    // Link 3 came back, but link 2's conflict is outstanding, and that is what
-    // the verdict reports (AAP §0.5.5).
+    // Link 3 came back, but link 2's conflict is outstanding, and an
+    // outstanding conflict makes the verdict `conflict`.
     expect(outcome.status).toBe('conflict');
     expect(outcome.restored.map((record) => record.id)).toEqual([third.record.id]);
     expect(outcome.skipped.map((record) => record.id)).toEqual([second.record.id, first.record.id]);
@@ -1910,7 +1910,7 @@ describe('a file whose records do not form a single chain', () => {
   });
 
   it('treats a rolled-back layer as history, not a fork: the live layer, then its parent', async () => {
-    // AAP 0.4.2 rollback then retry: plan version 2 was layered on the applied
+    // Follow-up rollback then retry: plan version 2 was layered on the applied
     // root and rolled back by the installer (reverted, the root still applied),
     // and plan version 3 was then layered on the same root. One parent, two
     // children — but only one of them live, so the file has one reverse order.
@@ -2076,7 +2076,7 @@ describe('a file whose records do not form a single chain', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The reconciliation table of AAP 0.5.1
+ * The reconciliation table: one verdict per record status and file state
  * ---------------------------------------------------------------------------
  */
 
@@ -2129,7 +2129,7 @@ interface ReconcileCase {
 }
 
 /**
- * The table of AAP §0.5.1, one row per branch.
+ * The reconciliation table, one row per branch.
  *
  * `pending` and `failed` share the three-way reading — the write may or may not
  * have landed — while `applied` is restore-only, because for that record the
@@ -3509,7 +3509,7 @@ describe('a pass over two files, one of which was edited', () => {
     const outcome = await cleanupSession(world.sessionId, world.context);
 
     // The restore beside it does not soften the verdict: an edited file was
-    // left alone, so `cleanup.status` is `conflict` (AAP §0.5.5).
+    // left alone, so `cleanup.status` is `conflict`.
     expect(outcome.status).toBe('conflict');
     expect(outcome.completedAt).toBe(FIXED_NOW);
     expect(outcome.restored.map((record) => record.file)).toEqual([OTHER_FILE]);

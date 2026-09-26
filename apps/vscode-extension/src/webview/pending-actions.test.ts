@@ -115,6 +115,7 @@ const REQUEST_DRAFTS: Readonly<Record<WebviewRequestType, WebviewRequestDraft>> 
   dismissPairing: { type: 'dismissPairing' },
   launchDevServer: { type: 'launchDevServer' },
   retryStage: { type: 'retryStage', stage: 'investigate' },
+  loadModifications: { type: 'loadModifications' },
 };
 
 // ---------------------------------------------------------------------------

@@ -1354,15 +1354,110 @@ function combinedSignal(...signals: readonly (AbortSignal | undefined)[]): Abort
   return present.length === 1 ? present[0] : AbortSignal.any(present);
 }
 
-/** Whether a stored `cleanup` sub-object already says what `next` says. */
+/**
+ * The conflict-report fields that record *when* a pass looked rather than
+ * *what* it found, and so never make a stored report stale.
+ *
+ * The engine stamps `detectedAt` afresh on every pass that re-reports a
+ * retained conflict (AAP §0.5.1: "retained, backup kept, re-reported"), so
+ * comparing it would rewrite every conflicted session on every start. The
+ * stored stamp stays truthful — it is when this unchanged conflict was first
+ * detected — and as soon as any other field changes, the new report is written
+ * with its own stamp. Typed against the schema's keys, so renaming the field
+ * there fails to compile here instead of silently comparing it again.
+ */
+const PASS_CLOCK_CONFLICT_FIELDS: ReadonlySet<string> = new Set<keyof ModificationConflict>([
+  'detectedAt',
+]);
+
+/** No field is exempt below the top level of a conflict report. */
+const NO_EXEMPT_FIELDS: ReadonlySet<string> = new Set<string>();
+
+/** Whether a value is a non-array object whose own keys can be compared. */
+function isFieldBag(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether two objects hold the same value under every own key of either,
+ * except the `exempt` ones.
+ *
+ * Keys are compared as a set, so their order is immaterial, and a key holding
+ * `undefined` equals an absent key: the stored side has been through the JSON
+ * round trip of `sessions.record`, which drops such keys and may reorder the
+ * rest, while the engine and the watcher compose reports with optional members
+ * spread in or left out. Iterating the union of keys — rather than a list of
+ * known fields — means a field added to `modificationConflictSchema` later is
+ * compared by default instead of being ignored.
+ */
+function sameFields(
+  left: Readonly<Record<string, unknown>>,
+  right: Readonly<Record<string, unknown>>,
+  exempt: ReadonlySet<string>,
+): boolean {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+
+  for (const key of keys) {
+    if (!exempt.has(key) && !sameJsonValue(left[key], right[key])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Whether two JSON-shaped values say the same thing: arrays element by element
+ * with order significant, objects by {@link sameFields} with nothing exempt,
+ * everything else by `Object.is`.
+ */
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) {
+    return true;
+  }
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) {
+      return false;
+    }
+
+    // Held as `unknown` elements, so nothing typed `any` escapes the narrowing.
+    const leftItems: readonly unknown[] = left;
+    const rightItems: readonly unknown[] = right;
+
+    return (
+      leftItems.length === rightItems.length &&
+      leftItems.every((item, index) => sameJsonValue(item, rightItems[index]))
+    );
+  }
+
+  return isFieldBag(left) && isFieldBag(right) && sameFields(left, right, NO_EXEMPT_FIELDS);
+}
+
+/**
+ * Whether a stored `cleanup` sub-object already carries the verdict `next`
+ * states: the same status, the same number of conflicts, and at every index a
+ * conflict report equal to `next`'s in every field — reason, hashes, backup
+ * path, message, diffs and any field the schema gains — except the pass-clock
+ * fields of {@link PASS_CLOCK_CONFLICT_FIELDS}.
+ *
+ * Order is significant, because it is the order both user interfaces list the
+ * conflicts in. `completedAt` is not compared either: like `detectedAt`, it
+ * says when a pass ran, and every pass has a new one. A record id alone is not
+ * enough — the same record re-reported as `backup-missing` after reading
+ * `content-changed`, or with a new digest after a second edit, is a different
+ * verdict the session must carry (AAP §0.5.1).
+ */
 function cleanupUnchanged(stored: SessionRecord['cleanup'], next: SessionCleanupOutcome): boolean {
   if (stored.status !== next.status || stored.conflicts.length !== next.conflicts.length) {
     return false;
   }
 
-  return stored.conflicts.every(
-    (conflict, index) => conflict.recordId === next.conflicts[index]?.recordId,
-  );
+  return stored.conflicts.every((conflict, index) => {
+    const incoming = next.conflicts[index];
+
+    return incoming !== undefined && sameFields(conflict, incoming, PASS_CLOCK_CONFLICT_FIELDS);
+  });
 }
 
 /** The session-record form of an outcome: `completedAt` only for a finished pass. */
@@ -1415,9 +1510,17 @@ interface ReconcileRuntime {
  * Records one session's cleanup verdict that no `SessionManager.end` is
  * waiting to record — a start-up reconciliation's, or a dormancy upgrade's —
  * through the manager when it exists, otherwise as the `cleanup` sub-object
- * alone (never the status, which only the manager writes). A verdict the
- * session already carries is not written again, which is what keeps a second
- * start over a reconciled store silent.
+ * alone (never the status, which only the manager writes).
+ *
+ * A verdict the session already carries is not written again, which is what
+ * keeps a second start over a reconciled store silent. "Already carries" is
+ * {@link cleanupUnchanged}: the same status and, index for index, conflict
+ * reports equal in every field but the pass clocks (`detectedAt`, and the
+ * outcome's `completedAt`), which a re-reported conflict gets anew on every
+ * pass. Any other change to a report — a new reason, digest, backup path,
+ * message or diff for the same record — is written and, through the manager,
+ * broadcast, so the stored report and its replay describe the file as it
+ * stands now.
  */
 async function deliverVerdict(
   deps: Pick<StartupReconciliationDeps, 'sessions' | 'outcomeSink'>,

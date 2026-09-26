@@ -1,10 +1,11 @@
 // ---------------------------------------------------------------------------
 // Tests for `scripts/check-no-hardcoding.mjs` - the static half of the
-// "No Hardcoded Behavior" guarantee (AAP 0.5.4).
+// "No Hardcoded Behavior" guarantee (`docs/ARCHITECTURE.md` section 3
+// describes the gate; the behavioural half is the deterministic-provider and
+// generalization tests).
 //
-// These four cases are the only automated evidence that the product's central
-// promise is mechanically enforced, so AAP 0.5.4's wording is the acceptance
-// criteria for this file, verbatim:
+// Four cases are the static guard's required acceptance cases, and this is
+// their requirement, verbatim:
 //
 //   "scripts/check-no-hardcoding.test.mjs asserts: a deliberate cheat (a branch
 //    on RecommendationsRail) fails; a prompt-level cheat (a prompt file naming a
@@ -32,12 +33,11 @@
 //     `apps/demo-app`, and the policy is still enforced against product source
 //     then.
 //   * "the committed policy is the generator's output, byte for byte" - the
-//     policy is a generated artifact (AAP 0.5.4), so the same names in a
-//     different order, a name listed twice, a reformatted file and a
-//     hand-written provenance field are each drift, even though none of them
-//     changes which names the gate matches. A comparison of membership alone
-//     passes every one of them and leaves a committed artifact no regeneration
-//     reproduces.
+//     policy is a generated artifact, so the same names in a different order,
+//     a name listed twice, a reformatted file and a hand-written provenance
+//     field are each drift, even though none of them changes which names the
+//     gate matches. A comparison of membership alone passes every one of them
+//     and leaves a committed artifact no regeneration reproduces.
 //   * "the scan fails closed" - an unlistable directory, an unreadable,
 //     undecodable or oversized file, a symbolic link where a scanned file was
 //     expected, and a corpus the harvest could only partly read each stop the
@@ -387,9 +387,9 @@ if (!canBeDeniedByMode) {
  * the given overrides merged over the real one.
  *
  * Why it exists: an unlistable directory is a fail-closed path - the scan must
- * stop rather than report a tree it could not read as clean (AAP 0.5.4) - and a
- * mode bit cannot provoke it for a privileged account, which is what `chmod`
- * with root leaves untested. Injecting the failure asserts the propagation on
+ * stop rather than report a tree it could not read as clean - and a mode bit
+ * cannot provoke it for a privileged account, which is what `chmod` with root
+ * leaves untested. Injecting the failure asserts the propagation on
  * every account, so the guarded `chmod` case becomes a second opinion instead of
  * the only coverage the path has.
  *
@@ -577,14 +577,14 @@ function astCase() {
 }
 
 /* -------------------------------------------------------------------------------------------------
- * AAP 0.5.4 case 1: a deliberate cheat fails
+ * Case 1: a deliberate cheat fails
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The forbidden pattern of AAP 0.1.2, written as a product file would have to
- * write it to work: a pre-authored panel for a demo component, selected by
- * matching the developer's question. It trips two rules at once, which is the
- * point - the gate does not depend on either half alone.
+ * The forbidden shortcut, written as a product file would have to write it to
+ * work: a pre-authored panel for a demo component, selected by matching the
+ * developer's question. It trips two rules at once, which is the point - the
+ * gate does not depend on either half alone.
  */
 const DELIBERATE_CHEAT = source(
   "import type { PanelSpec } from '@debuggen/panel-schema';",
@@ -686,7 +686,7 @@ describe('case 1: a deliberate cheat fails', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * AAP 0.5.4 case 2: a prompt-level cheat fails
+ * Case 2: a prompt-level cheat fails
  * ---------------------------------------------------------------------------------------------- */
 
 /** A versioned prompt that names a demo route instead of describing the answer's shape. */
@@ -801,7 +801,7 @@ describe('case 2: a prompt-level cheat fails', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * AAP 0.5.4 case 3: a legitimate overlap passes
+ * Case 3: a legitimate overlap passes
  * ---------------------------------------------------------------------------------------------- */
 
 /** A product primitive of the design system. `Button` is generic vocabulary, not demo knowledge. */
@@ -891,7 +891,7 @@ describe('case 3: a legitimate overlap passes', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * AAP 0.5.4 case 4: `--update` cannot be blessed by a leak
+ * Case 4: `--update` cannot be blessed by a leak
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -924,7 +924,7 @@ const DEMO_ROUTE_HANDLER = source(
   '}',
 );
 
-/** The independent corpus (AAP 0.5.4), whose names are subtracted from the policy. */
+/** The independent corpus, whose names are subtracted from the policy. */
 const FIXTURE_FORMAT = source(
   'export function formatUnitPrice(cents: number) {',
   '  return String(cents);',
@@ -1062,8 +1062,9 @@ describe('demo-import and demo-path', () => {
   });
 
   it('scans every product tree', astCase(), async () => {
-    // Pinned to the trees AAP 0.5.4 names, so shrinking the list is a failure here rather than
-    // a silently narrower gate: the expectations below are derived from the constant.
+    // Pinned to the four product trees the gate is required to cover, so shrinking the list is a
+    // failure here rather than a silently narrower gate: the expectations below are derived from
+    // the constant.
     expect([...PRODUCT_TREES]).toEqual([
       'apps/local-service',
       'apps/vscode-extension',
@@ -1910,9 +1911,9 @@ describe('policy-stale', () => {
  * the policy's canonical form
  * ---------------------------------------------------------------------------------------------- */
 
-// AAP 0.5.4 makes the policy a generated artifact: `--update` from the demo's
-// code index is the only way it is produced, it is committed and reviewed, "and
-// the check fails if the committed policy is stale". The committed BYTES are
+// The policy is a generated artifact: `--update` from the demo's code index is
+// the only way it is produced, it is committed and reviewed, and the check
+// fails if the committed policy is stale. The committed BYTES are
 // therefore the contract - the file is prettier-ignored precisely so its
 // generator owns them - and the cases below are the ones a comparison of
 // membership alone lets through: the same names in a different order, a name
@@ -2258,9 +2259,9 @@ describe('the committed policy artifact', () => {
   it('lists only identifiers the harvest rule keeps', async () => {
     // An entry `--update` could not have produced - a generic name added by
     // hand, an all-caps constant, a single-token name - would fail honest
-    // product code under a rule AAP 0.5.4 does not grant. `loadPolicy()` is used
-    // rather than `JSON.parse` so the committed document also has to satisfy the
-    // shape the gate refuses to run without.
+    // product code on a name the harvest rule never admits. `loadPolicy()` is
+    // used rather than `JSON.parse` so the committed document also has to
+    // satisfy the shape the gate refuses to run without.
     const policy = await loadPolicy(DEFAULT_ROOT);
     const rejected = policy.identifiers.filter((name) => !isDemoSpecificIdentifier(name));
 
@@ -2272,9 +2273,9 @@ describe('the committed policy artifact', () => {
   });
 
   it('shares no entry with the committed allowlist', async () => {
-    // `--update` subtracts the allowlist (AAP 0.5.4), so an overlap means the
-    // committed policy is not a faithful regeneration of its corpus. `check()`
-    // only warns about that and enforces the rest, which is the right runtime
+    // `--update` subtracts the allowlist, so an overlap means the committed
+    // policy is not a faithful regeneration of its corpus. `check()` only
+    // warns about that and enforces the rest, which is the right runtime
     // behaviour and the reason nothing else in the suite fails on it.
     const policy = await loadPolicy(DEFAULT_ROOT);
     const allowlist = loadAllowlist(DEFAULT_ROOT);
@@ -2799,9 +2800,9 @@ describe('fail-closed scanning', () => {
     // The same contract as the case above, on the account this suite actually
     // runs as: a directory the walk could not list is vocabulary that went
     // unchecked, so the run must stop with the environment exit code instead
-    // of reporting a clean tree (AAP 0.5.4). The failure is injected into the
-    // scanner's `readdirSync` rather than provoked with `chmod`, because uid 0
-    // bypasses mode bits and the guarded case then asserts nothing.
+    // of reporting a clean tree. The failure is injected into the scanner's
+    // `readdirSync` rather than provoked with `chmod`, because uid 0 bypasses
+    // mode bits and the guarded case then asserts nothing.
     const root = makeTree({
       ...artifacts({ identifiers: ['RecommendationsRail'] }),
       'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
@@ -2876,9 +2877,10 @@ describe('fail-closed scanning', () => {
     const root = makeTree({
       ...artifacts({ identifiers: ['RecommendationsRail'] }),
       'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
-      // Malformed TypeScript. The parser recovers and returns a partial tree
-      // instead of throwing, so this file used to count as scanned: a demo
-      // identifier inside the region it gave up on would never be reported.
+      // Malformed TypeScript. The parser recovers with a partial tree rather
+      // than throwing, so a file with syntax diagnostics must be recorded as
+      // `unparseable` and never counted as scanned - a demo identifier in the
+      // region the parser gave up on would otherwise go unreported.
       'apps/local-service/src/panels/broken.ts': source('export const broken = ;'),
     });
 
@@ -2962,8 +2964,9 @@ describe('fail-closed scanning', () => {
   });
 
   it('keeps an absent tree an informational note rather than a failure', astCase(), async () => {
-    // Only one of the product trees exists: this is the clone shape the gate
-    // runs on before every surface has landed, and it is not a scan failure.
+    // Only one of the product trees exists, as in a partial or sparse checkout:
+    // each absent tree contributes no files and is reported as a note, and the
+    // run still passes because the one present tree was scanned.
     const root = makeTree({
       ...artifacts({ identifiers: ['RecommendationsRail'] }),
       'packages/panel-schema/src/spec.ts': source('export const version = 1;'),

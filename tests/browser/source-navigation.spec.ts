@@ -1,6 +1,6 @@
 /**
- * Click-to-source, end to end (AAP §0.8.3 "`source-navigation`", §0.8.4
- * acceptance test 1): clicking a `SourceLink` in the DevTools panel makes the
+ * Click-to-source, end to end (docs/ARCHITECTURE.md, section 11.3 "A click,
+ * end to end"): clicking a `SourceLink` in the DevTools panel makes the
  * local service forward a `source.open` whose `location` names the right
  * project-relative file, line and column — observed where the editor observes
  * it. This spec stands in for the VS Code client: the fixtures' `editorClient`
@@ -45,8 +45,9 @@
  *    server's source map (`apps/local-service/src/source/resolve.ts`, route
  *    `source-map`, over `packages/code-analysis/src/source-map/resolver.ts`);
  * 3. otherwise the test fails, naming the expected location and the route that
- *    should have produced it. A missing chip is a product defect against AAP
- *    §0.8.4, never a reason to relax the assertion.
+ *    should have produced it. A missing chip is a product defect — clicking a
+ *    runtime row must open the editor at its call site — never a reason to
+ *    relax the assertion.
  *
  * The expected line is read from the copy the service serves (the session's
  * `projectRoot`) at click time, with the fixture helper `findLineContaining`:
@@ -92,9 +93,9 @@
  * before each click, the panel pages are closed by `openPanelPage`'s teardown
  * and every session is ended by the `sessions` fixture's tracked cleanup.
  *
- * Constraints (AAP §0.3.4, §0.5.4, §0.9.2): only the fixture app's vocabulary
- * appears; no credential is read or written here; the service runs with the
- * deterministic provider and nothing leaves localhost.
+ * Constraints: only the fixture app's vocabulary appears; no credential is
+ * read or written here; the service runs with the deterministic provider and
+ * nothing leaves localhost.
  */
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -152,7 +153,7 @@ const PING_PATH = '/api/ping';
 /** The kind the browser agent gives a `fetch` span (the live tail's kind badge reads it verbatim). */
 const FETCH_KIND = 'fetch';
 
-/** Generic questions about the click, in the fixture app's own terms (AAP §0.5.4). */
+/** Generic questions about the click, in the fixture app's own terms, naming no other app. */
 const ROUND_TRIP_QUESTION = 'Why does clicking the Run check button take so long to show a result?';
 const CONTRACT_QUESTION = 'Which code runs when the Run check button is clicked?';
 
@@ -457,7 +458,7 @@ async function locateCallSiteChip(
       "That location should come from the source-map route: the fetch initiator stack the browser agent captures (packages/telemetry/src/browser/fetch.ts), mapped through the dev server's chunk source map (packages/code-analysis/src/source-map/resolver.ts) and attached as TelemetryEvent.source by apps/local-service/src/source/resolve.ts — or from a hypothesis' suggested location resolved to the same call site.",
       `Chips in the generated panel: ${panelTargets.length === 0 ? 'none' : panelTargets.join(', ')}.`,
       `Live-tail rows naming ${PING_PATH}: ${String(tailRows)}; chips in the EventDetails drawer: ${drawerTargets.length === 0 ? 'none' : drawerTargets.join(', ')}.`,
-      'This is a product defect against AAP §0.8.4 acceptance test 1 (clicking a runtime row opens the editor at the call site), not a reason to relax this assertion.',
+      'This is a product defect — clicking a runtime row must open the editor at its call site — not a reason to relax this assertion.',
     ].join(' '),
   );
 }

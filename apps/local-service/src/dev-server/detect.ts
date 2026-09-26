@@ -268,15 +268,45 @@ export const PRELOAD_DEPENDENT_SIGNALS: readonly CaptureSignal[] = Object.freeze
   ),
 );
 
+/** One framework's dev CLI, as {@link FRAMEWORK_DEV_CLIS} lists it. */
+export interface FrameworkDevCli {
+  /** The framework whose dev server the CLI starts. */
+  readonly framework: DevServerFramework;
+  /** The binary a script or a launch command names: `next`. */
+  readonly binary: string;
+  /** The subcommand that starts the dev server: `dev`. */
+  readonly subcommand: string;
+  /**
+   * The binary's script inside its package, as found under a `node_modules`
+   * directory: `next/dist/bin/next` — what `node <…>/node_modules/next/dist/bin/next
+   * dev` runs.
+   */
+  readonly packageBin: string;
+}
+
 /**
- * Framework dev commands recognised inside a script, as binary + subcommand.
+ * The framework dev CLIs this product knows — the one table both halves of
+ * the dev-server module read:
  *
- * Matching the *shape* of the invocation — not a whole-command literal and not
- * a script name — is what lets `dev:web`, `cross-env … next dev` or
- * `node node_modules/next/dist/bin/next dev` all be found in any project.
+ * - {@link selectDevScript} matches a script's command against each entry's
+ *   binary and subcommand. Matching the *shape* of the invocation — not a
+ *   whole-command literal and not a script name — is what lets `dev:web`,
+ *   `cross-env … next dev` or `node node_modules/next/dist/bin/next dev` all be
+ *   found in any project; the same match decides which scripts are the
+ *   project's {@link DevServerDetection.devServerScripts}.
+ * - The launcher's `checkLaunchCommand` accepts a request's command that runs
+ *   an entry's `binary` with its `subcommand`, Node running its `packageBin`
+ *   under a `node_modules` directory with its `subcommand`, or a
+ *   package-manager run of one of those dev-server scripts.
  */
-const FRAMEWORK_DEV_COMMANDS: readonly { readonly binary: string; readonly subcommand: string }[] =
-  Object.freeze([{ binary: 'next', subcommand: 'dev' }]);
+export const FRAMEWORK_DEV_CLIS: readonly FrameworkDevCli[] = Object.freeze([
+  Object.freeze({
+    framework: 'next',
+    binary: 'next',
+    subcommand: 'dev',
+    packageBin: 'next/dist/bin/next',
+  } as const),
+]);
 
 /** Hostnames {@link probeDevServer} accepts, as `URL.hostname` renders them. */
 const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '[::1]']);
@@ -470,6 +500,20 @@ export interface DevServerDetection {
   readonly packageManagerSource: DevServerPackageManagerSource;
   /** The script that starts the dev server, when one could be selected. */
   readonly devScript?: DevScriptSelection;
+  /**
+   * The names of the project's **dev-server scripts**: the selected
+   * {@link DevServerDetection.devScript}, plus every runnable script — own,
+   * string-valued, with a non-blank command — whose command invokes a
+   * {@link FRAMEWORK_DEV_CLIS} entry (`next dev`, matched as in
+   * {@link selectDevScript}), each once, sorted in code-unit order. Present
+   * exactly when the manifest was read (and then possibly empty); absent when
+   * there is none or it could not be used. The launcher accepts a request's
+   * package-manager run only for one of these names, so a request can start
+   * the project's dev server and nothing else the manifest declares — never
+   * `deploy`, `db:reset`, `lint` or a lifecycle script such as `postinstall`.
+   * Names only: no script's command ever leaves this module through it.
+   */
+  readonly devServerScripts?: readonly string[];
   /** One paste-ready POSIX-shell line that starts an instrumented dev server. */
   readonly relaunchCommand: string;
   /**
@@ -484,7 +528,12 @@ export interface DevServerDetection {
    * this project's dev server is not running, no other process holds the
    * session URL (`occupied` is absent) and a dev script was found. A launch
    * request that supplies its own `command` may still succeed when this is
-   * `false`.
+   * `false` for want of a dev script alone — provided the launcher's
+   * `checkLaunchCommand` accepts that command: a package-manager run of one
+   * of {@link DevServerDetection.devServerScripts}, the framework's own dev
+   * CLI, or Node running that CLI from a `node_modules` directory. Without a
+   * dev script there is no dev-server script either, so such a command can
+   * only be one of the framework forms.
    */
   readonly canLaunch: boolean;
   /** Human-readable notes on every degraded step, in the order they occurred. */
@@ -1244,6 +1293,25 @@ export function selectDevScript(
   return chosen === undefined ? undefined : { name: chosen[0], command: chosen[1] };
 }
 
+/**
+ * The names of a manifest's dev-server scripts, frozen, in code-unit order —
+ * {@link DevServerDetection.devServerScripts}: the selected `devScript` (even
+ * when it matched only by name, such as a `dev` running a wrapper), and every
+ * {@link runnableScripts} entry whose command invokes a framework dev command.
+ * A script that does neither — `deploy`, `lint`, `postinstall` — is not one.
+ */
+function devServerScriptNames(
+  manifest: Pick<TargetManifest, 'scripts'>,
+  devScript: DevScriptSelection | undefined,
+): readonly string[] {
+  const names = runnableScripts(manifest.scripts)
+    .filter(([name, command]) => name === devScript?.name || invokesFrameworkDevCommand(command))
+    .map(([name]) => name);
+  // `runnableScripts` is already sorted and yields each own key once; the
+  // selected script is always one of its entries, so no second pass is needed.
+  return Object.freeze(names);
+}
+
 /** Own, string-valued, non-blank scripts, sorted by name in code-unit order. */
 function runnableScripts(scripts: Readonly<Record<string, string>>): [string, string][] {
   const entries: [string, string][] = [];
@@ -1265,7 +1333,7 @@ function compareCodeUnits(left: string, right: string): number {
 
 /**
  * Whether a script command runs a framework dev command: a token whose binary
- * name is a {@link FRAMEWORK_DEV_COMMANDS} binary, followed — past any
+ * name is a {@link FRAMEWORK_DEV_CLIS} binary, followed — past any
  * `-`-prefixed flags — by that binary's dev subcommand.
  */
 function invokesFrameworkDevCommand(command: string): boolean {
@@ -1276,7 +1344,7 @@ function invokesFrameworkDevCommand(command: string): boolean {
 
   return tokens.some((token, index) => {
     const binary = binaryNameOf(token);
-    return FRAMEWORK_DEV_COMMANDS.some(({ binary: expected, subcommand }) => {
+    return FRAMEWORK_DEV_CLIS.some(({ binary: expected, subcommand }) => {
       if (binary !== expected) {
         return false;
       }
@@ -1798,6 +1866,9 @@ async function runDetection(
     packageManager: packageManager.id,
     packageManagerSource: packageManager.source,
     ...(devScript === undefined ? {} : { devScript }),
+    ...(manifest === undefined
+      ? {}
+      : { devServerScripts: devServerScriptNames(manifest, devScript) }),
     relaunchCommand,
     relaunchHint,
     // An occupied address is not launchable: a child bound to the same port

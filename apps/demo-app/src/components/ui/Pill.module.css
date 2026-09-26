@@ -44,17 +44,8 @@
  *
  * `min-height` is what keeps the filter row even: only some categories have glyph art, a glyph is
  * taller than the 13px label, and without a floor the chips with art would stand taller than the
- * ones without. The floor is the shared compact-control token `--ls-control-sm`, which is the same
- * 32px this file previously took from the top of the spacing scale: the value has not moved, but a
- * chip, a `sm` Button and a `sm` Input now read one property instead of three, so a toolbar that
- * mixes all three lines them up by construction rather than by coincidence.
- *
- * BLITZY [A11Y]: the resulting target is 32px tall, below the 44x44 touch-target recommendation.
- * The height is the compact-control floor the shared token contract fixes for a chip, so it is
- * implemented as specified rather than silently enlarged; the chips sit in a pointer-and-keyboard
- * storefront view and every filter they apply is also reachable from the page's own controls. The
- * surfaces that can carry a full 44px target read `--ls-target-min` instead. Flagged for design
- * review. */
+ * ones without. The floor is the shared compact-control token `--ls-control-sm`, so a chip, a `sm`
+ * Button and a `sm` Input read one property and a toolbar that mixes all three lines them up. */
 .root {
   display: inline-flex;
   align-items: center;
@@ -161,8 +152,8 @@ button.root {
 
 /* Disabled chips keep their colours and lose their affordance, so a row of filters stays legible
  * while one of them is unavailable. Only the toggle path can match this. The dimming is the shared
- * `--ls-disabled-opacity` - the same 0.55 this rule already used, now named in `app/globals.css` so
- * that Button, Pill, Input and Select fade an unavailable control by one amount. */
+ * `--ls-disabled-opacity` declared in `app/globals.css`, so Button, Pill, Input and Select fade an
+ * unavailable control by one amount. */
 .root:disabled {
   cursor: not-allowed;
   opacity: var(--ls-disabled-opacity, 0.55);
@@ -172,10 +163,9 @@ button.root {
  * disabled button, so the guard is what keeps the fill from implying it can be pressed.
  *
  * Deliberately not wrapped in a `(hover: hover)` capability query. That query is the usual guard
- * against a chip staying in its hover appearance after a tap, but headless Chrome reports
- * `hover: none`, which is the browser this repository's own suites drive - a gated rule would be
- * unobservable in exactly the client that checks it, for a storefront whose hover step is a 3%
- * luminance shift on a pointer-and-keyboard view. The rule is therefore declared plainly.
+ * against a chip staying in its hover appearance after a tap, but a browser that reports
+ * `hover: none` would then never show the state, and the hover step here is only a 3% luminance
+ * shift on a pointer-and-keyboard view. The rule is therefore declared plainly.
  *
  * The selected rule is repeated at higher specificity rather than left to the base rule above:
  * an inverted chip lightens to the slate step of the palette instead of falling back to the
@@ -191,12 +181,11 @@ button.root {
 }
 
 /* Pressed. A chip and a Button sit side by side in this storefront - the catalog toolbar has both
- * in one row - and until now only one of them answered a press, so a reader pressing a chip got no
- * confirmation that the press had landed at all. The affordance is deliberately the Button's: one
- * pixel of travel plus a deeper fill, on the toggle path only, because a labelling `<span>` accepts
- * no press. Ungated by pointer capability, exactly as Button's pressed rules are: `:active` comes
- * from a touch, a mouse button and the Space key alike, so a device that reports `hover: none` must
- * still get it.
+ * in one row - so a chip answers a press the way a Button does and confirms that the press has
+ * landed. The affordance is deliberately the Button's: one pixel of travel plus a deeper fill, on
+ * the toggle path only, because a labelling `<span>` accepts no press. Ungated by pointer
+ * capability, exactly as Button's pressed rules are: `:active` comes from a touch, a mouse button
+ * and the Space key alike, so a device that reports `hover: none` must still get it.
  *
  * The border is mixed from `currentColor` rather than from `--ls-border`: every tone paints its
  * border with its own tone colour, and a flat hairline-and-ink mix would erase that tone for as

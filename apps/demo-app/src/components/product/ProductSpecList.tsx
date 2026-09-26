@@ -44,7 +44,7 @@ import styles from './ProductSpecList.module.css';
  * The test is typographic and never a label match. The server decides what a product's rows are
  * called - `SKU` today, a manufacturer part number or a catalogue reference tomorrow, in whatever
  * wording and casing the payload carries - so a list of blessed labels here would silently miss
- * the next one and would tie this component to the catalog service's vocabulary. The shape of the
+ * the next one and would tie this component to the catalog service's naming. The shape of the
  * value is the property that actually matters to a reader: a code is read character by character
  * and compared against a printed one, which is what the monospaced face, the fixed digit pitch
  * and the smaller step are for, while a sentence is read as words.
@@ -56,11 +56,8 @@ import styles from './ProductSpecList.module.css';
  * fails the second, so prose keeps the prose treatment.
  *
  * Declared at module scope so the expression is compiled once for the whole list rather than per
- * row, and named in the constant case this repository harvests no vocabulary from: an
- * upper-snake name carries no camel-case boundary, so it is not a multi-token demo identifier
- * that `scripts/check-no-hardcoding.mjs` would add to its policy. The pattern is anchored and
- * carries no capturing group, and `test` keeps no state on it - there is no `g` flag, so
- * `lastIndex` never advances between rows.
+ * row. The pattern is anchored and carries no capturing group, and `test` keeps no state on it -
+ * there is no `g` flag, so `lastIndex` never advances between rows.
  */
 const IDENTIFIER_VALUE = /^(?=\S+$)(?:\S*[0-9]\S*|[^a-z]+)$/;
 

@@ -905,7 +905,7 @@ describe('agent-control logs page-supplied document ids by fingerprint only', ()
       fingerprintPageId(FORGED_DOCUMENT_ID),
       fingerprintPageId(FORGED_DOCUMENT_ID_2),
     ]);
-    // Only log fields changed: the relay and the memo still carry the raw id.
+    // Only log fields carry a fingerprint; the relay and the memo retain the raw id.
     expect(c.send.mock.calls.map(([, payload]) => payload)).toMatchObject([
       { tabId: TAB_ID, documentId: FORGED_DOCUMENT_ID },
       { tabId: TAB_ID, documentId: FORGED_DOCUMENT_ID_2 },

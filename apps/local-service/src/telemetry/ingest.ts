@@ -17,6 +17,11 @@
  * 1. **Bound the batch.** The batch must be an array of at most
  *    {@link MAX_INGEST_BATCH} elements (or the lower `maxBatch` a caller
  *    configured). Anything else is a typed `Err`; a batch is never truncated.
+ *    An empty batch is answered with an empty report and touches nothing,
+ *    unless it is a **loss-only** batch: no events beside a positive loss
+ *    report, which a producer sends when no later batch will carry its loss (at
+ *    a capture's end). A loss-only batch goes through steps 1, 2 and 2½ only,
+ *    then straight to step 11.
  * 2. **Resolve attribution once.** `attributor.resolveBatch(context)` names the
  *    session and the open capture window from the batch's *transport* identity
  *    (the bound tab, or the `server-agent` credential's scoped project). A
@@ -32,8 +37,10 @@
  *    evidence is incomplete rather than look whole. It is recorded here, before
  *    the batch's own events are processed, because the loss happened whatever
  *    becomes of them; a refused batch records nothing, since the capture its
- *    loss belongs to is exactly what could not be established. A ledger failure
- *    is logged and never fails the batch.
+ *    loss belongs to is exactly what could not be established — a loss-only
+ *    batch included. A ledger failure is logged and never fails the batch. For
+ *    a loss-only batch this is the whole of its work: no secret is read and
+ *    nothing is parsed, persisted, correlated or tailed.
  * 3. **One request-key hasher per batch.** The session's secret is read from
  *    the store and `createRequestKeyHasher` is called once, so the
  *    non-extractable HMAC key is imported once per batch, not once per event.
@@ -147,12 +154,12 @@
  * held back. Held-back occurrences that no later record carries are written as
  * a trailing summary (`trailingSummary: true`) one interval later, so a flood
  * that stops is still reported. The debug records of batches that stored
- * nothing — empty, dropped whole, or entirely malformed — pass through a
- * separate throttle of the same shape, keyed by their producer (and session,
- * once attributed), so the first such batch of every producer in an interval
- * is reported whole and only its repeats are summarised; the debug record of
- * a batch that stored evidence is not throttled, being bounded by the
- * evidence itself. Keys are never written.
+ * nothing — empty, loss-only, dropped whole, or entirely malformed — pass
+ * through a separate throttle of the same shape, keyed by their producer (and
+ * session, once attributed), so the first such batch of every producer in an
+ * interval is reported whole and only its repeats are summarised; the debug
+ * record of a batch that stored evidence is not throttled, being bounded by
+ * the evidence itself. Keys are never written.
  *
  * ## Time base
  *
@@ -2486,7 +2493,8 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
   }
 
   /**
-   * The pipeline of the module notes, steps 1 to 11, in order.
+   * The pipeline of the module notes, steps 1 to 11, in order — a loss-only
+   * batch runs steps 1, 2 and 2½, then 11.
    *
    * @param reportedLoss The transport's `droppedCount`, as received; only the
    * browser transport carries one (step 2½).
@@ -2523,8 +2531,11 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
 
     const { source, received } = bounded.value;
     const state = newRunState(received);
+    // An event-less batch says something only as a loss report (see the module
+    // notes, step 1); only the browser transport carries one.
+    const lossOnly = received === 0 && isLossCount(reportedLoss) && reportedLoss > 0;
 
-    if (received === 0) {
+    if (received === 0 && !lossOnly) {
       emitDebugThrottled(
         log,
         throttleKey(DEBUG_CLASS.emptyBatch, unattributedScope(context, origin)),
@@ -2577,6 +2588,24 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
 
     // 2½. The producer's loss report, against the capture just resolved.
     await recordLoss(attribution, reportedLoss, state, scoped, originFields);
+
+    // A loss-only batch ends here, at step 11: it holds nothing to key, parse,
+    // persist, correlate or tail, so the session's secret is not even read.
+    if (lossOnly) {
+      emitDebugThrottled(
+        scoped,
+        throttleKey(DEBUG_CLASS.storedNothing, runScope(state), unattributedScope(context, origin)),
+        'loss-only telemetry batch accounted',
+        {
+          ...originFields,
+          received,
+          ...(state.producerDropped === undefined
+            ? {}
+            : { producerDropped: state.producerDropped }),
+        },
+      );
+      return ok(toReport(state));
+    }
 
     // 3. One request-key hasher per batch, from the session's secret.
     const hasher = await batchHasher(sessionId);

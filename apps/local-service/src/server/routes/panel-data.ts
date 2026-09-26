@@ -30,10 +30,23 @@
  * 4. the session must exist, and the whole per-session access matrix must allow
  *    the principal (`requireSessionAccess`: an editor by its announced workspace
  *    scope, a DevTools client by its binding);
- * 5. the body must satisfy protocol's declared request schema — panel-schema's
- *    `dataQuerySchema` itself, bound by identity in `HTTP_ROUTES`;
+ * 5. the body must satisfy protocol's declared request schema for the
+ *    operation, `panelDataRequestSchema` (bound in `HTTP_ROUTES`):
+ *    panel-schema's strict `DataQuery` extended with one optional `panelId`,
+ *    the id of the rendered panel the node belongs to. The route lifts
+ *    `panelId` off the query into the resolver's `PanelDataContext` and hands
+ *    the resolver the `DataQuery` alone. With a `panelId` the resolver reads
+ *    that panel's own capture — `409` when the session does not hold the panel
+ *    — and without one the live capture: the open one, else the most recent.
+ *    A body refused here is answered only after the revocation fence (step 7)
+ *    has passed, because reading it awaited the client;
  * 6. `PanelDataResolver.resolve` (`../../panels/data.ts`) answers the query;
- * 7. its `DataResult` is checked against protocol's `dataResultSchema` and
+ * 7. the **revocation fence**: the credential the middleware resolved the
+ *    principal from must still be live (`AuthService.requireLiveCredential`),
+ *    checked after each `await` that precedes a reply — the body read when the
+ *    body is refused, the resolver otherwise — and before that reply is built,
+ *    a refused body and the resolver's own failure included;
+ * 8. its `DataResult` is checked against protocol's `dataResultSchema` and
  *    against the query's own `source`, then sent **unchanged**.
  *
  * Everything that decides what the answer contains belongs to the resolver and
@@ -41,22 +54,37 @@
  * aggregates, the stable `id` tie-breaker every sort ends in, the page defaults
  * (`DATA_QUERY_DEFAULT_LIMIT`, `DATA_QUERY_DEFAULT_OFFSET`), the clamp at
  * `DATA_QUERY_MAX_LIMIT`, the `total` counted before paging and the
- * `nextOffset` echo. So is the choice of capture. The body may name the rendered
- * panel the query was sent for (`panelId`, protocol's `PanelDataRequest`); the
- * route lifts it off the query into the resolver's context — the session and
- * that panel, nothing else — and hands the resolver the `DataQuery` alone. The
- * resolver's documented rule then binds a panel's reads to the capture that
- * panel was generated from, and reads live evidence — the session's open
- * capture, else its most recent one — when no panel is named, so a panel still
- * on screen after a newer capture started keeps drawing its own evidence.
- * Re-deriving any of that here would be a second implementation of the property
- * the multi-page walk exists to prove: that paging neither duplicates nor skips
- * a row.
+ * `nextOffset` echo. So is the choice of capture: the route's context carries
+ * the session and the named panel, nothing else (step 5), and the resolver's
+ * documented rule binds a panel's reads to the capture that panel was
+ * generated from, so a panel still on screen after a newer capture started
+ * keeps drawing its own evidence. Re-deriving any of that here would be a
+ * second implementation of the property the multi-page walk exists to prove:
+ * that paging neither duplicates nor skips a row.
  *
  * The three single-value sources (`trace`, `componentTree`, `graph`) carry no
  * page and the array-valued ones always do; the route passes either shape
  * through exactly as the resolver built it and never adds, strips or rewrites a
  * paging field.
+ *
+ * ## The revocation fence
+ *
+ * The middleware resolves the principal once, before the handler runs; the
+ * handler then awaits the client's body, for as long as the client chooses,
+ * and the resolver's reads. A credential retired inside those waits — by
+ * `POST /credentials/rotate` on another connection (`AuthService.rotateAll`),
+ * by an expiry — must read nothing (AAP §0.5.6), and this route's one effect
+ * is disclosure: its reply. So every reply that follows an `await` is built
+ * only after the fence, with no `await` between the two: a body refused as
+ * unreadable, oversized, late or off-schema is fenced after its read, and
+ * everything the resolver answered is fenced after the resolver. The check and
+ * every retirement are synchronous, so no rotation can land between a fence
+ * that passed and the reply it guards. A retired or expired credential is
+ * answered `401` (`unknown-credential` / `expired-credential`), exactly as the
+ * middleware would have answered it; the verdict on its body, and whatever the
+ * resolver answered — evidence or a failure that describes the session — are
+ * discarded unsent. The resolver's reads may already have run; they change
+ * nothing, and nothing they read leaves the process.
  *
  * ## Success and failure (AAP §0.5.5)
  *
@@ -80,6 +108,8 @@
  * | paging value refused by the resolver | `400` | `PANEL_INVALID` |
  * | aggregate over more events than the resolver's ceiling | `400` | `PANEL_INVALID` |
  * | panel not held by the session, capture not the session's or not the panel's | `409` | `SESSION_INVALID_STATE` |
+ * | credential retired or expired while the request was in flight | `401` | `UNAUTHORIZED` |
+ * | revocation fence that could not read the credential, or threw | `500` | the failure's own code, fixed message |
  * | store failure, resolver defect, response drift | `500` | the failure's own code, fixed message |
  *
  * The body schema bounds `limit` at `DATA_QUERY_MAX_LIMIT` (panel-schema: "a
@@ -105,8 +135,8 @@
  * returns its handler keyed by operation id for `../http.ts` to register from
  * protocol's route table behind the auth middleware. It holds no state between
  * requests — no cache, no memoisation — reads no `process.env`, and opens no
- * database: the resolver, the session lookup and the binding lookup arrive by
- * injection from `main.ts` through `../http.ts`.
+ * database: the resolver, the session lookup, the binding lookup and the
+ * revocation fence arrive by injection from `main.ts` through `../http.ts`.
  */
 
 import type { Context, Handler } from 'hono';
@@ -137,6 +167,7 @@ import {
 } from '../auth.js';
 import type {
   AuthFailureReason,
+  AuthService,
   AuthenticatedOperation,
   Principal,
   PrincipalRole,
@@ -192,13 +223,13 @@ const SESSION_ID_PARAM = PANEL_DATA_ROUTE.params[0];
 /**
  * The largest request body this operation accepts, in bytes: sixteen kibibytes.
  *
- * A genuine body is one `DataQuery`: a source, a sort, two integers and a
+ * A genuine body is one `DataQuery` — a source, a sort, two integers and a
  * filter whose longest fields panel-schema bounds (a trace id, a component
- * name, a list drawn from the closed kind vocabulary) — well under two
- * kibibytes even at every bound. Sixteen leaves ample room while keeping the
- * route that every panel node calls from being made to buffer an arbitrarily
- * large body. A body declared or found larger is answered `413` without being
- * parsed.
+ * name, a list drawn from the closed kind vocabulary) — plus at most one
+ * `panelId` of sixty-four characters: well under two kibibytes even at every
+ * bound. Sixteen leaves ample room while keeping the route that every panel
+ * node calls from being made to buffer an arbitrarily large body. A body
+ * declared or found larger is answered `413` without being parsed.
  */
 export const MAX_PANEL_DATA_REQUEST_BODY_BYTES = 16 * 1024;
 
@@ -322,6 +353,15 @@ export interface PanelDataRoutesDeps {
 
   /** The tab bindings a DevTools principal acts through. */
   readonly bindings: PanelDataBindingLookup;
+
+  /**
+   * The access boundary's revocation fence, applied after the body read when
+   * the body is refused and after the resolver otherwise, before the reply is
+   * built (see the module documentation).
+   * The field name matches the sibling route modules' slices of the same
+   * service, so `../http.ts`'s dependency aggregate asks for one object.
+   */
+  readonly auth: Pick<AuthService, 'requireLiveCredential'>;
 
   /**
    * Where this module's diagnostics go; defaults to the no-op logger. Records
@@ -646,14 +686,16 @@ async function readJsonBody(c: Context<ServerEnv>): Promise<Result<unknown, Body
 
 /**
  * Reads and validates the body against protocol's route table — the same
- * `parseHttpRequest` the client SDK validates its outbound body with, so the
- * service accepts exactly the `DataQuery` a client can send and a panel node
- * can carry, with the optional id of the panel it belongs to. The rejection message is built by `describeZodIssues` from issue
- * paths and codes: a filter value, a trace id or a component name never
- * reaches it.
+ * `parseHttpRequest`, over the same `panelDataRequestSchema`, the client SDK
+ * validates its outbound body with — so the service accepts exactly what a
+ * client can send: the `DataQuery` a panel node carries and, optionally, the
+ * id of the panel the node belongs to. The rejection message is built by
+ * `describeZodIssues` from issue paths and codes: a filter value, a trace id
+ * or a component name never reaches it.
  *
  * @param c The request context.
- * @returns The validated query, or the refusal (`400`/`413`).
+ * @returns The validated body — the query and, when sent, the panel id — or
+ * the refusal (`400`/`408`/`413`).
  */
 async function readQuery(c: Context<ServerEnv>): Promise<Result<PanelDataRequest, BodyRejection>> {
   const raw = await readJsonBody(c);
@@ -890,6 +932,42 @@ async function resolveQuery(
 }
 
 /**
+ * The revocation fence (see the module documentation): the credential the
+ * middleware resolved `principal` from must still be live once the handler's
+ * awaits are behind it — the body read for a refused body, the resolver for
+ * every other answer.
+ *
+ * Synchronous, and called after the `await` that precedes the reply with none
+ * between it and the reply. A retired or expired credential is answered by
+ * `../auth.ts`'s `authErrorResponse` at `401` through {@link answerFailure},
+ * exactly like the middleware's own refusal; a store that cannot be read, or a
+ * fence that throws, is answered `500` with
+ * {@link PANEL_DATA_UNAVAILABLE_MESSAGE}. The fence fails closed: no answer is
+ * sent on a credential it could not confirm. A thrown value is not kept,
+ * because nothing below promises it is free of credential material.
+ *
+ * @param c The request context.
+ * @param auth The access boundary's fence.
+ * @param principal The principal the middleware resolved.
+ * @param context The logger and, once the body was read, the query's source.
+ * @returns `ok`, or the response that refuses the request.
+ */
+function requireLivePrincipal(
+  c: Context<ServerEnv>,
+  auth: PanelDataRoutesDeps['auth'],
+  principal: Principal,
+  context: FailureContext,
+): Result<void, Response> {
+  let live: Result<void, DebuggenError>;
+  try {
+    live = auth.requireLiveCredential(principal);
+  } catch {
+    live = err(portFailure('INTERNAL', 'credential-check-threw'));
+  }
+  return isErr(live) ? err(answerFailure(c, live.error, context)) : ok(undefined);
+}
+
+/**
  * The counts a success record may carry: whether the result is paged and, when
  * it is, how many items the filtered source holds and whether this page is the
  * last. Never a row, an id or a filter value.
@@ -915,18 +993,20 @@ function resultCounts(result: DataResult): Record<string, number | boolean> {
  * Registers nothing, builds no application, opens no socket and holds no state
  * between requests. The handler runs the steps of the module documentation in
  * order — role, id shape, DevTools binding, session and scope, body, resolver,
- * result check — so a caller that fails an earlier step learns nothing about a
- * later one, and answers `200` with the resolver's `DataResult` exactly as the
- * resolver built it.
+ * revocation fence, result check — so a caller that fails an earlier step
+ * learns nothing about a later one, and a credential retired while the request
+ * was in flight learns neither how its body was judged nor anything the
+ * resolver found. It answers `200` with the
+ * resolver's `DataResult` exactly as the resolver built it.
  *
- * @param deps The resolver, the session and binding lookups, and an optional
- * logger.
+ * @param deps The resolver, the session and binding lookups, the revocation
+ * fence, and an optional logger.
  * @returns A frozen record holding the one handler, keyed by
  * {@link PANEL_DATA_OPERATION}.
  *
  * @example
  * ```ts
- * const panelData = createPanelDataRoutes({ resolver, sessions, bindings: clients, logger });
+ * const panelData = createPanelDataRoutes({ resolver, sessions, bindings: clients, auth, logger });
  * const authFor = createAuthMiddleware(auth);
  * for (const operation of PANEL_DATA_OPERATIONS) {
  *   const { method, pattern } = HTTP_ROUTES[operation];
@@ -935,7 +1015,7 @@ function resultCounts(result: DataResult): Record<string, number | boolean> {
  * ```
  */
 export function createPanelDataRoutes(deps: PanelDataRoutesDeps): PanelDataRoutes {
-  const { resolver, sessions, bindings } = deps;
+  const { resolver, sessions, bindings, auth } = deps;
   const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
 
   const answerPanelData: PanelDataRouteHandler = async (c) => {
@@ -982,6 +1062,14 @@ export function createPanelDataRoutes(deps: PanelDataRoutesDeps): PanelDataRoute
 
     const query = await readQuery(c);
     if (isErr(query)) {
+      // The body read awaited the client for as long as it chose. A refused
+      // body is answered only once the fence has confirmed the credential is
+      // still live, so a credential retired while its body was arriving is
+      // told it is retired — never how its body was judged.
+      const liveAfterBody = requireLivePrincipal(c, auth, principal.value, { log: sessionLog });
+      if (isErr(liveAfterBody)) {
+        return liveAfterBody.error;
+      }
       return answerBodyRejection(c, query.error, { log: sessionLog });
     }
     const source = query.value.source;
@@ -994,6 +1082,15 @@ export function createPanelDataRoutes(deps: PanelDataRoutesDeps): PanelDataRoute
     const context: PanelDataContext =
       panelId === undefined ? { sessionId } : { sessionId, panelId };
     const resolved = await resolveQuery(resolver, context, dataQuery);
+
+    // The revocation fence. The resolver's was the handler's last `await`, so
+    // the credential is confirmed live here — before its answer, a failure as
+    // much as a result, reaches the caller — and nothing below awaits before
+    // the reply.
+    const live = requireLivePrincipal(c, auth, principal.value, queried);
+    if (isErr(live)) {
+      return live.error;
+    }
     if (isErr(resolved)) {
       return answerFailure(c, resolved.error, queried);
     }

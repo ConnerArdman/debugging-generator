@@ -13,7 +13,10 @@
  *
  * 1. **Tokenize.** {@link tokenizeQuestion} projects the question onto sorted,
  *    de-duplicated lexical hints. It is purely lexical and wording-invariant by
- *    construction (see below).
+ *    construction (see below), and it reads the question only after
+ *    `redactQuestionText` from `../context-builder.js` has redacted it — the
+ *    same redaction the builder applies before rendering it — so a value the
+ *    developer quoted or pasted never becomes a hint.
  * 2. **Build.** `../context-builder.js` assembles the request — it caps every
  *    section, renders the versioned `prompts/understand/vNNN.md` with its five
  *    placeholders, places the hints (never the raw question) in the structured
@@ -42,13 +45,13 @@
  * a plan or a panel: they only cut text into words and filter words against
  * two vocabularies of ordinary English and generic debugging terms. The model
  * decides what the question means. The stage itself (`createUnderstandStage`)
- * never reads the question except to hand it to the tokenizer.
+ * never reads the question except to hand it, redacted, to the tokenizer.
  *
  * ## Wording invariance
  *
  * The rules-based deterministic provider builds its answer from
  * `ModelRequest.input` alone, and the outbound guard inspects it field by field.
- * The raw question is rendered into the prompt only; the structured input
+ * The redacted question is rendered into the prompt only; the structured input
  * carries the tokenizer's output, which is lower-cased, stripped of
  * punctuation and stop words, de-duplicated and sorted. Two questions that
  * differ only in word order, filler words, capitalisation or punctuation
@@ -91,7 +94,7 @@ import type { Logger, Result } from '@debuggen/shared';
 import { sessionLogger, subsystemLogger } from '../../logging.js';
 import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
-import { CONTEXT_LIMITS } from '../context-builder.js';
+import { CONTEXT_LIMITS, redactQuestionText } from '../context-builder.js';
 import type {
   ContextBuilder,
   PipelineStageContext,
@@ -821,8 +824,8 @@ export function tokenizeQuestion(question: string): QuestionTokens {
 /* -------------------------------------------------------------------------------------------------
  * The stage contract
  *
- * Nothing below reads the question: `run` hands `context.question` to the
- * tokenizer and the context builder renders it into the prompt.
+ * Nothing below reads the question: `run` hands `context.question`, redacted,
+ * to the tokenizer and the context builder renders it into the prompt.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -1074,7 +1077,15 @@ export function createUnderstandStage(deps: UnderstandStageDeps): UnderstandStag
     }
 
     const started = context.now();
-    const hints = tokenizeQuestion(context.question);
+    // The hints are the question's only presence in the structured input, so
+    // they are cut from the redacted question the prompt renders: a quoted
+    // query value or a pasted header value yields no token. The text is handed
+    // over uncut because the tokenizer bounds its own read at the same
+    // `maxQuestionChars` and drops a word that bound splits, where a
+    // `…`-terminated cut would leave that word's head behind as a token.
+    const hints = tokenizeQuestion(
+      redactQuestionText(context.question, Number.POSITIVE_INFINITY).text,
+    );
     log.debug(STARTED_LOG, {
       stage: UNDERSTAND_STAGE,
       tokenCount: hints.tokens.length,

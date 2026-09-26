@@ -11,11 +11,11 @@
  *    database, and `generalization.spec.ts` proves the same chain minus the
  *    database tier on a project that shares no identifier with the demo. A
  *    per-spec copy of that walk would drift, and a drifted copy weakens exactly
- *    the claim the suite exists to make (AAP 0.8.3-0.8.4);
+ *    the claim the suite exists to make;
  * 2. **the panel node-type-set comparison** — `demo-excessive-renders.spec.ts`
  *    proves the render panel is *materially* different from the latency panel,
  *    which is a statement about two sets and their permitted overlap
- *    (AAP 0.6.5), not about a title.
+ *    (`docs/DEMO.md`, "How the three panels differ"), not about a title.
  *
  * So both live here once.
  *
@@ -30,7 +30,7 @@
  * deliberately absent from `tests/tsconfig.json`'s path map: DOM-level panel
  * assertions belong to the accessors the specs drive through `chrome.ts`.
  *
- * ## Privacy of failure text (AAP 0.5.2)
+ * ## Privacy of failure text
  *
  * A message here may print event ids, span ids, kinds, names, durations, node
  * types, request methods and redacted paths. It must never print a raw
@@ -355,9 +355,10 @@ export interface AncestorChainOptions {
  * Stops cleanly at three boundaries, none of which is an error:
  *
  * - **no parent**: a root, which is the interaction in a well-formed trace;
- * - **parent absent from the index**: the orphan case of AAP 0.4.2, where an
- *   event whose parent never arrived is attached to the trace root with a flag
- *   rather than dropped. The chain ends where the evidence ends;
+ * - **parent absent from the index**: the orphan case (`docs/ARCHITECTURE.md`,
+ *   "Attribution, joining and orphans"), where an event whose parent never
+ *   arrived is attached to the trace root with a flag rather than dropped. The
+ *   chain ends where the evidence ends;
  * - **a span id already visited**: a cycle, which only a malformed or truncated
  *   input produces. Guarded with a visited set *and* a depth cap so neither a
  *   two-node loop nor a long degenerate chain can hang the suite.
@@ -427,8 +428,7 @@ function describeStep(step: AncestorKindStep): string {
  * Renders an event as `kind name(spanId)`.
  *
  * Kind, name and span id only: an attribute map can carry a header value or a
- * statement, and a failure message is not the place to discover that (AAP
- * 0.5.2).
+ * statement, and a failure message is not the place to discover that.
  */
 export function describeEvent(event: TelemetryEvent): string {
   return `${event.kind} ${truncate(event.name)}(${event.spanId})`;
@@ -703,14 +703,14 @@ export function visualizationNodeTypesOf(spec: PanelSpec): Set<PanelNodeType> {
 }
 
 /**
- * The overlap two generated panels may legitimately share (AAP 0.6.5).
+ * The overlap two generated panels may legitimately share.
  *
- * The ruling is that the latency panel and the render panel share only the
- * summary header, the metric cards and the source chips, and that their
- * visualization bodies are otherwise disjoint. The summary header is not a
- * layout node — `PanelHost` renders it from `spec.summary` — so it never appears
- * in a node-type set, which leaves exactly `metricCards` and `sourceLink` as
- * permitted members of the intersection.
+ * The latency panel and the render panel share only the summary header, the
+ * metric cards and the source chips, and their visualization bodies are
+ * otherwise disjoint (`docs/DEMO.md`, "How the three panels differ"). The
+ * summary header is not a layout node — `PanelHost` renders it from
+ * `spec.summary` — so it never appears in a node-type set, which leaves exactly
+ * `metricCards` and `sourceLink` as permitted members of the intersection.
  */
 export const PERMITTED_VISUALIZATION_OVERLAP: ReadonlySet<PanelNodeType> = new Set<PanelNodeType>([
   'metricCards',
@@ -728,7 +728,7 @@ export interface DisjointVisualizationOptions {
 }
 
 /**
- * Asserts two generated panels are materially different (AAP 0.6.5, 0.8.4).
+ * Asserts two generated panels are materially different.
  *
  * Three assertions, because "materially different" is not one statement:
  *
@@ -804,10 +804,10 @@ export interface ValidPanelSpecOptions {
   /**
    * Accept a deterministic fallback panel.
    *
-   * `false` by default, because AAP 0.8.4 requires a genuinely generated panel:
-   * a fallback assembled from the capture aggregates proves the failure path
-   * works, not that the pipeline produced an answer. A spec deliberately
-   * checking that path opts in.
+   * `false` by default, because an acceptance run requires a genuinely
+   * generated panel: a fallback assembled from the capture aggregates proves
+   * the failure path works, not that the pipeline produced an answer. A spec
+   * deliberately checking that path opts in.
    */
   readonly allowFallback?: boolean | undefined;
   /** Prefixes the failure text with what the spec was proving. */
@@ -969,13 +969,14 @@ interface CitedReference {
  * Asserts every cited event id resolves to an event of the capture, and that
  * every observed fact cites at least one.
  *
- * The structural half of AAP 0.8.4's rule that observed facts cite evidence
- * that exists. It is deliberately checked against the events the spec actually
- * fetched from `POST /sessions/:id/panel-data` rather than through the schema
- * package's semantic validation: `validateAgainstCapture` works from a
- * `CaptureSummary`, whose sections are bounded top-N lists, so it answers
- * `unverifiable` for a reference to an event outside them — an honest answer
- * that is not the definitive one an acceptance test needs.
+ * The structural half of the rule that observed facts cite evidence that exists
+ * (`docs/ARCHITECTURE.md`, "Boundary rules"). It is deliberately checked
+ * against the events the spec actually fetched from
+ * `POST /sessions/:id/panel-data` rather than through the schema package's
+ * semantic validation: `validateAgainstCapture` works from a `CaptureSummary`,
+ * whose sections are bounded top-N lists, so it answers `unverifiable` for a
+ * reference to an event outside them — an honest answer that is not the
+ * definitive one an acceptance test needs.
  *
  * Only ids are reported on failure, never the statements that cited them.
  */
@@ -1035,7 +1036,7 @@ export function expectEvidenceResolves(
 }
 
 /**
- * Asserts an analysis keeps observation and inference apart (AAP 0.8.4).
+ * Asserts an analysis keeps observation and inference apart.
  *
  * Three checks: the analysis observed something at all — the schema permits an
  * empty `observed` array, so non-emptiness is asserted here rather than assumed
@@ -1127,8 +1128,8 @@ export interface RenderStatOptions {
  *
  * The component name arrives from the spec, never from this module: a demo
  * component name written here would be exactly the hardcoded demo knowledge the
- * product forbids (AAP 0.5.4), and `tests/e2e/**` being excluded from the guard
- * script is not a licence to write one.
+ * product forbids, and `tests/e2e/**` being excluded from the guard script is
+ * not a licence to write one.
  */
 export function expectRenderStat(
   stats: readonly RenderStat[],
@@ -1434,10 +1435,12 @@ export function expectMetricAvailable(
 /**
  * Asserts a metric is legitimately unavailable, and returns it.
  *
- * AAP 0.6.6 records `transferred_bytes` as genuinely unobservable for server
- * spans, so "n/a" is a correct answer that must be assertable as such. Treating
- * an unavailable metric as a failure — or, worse, reading its absent value as
- * zero — would turn a recorded gap into a fabricated measurement.
+ * `transferred_bytes` is genuinely unobservable for server spans — only a
+ * same-origin browser resource timing reports a transfer size, and the metric
+ * is unavailable, never `0`, when none did (`docs/ARCHITECTURE.md`, "Computed
+ * metrics") — so "n/a" is a correct answer that must be assertable as such.
+ * Treating an unavailable metric as a failure — or, worse, reading its absent
+ * value as zero — would turn a recorded gap into a fabricated measurement.
  */
 export function expectMetricUnavailable(
   metrics: readonly MetricValue[],

@@ -69,9 +69,22 @@
  *   is written, applies only the delta and reverse-restores a delta that failed
  *   part-way.
  * - **Versions come from their owners.** The next plan version is
- *   `SessionsRepo.nextPlanVersion`; analysis and panel versions and their
- *   `supersedes` links are assigned by the store through the delegated modules.
- *   Nothing here computes a version, and no row is ever updated in place.
+ *   `SessionsRepo.nextPlanVersion`; analysis and panel versions are assigned
+ *   by the store through the delegated modules. Nothing here computes a
+ *   version, and no row is ever updated in place.
+ * - **A regeneration supersedes exactly what the decision was made against.**
+ *   The existing-evidence path names the analysis and the panel it loaded — the
+ *   analysis port's `supersedes`, the panel port's `expectedPredecessor` — and
+ *   each owner refuses, before its model call and again inside the store's
+ *   insert transaction, a predecessor that is no longer the session's latest.
+ *   The latest panel is also re-read before the analysis is regenerated, so a
+ *   panel stored while the follow-up was being decided stops the run before
+ *   anything is stored. Each of those refusals carries
+ *   `details.reason: 'supersedes-stale'` and fails the run — this stage's own
+ *   check and the panel port's as `SESSION_INVALID_STATE`; a regenerated
+ *   artifact that still names another predecessor fails it with `STORE_ERROR`
+ *   (`analysis-ladder-inconsistent`, `panel-ladder-inconsistent`). No outcome
+ *   is recorded for a failed run, so the follow-up stays unanswered.
  * - **Plan version n+1 is recorded only after its install succeeded**, so a
  *   delta that failed part-way leaves the session's plan ladder — and the
  *   baseline of the next follow-up — at version n. `SessionManager.recordPlan`
@@ -961,6 +974,15 @@ function findAlteredInstalledAction(
  * prompt, the gate, validation, fallback, persistence and `panel.generated` —
  * and **emits no progress row**: this stage emits the `generate-panel` group
  * around the call.
+ *
+ * The request names the panel the follow-up was decided against in
+ * `expectedPredecessor`. An implementation stores a panel superseding exactly
+ * that panel or none at all: a session whose latest panel is another one is
+ * refused — before its model call, and by the store inside its insert
+ * transaction — with `SESSION_INVALID_STATE` and
+ * `details.reason: 'supersedes-stale'`, storing and broadcasting nothing. A
+ * returned panel naming any other predecessor fails the run as
+ * `panel-ladder-inconsistent` rather than being delivered.
  */
 export interface PanelRegenerationPort {
   /**
@@ -968,10 +990,11 @@ export interface PanelRegenerationPort {
    * capture, answering the follow-up question.
    *
    * @param request The session, the stored capture, both questions, the
-   * regenerated analysis, the capture summary, the recorded prompt version and
-   * the cancellation signal.
+   * regenerated analysis, the capture summary, the recorded prompt version,
+   * the panel the new one must supersede (`expectedPredecessor`) and the
+   * cancellation signal.
    * @returns The stored panel — a fallback panel included — or the subsystem's
-   * typed error. Never rejects.
+   * typed error, the stale-predecessor refusal included. Never rejects.
    */
   regenerate(
     request: PanelRegenerationRequest,
@@ -1063,9 +1086,11 @@ export interface FollowUpStageDeps {
   >;
   /**
    * The analysis and panel history, read one row at a time: the latest version
-   * of each, and — to prove a regeneration appended a version rather than
-   * mutating one — the superseded analysis by its id. The whole ladder is never
-   * listed, so a follow-up's reads stay constant as the session's history grows.
+   * of each; the latest panel again once the path is chosen, to prove it is
+   * still the panel the follow-up was decided against; and — to prove a
+   * regeneration appended a version rather than mutating one — the superseded
+   * analysis by its id. The whole ladder is never listed, so a follow-up's
+   * reads stay constant as the session's history grows.
    */
   readonly panels: Pick<PanelsRepo, 'getAnalysis' | 'getLatestAnalysis' | 'getLatestPanel'>;
   /** The modification journal, read only: the chain head of each file the delta patches. */
@@ -1367,10 +1392,6 @@ const DELTA_ROLLBACK_INCOMPLETE_LOG =
 const OUTCOME_UNRECORDED_LOG =
   'The follow-up outcome links could not be recorded; the stored artifacts stand.';
 
-/** Warn record of a regenerated panel whose stored predecessor link differs from the expected one. */
-const PANEL_SUPERSEDES_LOG =
-  'The regenerated panel supersedes a different panel than the one the follow-up was decided against.';
-
 /** Warn record of a progress row that could not be emitted. Fields: stage, row, error code. */
 const PROGRESS_FAILED_LOG =
   'A progress row of the follow-up stage could not be emitted; the stage continues.';
@@ -1506,6 +1527,49 @@ function analysisLadderError(): DebuggenError {
     {
       hint: 'Ask the follow-up again once the session is no longer changing.',
       details: { stage: ANALYZE_STAGE, reason: 'analysis-ladder-inconsistent' },
+    },
+  );
+}
+
+/**
+ * The panel the follow-up was decided against is no longer the session's
+ * latest panel — the shape of the panel subsystem's own stale-predecessor
+ * refusal: `SESSION_INVALID_STATE`, the `generate-panel` stage and
+ * `reason: 'supersedes-stale'`, with the version of the panel the session holds
+ * now when there is one.
+ */
+function panelPredecessorMovedError(latestPanelVersion: number | undefined): DebuggenError {
+  return new DebuggenError(
+    'SESSION_INVALID_STATE',
+    'The panel this follow-up was decided against is no longer the latest panel of the session, so nothing was regenerated.',
+    {
+      hint: "The session's panel changed while this answer was being prepared. Ask the follow-up again; it is then decided against the panel the session now holds.",
+      details: {
+        stage: GENERATE_PANEL_STAGE,
+        reason: 'supersedes-stale',
+        ...(latestPanelVersion === undefined ? {} : { latestPanelVersion }),
+      },
+    },
+  );
+}
+
+/**
+ * A regenerated panel does not supersede the panel the follow-up was decided
+ * against. Carries both versions — never an id or any content — so the broken
+ * rung can be located.
+ */
+function panelLadderError(panelVersion: number, previousPanelVersion: number): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'The regenerated panel was not stored as the next version superseding the panel the follow-up was decided against.',
+    {
+      hint: 'Ask the follow-up again once the session is no longer changing.',
+      details: {
+        stage: GENERATE_PANEL_STAGE,
+        reason: 'panel-ladder-inconsistent',
+        panelVersion,
+        previousPanelVersion,
+      },
     },
   );
 }
@@ -2332,12 +2396,17 @@ interface OutcomeRecord {
  * 4. `generateStructuredWithRepair` against {@link followUpDecisionSchema},
  *    exactly once; then {@link diffAdditionalActions} and
  *    {@link followUpPathFor}. The `followup` group closes.
- * 5. **Existing evidence**: the `onPathChosen` seam; the analysis port with
- *    `regenerate: true` and the previous analysis as `supersedes`, checked
- *    against the analysis ladder with two indexed single-row reads — the
- *    superseded analysis by id (`PanelsRepo.getAnalysis`) must be unchanged and
- *    the session's newest (`getLatestAnalysis`) must be the new one; the
- *    `generate-panel` group around the panel port's `regenerate`.
+ * 5. **Existing evidence**: the `onPathChosen` seam; one indexed read of the
+ *    session's latest panel (`PanelsRepo.getLatestPanel`), which must still be
+ *    the panel the follow-up was decided against — otherwise the run fails in
+ *    the `generate-panel` group as `supersedes-stale` and nothing is
+ *    regenerated; the analysis port with `regenerate: true` and the previous
+ *    analysis as `supersedes`, checked against the analysis ladder with two
+ *    indexed single-row reads — the superseded analysis by id
+ *    (`PanelsRepo.getAnalysis`) must be unchanged and the session's newest
+ *    (`getLatestAnalysis`) must be the new one; the `generate-panel` group
+ *    around the panel port's `regenerate` with the previous panel as
+ *    `expectedPredecessor`, whose answer must supersede exactly that panel.
  * 6. **New capture**: the `plan` group around `nextPlanVersion`, the adapter
  *    context, {@link buildFollowUpPlanInput}, `normalizePlan` with the previous
  *    actions, `instrumentationPlanSchema`, the installed-action check,
@@ -2660,8 +2729,11 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
   /**
    * The existing-evidence path (`generated → analyzing → generated`): the
    * analysis and then the panel are regenerated from the **stored** capture as
-   * new versions superseding their predecessors. Nothing touches a file and no
-   * row is updated in place.
+   * new versions superseding exactly the analysis and panel the follow-up was
+   * decided against. A panel that moved on since the decision stops the run
+   * before either is regenerated; a regeneration refused as stale, or answered
+   * with an artifact that names another predecessor, fails the run with no
+   * outcome recorded. Nothing touches a file and no row is updated in place.
    */
   const runExistingEvidence = async (
     context: PipelineStageContext,
@@ -2689,6 +2761,24 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
     }
     if (isAborted(context.signal)) {
       return fail(context, log, state, cancelledError(FOLLOW_UP_STAGE), startedAt);
+    }
+
+    // The decision answered the panel loaded before it was made. A panel stored since — another
+    // follow-up, a capture — means the developer no longer sees that panel, so nothing is
+    // regenerated: refused here, before the analysis port stores a version, in the group of the
+    // step whose predecessor moved. One indexed read, the same the decision was loaded with.
+    const latestPanel = callSync(() => deps.panels.getLatestPanel(sessionId), 'STORE_ERROR');
+    if (!latestPanel.ok || latestPanel.value?.id !== previousPanel.id) {
+      openGroup(context, log, state, GENERATE_PANEL_STAGE);
+      return fail(
+        context,
+        log,
+        state,
+        latestPanel.ok
+          ? panelPredecessorMovedError(latestPanel.value?.panelVersion)
+          : latestPanel.error,
+        startedAt,
+      );
     }
 
     // The analysis: re-derived from the stored capture as the next version. The
@@ -2745,7 +2835,10 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       return fail(context, log, state, cancelledError(ANALYZE_STAGE), startedAt);
     }
 
-    // The panel: regenerated from the same stored capture, answering the follow-up question.
+    // The panel: regenerated from the same stored capture, answering the follow-up question, as
+    // the version superseding exactly the panel the follow-up was decided against. The port
+    // refuses — before its model call and inside the store's insert transaction — a session whose
+    // latest panel moved on meanwhile, so a stale refusal arrives here as its error.
     openGroup(context, log, state, GENERATE_PANEL_STAGE);
     const generated = await settle(
       () =>
@@ -2757,6 +2850,7 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
           analysis,
           summary: analysed.value.summary,
           promptVersion: context.promptVersions[GENERATE_PANEL_STAGE],
+          expectedPredecessor: previousPanel.id,
           signal: context.signal,
         }),
       'INTERNAL',
@@ -2765,13 +2859,16 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       return fail(context, log, state, generated.error, startedAt);
     }
     const { panel } = generated.value;
-    // The stored link is the panel subsystem's, taken from the store. A disagreement is logged,
-    // never turned into a failure of a panel that is already stored and delivered.
+    // A panel naming any other predecessor means the port broke that contract: it describes a
+    // different question's version chain, so the run fails rather than deliver it as the answer.
     if (panel.supersedes !== previousPanel.id) {
-      log.warn(PANEL_SUPERSEDES_LOG, {
-        panelVersion: panel.panelVersion,
-        previousPanelVersion: previousPanel.panelVersion,
-      });
+      return fail(
+        context,
+        log,
+        state,
+        panelLadderError(panel.panelVersion, previousPanel.panelVersion),
+        startedAt,
+      );
     }
     closeGroup(context, log, state);
 
@@ -2805,7 +2902,7 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
         supersededAnalysisId: previousAnalysis.id,
         panel,
         panelVersion: panel.panelVersion,
-        supersededPanelId: panel.supersedes ?? previousPanel.id,
+        supersededPanelId: previousPanel.id,
         fallbackPanel: generated.value.fallback,
         analysisPromptVersion: analysed.value.promptVersion,
         panelPromptVersion: generated.value.promptVersion,

@@ -64,13 +64,18 @@ export const TRUNCATION_SUFFIX = '\u2026';
 /**
  * The complete deny-list vocabulary, in reporting order.
  *
- * `sensitive-header` and `url-query-value` classify a value by its position
- * rather than by its content, so they are reported by `headers.ts` and
- * `url.ts`; the remaining ids are content or name driven and are reported by
- * {@link findDeniedRules}. Five ids (`provider-key`, `jwt`, `private-key`,
- * `connection-string`, `entropy`) deliberately match the repository secret
- * gate's rule ids so that logs, findings reports and documentation use one
- * vocabulary across all three enforcement points.
+ * `url-query-value` classifies a value by its position rather than by its
+ * content, so it is reported by `url.ts` and `redactor.ts` only.
+ * `sensitive-header` is both: `headers.ts` and `redactor.ts` report it for a
+ * value found under a denied header name, and it is also the content rule that
+ * recognises a sensitive header *line* inside free text
+ * (`Authorization: Bearer …`, `Cookie: session=…`), which
+ * {@link findDeniedRules} reports like every other content rule. The remaining
+ * ids are content or name driven and are reported by {@link findDeniedRules}.
+ * Five ids (`provider-key`, `jwt`, `private-key`, `connection-string`,
+ * `entropy`) deliberately match the repository secret gate's rule ids so that
+ * logs, findings reports and documentation use one vocabulary across all three
+ * enforcement points.
  */
 export const REDACTION_RULE_IDS = [
   'sensitive-header',
@@ -192,6 +197,16 @@ const PROVIDER_SOURCE = '(?:' + PROVIDER_ALTERNATIVES.join('|') + ')';
 /**
  * `bearer-token`: an HTTP bearer credential. The scheme word is captured so
  * that only the credential is replaced and its presence stays observable.
+ *
+ * The credential must be at least eight characters long, and that threshold
+ * is deliberate. This rule runs over every captured string, and a bare
+ * `bearer` followed by a short word is ordinary English — "bearer token",
+ * "the bearer of", "bearer auth" — so matching any length here would replace
+ * prose in labels, messages and questions for no privacy gain. A short
+ * credential is not left behind by it: where one actually appears, inside a
+ * header line such as `Authorization: Bearer abc`, the `sensitive-header`
+ * line rule (see {@link HEADER_LINE_SOURCE}) replaces the whole value however
+ * short it is, and that rule runs first.
  */
 const BEARER_SOURCE = '\\b(bearer)\\s+' + wholeRun(BEARER_CHARS, 8, 4096);
 
@@ -277,6 +292,162 @@ const USERINFO_PASS = '[^\\s/?#@]{1,256}';
  * connection string stays diagnosable.
  */
 const USERINFO_SOURCE = '(' + SCHEME_SOURCE + '://)' + USERINFO_USER + ':' + USERINFO_PASS + '@';
+
+/**
+ * The six header names whose value is always replaced, lower-cased.
+ *
+ * The same list as `DENIED_HEADER_NAMES` in `./headers.ts` and as the outbound
+ * model guard's own copy — shared by convention, never by an import edge,
+ * because this module imports nothing. The colocated tests assert that every
+ * name `./headers.ts` denies is masked here as a header line, which is what
+ * keeps the copies aligned.
+ *
+ * A name that another name ends with comes after it (`proxy-authorization`
+ * before `authorization`, `set-cookie` before `cookie`), so the alternation
+ * reads the longer name whenever the text carries it.
+ */
+const HEADER_LINE_NAMES: readonly string[] = [
+  'proxy-authorization',
+  'authorization',
+  'set-cookie',
+  'cookie',
+  'x-api-key',
+  'x-auth-token',
+];
+
+/**
+ * Pattern source for `word` in any letter case, one character class per
+ * letter.
+ *
+ * Used instead of the `i` flag so that case-insensitivity applies to the
+ * header names alone: the already-redacted test in {@link HEADER_LINE_SOURCE}
+ * must match {@link REDACTION_MARKER} byte for byte, and under `i` it would
+ * also accept `[REDACTED]`, which is not the marker and must not be treated as
+ * one. Non-letters (the `-` inside a name) are literal outside a class.
+ */
+function anyCase(word: string): string {
+  let source = '';
+  for (const character of word) {
+    const lower = character.toLowerCase();
+    const upper = character.toUpperCase();
+    source += lower === upper ? character : '[' + lower + upper + ']';
+  }
+  return source;
+}
+
+/** Escapes every pattern metacharacter in `text`, so it matches only itself. */
+function literalSource(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * What must precede a header name: the start of the text, or one character
+ * that cannot continue a name.
+ *
+ * The class is the character set of a header token as it is written in
+ * practice, so `mycookie:` and `x-cookie:` are other names rather than a
+ * `cookie` header, while `note: Cookie: …`, a line break or a quote in front of
+ * the name all qualify. So does a written whitespace escape — `\n`, `\r`,
+ * `\t`, `\f` or `\u000b`, as `JSON.stringify` and string literals write a line
+ * break or a tab — because the outbound guard reads a JSON-rendered prompt
+ * section's `…\nAuthorization: …` as a header line, and text that went through
+ * this rule must never be one it refuses. It is consumed rather than asserted,
+ * because this module uses no lookbehind; it is therefore part of the kept
+ * prefix.
+ */
+const HEADER_NAME_BOUNDARY = '(?:^|\\\\(?:[nrtf]|u000[bB])|[^A-Za-z0-9_-])';
+
+/** One of {@link HEADER_LINE_NAMES}, in any letter case. */
+const HEADER_NAME_SOURCE = '(?:' + HEADER_LINE_NAMES.map(anyCase).join('|') + ')';
+
+/** Spaces and tabs around the separator: never a line break. */
+const HEADER_SPACING = '[ \\t]{0,' + RUN_LIMIT + '}';
+
+/**
+ * The kept prefix of a header line, as capture group 1: the boundary, the
+ * name, the `:` separator and the spacing on both sides of it — everything
+ * that says *which* header was there and nothing of what it carried.
+ */
+const HEADER_PREFIX_SOURCE =
+  '(' + HEADER_NAME_BOUNDARY + HEADER_NAME_SOURCE + HEADER_SPACING + ':' + HEADER_SPACING + ')';
+
+/**
+ * A header value: the rest of the line, starting at its first character that
+ * is not a space or a tab. A line break ends it, so a multi-line value loses
+ * only the header's own line; an empty value (`Cookie:` at the end of a line)
+ * has nothing to hide and is not matched.
+ */
+const HEADER_VALUE_SOURCE = '[^ \\t\\r\\n][^\\r\\n]{0,' + RUN_LIMIT + '}';
+
+/**
+ * Pattern source matching any prefix of `text` — the empty one and `text`
+ * itself included — as nested optional groups, so a mismatch backtracks at
+ * most `text.length` steps.
+ */
+function prefixSource(text: string): string {
+  let source = '';
+  for (const character of Array.from(text).reverse()) {
+    source = '(?:' + literalSource(character) + source + ')?';
+  }
+  return source;
+}
+
+/**
+ * Refuses a value that is already redacted, in one of two forms:
+ *
+ * - exactly {@link REDACTION_MARKER}, ending at a line break or at the end of
+ *   the text. That is the form this rule produces, so the rule is a fixed
+ *   point of its own output, and it is the form the outbound model guard
+ *   treats as already redacted rather than as a finding;
+ * - a prefix of the marker (possibly empty) followed by
+ *   {@link TRUNCATION_SUFFIX} at the very end of the text — `Cookie: [red…`,
+ *   `Cookie: …`. That is what {@link truncate} leaves when a preview bound
+ *   cuts a redacted header line, and it is made of fixed characters only, so
+ *   it carries nothing to hide. Treating it as a value would make a bounded
+ *   preview stop being a fixed point of {@link scrub}: a second pass would
+ *   re-mask it, report a finding that hides nothing, and the preview would be
+ *   cut back to the same text.
+ *
+ * Exact, not case-folded: `[REDACTED]` is not the marker and is replaced.
+ */
+const HEADER_ALREADY_REDACTED =
+  '(?!' +
+  literalSource(REDACTION_MARKER) +
+  '(?:[\\r\\n]|$)|' +
+  prefixSource(REDACTION_MARKER) +
+  literalSource(TRUNCATION_SUFFIX) +
+  '$)';
+
+/**
+ * `sensitive-header`: a sensitive header written out as a line of free text —
+ * `Authorization: Bearer abc`, `note: Cookie: session=abc; theme=dark`,
+ * `X-Api-Key:k` — anywhere in a captured string, a question or a label.
+ *
+ * `./headers.ts` masks a header value by *position*, when it arrives under a
+ * header attribute key or inside a header map. The same header copied into a
+ * log message, an error string or a page's own text arrives under an ordinary
+ * key, and no other content rule recognises it: a short bearer credential is
+ * below the bearer rule's threshold and a cookie has no credential shape at
+ * all. So the line itself is the pattern: one of the six denied names, a `:`,
+ * and a non-empty value. The whole value is replaced — never only a token
+ * inside it — which is how `./headers.ts` treats the same header, and the name
+ * is kept so the header's presence stays diagnosable:
+ * `Authorization: Bearer abc` becomes `Authorization: [redacted]`.
+ */
+const HEADER_LINE_SOURCE = HEADER_PREFIX_SOURCE + HEADER_ALREADY_REDACTED + HEADER_VALUE_SOURCE;
+
+/**
+ * Every sensitive header line with a value, the already-redacted form
+ * included — the form {@link cutAtCredentialBoundary} locates.
+ *
+ * The cut has to move back to the kept prefix even when the value is already
+ * the marker: a cut inside `Cookie: [redacted]` followed by a line break would
+ * otherwise leave `Cookie: [reda` in front of the appended marker, a value the
+ * rule no longer recognises as redacted, and the cut result would stop being
+ * a fixed point of {@link scrub}. Moved back, the cut produces the same
+ * `Cookie: [redacted]` the replacement produces.
+ */
+const HEADER_LINE_LOCATE_SOURCE = HEADER_PREFIX_SOURCE + HEADER_VALUE_SOURCE;
 
 /*
  * ---------------------------------------------------------------------------
@@ -385,6 +556,26 @@ const USERINFO_CROSSING_SOURCE =
   '(' + SCHEME_SOURCE + '://)' + USERINFO_USER + ':' + '[^\\s/?#@]{0,' + CROSSING_LIMIT + '}$';
 
 /*
+ * A header line whose value is still going where the examined text ends. The
+ * prefix is the rule's own kept prefix with every bound widened to the
+ * crossing limit, so a line whose spacing or value is longer than the rule's
+ * bounds is still recognised by the name that identifies it.
+ */
+const HEADER_CROSSING_SPACING = '[ \\t]{0,' + CROSSING_LIMIT + '}';
+
+const HEADER_LINE_CROSSING_SOURCE =
+  '(' +
+  HEADER_NAME_BOUNDARY +
+  HEADER_NAME_SOURCE +
+  HEADER_CROSSING_SPACING +
+  ':' +
+  HEADER_CROSSING_SPACING +
+  ')' +
+  '[^\\r\\n]{0,' +
+  CROSSING_LIMIT +
+  '}$';
+
+/*
  * Patterns are compiled exactly once, in three roles that never share an
  * instance. Detection instances are non-global so that `test` never carries
  * `lastIndex` state between calls; the replacement instances are global and
@@ -394,6 +585,9 @@ const USERINFO_CROSSING_SOURCE =
  * roles on one instance is a classic source of redaction that passes
  * intermittently, so each role gets its own.
  */
+const HEADER_LINE_DETECT = new RegExp(HEADER_LINE_SOURCE);
+const HEADER_LINE_REPLACE = new RegExp(HEADER_LINE_SOURCE, 'g');
+const HEADER_LINE_LOCATE = new RegExp(HEADER_LINE_LOCATE_SOURCE, 'g');
 const PROVIDER_DETECT = new RegExp(PROVIDER_SOURCE);
 const PROVIDER_REPLACE = new RegExp(PROVIDER_SOURCE, 'g');
 const PROVIDER_LOCATE = new RegExp(PROVIDER_SOURCE, 'g');
@@ -426,10 +620,16 @@ const USERINFO_LOCATE = new RegExp(USERINFO_SOURCE, 'g');
  * altogether — so this fourth role, like the first, carries no state between
  * calls.
  */
+const HEADER_LINE_CROSSING = new RegExp(HEADER_LINE_CROSSING_SOURCE);
 const PROVIDER_CROSSING = new RegExp(PROVIDER_CROSSING_SOURCE);
 const BEARER_CROSSING = new RegExp(BEARER_CROSSING_SOURCE, 'i');
 const JWT_CROSSING = new RegExp(JWT_CROSSING_SOURCE);
 const USERINFO_CROSSING = new RegExp(USERINFO_CROSSING_SOURCE);
+
+/** Keeps a header line's name and separator and replaces its whole value. */
+function redactHeaderLineValue(_match: string, prefix: string): string {
+  return prefix + REDACTION_MARKER;
+}
 
 /** Keeps the scheme word and replaces only the credential after it. */
 function redactBearerCredential(_match: string, scheme: string): string {
@@ -467,7 +667,8 @@ function redactPemBlocks(input: string): string {
  *
  * Capture group 1, where a pattern has one, is by convention the **kept
  * prefix**: text that survives redaction because it is diagnostic rather than
- * secret (a bearer scheme word, a URL's scheme). Both the replacement
+ * secret (a bearer scheme word, a URL's scheme, a header line's name and
+ * separator). Both the replacement
  * functions and {@link cutAtCredentialBoundary} rely on that convention, so a
  * pattern added here must use a non-capturing group for anything else.
  */
@@ -481,7 +682,9 @@ interface PatternRule {
   /**
    * Global instance used only to find match *positions*, never to test or to
    * replace. {@link cutAtCredentialBoundary} resets its `lastIndex` before
-   * every scan.
+   * every scan. It may be wider than the replacement pattern — the header
+   * line rule locates its own already-redacted form too — because a cut has
+   * to move back to the kept prefix wherever this rule's shape crosses it.
    */
   readonly locate: RegExp;
   /**
@@ -490,7 +693,7 @@ interface PatternRule {
    * enough for {@link locate} to complete a match that begins before the cut:
    * a run of body characters for the runs, a segment separator for a JOSE
    * token, the `@` that terminates a URL's userinfo, the remainder of a
-   * key-file delimiter.
+   * key-file delimiter, a separator and a value for a header line.
    */
   readonly continuation: string;
   /**
@@ -506,11 +709,36 @@ interface PatternRule {
 }
 
 /**
+ * The `sensitive-header` line rule, named on its own because
+ * {@link applyPatterns} runs it twice (see there).
+ */
+const SENSITIVE_HEADER_LINE_RULE: PatternRule = Object.freeze<PatternRule>({
+  id: 'sensitive-header',
+  detect: HEADER_LINE_DETECT,
+  redact: (input) => input.replace(HEADER_LINE_REPLACE, redactHeaderLineValue),
+  locate: HEADER_LINE_LOCATE,
+  // A separator and a value: what a header name or its spacing that reaches
+  // the end of the examined window could have continued with. A match
+  // completed this way keeps everything up to its value, all of it past the
+  // cut, so it never moves a cut in front of text that was examined.
+  continuation: ':' + CONTINUATION_RUN,
+  crossing: HEADER_LINE_CROSSING,
+});
+
+/**
  * The content-driven rules, held in {@link REDACTION_RULE_IDS} order so that
  * {@link findDeniedRules} can report in that order by iterating once. Each id
  * appears exactly once, which is what makes the reported list unique.
+ *
+ * The header line rule is first, and that order is part of its meaning: it
+ * replaces a header's *whole* value, so running it before the bearer and JOSE
+ * rules turns `Authorization: Bearer <credential>` into
+ * `Authorization: [redacted]` whatever the credential's length, rather than
+ * letting the bearer rule keep the scheme word of a long credential and pass a
+ * short one through.
  */
 const PATTERN_RULES: readonly PatternRule[] = Object.freeze<PatternRule[]>([
+  SENSITIVE_HEADER_LINE_RULE,
   {
     id: 'provider-key',
     detect: PROVIDER_DETECT,
@@ -581,8 +809,10 @@ const PATTERN_RULES: readonly PatternRule[] = Object.freeze<PatternRule[]>([
  * Names that are sensitive because of *where* they appear rather than what
  * they are called — `cookie` and `set-cookie` in a header set, for instance —
  * are not listed here. `headers.ts` holds the header deny list and reports
- * them as `sensitive-header`; this vocabulary covers names wherever they
- * occur, including React props, hook state and span attributes.
+ * them as `sensitive-header`, and the `sensitive-header` line rule above
+ * recognises the same six names written out as a header line inside free
+ * text; this vocabulary covers names wherever they occur, including React
+ * props, hook state and span attributes.
  */
 const SENSITIVE_NAME_TERMS: readonly string[] = [
   'key',
@@ -713,8 +943,9 @@ function crossingCutFor(rule: PatternRule, text: string, headLength: number): nu
  * marker, or `scheme://[redacted]` — so a truncated value stays as
  * diagnosable as a redacted one. The whitespace walk exists for the bearer
  * rule, whose capture ends at the scheme word while the credential starts
- * after the separator; no other rule's prefix is followed by whitespace, so
- * it is a no-op for them.
+ * after the separator. The header line rule's prefix already ends with its own
+ * spacing, and no other rule's prefix is followed by whitespace, so it is a
+ * no-op for them.
  */
 function cutPosition(probe: string, match: RegExpExecArray, headLength: number): number {
   const kept = match[1] ?? '';
@@ -763,8 +994,8 @@ function cutPosition(probe: string, match: RegExpExecArray, headLength: number):
  * - **Total and pure.** Any string and any bound are accepted, including a
  *   bound of zero or less, and nothing throws.
  *
- * @param value - Text to cut, examined past the cut as described.
- * @param limit - Maximum number of code units to return.
+ * @param value Text to cut, examined past the cut as described.
+ * @param limit Maximum number of code units to return.
  * @returns The head of `value`, cut clear of any credential crossing it.
  */
 export function cutAtCredentialBoundary(value: string, limit: number): string {
@@ -795,9 +1026,10 @@ export function cutAtCredentialBoundary(value: string, limit: number): string {
 /**
  * Holds a scrubbed result to {@link MAX_SCAN_LENGTH} code units.
  *
- * Two rules grow the text they replace (`Bearer x` becomes
- * `Bearer [redacted]`, and short userinfo becomes the marker), so a value
- * just under the bound can come back over it. Clamping here keeps
+ * Three rules grow the text they replace (`Bearer x` becomes
+ * `Bearer [redacted]`, `Cookie: a` becomes `Cookie: [redacted]`, and short
+ * userinfo becomes the marker), so a value just under the bound can come back
+ * over it. Clamping here keeps
  * {@link scrub} idempotent: its output is always short enough that a second
  * call takes the unbounded path and changes nothing. The cut goes through
  * {@link cutAtCredentialBoundary} like every other cut in this module: the
@@ -813,13 +1045,35 @@ function clampScanned(result: string): string {
   return cutAtCredentialBoundary(result, room) + REDACTION_MARKER;
 }
 
-/** Applies every content-driven rule once, in table order. */
+/**
+ * Applies every content-driven rule once, in table order, and then the header
+ * line rule a second time if any later rule changed the text.
+ *
+ * The second pass is what keeps {@link scrub} idempotent. A header name only
+ * counts when the character in front of it cannot continue a name, and a
+ * replacement can create exactly such a character: the marker ends in `]`.
+ * Text such as a key-file block's closing dashes or an upper-case access
+ * identifier followed directly by `cookie: …` puts a name character in front
+ * of the header on the first pass, and the marker in front of it once that
+ * credential is replaced — so without the second pass the header line would be
+ * masked by the *next* call rather than this one. The second pass cannot
+ * create work for the other rules in turn: it only ever replaces text between
+ * a separator and a line break with the marker, which no other pattern's run
+ * can extend into.
+ *
+ * Nothing is rescanned when the later rules changed nothing, which is almost
+ * every value: that case costs one string comparison.
+ */
 function applyPatterns(input: string): string {
   let output = input;
+  let afterHeaderLines = input;
   for (const rule of PATTERN_RULES) {
     output = rule.redact(output);
+    if (rule === SENSITIVE_HEADER_LINE_RULE) {
+      afterHeaderLines = output;
+    }
   }
-  return output;
+  return output === afterHeaderLines ? output : SENSITIVE_HEADER_LINE_RULE.redact(output);
 }
 
 /**
@@ -830,7 +1084,7 @@ function applyPatterns(input: string): string {
  * character; the theoretical maximum for a string of `n` distinct
  * characters is `log2(n)`.
  *
- * @param value - Value to measure. Never inspected for meaning.
+ * @param value Value to measure. Never inspected for meaning.
  * @returns Bits of entropy per character, always finite and non-negative.
  */
 export function shannonEntropy(value: string): number {
@@ -872,7 +1126,7 @@ export function shannonEntropy(value: string): number {
  *   than stringified (which could run page code) or silently dropped (which
  *   would hide that anything was there).
  *
- * @param value - Value of any type, as an untrusted caller supplied it.
+ * @param value Value of any type, as an untrusted caller supplied it.
  * @returns Text to scan, or the marker when the value cannot be scanned.
  */
 export function asScannableText(value: unknown): string {
@@ -895,7 +1149,7 @@ export function asScannableText(value: unknown): string {
  * this function stays exported for callers that need the stricter test on
  * its own, such as a heuristic over unnamed values.
  *
- * @param value - Value to test.
+ * @param value Value to test.
  */
 export function isHighEntropySecret(value: string): boolean {
   if (value.length < ENTROPY_MIN_LENGTH) {
@@ -913,7 +1167,7 @@ export function isHighEntropySecret(value: string): boolean {
  * while the product's own identifiers (`sessionId`, `request_key`, `spanId`,
  * `traceId`) are exempt by exact normalised name.
  *
- * @param name - Attribute, header or property name.
+ * @param name Attribute, header or property name.
  */
 export function isSensitiveKeyName(name: string): boolean {
   const normalised = normaliseName(name);
@@ -928,14 +1182,16 @@ export function isSensitiveKeyName(name: string): boolean {
 
 /**
  * Removes credential material from a value by content, applying every
- * content-driven rule: provider credentials, bearer credentials, JOSE
- * tokens, PEM private keys and credentialed connection strings.
+ * content-driven rule: sensitive header lines, provider credentials, bearer
+ * credentials, JOSE tokens, PEM private keys and credentialed connection
+ * strings.
  *
  * Guarantees, each covered by the colocated tests:
  *
  * - **Idempotent.** `scrub(scrub(v)) === scrub(v)` for every input. No
- *   pattern matches {@link REDACTION_MARKER} or the `Bearer [redacted]` form
- *   that the bearer rule produces.
+ *   pattern matches {@link REDACTION_MARKER}, the `Bearer [redacted]` form
+ *   that the bearer rule produces or the `Cookie: [redacted]` form that the
+ *   header line rule produces.
  * - **No unscanned input is ever returned.** A value longer than
  *   {@link MAX_SCAN_LENGTH} is scrubbed up to the bound and its unexamined
  *   tail is replaced by {@link REDACTION_MARKER} rather than passed through.
@@ -945,10 +1201,11 @@ export function isSensitiveKeyName(name: string): boolean {
  *   prefix and first characters in front of the marker.
  * - **Bounded output.** The result is never longer than
  *   {@link MAX_SCAN_LENGTH} code units.
- * - **Presence is preserved where it is diagnosable.** A bearer scheme word
- *   and a URL's scheme and authority survive; only the credential goes. That
- *   holds at a cut too: a bearer credential the bound removes still reads
- *   `Bearer [redacted]`.
+ * - **Presence is preserved where it is diagnosable.** A bearer scheme word,
+ *   a header line's name and a URL's scheme and authority survive; only the
+ *   credential goes. That holds at a cut too: a bearer credential the bound
+ *   removes still reads `Bearer [redacted]`, and a header value it removes
+ *   still reads `Cookie: [redacted]`.
  * - **No credential tail survives.** A match consumes the whole run of
  *   credential characters, not just the length that identified it, so a
  *   credential longer than its usual shape does not leave a remainder.
@@ -957,7 +1214,7 @@ export function isSensitiveKeyName(name: string): boolean {
  *
  * Scrub before truncating, never the other way round — see {@link truncate}.
  *
- * @param value - Value to scrub. Typed `unknown` because the callers on the
+ * @param value Value to scrub. Typed `unknown` because the callers on the
  * ingest path hold untrusted, unvalidated data; see {@link asScannableText}
  * for what each type becomes.
  * @returns The value with every matched credential replaced.
@@ -991,8 +1248,8 @@ export function scrub(value: unknown): string {
  * and {@link asScannableText} decides what each type becomes before the name
  * rule is applied.
  *
- * @param name - Attribute, header or property name.
- * @param value - Value captured under that name, of any type.
+ * @param name Attribute, header or property name.
+ * @param value Value captured under that name, of any type.
  */
 export function scrubNamedValue(name: string, value: unknown): string {
   const text = asScannableText(value);
@@ -1016,10 +1273,16 @@ export function scrubNamedValue(name: string, value: unknown): string {
  * {@link scrubNamedValue} redacts, while {@link isHighEntropySecret} remains
  * available for the stricter content-only test.
  *
- * `sensitive-header` and `url-query-value` are never reported by this
- * function. They classify a value by its position in a header set or a query
- * string, which only `headers.ts` and `url.ts` can see; they are part of the
- * vocabulary so those handlers report in the same terms.
+ * `sensitive-header` is reported here when the value contains a sensitive
+ * header *line* — one of the six denied names, a `:` and a value that is not
+ * already redacted (exactly {@link REDACTION_MARKER}, or what a preview cut
+ * leaves of it at the end of the text; see {@link HEADER_ALREADY_REDACTED}) —
+ * which is the content rule {@link scrub} applies. A value that merely sits under a denied header name
+ * is the positional case, which only `headers.ts` and `redactor.ts` can see
+ * and which they report themselves. `url-query-value` is never reported by
+ * this function: it classifies a value by its position in a query string,
+ * which only `url.ts` can see, and it is part of the vocabulary so that
+ * handler reports in the same terms.
  *
  * Unlike {@link scrub}, detection reads the whole value rather than a bounded
  * window: a caller asking whether a value is safe must not be told "yes"
@@ -1030,8 +1293,8 @@ export function scrubNamedValue(name: string, value: unknown): string {
  * which is what lets the outbound guard refuse such a payload outright rather
  * than send a bounded scrub of it, whose tail the bound replaced.
  *
- * @param value - Value to inspect.
- * @param name - Optional name the value was captured under.
+ * @param value Value to inspect.
+ * @param name Optional name the value was captured under.
  * @returns Matched rule ids, ordered and unique; empty when nothing matched.
  */
 export function findDeniedRules(value: string, name?: string): RedactionRuleId[] {
@@ -1051,8 +1314,8 @@ export function findDeniedRules(value: string, name?: string): RedactionRuleId[]
  * Whether a value matches any deny-list rule, short-circuiting on the first
  * match. Equivalent to `findDeniedRules(value, name).length > 0`.
  *
- * @param value - Value to inspect.
- * @param name - Optional name the value was captured under.
+ * @param value Value to inspect.
+ * @param name Optional name the value was captured under.
  */
 export function containsDenied(value: string, name?: string): boolean {
   if (value.length > 0 && name !== undefined && isSensitiveKeyName(name)) {
@@ -1084,8 +1347,8 @@ export function containsDenied(value: string, name?: string): boolean {
  * lone surrogate is never emitted. The result, suffix included, is never
  * longer than `maxLength` code points, which makes truncation idempotent.
  *
- * @param value - Value to shorten, expected to be scrubbed already.
- * @param maxLength - Maximum number of code points to return. A value of `0`
+ * @param value Value to shorten, expected to be scrubbed already.
+ * @param maxLength Maximum number of code points to return. A value of `0`
  * or less yields an empty string; a non-integer bound is floored; a
  * non-finite bound means no truncation.
  */

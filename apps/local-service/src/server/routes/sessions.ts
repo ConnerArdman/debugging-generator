@@ -69,8 +69,9 @@
  * - **Retention** belongs to `../../store/retention.ts`, reached through the
  *   injected {@link SessionRetentionPort}: which sessions have aged out, the
  *   conflict-backup exemption, the orphan-backup grace and every deletion are
- *   its decisions. `session.purge` only authorizes, runs one sweep at a time
- *   and reports the sweep's counts.
+ *   its decisions. `session.purge` only authorizes, scopes the sweep to the
+ *   editor's announced workspace, runs one sweep at a time and reports the
+ *   sweep's counts.
  *
  * What remains here is the request boundary, applied in a fixed order so a
  * caller that fails an early step learns nothing about a later one:
@@ -183,9 +184,20 @@
  *   `503 TRANSPORT_DISCONNECTED` — in that order, and each before anything is
  *   sent (protocol's `http.ts`, Section D2).
  * - `session.purge` answers once the retention sweep has finished, with what it
- *   removed. It is single-flight: a purge requested while one is running joins
- *   that sweep and receives the same report, so two sweeps never race over the
- *   same rows and files. The sweep only ever deletes sessions last updated
+ *   removed. The sweep is **scoped** to the requesting editor: it acts only on
+ *   the state of projects under the workspace folders the editor's credential
+ *   announced — the very check `requireProjectScope` makes for every other
+ *   route (AAP §0.5.6), joined by a canonical one: the folders and each stored
+ *   root are resolved on disk, and a root is admitted only when its real
+ *   location lies under a real folder — so a purge for workspace A never
+ *   removes workspace B's sessions, telemetry, backups or index caches, not
+ *   even through a link inside A that points into B (CWE-863); the start-up
+ *   sweep in `main.ts` alone is machine-wide. Sweeps are serialised: a purge
+ *   requested while a sweep for the **same** folder set is running or queued
+ *   joins it and receives the same report, and one for another folder set
+ *   waits for the sweep before it, so two sweeps never race over the same rows
+ *   and files and no editor receives a sweep — or a report — started for
+ *   another workspace. The sweep only ever deletes sessions last updated
  *   before the `DEBUGGEN_RETENTION_DAYS` window; a session inside the window —
  *   every active one — is never touched, and an aged session whose journal
  *   holds a `conflict` record is kept, with its backups, and named in the
@@ -251,6 +263,7 @@
  * | malformed or unknown session id | `404` | `SESSION_NOT_FOUND` |
  * | malformed or unknown panel id, or a panel of another session | `404` | `SESSION_NOT_FOUND` |
  * | project root that is not absolute | `400` | `PROJECT_NOT_FOUND` |
+ * | project root (of a new session or a follow-up) that is, contains or lies inside `$DEBUGGEN_HOME`, or cannot be resolved on disk | `400` | `FS_UNSAFE_PATH` |
  * | body larger than the operation's bound, declared or as it arrives | `413` | `PROTOCOL_INVALID_MESSAGE` |
  * | body that did not arrive within `../http.ts`'s time ceiling | `408` | `PROTOCOL_INVALID_MESSAGE` |
  * | unreadable, non-JSON or off-schema body; a sent dev-server URL that is not a loopback address | `400` | `PROTOCOL_INVALID_MESSAGE` |
@@ -291,7 +304,7 @@
  *
  * It registers nothing, builds no hono application, opens no socket, database
  * or child process, reads no `process.env` and holds no state between requests
- * beyond the one retention sweep concurrent `session.purge` requests share.
+ * beyond the retention sweeps `session.purge` requests have running or queued.
  * It returns its handlers keyed by operation id for `../http.ts` to register
  * from protocol's route table behind the auth middleware; every collaborator
  * arrives by injection from `main.ts` through `../http.ts`.
@@ -307,7 +320,7 @@
  *   modifications: modificationsRepo,
  *   bindings: clients,
  *   devServers: devServerLookupFromLaunches(launcher),
- *   retention: { purge: () => runRetention(retentionDeps) },
+ *   retention: { purge: (scope) => runRetention(retentionDeps, { scope }) },
  *   auth,
  *   logger,
  * });
@@ -361,6 +374,7 @@ import {
   isAbsolutePosix,
   isErr,
   isWindowsAbsolute,
+  isWithin,
   newId,
   newMessageId,
   noopLogger,
@@ -370,6 +384,12 @@ import {
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result, SessionId } from '@debuggen/shared';
 
+import {
+  PROJECT_ROOT_UNRESOLVABLE_REASON,
+  STATE_HOME_OVERLAP_REASON,
+  canonicalizePath,
+  requireProjectOutsideStateHome,
+} from '../../config.js';
 import type { DevServerProbeResult } from '../../dev-server/detect.js';
 import { LOG_ERROR_FIELD_KEY, sessionLogger, subsystemLogger } from '../../logging.js';
 import type { PipelineOrchestrator } from '../../pipeline/orchestrator.js';
@@ -385,7 +405,7 @@ import { isTerminalSessionStatus } from '../../sessions/state-machine.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { ModificationsRepo } from '../../store/modifications-repo.js';
 import type { PanelsRepo } from '../../store/panels-repo.js';
-import type { RetentionReport } from '../../store/retention.js';
+import type { RetentionReport, RetentionScope } from '../../store/retention.js';
 import type { SessionsRepo } from '../../store/sessions-repo.js';
 import {
   AUTH_FAILURE_REASONS,
@@ -934,17 +954,30 @@ export interface DevServerLookupOptions {
  * `runRetention` over the very dependencies the start-up sweep used — the
  * store, the four repositories, the configured paths and
  * `DEBUGGEN_RETENTION_DAYS` window, the logger and the clock — so the command
- * and the start-up pass apply one rule set. The caller supplies no option: the
- * window is the developer's configuration, never a request's.
+ * and the start-up pass apply one rule set. The one option a request decides
+ * is whose state the sweep may remove: the scope of the requesting editor's
+ * credential. The window is the developer's configuration, never a request's.
+ *
+ * @example
+ * ```ts
+ * const retention: SessionRetentionPort = {
+ *   purge: (scope) => runRetention(retentionDeps, { scope }),
+ * };
+ * ```
  */
 export interface SessionRetentionPort {
   /**
-   * Runs one retention sweep.
+   * Runs one retention sweep limited to `scope`.
    *
+   * @param scope Admits the project roots whose state the sweep may remove —
+   *   for `session.purge`, those whose canonical location lies under the
+   *   requesting editor's canonical workspace folders. It answers
+   *   asynchronously, because it resolves each root on disk. Passed on as
+   *   `runRetention`'s `scope` option.
    * @returns The sweep's report — per-item problems are in its `errors` — or
    * `Err` only when the sweep could not run at all.
    */
-  purge(): Promise<Result<RetentionReport, DebuggenError>>;
+  purge(scope: RetentionScope): Promise<Result<RetentionReport, DebuggenError>>;
 }
 
 /**
@@ -1020,8 +1053,23 @@ export interface SessionRoutesDeps {
    */
   readonly devServers?: SessionDevServerLookup | undefined;
 
-  /** The retention sweep `session.purge` runs, one at a time. */
+  /** The retention sweep `session.purge` runs, scoped to the editor and one at a time. */
   readonly retention: SessionRetentionPort;
+
+  /**
+   * The state root (`$DEBUGGEN_HOME`) as `realpath` resolved it once at
+   * start-up. `session.create` and `session.question` refuse a project root
+   * that is, contains or lies inside it — canonicalised by
+   * `requireProjectOutsideStateHome` of `../../config.ts`, so a symbolic link
+   * into the state root is refused too — with `400 FS_UNSAFE_PATH`, before
+   * any dev server is resolved, any session is stored or any follow-up can
+   * re-plan and patch (AAP §0.4.2: session data and backups stay outside the
+   * target project; CWE-200). The same field, by the same name and type, is
+   * declared by `./dev-server.ts`, so `../http.ts`'s aggregate carries one
+   * value to both. `main.ts` always supplies it; a suite that composes these
+   * routes without a state tree leaves it out, and no overlap check is made.
+   */
+  readonly canonicalStateHome?: string | undefined;
 
   /**
    * The access boundary's revocation fence, applied by every `POST` handler
@@ -1274,9 +1322,17 @@ const STATUS_BY_CODE: ReadonlyMap<DebuggenErrorCode, DescribedStatus> = new Map<
  * a statement, a provider response (CWE-209). Those are always answered with
  * the fixed summary and a `ref`, and the failure itself is logged under the
  * same `ref`.
+ *
+ * `FS_UNSAFE_PATH` is listed for one refusal this module composes: a project
+ * root that overlaps the state root ({@link stateHomeRefusal}), whose constant
+ * sentence — "set DEBUGGEN_HOME outside the project" — is the only way the
+ * developer learns what to change. It is registered as product text where it
+ * is raised; any other `FS_UNSAFE_PATH` failure, whose message may quote a
+ * path, is never registered and so still receives the fixed copy.
  */
 const VERBATIM_REFUSAL_CODES: ReadonlySet<DebuggenErrorCode> = new Set<DebuggenErrorCode>([
   'PROTOCOL_INVALID_MESSAGE',
+  'FS_UNSAFE_PATH',
   'PROJECT_NOT_FOUND',
   'SESSION_NOT_FOUND',
   'SESSION_INVALID_STATE',
@@ -1419,6 +1475,35 @@ function pipelineStillRunning(): DebuggenError {
       details: { reason: 'pipeline-still-running' },
     },
   );
+}
+
+/**
+ * The `400` for a project root that overlaps the state root, or whose
+ * canonical location could not be established to show it does not.
+ *
+ * `../../config.ts`'s `requireProjectOutsideStateHome` raises both as
+ * `FS_UNSAFE_PATH` errors whose message and hint are constant sentences that
+ * name no path; they are rebuilt here with the message registered as product
+ * text, so {@link describedRefusalBody} sends the instruction — set
+ * `DEBUGGEN_HOME` outside the project — verbatim. Any other error (a rejected
+ * check, converted by {@link settled}) passes through unchanged and is
+ * answered as its own code would be.
+ *
+ * @param error The check's refusal.
+ * @returns The refusal to answer the request with.
+ */
+function stateHomeRefusal(error: DebuggenError): DebuggenError {
+  const reason = reasonOf(error);
+  if (
+    error.code !== 'FS_UNSAFE_PATH' ||
+    (reason !== STATE_HOME_OVERLAP_REASON && reason !== PROJECT_ROOT_UNRESOLVABLE_REASON)
+  ) {
+    return error;
+  }
+  return new DebuggenError(error.code, authorProductText(error.message), {
+    ...(error.hint === undefined ? {} : { hint: error.hint }),
+    ...(error.details === undefined ? {} : { details: error.details }),
+  });
 }
 
 /** The `409` for an element requested of a session in a terminal status. */
@@ -1576,6 +1661,131 @@ export function toSessionPurgeResponse(
     issueCount: report.errors.length,
     durationMs: report.durationMs,
   };
+}
+
+/** The scope one `session.purge` hands its sweep, and what building it could not resolve. */
+interface PurgeScope {
+  /** The predicate, closed over the request's principal and its canonical folders. */
+  readonly scope: RetentionScope;
+  /** How many of the principal's workspace folders could not be canonicalised; each admits nothing. */
+  readonly unresolvedFolders: number;
+}
+
+/**
+ * The workspace folders whose projects a `session.purge` of `principal` may
+ * sweep: an editor's announced folders, normalised and de-duplicated. Every
+ * other role — which the operation's role row refuses before the handler runs
+ * — has none, so its scope admits nothing.
+ */
+function purgeFoldersOf(principal: Principal): readonly string[] {
+  if (principal.role !== 'vscode') {
+    return [];
+  }
+  return [
+    ...new Set(principal.scope.workspaceFolders.map((folder) => normalizePosix(toPosix(folder)))),
+  ];
+}
+
+/**
+ * `path`'s canonical location through `../../config.ts`'s `canonicalizePath`,
+ * or `undefined` when it cannot be established. A throw is read as
+ * unresolvable too, so the caller never has to guard against one.
+ */
+async function canonicalLocationOf(path: string): Promise<string | undefined> {
+  try {
+    const canonical = await canonicalizePath(path);
+    return isErr(canonical) ? undefined : canonical.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The scope of the retention sweep `session.purge` runs for `principal`,
+ * built once per purge (CWE-863; AAP §0.5.6).
+ *
+ * Every workspace folder the editor announced is canonicalised first, once:
+ * each symbolic link resolved, a folder that does not exist yet judged by its
+ * nearest existing ancestor. A folder that cannot be canonicalised — a link
+ * loop, a directory this account may not read — contributes no canonical
+ * folder, so it admits nothing. The scope then admits a stored project root
+ * only when **both** hold:
+ *
+ * 1. `requireProjectScope` lets the principal act on it — the same lexical
+ *    check every other route makes; it runs first, so a root outside the
+ *    announced folders is never resolved on disk;
+ * 2. the root's own canonical location lies within at least one canonical
+ *    folder (`isWithin`, whole path segments).
+ *
+ * So `/w/A/link-to-B`, a link inside workspace A whose target lives in B, is
+ * not A's: it passes the lexical check and fails the canonical one. A root
+ * whose canonical location cannot be established is refused, which keeps its
+ * state. A root that no longer exists is judged by its nearest existing
+ * ancestor, so the aged state of a project deleted from A is still A's to
+ * remove. The lexical check holds on its own merits: this module does not
+ * rely on `requireProjectScope` resolving links, and keeps working unchanged
+ * if it does.
+ *
+ * @param principal The requesting principal, already past the revocation fence.
+ * @returns The scope, and how many folders could not be canonicalised.
+ *
+ * @example
+ * ```ts
+ * // /w/A announced; /w/A/link-to-B → /w/B/app
+ * const { scope } = await purgeScopeOf(editor);
+ * await scope('/w/A/app'); // true
+ * await scope('/w/A/link-to-B'); // false: it really lives in B
+ * await scope('/w/B/app'); // false: outside the announced folders
+ * ```
+ */
+async function purgeScopeOf(principal: Principal): Promise<PurgeScope> {
+  const resolved = await Promise.all(purgeFoldersOf(principal).map(canonicalLocationOf));
+  const canonicalFolders = Object.freeze(
+    resolved.filter((folder): folder is string => folder !== undefined),
+  );
+  const unresolvedFolders = resolved.length - canonicalFolders.length;
+
+  const scope: RetentionScope = async (projectRoot) => {
+    if (canonicalFolders.length === 0 || isErr(requireProjectScope(principal, projectRoot))) {
+      return false;
+    }
+    const canonicalRoot = await canonicalLocationOf(projectRoot);
+    return (
+      canonicalRoot !== undefined &&
+      canonicalFolders.some((folder) => isWithin(folder, canonicalRoot))
+    );
+  };
+  return { scope, unresolvedFolders };
+}
+
+/** Orders two strings by UTF-16 code unit, independent of any locale. */
+function compareCodeUnits(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
+/**
+ * The key under which `session.purge` requests share one sweep: equal exactly
+ * when their announced folder sets are, so their scopes ({@link purgeScopeOf})
+ * pass the same lexical check and — resolved from the same folders — admit
+ * the same canonical locations. An editor's is its set of announced workspace
+ * folders — normalised, de-duplicated and sorted, so the order they were
+ * announced in does not matter; any other principal's is its own credential,
+ * which it shares with no one.
+ *
+ * @param principal The requesting principal.
+ * @returns The key; never shown or logged.
+ */
+function purgeScopeKey(principal: Principal): string {
+  if (principal.role === 'vscode') {
+    const folders = new Set(
+      principal.scope.workspaceFolders.map((folder) => normalizePosix(toPosix(folder))),
+    );
+    return JSON.stringify([principal.role, ...[...folders].sort(compareCodeUnits)]);
+  }
+  return JSON.stringify([principal.role, principal.tokenHash]);
 }
 
 /**
@@ -2711,8 +2921,8 @@ function unstartedPipelineFailure(error: DebuggenError): SessionFailure {
  * Builds the eleven session route handlers for `../http.ts` to register.
  *
  * Registers nothing, builds no application and opens no socket. The only state
- * held between requests is the one retention sweep `session.purge` may have
- * running, which concurrent purges share. Each handler runs the steps of the
+ * held between requests is the retention sweeps `session.purge` has running or
+ * queued, one per workspace folder set, which purges of that set share. Each handler runs the steps of the
  * module documentation in order and answers either `200` with the operation's
  * response body, checked against protocol's response schema, or protocol's
  * error body at the status {@link sessionRouteFailureStatus} assigns.
@@ -2725,7 +2935,7 @@ function unstartedPipelineFailure(error: DebuggenError): SessionFailure {
  * ```ts
  * const routes = createSessionRoutes({
  *   manager, reopener, orchestrator, sessions, panels, modifications, bindings: clients,
- *   retention: { purge: () => runRetention(retentionDeps) }, auth,
+ *   retention: { purge: (scope) => runRetention(retentionDeps, { scope }) }, auth,
  * });
  * app.on('POST', HTTP_ROUTES['session.create'].pattern, authFor('session.create'),
  *   routes['session.create']);
@@ -2772,6 +2982,36 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
     principal: Principal,
     context: RequestContext,
   ): Result<void, Response> => requireLivePrincipal(c, auth, principal, context);
+
+  /**
+   * Refuses a project root that is, contains or lies inside the state root
+   * (see {@link SessionRoutesDeps.canonicalStateHome}), answered
+   * `400 FS_UNSAFE_PATH` in the check's own constant words. Awaits the
+   * canonicalisation, so every caller runs it before its revocation fence.
+   * Without a canonical state root no check is made.
+   *
+   * @param c The request context.
+   * @param projectRoot The normalised absolute root the request acts on.
+   * @param context The logger and the operation.
+   * @returns `ok`, or the response that refuses the request.
+   */
+  async function keepApartFromStateHome(
+    c: Context<ServerEnv>,
+    projectRoot: string,
+    context: RequestContext,
+  ): Promise<Result<void, Response>> {
+    const stateHome = deps.canonicalStateHome;
+    if (stateHome === undefined) {
+      return ok(undefined);
+    }
+    const checked = await settled(
+      () => requireProjectOutsideStateHome(stateHome, projectRoot),
+      'state-home-check-rejected',
+    );
+    return isErr(checked)
+      ? err(answerFailure(c, stateHomeRefusal(checked.error), context))
+      : ok(undefined);
+  }
 
   /* ----------------------------------------------------------------------------------------------
    * Work that continues after a reply
@@ -3240,6 +3480,13 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
     if (isErr(scoped)) {
       return answerFailure(c, scoped.error, context);
     }
+    // Session data and backups live outside the project (AAP §0.4.2): a root
+    // that overlaps the state root is refused before any dev server is looked
+    // up, held or probed, and before anything is stored.
+    const apart = await keepApartFromStateHome(c, projectRoot.value, context);
+    if (isErr(apart)) {
+      return apart.error;
+    }
 
     const devServer = await resolveDevServerUrl(
       projectRoot.value,
@@ -3384,6 +3631,12 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
     const body = await readBody(c, SESSION_QUESTION_OPERATION);
     if (isErr(body)) {
       return answerBodyRejection(c, body.error, context);
+    }
+    // A follow-up can re-plan and patch the project, writing backups into the
+    // state root: refused, like a new session, when the two overlap.
+    const apart = await keepApartFromStateHome(c, record.projectRoot, context);
+    if (isErr(apart)) {
+      return apart.error;
     }
 
     const attemptId = body.value.attemptId ?? newId(FOLLOW_UP_ATTEMPT_ID_PREFIX);
@@ -3770,26 +4023,49 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
   };
 
   /**
-   * The retention sweep currently running for `session.purge`, shared by every
-   * request that arrives while it runs; cleared once it settles, so the next
-   * purge starts a fresh sweep. It never rejects: {@link settled} turns a
-   * rejection into the `Err` it should have been.
+   * The retention sweep running or queued for `session.purge`, per scope key
+   * ({@link purgeScopeKey}): shared by every request of that scope that arrives
+   * before it settles, and cleared once it does, so the next purge of the
+   * scope starts a fresh sweep. A request of another scope never receives it.
+   * No entry ever rejects: {@link settled} turns a rejection into the `Err` it
+   * should have been.
    */
-  let purgeInFlight: Promise<Result<RetentionReport, DebuggenError>> | undefined;
+  const purgesByScope = new Map<string, Promise<Result<RetentionReport, DebuggenError>>>();
 
-  /** The running sweep, or a new one when none runs; `joined` says which. */
-  function runPurgeOnce(): {
+  /**
+   * The sweep queued last. Each new sweep starts only once it has settled, so
+   * two sweeps — of one scope or of two overlapping ones — never run at once.
+   * Never rejects, like every sweep it chains.
+   */
+  let purgeQueueTail: Promise<unknown> = Promise.resolve();
+
+  /**
+   * The sweep of `principal`'s scope already running or queued, or a new one
+   * over `scope` — the one {@link purgeScopeOf} built for this request —
+   * queued behind every other; `joined` says which. Synchronous, so nothing
+   * lands between the caller's revocation fence and the sweep it starts or
+   * joins.
+   */
+  function runPurgeOnce(
+    principal: Principal,
+    scope: RetentionScope,
+  ): {
     readonly sweep: Promise<Result<RetentionReport, DebuggenError>>;
     readonly joined: boolean;
   } {
-    if (purgeInFlight !== undefined) {
-      return { sweep: purgeInFlight, joined: true };
+    const key = purgeScopeKey(principal);
+    const pending = purgesByScope.get(key);
+    if (pending !== undefined) {
+      return { sweep: pending, joined: true };
     }
-    const sweep = settled(() => retention.purge(), 'retention-purge-rejected');
-    purgeInFlight = sweep;
+    const sweep = purgeQueueTail.then(() =>
+      settled(() => retention.purge(scope), 'retention-purge-rejected'),
+    );
+    purgeQueueTail = sweep;
+    purgesByScope.set(key, sweep);
     void sweep.finally(() => {
-      if (purgeInFlight === sweep) {
-        purgeInFlight = undefined;
+      if (purgesByScope.get(key) === sweep) {
+        purgesByScope.delete(key);
       }
     });
     return { sweep, joined: false };
@@ -3798,9 +4074,13 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
   /**
    * `session.purge`: runs the retention sweep now, for
    * `debuggen.purgeSessions`, and answers with its report once it finished.
-   * Editor role only; the body is protocol's empty object. Never touches a
-   * session inside the retention window — which sessions go is the sweep's
-   * rule, not this handler's.
+   * Editor role only; the body is protocol's empty object. The sweep is scoped
+   * to the projects that really live under the editor's announced workspace
+   * folders ({@link purgeScopeOf}): the folders are canonicalised once, after
+   * the revocation fence and before the sweep is started or joined. A purge of
+   * the same folder set joins one already running or queued, any other waits
+   * its turn. Never touches a session inside the retention window — which
+   * sessions go is the sweep's rule, not this handler's.
    */
   const purgeSessions: SessionRouteHandler = async (c) => {
     c.header(CACHE_CONTROL_HEADER, NO_STORE);
@@ -3815,13 +4095,32 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
       return answerBodyRejection(c, body.error, context);
     }
 
-    // Fenced before a sweep is started or joined: a retired credential neither
-    // runs one nor receives the report of one another request started.
+    // Fenced before anything is resolved: a retired credential neither reads
+    // the disk, runs a sweep, nor receives the report of one another request
+    // started.
     const live = fence(c, principal.value, context);
     if (isErr(live)) {
       return live.error;
     }
-    const { sweep, joined } = runPurgeOnce();
+    const { scope, unresolvedFolders } = await purgeScopeOf(principal.value);
+    if (unresolvedFolders > 0) {
+      // A count only: a folder is a path on this machine and is never logged.
+      context.log.warn(
+        'Workspace folders could not be resolved on disk; the purge admits nothing under them',
+        {
+          operation: SESSION_PURGE_OPERATION,
+          unresolvedFolders,
+        },
+      );
+    }
+    // Fenced again after that await, immediately before the sweep is started
+    // or joined with nothing awaited in between: a credential retired while
+    // the folders resolved runs nothing either.
+    const stillLive = fence(c, principal.value, context);
+    if (isErr(stillLive)) {
+      return stillLive.error;
+    }
+    const { sweep, joined } = runPurgeOnce(principal.value, scope);
     const swept = await sweep;
     if (isErr(swept)) {
       return answerFailure(c, swept.error, context);

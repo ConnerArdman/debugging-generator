@@ -20,9 +20,10 @@
  *    placed in every field a caller can put text into — a statement, a key
  *    name, an event id, a label, a trace id, a location file, a confidence —
  *    and none of them may reach the error's message, hint, details, stack or
- *    serialised form (AAP 0.5.2). `describeIssues` is exercised directly on
- *    issues whose message and input *are* the sentinel, so the rule is proved
- *    at the one place it is implemented.
+ *    serialised form, because a rejected value can carry developer data.
+ *    `describeIssues` is exercised directly on issues whose message and input
+ *    *are* the sentinel, so the rule is proved at the one place it is
+ *    implemented.
  * 4. **Confidence is ordered, and only three strings are confidences.**
  *    `compareConfidence` is a total, antisymmetric comparator over
  *    `low < medium < high` that reports zero for equal levels, and
@@ -35,8 +36,8 @@
  * Everything here is synchronous and pure; nothing reaches the filesystem, the
  * network or `$DEBUGGEN_HOME`. Identifiers are generic, because
  * `scripts/check-no-hardcoding.mjs` scans this package and because a test that
- * knew an application's vocabulary would be evidence of the coupling AAP 0.5.4
- * forbids.
+ * knew an application's vocabulary would be evidence of the coupling to one
+ * application that script forbids.
  */
 
 import { describe, expect, it } from 'vitest';

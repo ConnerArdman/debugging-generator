@@ -1063,10 +1063,9 @@ const CATALOGUED_NODE_TYPES = PANEL_NODE_CATALOG_ENTRIES.map((entry) => entry.ty
  *
  * States the rules rather than the values that broke them, and says plainly what
  * a failure here means — a defect in panel generation, answered with the
- * deterministic fallback panel rather than with another attempt at the model
- * (AAP 0.5.3, AAP 0.5.5). The node types and the metric count are derived from
- * the catalog and the telemetry package's vocabulary so the sentence cannot go
- * stale.
+ * deterministic fallback panel rather than with another attempt at the model.
+ * The node types and the metric count are derived from the catalog and the
+ * telemetry package's vocabulary so the sentence cannot go stale.
  */
 const PANEL_INVARIANT_HINT = `Every node must be a catalogued type (${CATALOGUED_NODE_TYPES}); a query-backed node must name a source its type can read, and a container or source link must carry none; only containers carry children, and every node id is unique; metric ids come from the fixed set of ${String(METRIC_IDS.length)}; and a panel that supersedes another is at least version 2. A failure here is a defect in panel generation rather than an unanswerable question: show the deterministic fallback panel for this capture, and use the issue paths in this error's details to locate the nodes at fault.`;
 
@@ -1097,9 +1096,9 @@ interface PanelIssueDetail extends SchemaIssueSummary {
  *   read, from its catalog entry.
  *
  * Both are closed vocabularies owned by the catalog and never the rejected
- * value (AAP 0.5.2), which is what makes them safe to log and to show; they are
- * what turns "this node is wrong" into "this node is wrong, and this is what
- * would be right".
+ * value, which can carry developer data; that is what makes them safe to log
+ * and to show, and they are what turns "this node is wrong" into "this node is
+ * wrong, and this is what would be right".
  *
  * @param code The issue's code.
  * @param nodeType The node's catalogued type, where it has one.

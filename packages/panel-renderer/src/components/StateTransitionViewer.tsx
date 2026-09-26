@@ -1,32 +1,32 @@
 /**
  * `StateTransitionViewer` — the `stateTransitions` node of the panel catalog.
  *
- * AAP 0.6.2 states this node in one line: "component, hook index/label, old
- * value summary, triggering event, new value summary — old → trigger → new
- * rows; trigger links to its event." That is the row this file draws, and the
- * order of its columns is that sentence read left to right.
+ * Each row is one observed transition read old → trigger → new: the component,
+ * the hook index or label, the value summary before, the triggering event and
+ * the value summary after, with the trigger linking to its event. The columns
+ * are that sequence read left to right.
  *
- * It belongs to the distinctive set of the excessive-render panel (AAP 0.6.5)
- * beside the render table, the component tree and the dependency graph: those
- * four are why a panel answering "why is this updating so often" is a
- * materially different panel from one answering "why was this slow", which
+ * It belongs to the distinctive set of the excessive-render panel beside the
+ * render table, the component tree and the dependency graph: those four are
+ * why a panel answering "why is this updating so often" is a materially
+ * different panel from one answering "why was this slow", which
  * `tests/e2e/demo-excessive-renders.spec.ts` asserts by comparing the node-type
  * sets of the two.
  *
  * ## The values are opaque strings, and that is the design
  *
  * `previousValue` and `nextValue` arrive **already scrubbed and already
- * bounded** by the producer: AAP 0.5.2 captures hook state as a category plus a
+ * bounded** by the producer: it captures hook state as a category plus a
  * preview of at most 120 code points, passed through the credential patterns
- * first, and it implements no opt-in for full values. So this file treats a
- * summary as text and nothing else. Nothing here parses one, expands one,
- * re-serialises one, compares two of them, or offers a control that would show
- * "the rest" — there is no rest to show, and a viewer that behaved as though
- * there were would be inventing the one thing the capture deliberately never
- * took. Shortening for display goes through `../utils/format`'s
- * {@link oneLinePreview}, whose default budget *is* that 120-code-point bound,
- * so the renderer can never present more than the producer was allowed to
- * capture.
+ * first, and no opt-in for full values exists (see `docs/SECURITY.md`,
+ * "Never captured"). So this file treats a summary as text and nothing else.
+ * Nothing here parses one, expands one, re-serialises one, compares two of
+ * them, or offers a control that would show "the rest" — there is no rest to
+ * show, and a viewer that behaved as though there were would be inventing the
+ * one thing the capture deliberately never took. Shortening for display goes
+ * through `../utils/format`'s {@link oneLinePreview}, whose default budget
+ * *is* that 120-code-point bound, so the renderer can never present more than
+ * the producer was allowed to capture.
  *
  * A table cell is narrower than most summaries, so a cell clips its summary to
  * its own track with an ellipsis rather than letting it paint across the next
@@ -45,9 +45,10 @@
  * comparing the two previews, because two values that differ only past the
  * truncation bound have identical previews. This file therefore labels a
  * `false` row as *no values reported* and never as *unchanged*: the render
- * trigger vocabulary of AAP 0.2.3 keeps `unchanged` and `unknown` apart on
- * purpose, and folding "we could not describe it" into "it did not change"
- * would be exactly the false claim that separation exists to prevent.
+ * trigger vocabulary keeps `unchanged` and `unknown` apart on purpose (see
+ * `docs/ARCHITECTURE.md`, "Computed metrics"), and folding "we could not
+ * describe it" into "it did not change" would be exactly the false claim that
+ * separation exists to prevent.
  *
  * The same rule covers the aggregate's **truncation sentinel** — a row carrying
  * `truncated` with no transition source and no previews. It is a disclosure
@@ -157,19 +158,20 @@
  * No sorting, filtering or paging arithmetic on a resolved page beyond the one
  * local narrowing the toolbar declares (see the "changed only" toggle, whose
  * scope the footer states) and the removal of a row a later page repeats (see
- * `appendPage`). Ordering is the service's: AAP 0.4.2 applies
- * `filter`, `sort`, `limit` and `offset` where the whole capture is, and a sort
- * here is a **re-query** mapped onto that vocabulary. No transport either — no
- * `fetch`, no socket, no message port: data arrives through the `DataProvider`
- * interface and interactions leave through `PanelActions` (AAP 0.1.2, 0.6.2).
- * And no application vocabulary: every name on screen comes from the data
- * (AAP 0.5.4).
+ * `appendPage`). Ordering is the service's: it applies `filter`, `sort`,
+ * `limit` and `offset` where the whole capture is (see `docs/ARCHITECTURE.md`,
+ * "Panel data"), and a sort here is a **re-query** mapped onto that
+ * vocabulary. No transport either — no `fetch`, no socket, no message port:
+ * data arrives through the `DataProvider` interface and interactions leave
+ * through `PanelActions` (see `docs/ARCHITECTURE.md`,
+ * "The renderer contract"). And no application vocabulary: every name on
+ * screen comes from the data.
  *
  * ## Class-name contract
  *
  * Implemented by `../styles/components.css`, which is the defining side. This
  * file contributes class names and no visual value; the only `style` attribute
- * it emits anywhere is none at all (AAP 0.6.4).
+ * it emits anywhere is none at all.
  *
  * | Class                              | Role                                     |
  * | ---------------------------------- | ---------------------------------------- |
@@ -201,7 +203,7 @@
  * `DataTable` owns `dg-is-selected` on the row it was told is selected — and
  * which row that is comes from the panel's shared selection, so a record
  * selected in any view or evidence chip marks its transition here, and a
- * transition activated here marks its record everywhere else (AAP 0.7.3).
+ * transition activated here marks its record everywhere else.
  *
  * @see ../host/useQuery for the one-page-at-a-time resolution contract and the
  * `nextOffset` every "Load more" advances to.
@@ -296,8 +298,8 @@ type StateTransitionsQuery = DataQuery & { source: typeof STATE_TRANSITIONS_SOUR
  *
  * Chronological, because a sequence of state changes is a narrative: the value
  * a hook held, what moved it, and what it holds now only make sense in the
- * order they happened. AAP 0.4.2 keeps ordering on the side that holds the
- * whole capture, so this is the value put on the query, never a local sort.
+ * order they happened. Ordering belongs to the side that holds the whole
+ * capture, so this is the value put on the query, never a local sort.
  */
 const DEFAULT_SORT: DataQuerySort = 'start_asc';
 
@@ -342,15 +344,15 @@ const ALL_COMPONENTS = '';
  * Copy
  *
  * Product wording only: not one of these strings names a component, a hook, a
- * route or anything else belonging to the application under investigation
- * (AAP 0.5.4). Every name on screen arrives in the data.
+ * route or anything else belonging to the application under investigation.
+ * Every name on screen arrives in the data.
  * ---------------------------------------------------------------------------
  */
 
 /** The accessible name of the grid when the node carries no title of its own. */
 const CATALOG_LABEL = catalogEntryFor(STATE_TRANSITIONS_SOURCE).label;
 
-/** What the empty state says: a real answer, not a failure (AAP 0.5.5). */
+/** What the empty state says: a real answer, not a failure. */
 const EMPTY_MESSAGE = 'No state transitions were captured for this interaction.';
 
 /** The short label above {@link EMPTY_MESSAGE}. */
@@ -403,9 +405,9 @@ const UNREPORTED_HINT =
  * What a shortened summary's tooltip says.
  *
  * It explains the bound rather than offering the rest, because there is no rest
- * in this process: AAP 0.5.2 captures a bounded preview and implements no
- * opt-in for a full value, so a control promising one would promise something
- * the whole product deliberately cannot deliver.
+ * in this process: the producer captures only a bounded, redacted preview and
+ * no opt-in for a full value exists, so a control promising one would promise
+ * something the whole product deliberately cannot deliver.
  */
 const VALUE_SHORTENED_HINT =
   'The capture keeps a bounded summary of this value rather than the value itself, and it is shown shortened to fit.';
@@ -449,9 +451,8 @@ const DETAIL_HIDE_LABEL = 'Hide details of';
  * The row's identity and its two summaries come first, under the same words
  * as their column headers, because a cell clips what the detail has room to
  * show whole: the component and hook names, and each summary exactly as the
- * row displays it — the bounded preview, never more than the row was given
- * (AAP 0.5.2). Then the categories and identifiers the columns have no room
- * for at all.
+ * row displays it — the bounded preview, never more than the row was given.
+ * Then the categories and identifiers the columns have no room for at all.
  */
 const DETAIL_LABELS = {
   component: HEADERS.component,
@@ -533,10 +534,10 @@ const NO_KEYS: readonly string[] = Object.freeze([]);
  * Clamp an authored page size into the contract's per-request bounds.
  *
  * The query schema bounds one request's `limit` at `[0, DATA_QUERY_MAX_LIMIT]`,
- * and AAP 0.4.2 defaults an omitted one to `DATA_QUERY_DEFAULT_LIMIT`. The
- * maximum is a bound on a single page and never on how many rows "Load more"
- * can reach: the result is sent unchanged with every page of a sequence, and
- * the sequence itself goes as far as the provider's `nextOffset` does.
+ * and an omitted one defaults to `DATA_QUERY_DEFAULT_LIMIT`. The maximum is a
+ * bound on a single page and never on how many rows "Load more" can reach: the
+ * result is sent unchanged with every page of a sequence, and the sequence
+ * itself goes as far as the provider's `nextOffset` does.
  *
  * Zero is preserved exactly. It is an explicit request for a total without
  * rows, which a node may legitimately make, and the absence of the field is the
@@ -686,7 +687,7 @@ function transitionNounFor(count: number): string {
  * Positions are one-based because a reader counts that way; offsets are how
  * many items were skipped, so the first item of a page at offset `n` is item
  * `n + 1`. Generic product wording only: no sentence names anything of the
- * application under investigation (AAP 0.5.4).
+ * application under investigation.
  *
  * @example
  * ```ts
@@ -1016,8 +1017,8 @@ function triggerLabelOf(transition: StateTransition): string {
  *
  * First appearance decides a component's position and every row keeps its place
  * within its component, so the capture's order survives inside each group —
- * which is the only order this view may claim, since AAP 0.4.2 puts ordering on
- * the side that holds the whole capture. Nothing is merged, summed or dropped:
+ * which is the only order this view may claim, since ordering belongs to the
+ * side that holds the whole capture. Nothing is merged, summed or dropped:
  * the output is a permutation of the input and the footer says grouping is on.
  *
  * Rows whose producer named no component share one bucket. They are not being
@@ -1271,7 +1272,7 @@ function viewFor(held: ViewState, requestKey: string): ViewState {
  * A node and an optional class name — the shape every query-backed component in
  * this package takes. Data is not a prop: it is resolved from the node's own
  * `query` through the ambient `DataProvider`, which is what stops a host surface
- * from handing a view rows that its query never asked for (AAP 0.6.2).
+ * from handing a view rows that its query never asked for.
  */
 export interface StateTransitionViewerProps {
   /**
@@ -1748,11 +1749,12 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
   const anyLoaded = loaded.length > 0;
   const firstPageLoading = status === 'loading' && !anyLoaded;
   const firstPageFailed = status === 'error' && !anyLoaded;
-  // A failure, first page or later, is shown through the package's one failure
-  // contract (B2-F14, B1-F16) with the request that failed, offset included —
-  // what a developer needs to reproduce it. A first page's failure is the
-  // view's own; one behind loaded rows is a page failure, whose copy says the
-  // rows above it are unaffected.
+  // A failure, first page or later, is shown through the package's shared
+  // error-state design, the one layout every query-backed node renders its
+  // failure with (`queryFailureProps` onto `ErrorState`), together with the
+  // request that failed, offset included — what a developer needs to reproduce
+  // it. A first page's failure is the view's own; one behind loaded rows is a
+  // page failure, whose copy says the rows above it are unaffected.
   const failedResult = { error, announcement, retry };
 
   // The footer's paging control, read off the status of the page requested
@@ -1871,10 +1873,9 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
  * value before, the trigger, the value after, what was reported.
  *
  * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
- * in `../primitives/DataTable`, AAP 0.6.4): `DataTable` resolves each role to
- * a track built from the design system's column floor and share tokens, the
- * same track every other table gives content of that kind. The roles follow
- * the content:
+ * in `../primitives/DataTable`): `DataTable` resolves each role to a track
+ * built from the design system's column floor and share tokens, the same track
+ * every other table gives content of that kind. The roles follow the content:
  *
  * - the component — the disclosure control, the name and its source chip — is
  *   `name`, the identifier role;
@@ -2141,9 +2142,10 @@ interface ValueCellProps {
  *
  * The received string is handed to {@link oneLinePreview} and to nothing else:
  * no parsing, no expansion, no re-serialisation, no comparison with the other
- * side (AAP 0.5.2). When the formatter shortened it, the cell says so through a
- * state class and a tooltip that explains the bound — it does not offer the
- * rest, because there is no rest to offer. That summary is the tooltip's
+ * side, because it is the producer's bounded, redacted preview and nothing
+ * more. When the formatter shortened it, the cell says so through a state
+ * class and a tooltip that explains the bound — it does not offer the rest,
+ * because there is no rest to offer. That summary is the tooltip's
  * trigger, focusable at `tabIndex={-1}` so the grid's arrow keys reach it and
  * its focus opens the explanation (see this module's header); a summary shown
  * whole has no tooltip and so no tab index at all.
@@ -2245,7 +2247,7 @@ function TriggerCell(props: TriggerCellProps): ReactElement {
 
     // No wrapper: one child, no spacing to own, and the cell's own class rides
     // on the text run — a container that adds nothing is a DOM level a reader's
-    // assistive technology walks for no reason (AAP 0.6.4's flattening rule).
+    // assistive technology walks for no reason.
     return (
       <Tooltip content={known ? TRIGGER_OUT_OF_SLICE_HINT : TRIGGER_UNDETERMINED_HINT}>
         <Text
@@ -2310,12 +2312,12 @@ interface ChangedCellProps {
  *   reported floor, which describes a list and no value at all.
  *
  * Each chip carries a glyph and a word as well as a tone, so the state is never
- * conveyed by colour alone (AAP 0.6.4). The two chips that carry an
- * explanation are that tooltip's trigger, focusable at `tabIndex={-1}` so the
- * grid's arrow keys reach it (see this module's header); the changed chip
- * explains nothing and takes no tab index. A chip clips at its
- * own border in a track narrower than its word, so the changed chip carries its
- * word as its `title`; the other two already open their tooltip on hover.
+ * conveyed by colour alone. The two chips that carry an explanation are that
+ * tooltip's trigger, focusable at `tabIndex={-1}` so the grid's arrow keys
+ * reach it (see this module's header); the changed chip explains nothing and
+ * takes no tab index. A chip clips at its own border in a track narrower than
+ * its word, so the changed chip carries its word as its `title`; the other two
+ * already open their tooltip on hover.
  *
  * @param props See {@link ChangedCellProps}.
  * @returns The cell.
@@ -2438,8 +2440,8 @@ interface TransitionDetailProps {
  * than ellipsized. Each summary is the row's displayed string exactly — the
  * bounded preview {@link previewOf} produced for the cell — so this block never
  * shows more of a value than the row was given, and a summary the display
- * bound shortened appears here shortened too (AAP 0.5.2): there is no rest of
- * it in this process to show.
+ * bound shortened appears here shortened too: there is no rest of it in this
+ * process to show.
  *
  * Then the vocabulary the columns have no room for — the value's category, the
  * dimension that changed, the trigger's kind — and the identifiers a developer
@@ -2570,8 +2572,7 @@ interface DetailFieldProps {
  * One captioned field of an expanded row.
  *
  * A caption and its value on one line, spaced by the layout primitive rather
- * than by a margin, so the detail block has no bespoke spacing of its own
- * (AAP 0.6.4).
+ * than by a margin, so the detail block has no bespoke spacing of its own.
  *
  * @param props See {@link DetailFieldProps}.
  * @returns The field.

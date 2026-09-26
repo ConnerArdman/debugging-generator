@@ -37,6 +37,16 @@
  * - **`ingestSeq`.** Store-assigned, strictly increasing across batches and
  *   producers, untouched by an idempotent replay, and the final tie-break of a
  *   deterministic canonical order.
+ * - **Loss-only reports.** A `telemetry.event` frame with no events and a
+ *   positive `droppedCount` — a producer's last word at a capture's end — is
+ *   accepted, persists and tails nothing, and reaches the capture's loss
+ *   ledger, so the stopped capture's persisted coverage counts the loss and is
+ *   not complete. An empty frame without a positive loss is refused as
+ *   `PROTOCOL_INVALID_MESSAGE`, and one naming another capture is dropped as
+ *   `stale-capture`; neither records anything. The service's ledger lives in
+ *   its own repository instance, out of the suite's reach, so its total is
+ *   read from the record ingest writes when the ledger accepts a report, then
+ *   from the persisted coverage.
  *
  * ## The sentinel protocol (AAP §0.10 — no committed secrets)
  *
@@ -79,8 +89,20 @@ import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { isMessageOfType } from '@debuggen/protocol';
-import type { CreateEnvelopeOptions, ProtocolMessage, SessionRecord } from '@debuggen/protocol';
-import { isErr, newEventId, newProducerId, newSpanId, newTraceId } from '@debuggen/shared';
+import type {
+  CreateEnvelopeOptions,
+  MessagePayload,
+  ProtocolMessage,
+  SessionRecord,
+} from '@debuggen/protocol';
+import {
+  isErr,
+  newCaptureId,
+  newEventId,
+  newProducerId,
+  newSpanId,
+  newTraceId,
+} from '@debuggen/shared';
 import {
   DEFAULT_DUPLICATE_WINDOW_MS,
   MAX_PREVIEW_LENGTH,
@@ -2179,5 +2201,241 @@ describe('inside the capture window', () => {
     it('leaves no substituted material anywhere after every path ran', () => {
       expectNoSubstitutedMaterialAnywhere();
     });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Loss-only reports
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The inspected tab of the loss-only suite: its own credential, project and session. */
+const LOSS_TAB_ID = 4_219;
+
+/** The loss the page agent reports for the open capture. */
+const REPORTED_LOSS = 7;
+
+/** The loss a stale frame claims: a different number, so the capture's total tells them apart. */
+const STALE_LOSS = 11;
+
+/** The message ingest logs once the ledger recorded a loss report, with the ledger's total. */
+const LOSS_RECORDED_MESSAGE = 'a producer reported discarded events; recorded against the capture';
+
+/**
+ * Placed after every other suite on purpose: the stale-capture case below
+ * writes the file's only `stale-capture` drop, and the drop-vocabulary case
+ * above reads every drop record the file wrote before it ran.
+ */
+describe('loss-only reports', () => {
+  /** What the setup establishes for this suite. */
+  interface LossTab {
+    /** The DevTools connection that announced {@link LOSS_TAB_ID} in its hello. */
+    readonly devtools: HarnessWsClient;
+    /** The session bound to that tab, on a project copy of its own. */
+    readonly sessionId: string;
+    /** That session's open capture. */
+    readonly captureId: string;
+  }
+
+  let lossTab: LossTab | undefined;
+
+  /** The suite's state, or a failure naming the setup that did not run. */
+  function lossTabOf(): LossTab {
+    if (lossTab === undefined) {
+      throw new Error('The loss-only tab was not set up.');
+    }
+    return lossTab;
+  }
+
+  /** Sends one `telemetry.event` payload on the tab's connection and returns its error codes. */
+  async function relayPayload(
+    payload: MessagePayload<'telemetry.event'>,
+  ): Promise<readonly string[]> {
+    const { devtools } = lossTabOf();
+    const receipt = devtools.send('telemetry.event', payload);
+    expect(isErr(receipt.result), 'the telemetry.event frame was written').toBe(false);
+    expect(await devtools.flush(), 'the service processed the frame before the barrier').toBe(true);
+    return devtools.errorsFor(receipt.id).map((error) => error.code);
+  }
+
+  /**
+   * `records` without the trailing summaries an ingest log throttle may write
+   * for an earlier suite's held-back records: those report old batches, not
+   * the frame under test.
+   */
+  function withoutTrailingSummaries(records: readonly CapturedLogRecord[]): CapturedLogRecord[] {
+    return records.filter((record) => record.fields.trailingSummary !== true);
+  }
+
+  /** The ledger totals ingest logged for the suite's capture since `from`. */
+  function recordedLossTotals(from: number): unknown[] {
+    const { captureId } = lossTabOf();
+    return ingestRecords(from)
+      .filter(
+        (record) =>
+          record.message === LOSS_RECORDED_MESSAGE && record.fields.captureId === captureId,
+      )
+      .map((record) => record.fields.captureDroppedEvents);
+  }
+
+  /**
+   * Every loss report ingest handed to its ledger since `from`, whichever
+   * capture and whatever the ledger answered: each such attempt is logged once
+   * with its `droppedEvents` count.
+   */
+  function recordedLossReports(from: number): CapturedLogRecord[] {
+    return ingestRecords(from).filter((record) => typeof record.fields.droppedEvents === 'number');
+  }
+
+  beforeAll(async () => {
+    const { harness } = current();
+    // Captures are exclusive per project, so this session gets a copy of its
+    // own, readied and captured exactly like the file's first session.
+    const project = await harness.copyFixtureProject();
+    const launched = recordResponse(await harness.launchDevServer(project.root));
+    if (isErr(launched)) {
+      throw new Error(`The loss-only dev server did not launch: ${launched.error.message}`);
+    }
+    const session = recordResponse(
+      await harness.createSession({
+        projectRoot: project.root,
+        question: 'Why is the report slow to load?',
+      }),
+    );
+
+    const { client: devtools } = await harness.connectDevtools({ tabId: LOSS_TAB_ID });
+    const bound = await harness.bindTab(devtools, {
+      tabId: LOSS_TAB_ID,
+      url: session.devServerUrl,
+      origin: new URL(session.devServerUrl).origin,
+    });
+    if (isErr(bound)) {
+      throw new Error(
+        `The loss-only tab was not bound (${bound.error.code}): ${bound.error.message}`,
+      );
+    }
+    const ready = devtools.send('agent.ready', {
+      tabId: LOSS_TAB_ID,
+      documentId: assemble('doc-', randomHex(8)),
+      producerId: newProducerId(),
+      url: session.devServerUrl,
+      installedBeforeReact: true,
+      reactDetected: true,
+    });
+    if (!(await devtools.flush()) || devtools.errorsFor(ready.id).length > 0) {
+      throw new Error(`agent.ready for the loss-only tab was refused: ${devtools.describe()}`);
+    }
+    await harness.ws({
+      client: 'server-agent',
+      projectRoot: project.root,
+      token: harness.issueServerAgentCredential(project.root).token,
+    });
+    await harness.editor(project.root);
+
+    const settled = await harness.waitForSession(
+      session.id,
+      (record: SessionRecord) => record.status === 'ready' || record.status === 'failed',
+    );
+    if (settled.status !== 'ready') {
+      throw new Error(`The loss-only session settled in "${settled.status}" instead of "ready".`);
+    }
+    const started = recordResponse(await harness.startCapture(session.id));
+    if (isErr(started)) {
+      throw new Error(
+        `The loss-only capture did not start (${started.error.code}): ${started.error.message}`,
+      );
+    }
+    lossTab = { devtools, sessionId: session.id, captureId: started.value.captureId };
+  });
+
+  it('records a loss-only report against the open capture, storing and tailing nothing', async () => {
+    const { harness } = current();
+    const { devtools, captureId } = lossTabOf();
+    const rowsBefore = tableRowCount();
+    const framesBefore = devtools.received.length;
+    const mark = harness.logger.records.length;
+
+    const errors = await relayPayload({
+      events: [],
+      armedCaptureId: captureId,
+      droppedCount: REPORTED_LOSS,
+    });
+
+    expect(errors, 'a loss-only report is accepted').toEqual([]);
+    expect(recordedLossTotals(mark), 'the ledger holds the loss for the capture').toEqual([
+      REPORTED_LOSS,
+    ]);
+    expect(tableRowCount(), 'nothing was persisted').toBe(rowsBefore);
+    expect(withoutTrailingSummaries(summaryRecords(mark)), 'no event pipeline ran').toEqual([]);
+    expect(withoutTrailingSummaries(dropRecords(mark)), 'nothing was dropped').toEqual([]);
+    expect(devtools.received.slice(framesBefore).filter(isTailFrame), 'nothing was tailed').toEqual(
+      [],
+    );
+  });
+
+  it('refuses an empty batch that reports no loss with PROTOCOL_INVALID_MESSAGE, recording nothing', async () => {
+    const { harness } = current();
+    const { captureId } = lossTabOf();
+    const rowsBefore = tableRowCount();
+    const mark = harness.logger.records.length;
+
+    expect(await relayPayload({ events: [] }), 'no loss report').toEqual([
+      'PROTOCOL_INVALID_MESSAGE',
+    ]);
+    expect(
+      await relayPayload({ events: [], armedCaptureId: captureId, droppedCount: 0 }),
+      'a loss report of zero',
+    ).toEqual(['PROTOCOL_INVALID_MESSAGE']);
+
+    // Refused at the protocol boundary: ingest never saw either frame.
+    expect(recordedLossReports(mark)).toEqual([]);
+    expect(withoutTrailingSummaries(dropRecords(mark))).toEqual([]);
+    expect(tableRowCount()).toBe(rowsBefore);
+  });
+
+  it('drops a loss-only report naming another capture as stale-capture, recording nothing', async () => {
+    const { harness } = current();
+    const rowsBefore = tableRowCount();
+    const mark = harness.logger.records.length;
+
+    const errors = await relayPayload({
+      events: [],
+      armedCaptureId: newCaptureId(),
+      droppedCount: STALE_LOSS,
+    });
+
+    expect(errors, 'a drop is an honest report, never an error').toEqual([]);
+    const drops = withoutTrailingSummaries(dropRecords(mark));
+    expect(drops.map((record) => record.fields.reason)).toEqual(['stale-capture']);
+    expect(drops.map((record) => record.fields.received)).toEqual([0]);
+    expect(recordedLossReports(mark), 'the loss belongs to no established capture').toEqual([]);
+    expect(tableRowCount()).toBe(rowsBefore);
+  });
+
+  it('persists the recorded loss in the stopped capture’s coverage, which is not complete', async () => {
+    const { harness } = current();
+    const { devtools, sessionId, captureId } = lossTabOf();
+
+    const stopped = recordResponse(await harness.stopCapture(sessionId));
+    if (isErr(stopped)) {
+      throw new Error(`capture.stop was refused (${stopped.error.code}): ${stopped.error.message}`);
+    }
+
+    // Only the accepted report counts: neither the refused frames nor the stale one reached it.
+    const expected = { producerDroppedEvents: REPORTED_LOSS, complete: false };
+    expect(stopped.value.summary.eventCount).toBe(0);
+    expect(stopped.value.summary.coverage).toMatchObject(expected);
+
+    const stored = harness.repos.sessions.getCapture(captureId);
+    if (isErr(stored)) {
+      throw new Error(`The stopped capture could not be read: ${stored.error.message}`);
+    }
+    expect(stored.value?.sessionId).toBe(sessionId);
+    expect(stored.value?.capture.stoppedAt, 'the window is closed').toBeDefined();
+    expect(stored.value?.capture.summary?.coverage, 'the persisted summary').toMatchObject(
+      expected,
+    );
+    // The connection speaks only for this tab, whose capture stored nothing:
+    // no tail frame ever reached it, the stop barrier's wait included.
+    expect(devtools.received.filter(isTailFrame), 'nothing was ever tailed').toEqual([]);
   });
 });

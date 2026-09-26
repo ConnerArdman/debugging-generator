@@ -1618,6 +1618,8 @@ let cascade: IndexedProject;
 /** The cascade project's on-disk identity, stamped before it was opened. */
 let cascadeStamps: ReadonlyMap<string, FileStamp>;
 
+// A 30 s ceiling, not a budget: this hook parses a program, which a loaded
+// machine can push past the 10 s hook default and so fail every case below.
 beforeAll(async () => {
   // Stamped first, so that opening the project and running every extractor over
   // it happens inside the window the purity assertions cover.
@@ -1631,7 +1633,7 @@ beforeAll(async () => {
   cascadeRoot = writeScratchProject('server-functions-cascade', CASCADE_PROJECT);
   cascadeStamps = stampTree(cascadeRoot);
   cascade = await indexProjectAt(cascadeRoot);
-});
+}, 30_000);
 
 afterAll(() => {
   for (const root of [scratchRoot, cascadeRoot]) {

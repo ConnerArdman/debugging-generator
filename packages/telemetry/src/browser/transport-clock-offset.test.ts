@@ -1,8 +1,8 @@
 // @vitest-environment happy-dom
 /**
- * Tests for the page producer's per-document `clockOffsetMs` (AAP 0.2.3: "a
- * recorded per-producer `clockOffsetMs` (server `Date` header versus local
- * clock, informational)").
+ * Tests for the page producer's per-document `clockOffsetMs`: a recorded
+ * per-producer estimate of the server `Date` header versus the local clock,
+ * informational only (`docs/ARCHITECTURE.md` §5.2).
  *
  * ## What these cases pin
  *
@@ -69,7 +69,7 @@ import type { EventDraft } from './transport.js';
  * Fixtures
  *
  * Neutral vocabulary: nothing below names a component, route or symbol of any
- * particular project (AAP 0.5.4).
+ * particular project.
  * ---------------------------------------------------------------------------
  */
 

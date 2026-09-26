@@ -1,22 +1,23 @@
 /**
  * `RenderTable` — per-component render statistics: how often each component
  * rendered, how much time that took, what triggered those renders and which of
- * its inputs changed (AAP 0.6.2).
+ * its inputs changed.
  *
  * This module is the component behind the node catalog's `renderTable` type and
- * the anchor of the re-render panel (AAP 0.6.5): a panel built around "why is
- * this rendering so often" is materially different from a latency panel because
- * of this view and its two neighbours, and acceptance test 2 (AAP 0.8.4) is
- * read off it — "render counts and timing per component; trigger attribution
- * (context/props/state) where determinable; component names link to
- * declarations".
+ * the anchor of the re-render panel: a panel built around "why is this rendering
+ * so often" is materially different from a latency panel because of this view
+ * and its two neighbours, and the render-count acceptance flow of the end-to-end
+ * suite is read off it — render counts and timing per component, trigger
+ * attribution (context/props/state) where determinable, and component names
+ * that link to their declarations.
  *
  * ## THE TRIGGER VOCABULARY IS THE POINT, AND `unchanged` ≠ `unknown`
  *
  * A render count on its own proves nothing: a component that renders often
  * because its inputs changed often is working exactly as asked. What makes this
  * table evidence is the attribution beside the count, and that attribution has
- * one distinction it must never blur (AAP 0.2.3):
+ * one distinction it must never blur — the one the metric definitions in
+ * `docs/ARCHITECTURE.md` ("Computed metrics") draw between the two counts:
  *
  *   - `unchanged` — all three inputs were **evaluated** and none had changed:
  *     props were shallow-equal, own hook state was unchanged, and no consumed
@@ -33,29 +34,31 @@
  * the zeros, each with its own word and its own tone; and **no expression in
  * this file adds, merges, defaults or substitutes one for the other**. Reporting
  * an unclassifiable render as a stable-input render would be exactly the
- * unevidenced assertion AAP 0.8.4 forbids in an analysis, arrived at through the
+ * unevidenced assertion an analysis may never contain, arrived at through the
  * renderer instead of through the model.
  *
- * ## PROP NAMES ONLY — VALUES NEVER REACH THIS COMPONENT (AAP 0.5.2)
+ * ## PROP NAMES ONLY — VALUES NEVER REACH THIS COMPONENT
  *
  * The producer's fiber diffing sends key **names** plus change counts, bounded
- * by its own per-render key cap, and never a prop value. So this view renders
- * names and counts and nothing else: there is no value column, no value preview,
- * no expand-to-value affordance and no "show full value" control (opt-in full
- * values are explicitly not implemented in v1). Every name is additionally put
- * through `../utils/format`'s shared truncation budget before it is drawn, so a
- * pathological key cannot stretch a row, and the cell's "+N more" indicator
- * counts only the names that actually arrived — the cap is upstream, so nothing
- * here may imply the list is complete.
+ * by its own per-render key cap, and never a prop value, which
+ * `docs/SECURITY.md` ("Never captured") lists among the data the product never
+ * captures. So this view renders names and counts and nothing else: there is
+ * no value column, no value preview, no expand-to-value affordance and no "show
+ * full value" control (opt-in full values are explicitly not implemented in
+ * v1). Every name is additionally put through `../utils/format`'s shared
+ * truncation budget before it is drawn, so a pathological key cannot stretch a
+ * row, and the cell's "+N more" indicator counts only the names that actually
+ * arrived — the cap is upstream, so nothing here may imply the list is
+ * complete.
  *
  * ## DATA ARRIVES THROUGH THE NODE'S QUERY, INTERACTIONS LEAVE THROUGH ACTIONS
  *
  * The only data path is `../host/useQuery` resolving this node's own
  * `DataQuery` against the ambient `DataProvider`; the only interaction path is
  * `../host/PanelActions`. No socket, no `fetch`, no transport knowledge of any
- * kind (AAP 0.1.2) — and no runtime import of `@debuggen/telemetry` either: the
- * aggregate shapes are consumed as types, so the page bundle carries the
- * renderer and not the capture pipeline.
+ * kind — and no runtime import of `@debuggen/telemetry` either: the aggregate
+ * shapes are consumed as types, so the page bundle carries the renderer and not
+ * the capture pipeline.
  *
  * Three actions are raised, and one deliberately is not:
  *
@@ -77,7 +80,7 @@
  *     not point at (see `../host/PanelActions` on why a fabricated coordinate is
  *     worse than an absent one).
  *
- * ## PAGING IS HONEST ABOUT WHAT IT HAS (AAP 0.4.2)
+ * ## PAGING IS HONEST ABOUT WHAT IT HAS
  *
  * Two bounds apply and the reader is told about both. The result is paged —
  * every request carries the node's `limit`, which defaults to 200 and is clamped
@@ -128,10 +131,10 @@
  * `../host/useQuery`: its title, a generic lead followed by the provider's own
  * cause, the failing query as `formatDataQuery` prints it and a working retry)
  * and empty (a node-specific sentence in generic product vocabulary) — never a
- * blank area, and never a failure dressed as a result (AAP 0.5.5). The node's
- * empty sentence is reserved for an empty result. A count-only query, a page at
- * or past the end of a counted result, an empty page below a positive total and
- * a later page with no total each get their own sentence, stating the total when
+ * blank area, and never a failure dressed as a result. The node's empty
+ * sentence is reserved for an empty result. A count-only query, a page at or
+ * past the end of a counted result, an empty page below a positive total and a
+ * later page with no total each get their own sentence, stating the total when
  * one was reported. None of them says the capture holds nothing.
  *
  * Where a state is drawn depends on whether the reader has chosen an order.
@@ -140,11 +143,11 @@
  * and the grid's header stay mounted through every state of the re-query, and
  * the state is drawn in the grid's empty slot beneath the header: unmounting
  * them would destroy the very control the reader is operating and drop focus
- * to the document, after every change (AAP 0.6.4, full keyboard navigation).
- * The rows of the previous order are released by the same gesture, so the
- * header never stands over rows it no longer describes.
+ * to the document after every change, which full keyboard navigation cannot
+ * survive. The rows of the previous order are released by the same gesture, so
+ * the header never stands over rows ranked by an order it does not report.
  *
- * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE (AAP 0.6.4)
+ * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE
  *
  * This file declares class names and nothing else: no inline style object, no
  * colour, no length, no literal CSS value. Every declaration behind the names
@@ -183,7 +186,7 @@
  * this file draws itself is an individual render's, inside a detail row the
  * primitive does not structure.
  *
- * ## NOTHING HERE KNOWS ANY PROJECT (AAP 0.5.4)
+ * ## NOTHING HERE KNOWS ANY PROJECT
  *
  * Every component name, prop name, file path and count on screen comes from the
  * data. No column header, empty sentence, tooltip or comment in this file names
@@ -274,10 +277,11 @@ const RENDERS_SOURCE = 'renders' satisfies DataQuerySource;
  *
  * Every string a reader sees, declared once, and all of it generic product
  * vocabulary: nothing below names a component, a prop, a file or a route of any
- * inspected application (AAP 0.5.4). The one exception is the failure copy,
- * which is not declared here at all: both failure boxes take their title, lead
- * and query block from `queryFailureProps`, so a failed page of render
- * statistics reads exactly like every other failed node (B1-F16, B2-F14).
+ * inspected application. The one exception is the failure copy, which is not
+ * declared here at all: it comes from the shared error-state contract in
+ * `../host/useQuery`, whose `queryFailureProps` gives both failure boxes their
+ * title, lead and query block, so a failed page of render statistics reads
+ * exactly like every other failed node.
  * ---------------------------------------------------------------------------
  */
 
@@ -287,7 +291,7 @@ const TABLE_CAPTION = 'Render statistics per component';
 /** Announced while the page is resolving; never painted. */
 const LOADING_LABEL = 'Loading render statistics…';
 
-/** The empty sentence for this node — the wording AAP 0.6.2 gives this component. */
+/** The node's fixed empty sentence, said only for an empty result. */
 const EMPTY_MESSAGE = 'No renders were captured for this interaction.';
 
 /** The first line above {@link EMPTY_MESSAGE}. */
@@ -428,7 +432,7 @@ const COLUMN_HEADERS = Object.freeze({
  * The two that matter most are `unchanged` and `unknown`: they are adjacent
  * columns of similar-looking figures that mean opposite things, so each states
  * its own definition in full rather than relying on the reader inferring the
- * difference from two words (AAP 0.2.3).
+ * difference from two words.
  */
 const COLUMN_TOOLTIPS = Object.freeze({
   triggers: `Renders by trigger, over the whole vocabulary and including the zeros. "${formatRenderTriggerLabel(
@@ -457,9 +461,9 @@ const COLUMN_TOOLTIPS = Object.freeze({
  * `../primitives/DataTable`) to a grid track built from the
  * `--dg-column-min-*` floor and `--dg-column-share-*` share tokens, so this
  * table agrees with every other table on both extension surfaces about how wide
- * a count or a duration is, and no length is chosen here (AAP 0.6.4). Each
- * column takes the smallest role whose floor keeps its content readable, in the
- * vocabulary every table shares:
+ * a count or a duration is, and no length is chosen here. Each column takes the
+ * smallest role whose floor keeps its content readable, in the vocabulary every
+ * table shares:
  *
  *   component     text      the identity column: the disclosure toggle, the
  *                           source glyph and the component name, which
@@ -509,7 +513,7 @@ const COLUMN_WIDTHS = Object.freeze({
  * Both are drawn over their whole vocabulary, zeros included, because an absent
  * chip cannot say which of two things it means — "nothing fell into this
  * bucket" or "this bucket is not shown" — and for the trigger vocabulary those
- * two readings support opposite conclusions (AAP 0.2.3).
+ * two readings support opposite conclusions.
  *
  * Every list below is therefore accompanied by a compile-time proof that it
  * names the vocabulary in full. The device is the one `../host/PanelActions`
@@ -655,7 +659,7 @@ const DEFAULT_SORT: DataQuerySort = 'count_desc';
  * Presentation bounds
  *
  * Counts, never lengths: nothing below reaches a class, a custom property or a
- * declaration (AAP 0.6.4).
+ * declaration.
  * ---------------------------------------------------------------------------
  */
 
@@ -1316,9 +1320,9 @@ interface DescribedHeaderProps {
  * The text is focusable, because `Tooltip` opens on focus arriving inside it
  * and a trigger nothing can focus is a definition only a pointer can reach —
  * and two of these definitions are what keep `Stable inputs` and
- * `Unclassified` from being read as one figure (AAP 0.2.3). It follows the
- * header rule of `../primitives/DataTable`, the same one the grid applies to
- * its own sort buttons: while at least one data row renders, it is
+ * `Unclassified` from being read as one figure. It follows the header rule of
+ * `../primitives/DataTable`, the same one the grid applies to its own sort
+ * buttons: while at least one data row renders, it is
  * `tabIndex={-1}` — the grid is one Tab stop, and ArrowUp from the first row
  * moves onto the header's controls, where ArrowLeft/ArrowRight walk them and
  * the definition opens as focus lands — and while the grid has no row to
@@ -1389,7 +1393,7 @@ interface OccurrenceRowProps {
  * system's one selected-state class, `dg-is-selected`, on the whole line, and
  * its select control reports `aria-pressed="true"` — so the render a reader
  * picked here, or picked as the same event in any other view, stays marked, and
- * the state is carried by an attribute as well as by a colour (AAP 0.6.4).
+ * the state is carried by an attribute as well as by a colour.
  *
  * It renders inside the grid's detail row, so every control in it — the select
  * button, the trigger chip and the source chip — is `tabIndex={-1}`: the grid is
@@ -1472,7 +1476,7 @@ interface RenderDetailProps {
  * incomplete, says so outright — an expansion that silently showed a prefix
  * would invite the reader to count renders that are not there. The prop list
  * states that names and counts are all that exist, so its length is never read
- * as the width of a props object (AAP 0.5.2).
+ * as the width of a props object.
  *
  * @param props See {@link RenderDetailProps}.
  * @returns The detail block.
@@ -1617,7 +1621,7 @@ interface RenderTableZeroRowsProps {
  * names a next page (a sentence about that page alone) and a resolved sequence
  * with no rows at all (the copy {@link emptyStateCopy} chose, with the view's
  * glyph only for the empty capture). Never a blank area, and never a failure
- * dressed as a result (AAP 0.5.5).
+ * dressed as a result.
  *
  * One definition serves both places the state is drawn — alone in the block
  * for the first answer, and in the grid's empty slot beneath a header that
@@ -1708,9 +1712,9 @@ interface ColumnContext {
  * Two of the ten columns exist for one reason, and it is the reason this whole
  * view is evidence rather than a chart: `Stable inputs` and `Unclassified` are
  * separate columns, with separate headers and separate definitions, because the
- * counts behind them mean opposite things (AAP 0.2.3). Nothing in this function
- * combines them, and the histogram beside them prints all five buckets — zeros
- * included — so a bucket can never be inferred from the absence of a chip.
+ * counts behind them mean opposite things. Nothing in this function combines
+ * them, and the histogram beside them prints all five buckets — zeros included —
+ * so a bucket can never be inferred from the absence of a chip.
  *
  * Every column's width is its role in {@link COLUMN_WIDTHS}, which the
  * primitive resolves to a token-built track: a floor that keeps the column's
@@ -1718,11 +1722,11 @@ interface ColumnContext {
  * below its floor, so a narrow panel scrolls the table horizontally rather than
  * collapsing a column and overprinting its neighbour.
  *
- * The component name IS the row's link to its declaration (AAP 0.6.2,
- * "component name → `onOpenSource`"): when the row resolved to a location the
- * name is drawn as a `./SourceLink` captioned with the name and handed that
- * very location, so there is one source control per row and the reader clicks
- * the name itself. A row that resolved to no location draws the name as text.
+ * The component name IS the row's link to its declaration, and so the row's
+ * `onOpenSource` control: when the row resolved to a location the name is
+ * drawn as a `./SourceLink` captioned with the name and handed that very
+ * location, so there is one source control per row and the reader clicks the
+ * name itself. A row that resolved to no location draws the name as text.
  * Either way the name ellipsizes inside its column rather than overprinting the
  * next one, and a tooltip keeps it readable: an unlinked name's tooltip is the
  * whole name, and a linked name's is the link's own — the declared symbol and
@@ -1768,9 +1772,9 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
 
         // The name as every surface of this cell shows it — the caption, the
         // unlinked name's tooltip, the row header's escort: bounded by the
-        // shared preview budget (AAP 0.5.2), which no real component name
-        // reaches, and otherwise whole. The column's width clips it visually
-        // only, with an ellipsis; no layout concern shortens the text itself.
+        // shared preview budget, which no real component name reaches, and
+        // otherwise whole. The column's width clips it visually only, with an
+        // ellipsis; no layout concern shortens the text itself.
         const name = truncate(stat.component);
 
         return (

@@ -303,7 +303,7 @@
  * the rule above reserves for it rather than the label, never takes a pointer event that was meant
  * for the control beneath it, and reserves a width that suits two digits so the row does not nudge
  * sideways as the count changes - tabular figures in the monospace stack are what make every digit
- * the same width, which matters because this header re-renders several times a second. */
+ * the same width. */
 .cartBadge {
   position: absolute;
   inset-block-start: var(--header-chip-offset, -4px);
@@ -334,10 +334,8 @@
   }
 }
 
-/* Below the desktop measure there is no room for the strip beside the field, so the track is
- * dropped. Hiding it leaves the rail mounted - the component renders it either way - so nothing
- * about its behaviour changes; the strip is present from 1024px up, which is where the browser and
- * end-to-end suites run. */
+/* Below the desktop measure there is no room for the strip beside the field, so the track is not
+ * displayed; the strip is shown from 1024px up. */
 @media (max-width: 1023px) {
   .miniRail {
     display: none;

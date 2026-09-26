@@ -10,25 +10,33 @@
  * and stays visible while the session runs and after it ends (AAP 0.5.1). A
  * change the developer cannot see here is a change they cannot trust, so the
  * component renders one row for every record it is given — none is hidden,
- * grouped away or collapsed into a count.
+ * grouped away or collapsed into a count — and says so when the journal holds
+ * records it was not given.
  *
- * ## Data in, one callback out
+ * ## Data in, two callbacks out
  *
  * `props.modifications` is `WebviewState.modifications`: the session's
- * `ModificationRecord[]`, which the host keeps from the session record and from
- * `instrumentation.ready` / `cleanup.completed` (AAP 0.4.2). The rows appear in
- * exactly that order — the order the installer applied the plan in, which is
- * meaningful when a follow-up layers a second record onto the same file — and
- * are never re-sorted. `DataTable` is controlled and never re-orders rows
- * itself, so passing the array through is both the simplest and the faithful
- * choice.
+ * `ModificationRecord[]`, which the host keeps from the session record, from
+ * `instrumentation.ready` / `cleanup.completed` (AAP 0.4.2) and from its reads
+ * of the paged journal. The rows appear in exactly that order — the order the
+ * installer applied the plan in, which is meaningful when a follow-up layers a
+ * second record onto the same file — and are never re-sorted. `DataTable` is
+ * controlled and never re-orders rows itself, so passing the array through is
+ * both the simplest and the faithful choice.
  *
- * The only interaction that leaves this component is `onOpenFile(file)`, raised
- * with the record's `file` **exactly as received**: a project-relative POSIX
- * path, with no workspace root prepended and no line appended. `App.tsx` owns
- * the host bridge and turns it into the open request; containment is enforced
- * downstream, where a file-system decision belongs. Nothing here fetches, posts
- * a host message or opens a socket: the diff arrives on the record.
+ * `props.total` is `WebviewState.modificationsTotal`: the journal's length as
+ * the service last counted it. When it exceeds the rows given, the list is
+ * incomplete, and the component states "Showing ‹N› of ‹M› recorded file
+ * modifications" instead of letting the rows pass for the whole journal.
+ *
+ * Two interactions leave this component. `onOpenFile(file)` is raised with the
+ * record's `file` **exactly as received**: a project-relative POSIX path, with
+ * no workspace root prepended and no line appended; containment is enforced
+ * downstream, where a file-system decision belongs. `onLoadMore()`, the
+ * missing-records warning's "Load all modifications" control, asks for the
+ * whole journal. `App.tsx` owns the host bridge and turns each into its
+ * request. Nothing here fetches, posts a host message or opens a socket: the
+ * diff arrives on the record.
  *
  * ## The one piece of local state
  *
@@ -44,6 +52,9 @@
  *
  * ```text
  * div.dgv-modifications                     root, in every state
+ *   Stack                                   only while records are missing
+ *     Text sm warning (p, role=status)      Showing ‹N› of ‹M› recorded …
+ *     Button secondary sm                   Load all modifications (with onLoadMore)
  *   DataTable (compact, caption hidden)     role=grid, owned by the primitive
  *     File   (rowheader)                    Stack .dgv-modifications__identity
  *       Code sm                             .dgv-modifications__file — the path, as
@@ -64,8 +75,10 @@
  * `DataTable` owns the whole ARIA grid — `role="grid"`, exact
  * `aria-rowcount`/`aria-colcount`, `rowheader`/`gridcell`, the roving tab stop
  * and the `aria-colspan` detail row — so this component adds no role of its
- * own. It meets the primitive's two caller obligations: every control rendered
- * in a cell or in the detail row is `tabIndex={-1}` — the diff's region
+ * own inside it; the one role it does add, the warning's `status`, sits
+ * outside the grid, and so does its control, an ordinary Tab stop. It meets
+ * the primitive's two caller obligations: every control rendered in a cell or
+ * in the detail row is `tabIndex={-1}` — the diff's region
  * included, through `DiffView`'s `innerTabIndex` — (the grid is one Tab stop,
  * and its arrow keys reach the controls), and the disclosure button carries
  * `aria-expanded={meta.expanded}` and `aria-controls={meta.detailRowId}`,
@@ -102,13 +115,18 @@
  *
  * ## States (AAP 0.5.5 — never a blank area)
  *
- * Fixed precedence, highest first: `error` > `pending` > empty > the table. A
- * failure is never shown as an empty list and a load never flashes the empty
- * message. `ErrorState`, `LoadingState` and `EmptyState` own their live-region
- * roles (`alert`, `status` with `aria-busy`, `status`). The empty state is the
- * component's own `EmptyState` rather than `DataTable`'s: a runtime-only plan
- * modifies no file, which is the good outcome, so it is worded neutrally and
- * renders without an empty grid header above it.
+ * Fixed precedence, highest first: `error` > `pending` > incomplete and
+ * empty > empty > the table, above which the missing-records warning stands
+ * while the list is incomplete. A failure is never shown as an empty list, a
+ * load never flashes the empty message, and a list whose records have not
+ * arrived never claims that no file was modified: with no rows and a `total`
+ * above zero, the warning stands in for the empty state. `ErrorState`, `LoadingState` and
+ * `EmptyState` own their live-region roles (`alert`, `status` with
+ * `aria-busy`, `status`); the warning is a polite `status` line of its own.
+ * The empty state is the component's own `EmptyState` rather than
+ * `DataTable`'s: a runtime-only plan modifies no file, which is the good
+ * outcome, so it is worded neutrally and renders without an empty grid header
+ * above it.
  *
  * ## Privacy and neutrality (AAP 0.5.2, 0.5.4)
  *
@@ -181,6 +199,28 @@ export interface ModificationsListProps {
    * retry control only when this is supplied.
    */
   onRetry?: (() => void) | undefined;
+
+  /**
+   * How many records the session's journal holds, as the service last counted
+   * it (`WebviewState.modificationsTotal`). A value above the length of
+   * {@link ModificationsListProps.modifications} means records are missing:
+   * the component states how many of them are shown, and never says that no
+   * file was modified.
+   */
+  total?: number | undefined;
+
+  /**
+   * Asks the host to load the whole journal. Rendered as the "Load all
+   * modifications" control of the missing-records warning, only when this is
+   * supplied.
+   */
+  onLoadMore?: (() => void) | undefined;
+
+  /**
+   * A load asked for through {@link ModificationsListProps.onLoadMore} is in
+   * flight: its control is disabled until the host answers.
+   */
+  loadingMore?: boolean | undefined;
 
   /**
    * Extra classes for the root element, applied in every state and composed
@@ -275,6 +315,22 @@ const EMPTY_MESSAGE = 'No files were modified for this session.';
 
 /** The error-state title; the caller's message beneath it says why. */
 const ERROR_TITLE = 'Could not show the modified files';
+
+/** The visible text of the control that asks the host for the whole journal. */
+const LOAD_ALL_LABEL = 'Load all modifications';
+
+/**
+ * The missing-records warning: how many of the journal's records are shown.
+ * Generic product copy, true however the records went missing.
+ *
+ * @param shown How many records the list renders.
+ * @param total How many the journal holds.
+ * @returns The sentence.
+ */
+function shortfallMessage(shown: number, total: number): string {
+  const noun = total === 1 ? 'file modification' : 'file modifications';
+  return `Showing ${String(shown)} of ${String(total)} recorded ${noun}; the rest have not been loaded.`;
+}
 
 /** Announced, never painted, while the records are resolving. */
 const LOADING_LABEL = 'Loading modified files';
@@ -694,17 +750,72 @@ function buildColumns(
   ];
 }
 
+/** The props of {@link JournalShortfall}. */
+interface JournalShortfallProps {
+  /** How many records the list renders. */
+  readonly shown: number;
+  /** How many the journal holds; greater than `shown`. */
+  readonly total: number;
+  /** Asks the host for the whole journal; the control renders only with it. */
+  readonly onLoadMore: (() => void) | undefined;
+  /** Whether that request is in flight. */
+  readonly loadingMore: boolean;
+}
+
+/**
+ * The missing-records warning: a polite status line saying how many of the
+ * journal's records are shown, and — when the caller can ask the host for the
+ * rest — the "Load all modifications" control, disabled while that load is in
+ * flight. The control sits outside the grid, so it is an ordinary Tab stop.
+ * The tone reinforces the words; it never carries the warning alone.
+ */
+function JournalShortfall(props: JournalShortfallProps): ReactElement {
+  const { shown, total, onLoadMore, loadingMore } = props;
+
+  return (
+    <Stack gap={2} align="start">
+      <Text as="p" size="sm" tone="warning" role="status">
+        {shortfallMessage(shown, total)}
+      </Text>
+      {onLoadMore === undefined ? null : (
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={loadingMore}
+          aria-busy={loadingMore}
+          onClick={() => {
+            onLoadMore();
+          }}
+        >
+          {LOAD_ALL_LABEL}
+        </Button>
+      )}
+    </Stack>
+  );
+}
+
 /**
  * Renders the session's modification records as a grid with one row per
  * record and an expandable diff, or the error, loading or empty state in its
- * place.
+ * place, and warns — above the grid, or instead of the empty state — when the
+ * journal holds records the list does not.
  *
  * @param props See {@link ModificationsListProps}.
  * @returns One root element carrying `dgv-modifications` and `props.className`,
  *   holding the table or the state primitive that stands in for it.
  */
 export function ModificationsList(props: ModificationsListProps): ReactElement {
-  const { modifications, onOpenFile, pending = false, error, onRetry, className } = props;
+  const {
+    modifications,
+    onOpenFile,
+    pending = false,
+    error,
+    onRetry,
+    total,
+    onLoadMore,
+    loadingMore = false,
+    className,
+  } = props;
 
   // Hooks run before any branch, as they must. The expanded id is the only
   // local state: which record's diff is open, or none.
@@ -728,15 +839,27 @@ export function ModificationsList(props: ModificationsListProps): ReactElement {
 
   const columns = useMemo(() => buildColumns(toggle, onOpenFile), [toggle, onOpenFile]);
 
+  // Records the journal holds that the list does not: stated, never hidden.
+  const shortfall =
+    total !== undefined && total > modifications.length ? (
+      <JournalShortfall
+        shown={modifications.length}
+        total={total}
+        onLoadMore={onLoadMore}
+        loadingMore={loadingMore}
+      />
+    ) : null;
+
   let body: ReactElement;
   if (hasText(error)) {
     body = <ErrorState message={error} title={ERROR_TITLE} onRetry={onRetry} />;
   } else if (pending) {
     body = <LoadingState variant="rows" rows={LOADING_ROWS} label={LOADING_LABEL} />;
   } else if (modifications.length === 0) {
-    body = <EmptyState message={EMPTY_MESSAGE} />;
+    // With records missing, an empty list is not "nothing was modified".
+    body = shortfall ?? <EmptyState message={EMPTY_MESSAGE} />;
   } else {
-    body = (
+    const table = (
       <DataTable
         rows={modifications}
         columns={columns}
@@ -748,6 +871,15 @@ export function ModificationsList(props: ModificationsListProps): ReactElement {
         renderExpandedRow={renderRecordDetail}
       />
     );
+    body =
+      shortfall === null ? (
+        table
+      ) : (
+        <Stack gap={2}>
+          {shortfall}
+          {table}
+        </Stack>
+      );
   }
 
   return <div className={joinClassNames(ROOT_CLASS, className)}>{body}</div>;

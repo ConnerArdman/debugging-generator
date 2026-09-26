@@ -103,27 +103,12 @@ export function BlankSlate({
       data-framed={framed ? 'true' : undefined}
     >
       {/*
-        The source is a literal path built from the closed union above, never a static asset
-        import: that form resolves through the ambient declarations Next.js generates into the
-        git-ignored next-env.d.ts, so a clean clone that has only run `prisma generate` would fail
-        `pnpm typecheck` on it. The assets' intrinsic 240x180 travels as the width and height
-        attributes so the box is reserved before the file arrives and nothing below it shifts, and
-        a plain img element needs no image configuration of any kind - the optimiser skips SVG
-        regardless.
-
-        `loading="lazy"` is here for the document head rather than for the network. React's server
-        renderer hoists a `<link rel="preload" as="image">` into the head for every non-lazy image
-        it renders, and the App Router serialises the not-found slot - one of this component's
-        callers - into the payload of every route, so that a notFound() raised on the client can be
-        shown without a round trip. The artwork is decorative and branch-conditional, so without
-        this attribute a screen that merely carries an empty state it never displays still asks the
-        browser to preload the illustration, wastes the request that follows, and earns the "was
-        preloaded using link preload but not used" advisory. Declaring the image lazy is the
-        honest description of that artwork and it is also what both renderers check: the HTML
-        renderer and the Flight serialiser each skip the hint when the element says `loading="lazy"`.
-        Nothing changes where the block does render - a lazy image already in the viewport, which is
-        where this one sits whenever an empty state is on screen, is fetched immediately - and the
-        width and height above keep the box reserved either way.
+        A literal path built from the closed `art` union, not a static asset import, which would
+        depend on the typings Next.js generates into next-env.d.ts. The intrinsic 240x180 size
+        reserves the box so nothing below it shifts. `alt` is the caller's, and `''` when the
+        heading already carries the meaning. `loading="lazy"` because the art is decorative and
+        often rendered in a branch that is not displayed, so it must not earn an image preload
+        hint; an empty state that is on screen still loads it immediately.
       */}
       <img
         className={styles.art}

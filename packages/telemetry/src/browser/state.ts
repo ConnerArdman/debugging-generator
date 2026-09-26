@@ -78,9 +78,9 @@
  *
  * ## Bounds are load-bearing
  *
- * The demo's second seeded defect ticks a provider every 250 ms with 48 cards
- * consuming it (AAP 0.8.2): a minute of that is thousands of transitions. Two
- * bounds keep one capture from becoming a memory profile of the page —
+ * A provider that ticks several times a second with dozens of consumers
+ * produces thousands of transitions a minute. Two bounds keep one capture from
+ * becoming a memory profile of the page —
  * {@link MAX_TRANSITIONS_PER_COMMIT} per call and
  * {@link MAX_TRANSITIONS_PER_CAPTURE} per capture.
  *
@@ -251,7 +251,7 @@ const KEY_RENDER_SPAN_ID: StateAttributeKey = 'renderSpanId';
  * The fiber's identity within the document, when `./react.ts` resolved one.
  *
  * Two components with the same display name are one row when grouped by
- * `component`; the fiber id is what distinguishes the forty-eighth card from
+ * `component`; the fiber id is what distinguishes the last row of a list from
  * the first.
  */
 const KEY_FIBER_ID: StateAttributeKey = 'fiberId';
@@ -383,7 +383,7 @@ export interface RecordTransitionsInput {
    * The fiber's identity within this document, when one was resolved
    * (bippy's `getFiberId`).
    *
-   * What separates the forty-eighth card from the first when both render the
+   * What separates the last row of a list from the first when both render the
    * same component. Omitted when unknown; a non-integer is ignored.
    */
   fiberId?: number;
@@ -712,9 +712,9 @@ function mergeLineage(target: Record<string, unknown>, lineage: unknown): void {
  * resolved once.
  *
  * Validating per call rather than per change matters at the bounds this module
- * works under: one commit of the demo's catalog grid can produce dozens of
- * transitions, and the component name, the render span, the trigger and the
- * timestamp are one answer for all of them.
+ * works under: one commit of a large list can produce dozens of transitions,
+ * and the component name, the render span, the trigger and the timestamp are
+ * one answer for all of them.
  */
 interface CallContext {
   /** The component name, when the caller supplied a usable one. */

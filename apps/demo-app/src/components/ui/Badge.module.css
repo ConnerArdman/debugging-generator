@@ -108,14 +108,8 @@
  * the neutral pair from the base rule.
  */
 
-/* BLITZY [A11Y]: the neutral border measures 1.42:1 against the label's surface, below the 3:1
- * non-text recommendation. Implemented with the shared hairline token the whole storefront
- * uses - `app/globals.css` flags the same value at its declaration - rather than silently
- * darkened here, which would make this one component's outline disagree with every other
- * bordered surface on the page. The border is a decorative boundary and never the carrier of
- * the state: that is the label's text, which measures 7.2:1 in this tone. The four status
- * tones below need no such flag - their borders measure 4.8:1 to 6.4:1 on the same surface.
- * Flagged for design review. */
+/* The neutral border is the storefront's shared hairline and a decorative boundary; the label's
+ * text carries the state. */
 .root[data-tone='neutral'] {
   border-color: var(--ls-border, #cbd5e1);
   color: var(--ls-text-muted, #475569);

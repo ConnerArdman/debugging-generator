@@ -15,23 +15,24 @@
  *     stayed the same.
  *
  * Only one of them could ever support a conclusion about a re-render, and
- * neither may be presented as the other (AAP 0.2.3's `unchanged`-versus-
- * `unknown` separation, and AAP 0.8.4's separation of observed facts from
- * likely causes). Four cases below pin that distinction: the undetermined
- * trigger renders a non-interactive label whose row text never claims
- * "unchanged"; an attributed-but-unopenable trigger says why it cannot be
- * opened instead of claiming to be undetermined; a `changed: false` row carries
- * the *no values reported* chip with its own state class and the hint that
- * denies the equality reading; and a `changed: true` row carries neither.
+ * neither may be presented as the other: the render trigger vocabulary keeps
+ * `unchanged` apart from `unknown` (see `docs/ARCHITECTURE.md`,
+ * "Computed metrics"), and a panel keeps observed facts apart from likely
+ * causes. Four cases below pin that distinction: the undetermined trigger
+ * renders a non-interactive label whose row text never claims "unchanged"; an
+ * attributed-but-unopenable trigger says why it cannot be opened instead of
+ * claiming to be undetermined; a `changed: false` row carries the *no values
+ * reported* chip with its own state class and the hint that denies the
+ * equality reading; and a `changed: true` row carries neither.
  *
- * The second guarantee this suite holds is the privacy bound of AAP 0.5.2: hook
- * values arrive as bounded, already-scrubbed summaries of at most
- * {@link MAX_PREVIEW_LENGTH} code points, and **no opt-in for full values
- * exists in v1**. So a 120-code-point summary must render byte-identically, a
- * longer one must be shortened rather than shown, and no control anywhere in a
- * value cell may offer to expand, parse or reveal one — there is nothing to
- * reveal, and an affordance implying otherwise would promise what the product
- * deliberately never captured.
+ * The second guarantee this suite holds is the capture's privacy bound (see
+ * `docs/SECURITY.md`, "Never captured"): hook values arrive as bounded,
+ * already-scrubbed summaries of at most {@link MAX_PREVIEW_LENGTH} code points,
+ * and **no opt-in for full values exists in v1**. So a 120-code-point summary
+ * must render byte-identically, a longer one must be shortened rather than
+ * shown, and no control anywhere in a value cell may offer to expand, parse or
+ * reveal one — there is nothing to reveal, and an affordance implying
+ * otherwise would promise what the product deliberately never captured.
  *
  * A cell still clips what its track cannot hold, so the clipped-cell cases pin
  * where the rest of the *displayed* text is readable: a whole summary's and a
@@ -92,11 +93,10 @@
  *     produces one (`aggregateStateTransitions`) is never called here: this is
  *     a renderer suite, and computing the fixture with the same code that
  *     produced the contract would test neither.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4): `ExampleWidget`,
- *     `useExampleValue`, `src/example/widget.tsx`. Nothing from any inspected
- *     application, demonstration or otherwise;
- *     `scripts/check-no-hardcoding.mjs` scans this text with the rest of
- *     `packages/**`.
+ *   - **Generic fixture vocabulary only**: `ExampleWidget`, `useExampleValue`,
+ *     `src/example/widget.tsx`. Nothing from any inspected application,
+ *     demonstration or otherwise; `scripts/check-no-hardcoding.mjs` skips test
+ *     files, so this suite keeps the product's neutral vocabulary by convention.
  *   - **Queries by role and accessible name.** A class is read only off an
  *     element already obtained semantically, since no `jest-dom` matcher is
  *     available in this repository.
@@ -152,8 +152,8 @@ import { StateTransitionViewer } from './StateTransitionViewer';
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Application-neutral throughout (AAP 0.5.4). The identifiers are shaped as a
- * capture shapes them — a 32-hex trace id, 16-hex span ids, epoch-millisecond
+ * Application-neutral throughout. The identifiers are shaped as a capture
+ * shapes them — a 32-hex trace id, 16-hex span ids, epoch-millisecond
  * observation times — because the component reads and displays those fields.
  * ---------------------------------------------------------------------------
  */
@@ -669,7 +669,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -1233,7 +1233,7 @@ const COUNT_SEPARATOR = ' \u00b7 ';
  * Three facts, never conflated: what is drawn after the reader's own narrowing,
  * what the page holds, and what the source holds after the query's filter —
  * the last omitted entirely when the provider reported no total, because
- * nothing may be claimed about it (AAP 0.4.2).
+ * nothing may be claimed about it.
  *
  * @param drawn Rows on screen.
  * @param loaded Rows in the resolved page.
@@ -1261,7 +1261,7 @@ describe('StateTransitionViewer states', () => {
     expect(busy.textContent).toContain(LOADING_LABEL);
 
     // Nothing is drawn yet: no grid, therefore no rows, and above all no empty
-    // state — an unsettled query is not an answer (AAP 0.5.5).
+    // state — an unsettled query is not an answer.
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('alert')).toBeNull();
@@ -1283,8 +1283,7 @@ describe('StateTransitionViewer states', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     // Queried by a generic substring of the product's own copy, then checked to
-    // be exactly that: product vocabulary, naming no inspected project
-    // (AAP 0.5.4).
+    // be exactly that: product vocabulary, naming no inspected project.
     const message = await screen.findByText(/no state transitions were captured/i);
     expect(message.textContent).toBe(EMPTY_CAPTURE_MESSAGE);
 
@@ -1327,11 +1326,11 @@ describe('StateTransitionViewer states', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.classList.contains('dg-state-transitions__error')).toBe(true);
 
-    // What failed, in the package's one failure contract: the generic lead,
-    // then the provider's own cause as a sentence of its own, plus its CODE so
-    // a developer has something to search for (B2-F14). The cause is stated
+    // What failed, in the package's shared error-state design: the generic
+    // lead, then the provider's own cause as a sentence of its own, plus its
+    // CODE so a developer has something to search for. The cause is stated
     // inside the error box, never where an analysis goes, so it cannot read as
-    // a finding about the capture (AAP 0.5.5).
+    // a finding about the capture.
     expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
     expect(alert.textContent).toContain('The channel to the service is closed.');
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
@@ -1368,10 +1367,10 @@ describe('StateTransitionViewer states', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    // One design for every failed node (B2-F14, B1-F16), in its fixed order:
-    // the default glyph, the view-scope title, the generic lead followed by the
-    // provider's own cause, the provider's hint on a line of its own, the code
-    // as a chip, the query, and a retry.
+    // The shared error-state design, one for every failed node, in its fixed
+    // order: the default glyph, the view-scope title, the generic lead followed
+    // by the provider's own cause, the provider's hint on a line of its own,
+    // the code as a chip, the query, and a retry.
     const alert = await screen.findByRole('alert');
     expect(alert.querySelector('.dg-error-state__icon svg')).not.toBeNull();
     expect(
@@ -1491,7 +1490,7 @@ describe('StateTransitionViewer rows', () => {
     }
 
     // The order the rows are in is the order that was requested, not one
-    // applied here (AAP 0.4.2).
+    // applied here.
     expect(soleQuery(stub).sort).toBe(CHRONOLOGICAL);
   });
 
@@ -1616,7 +1615,7 @@ describe('StateTransitionViewer order', () => {
 
     // A permutation and nothing more: first appearance decides a component's
     // position, and each component keeps the order the capture returned —
-    // which is the only order this view may claim (AAP 0.4.2).
+    // which is the only order this view may claim.
     expect(renderedValuesBefore()).toEqual([...GROUPED_VALUES]);
     expect([...renderedValuesBefore()].sort()).toEqual([...INTERLEAVED_VALUES].sort());
 
@@ -1698,10 +1697,10 @@ describe('StateTransitionViewer value summaries', () => {
 
     const cells = cellsOf(rowWithValueBefore(AT_BOUND_SUMMARY));
 
-    // AAP 0.5.2 captures a bounded summary and implements no opt-in for the
-    // full value, so an affordance promising one would promise something this
-    // product deliberately cannot deliver. Neither value cell holds a control
-    // of any kind — not a button, not a link, not a checkbox.
+    // The producer captures only a bounded, redacted summary and no opt-in for
+    // the full value exists, so an affordance promising one would promise
+    // something this product deliberately cannot deliver. Neither value cell
+    // holds a control of any kind — not a button, not a link, not a checkbox.
     for (const cell of [cells.previous, cells.next]) {
       expect(within(cell).queryAllByRole('button')).toHaveLength(0);
       expect(within(cell).queryAllByRole('link')).toHaveLength(0);
@@ -2212,7 +2211,7 @@ describe('StateTransitionViewer reported state', () => {
     const cells = cellsOf(rowWithValueBefore(NOT_AVAILABLE_LABEL));
 
     // A word, not a colour: the state is legible to a reader who cannot see
-    // the tone at all (AAP 0.6.4). The chip's own text IS the indicator.
+    // the tone at all. The chip's own text IS the indicator.
     const badge = within(cells.changed).getByText(UNREPORTED_LABEL);
     expect(badge.textContent).toBe(UNREPORTED_LABEL);
     expect(badge.classList.contains('dg-badge')).toBe(true);
@@ -2330,8 +2329,10 @@ describe('StateTransitionViewer interactions', () => {
     const received = call[0];
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
-    // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2, hop 1 of five).
+    // `confidence` and an invented extra field both fail here. This handler is
+    // the first hop of the path a click takes to the editor, and every hop
+    // after it acts on the object it is handed (see `docs/ARCHITECTURE.md`,
+    // "A click, end to end").
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -2543,7 +2544,7 @@ describe('StateTransitionViewer narrowing', () => {
     await user.selectOptions(picker, COMPONENT_PANEL);
 
     // A narrowing is a re-query against the whole capture, not a filter over
-    // the page that happens to be loaded (AAP 0.4.2).
+    // the page that happens to be loaded.
     expect(stub.resolve).toHaveBeenCalledTimes(2);
 
     const narrowed = queryOfCall(stub, 2);
@@ -4021,13 +4022,18 @@ describe('StateTransitionViewer keyboard model', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The panel's shared selection, and the toolbar's filter reports (B2-F21)
+ * The panel's shared selection, and the toolbar's filter reports
  *
  * Under the panel host the selected row is the panel's one selection — the
  * record any view or evidence chip last selected — rather than a state of this
- * view (AAP 0.7.3: evidence chips "select the underlying events"). These cases
- * provide that selection directly through `PanelSelectionContext`, which is
- * exactly what the host mounts, and re-render with another value to move it.
+ * view, so the events an evidence chip selects are marked here as they are in
+ * every other view. These cases provide that selection directly through
+ * `PanelSelectionContext`, which is exactly what the host mounts, and
+ * re-render with another value to move it.
+ *
+ * Every toolbar change is reported through `onFilterChange` as the whole
+ * toolbar state it leaves — the order, both toggles and any component
+ * narrowing — in plain strings and never as a query shape.
  * ---------------------------------------------------------------------------
  */
 

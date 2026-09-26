@@ -83,7 +83,9 @@
  * look live again ({@link ExtensionState.hasAcknowledgedEnd}). The journal
  * fetched over HTTP (`GET /sessions/:id/modifications`) is folded in through
  * {@link ExtensionState.applyModificationJournal} under the same append-only
- * rule, and never moves a record's status back. Each merge rule is documented
+ * rule, and never moves a record's status back; the journal's `total` it
+ * reports is kept beside the list ({@link ExtensionState.modificationsTotal}),
+ * so the view can say when records are missing. Each merge rule is documented
  * where it is applied.
  *
  * ## Which session is active is decided by the editor, never by a push
@@ -719,6 +721,7 @@ export class ExtensionState implements vscode.Disposable {
   private progressValue: readonly ProgressEntry[] = Object.freeze([]);
   private relevantFilesValue: readonly RelevantFile[] = Object.freeze([]);
   private modificationsValue: readonly ModificationRecord[] = Object.freeze([]);
+  private modificationsTotalValue: number | undefined;
   private runtimeHooksValue: readonly string[] = Object.freeze([]);
   private unavailableSignalsValue: readonly UnavailableSignalPayload[] = Object.freeze([]);
   private analysisValue: AnalysisResult | undefined;
@@ -852,6 +855,24 @@ export class ExtensionState implements vscode.Disposable {
   /** Every file modification the active session made, in the order applied. */
   get modifications(): readonly ModificationRecord[] {
     return this.modificationsValue;
+  }
+
+  /**
+   * How many records the active session's modification journal holds, as the
+   * service counted it: the largest `total` a journal read recorded through
+   * {@link applyModificationJournal} reported for the session. The journal is
+   * append-only, so no read can count fewer records than an earlier one did; a
+   * read answered late with an older, smaller count therefore never lowers it.
+   * `undefined` until a read reported one, and again once another session
+   * becomes active.
+   *
+   * Pushes (`session.updated`, `instrumentation.ready`, `cleanup.completed`)
+   * extend {@link modifications} without touching it, so a reader compares the
+   * two: a total above the list's length means records the editor has not
+   * received, and a later push or read that delivers them ends the difference.
+   */
+  get modificationsTotal(): number | undefined {
+    return this.modificationsTotalValue;
   }
 
   /** The runtime hooks the latest `instrumentation.ready` reported as up. */
@@ -1397,19 +1418,36 @@ export class ExtensionState implements vscode.Disposable {
    * session did. An answer about any session other than the active one
    * changes nothing.
    *
+   * `total` is the journal's length as the service counted it. It raises
+   * {@link modificationsTotal} and never lowers it: two reads can overlap and
+   * finish in either order, and the journal only grows, so the larger count is
+   * the newer one. A value that is not a non-negative safe integer is ignored,
+   * and an omitted one keeps the total already held. Because the merge puts the
+   * answer's records first, a caller that reads the journal in several pages
+   * gathers every page and applies them in one call.
+   *
    * @param sessionId The session the journal was requested for.
    * @param journal The service's answer, in applied order.
+   * @param total The journal's `total`, when the read reported one.
    * @returns Whether the journal was recorded for the active session.
    *
    * @example
    * ```ts
-   * const page = await client.getModifications(id, undefined, { endpoint: state.activeSessionEndpoint });
-   * if (isOk(page)) state.applyModificationJournal(id, page.value.modifications);
+   * const read = await readModificationJournal(client, id, { endpoint: state.activeSessionEndpoint });
+   * if (isOk(read)) state.applyModificationJournal(id, read.value.modifications, read.value.total);
    * ```
    */
-  applyModificationJournal(sessionId: string, journal: readonly ModificationRecord[]): boolean {
+  applyModificationJournal(
+    sessionId: string,
+    journal: readonly ModificationRecord[],
+    total?: number,
+  ): boolean {
     if (this.isDisposed || this.sessionValue?.id !== sessionId) {
       return false;
+    }
+    if (total !== undefined && Number.isSafeInteger(total) && total >= 0) {
+      const known = this.modificationsTotalValue;
+      this.modificationsTotalValue = known === undefined ? total : Math.max(known, total);
     }
     const held = new Map(this.modificationsValue.map((record) => [record.id, record]));
     const listed = new Set<string>();
@@ -1490,11 +1528,11 @@ export class ExtensionState implements vscode.Disposable {
    * listeners never see the empty state in between.
    *
    * Clears the session and its owning endpoint, its progress rows, relevant
-   * files, modifications, instrumentation report, analysis, panel summary,
-   * session target, capture window and failure. Keeps the connection,
-   * provider, service URL and {@link sessionList}; keeps the pairing code,
-   * which belongs to the Chrome
-   * extension rather than to any session; keeps a target selected while no
+   * files, modifications and their counted total, instrumentation report,
+   * analysis, panel summary, session target, capture window and failure.
+   * Keeps the connection, provider, service URL and {@link sessionList};
+   * keeps the pairing code, which belongs to the Chrome extension rather than
+   * to any session; keeps a target selected while no
    * session was active (it is the next question's input); and keeps the
    * previous session's cleanup status visible until the next session's record
    * replaces it, so "files restored" does not vanish the moment the developer
@@ -1509,6 +1547,7 @@ export class ExtensionState implements vscode.Disposable {
     this.progressValue = Object.freeze([]);
     this.relevantFilesValue = Object.freeze([]);
     this.modificationsValue = Object.freeze([]);
+    this.modificationsTotalValue = undefined;
     this.runtimeHooksValue = Object.freeze([]);
     this.unavailableSignalsValue = Object.freeze([]);
     this.analysisValue = undefined;
@@ -1981,6 +2020,7 @@ export class ExtensionState implements vscode.Disposable {
     const target = this.targetValue;
     const pairing = this.pairing;
     const failure = this.failureValue;
+    const modificationsTotal = this.modificationsTotalValue;
     const snapshot: WebviewState = {
       connection: {
         status: this.connectionStatusValue,
@@ -1992,6 +2032,7 @@ export class ExtensionState implements vscode.Disposable {
       progress: this.progressValue,
       relevantFiles: this.relevantFilesValue,
       modifications: this.modificationsValue,
+      ...(modificationsTotal !== undefined ? { modificationsTotal } : {}),
       ...(analysis !== undefined ? { analysis } : {}),
       ...(latestPanel !== undefined ? { latestPanel } : {}),
       ...(target !== undefined ? { target } : {}),

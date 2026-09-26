@@ -128,10 +128,10 @@ export type CatalogGridQuery = {
  * `categories` is `readonly` because the row below only reads the list, so the page may hand over
  * the array it already holds without copying it first.
  *
- * There is no message prop for a listing that did not arrive. A failed read produces no page of
- * products to draw controls, counts and a pager around, so the page renders its own notice in place
- * of this component rather than handing it an invented empty page - which is what kept "the catalog
- * is empty" and "the catalog could not be read" from being told apart here.
+ * There is no error prop. A failed read produces no page of products to draw controls, counts and a
+ * pager around, so the page renders its own notice in place of this component rather than handing
+ * it an invented empty page. An empty catalog - `CatalogEmptyNotice` here - and an unreadable one
+ * therefore stay distinct.
  */
 export interface CatalogGridProps {
   /** One page of products, exactly as the catalog listing returned it. */
@@ -440,9 +440,6 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
    * it cannot use. Building from the applied query cannot produce such a link.
    * `products.pageSize` rather than the requested one for the same reason: it is the size the
    * answer was actually built with, and it is what the pager's own page count is derived from.
-   *
-   * Declared as a plain function and passed straight down - the pager is not memoised, so there is
-   * nothing for a stable identity to save here.
    */
   function hrefForCatalogPage(target: number): string {
     const wantedCatalogQuery = buildCatalogQuery(applied, products.pageSize, target);
@@ -517,13 +514,10 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
   return (
     <section className={styles.root} aria-labelledby={CATALOG_HEADING_ID}>
       {/*
-        The surface's name, as a real heading rather than the `aria-label` that used to carry it.
-        An `aria-label` names a region for a reader who lists regions, but it contributes nothing to
-        the page's heading outline, which left every card's level-3 title with no level-2 heading
-        above it - an outline that stepped from the page's `h1` straight to level 3. The text is the
-        one the label stated, so the region's accessible name is unchanged; `ui/VisuallyHidden`
-        keeps the heading out of the visual rendering and out of layout, because the toolbar and the
-        grid beneath it already say what this surface is.
+        The surface's name: a level-2 heading that names the region through `aria-labelledby` and
+        gives the cards' level-3 titles a parent in the page's heading outline. `ui/VisuallyHidden`
+        keeps it out of the visual rendering and out of layout, because the toolbar and the grid
+        beneath it already say what this surface is.
       */}
       <VisuallyHidden>
         <h2 id={CATALOG_HEADING_ID}>Product catalog</h2>

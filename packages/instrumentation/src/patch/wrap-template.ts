@@ -38,10 +38,12 @@
  * it cannot preserve is a *sloppy* function's mapping between `arguments[i]` and
  * its named parameter bindings, or its `arguments.callee` identity, which is why
  * {@link detectArgumentsHazard} exists and why those targets are refused rather
- * than rewritten. The original body is then replaced with the three statements
- * {@link buildWrapperBody} produces:
+ * than rewritten. The original body is then replaced with what
+ * {@link buildWrapperBody} produces — one comment line,
+ * {@link WRAPPER_COMMENT_LINE}, and three statements:
  *
  * ```ts
+ * // Debug Generator instrumentation: the guard tests helper availability, so the body runs exactly once.
  * const __dbg = (globalThis as { __DEBUGGEN__?: __DebuggenSpanHelper }).__DEBUGGEN__;
  * if (__dbg && typeof __dbg.span === "function") return __dbg.span(name, meta, () => __orig.apply(this, arguments as never));
  * return __orig.apply(this, arguments as never);
@@ -444,16 +446,17 @@ export const DEFAULT_REST_PARAMETER_TYPE = 'unknown[]' as const;
 /**
  * How the wrapper forwards the caller's arguments to the inner function.
  *
- * - `'arguments'` — the form AAP §0.5.1 states verbatim, for every target that
- *   binds `arguments`: function declarations, function expressions, class
- *   methods and object-literal methods. The wrapper keeps the original
- *   parameter list, so parameter defaults, destructuring patterns and the
- *   function's `length` are all preserved exactly, and `arguments` carries what
- *   the caller actually passed, with the same `length`. What it does **not**
- *   carry is a sloppy-mode body's *mapping* from `arguments[i]` to its named
- *   parameter bindings, nor its `arguments.callee` identity: the inner function
- *   the body moves into binds an `arguments` object of its own. Those targets
- *   are refused rather than rewritten — see {@link detectArgumentsHazard}.
+ * - `'arguments'` — the template's primary form, shown in this module's
+ *   overview, for every target that binds `arguments`: function declarations,
+ *   function expressions, class methods and object-literal methods. The
+ *   wrapper keeps the original parameter list, so parameter defaults,
+ *   destructuring patterns and the function's `length` are all preserved
+ *   exactly, and `arguments` carries what the caller actually passed, with the
+ *   same `length`. What it does **not** carry is a sloppy-mode body's
+ *   *mapping* from `arguments[i]` to its named parameter bindings, nor its
+ *   `arguments.callee` identity: the inner function the body moves into binds
+ *   an `arguments` object of its own. Those targets are refused rather than
+ *   rewritten — see {@link detectArgumentsHazard}.
  * - `'rest'` — for arrow functions, which have no `arguments` binding. The
  *   wrapper takes {@link WrapperBody.restParameter} instead of the original
  *   parameter list and forwards it by reference, so an arrow handed to a
@@ -633,8 +636,8 @@ export function detectArgumentsHazard(facts: ArgumentsHazardFacts): ArgumentsHaz
 /**
  * What the wrapper passes as the inner function's receiver.
  *
- * - `'this'` — forwards the enclosing function's `this`, which is what AAP
- *   §0.5.1 states and what a target whose body uses `this` requires: a class or
+ * - `'this'` — forwards the enclosing function's `this`: the template's primary
+ *   form, and what a target whose body uses `this` requires — a class or
  *   object-literal method. Legal wherever `this` has a type.
  * - `'undefined'` — passes no receiver. Required for a standalone function
  *   declaration in a **TypeScript** file: `noImplicitThis` (part of `strict`)
@@ -948,19 +951,26 @@ function checkName(role: string, value: string): Result<string> {
 }
 
 /**
- * The comment lines emitted above the wrapper, one per array entry.
+ * The single comment line emitted above the wrapper's three statements.
  *
- * Short on purpose. It is read by a developer who opens a file mid-session and
- * wants to know why it looks different, and by whoever reviews a diff of the
- * patch, so it says what the block is, that it is temporary, and the one
- * property of the branch below that a reader must not "simplify": the guard
- * tests whether the helper is *there*, not what it returned, which is what
- * keeps the body from running twice.
+ * One line, with no line terminator in it: everything this template emits lands
+ * in a file the developer owns, so the prose it adds is the least that explains
+ * the block. It is read by a developer who opens an instrumented file and wants
+ * to know why it looks different, and by whoever reviews a diff of the patch,
+ * so it states two things only: what the block is, and the one property of the
+ * branch below that a reader must not "simplify" — the guard tests whether the
+ * helper is *there*, not what it returned, which is what keeps the body from
+ * running twice.
+ *
+ * It deliberately makes no promise about when the block goes away. Cleanup
+ * restores a file only while its content still matches what the patch wrote; a
+ * file the developer has edited since is left as it is and reported as a
+ * conflict (docs/ARCHITECTURE.md, "Conflicts are reported, never overwritten").
+ * A line promising removal would be false in precisely the file where the
+ * developer is most likely to read it.
  */
-export const WRAPPER_COMMENT_LINES = Object.freeze([
-  '// Debug Generator: temporary instrumentation, removed when the session ends.',
-  '// The guard tests helper availability, never its result, so the body runs exactly once.',
-] as const);
+export const WRAPPER_COMMENT_LINE =
+  '// Debug Generator instrumentation: the guard tests helper availability, so the body runs exactly once.' as const;
 
 /** Inputs for {@link buildWrapperBody}. */
 export interface WrapperBodyOptions {
@@ -983,8 +993,8 @@ export interface WrapperBodyOptions {
   /**
    * What the inner function receives as `this`.
    *
-   * Defaults to `'this'` for the `'arguments'` call style — the form AAP §0.5.1
-   * states — and to `'undefined'` for `'rest'`, whose targets are arrow
+   * Defaults to `'this'` for the `'arguments'` call style — the template's
+   * primary form — and to `'undefined'` for `'rest'`, whose targets are arrow
    * functions that ignore a receiver. Override it with `'undefined'` for a
    * standalone function declaration in a TypeScript file, where referencing
    * `this` is a type error; see {@link WRAPPER_RECEIVERS}.
@@ -1059,7 +1069,7 @@ export interface WrapperBodyOptions {
  * parsing the output.
  */
 export interface WrapperBody {
-  /** {@link WRAPPER_COMMENT_LINES}, joined with newlines. */
+  /** {@link WRAPPER_COMMENT_LINE}, the one line of prose above the statements. */
   readonly comment: string;
 
   /** `const __dbg = …;` — the single read of the span-helper global. */
@@ -1152,8 +1162,7 @@ export interface WrapperBody {
  * function produces the statements that call it:
  *
  * ```ts
- * // Debug Generator: temporary instrumentation, removed when the session ends.
- * // The guard tests helper availability, never its result, so the body runs exactly once.
+ * // Debug Generator instrumentation: the guard tests helper availability, so the body runs exactly once.
  * const __dbg = (globalThis as { __DEBUGGEN__?: __DebuggenSpanHelper }).__DEBUGGEN__;
  * if (__dbg && typeof __dbg.span === "function") return __dbg.span("loadThing", { file: "src/lib/thing.ts", line: 42, column: 3, symbol: "loadThing" }, () => __orig.apply(this, arguments as never));
  * return __orig.apply(this, arguments as never);
@@ -1284,7 +1293,7 @@ export function buildWrapperBody(options: WrapperBodyOptions): Result<WrapperBod
   const guardedReturn = `if (${helper} && typeof ${helper}.span === "function") return ${helper}.span(${toStringLiteral(spanName.value)}, ${metaLiteral.value}, () => ${innerCall});`;
   const fallbackReturn = `return ${innerCall};`;
 
-  const comment = WRAPPER_COMMENT_LINES.join('\n');
+  const comment = WRAPPER_COMMENT_LINE;
   const statements = Object.freeze([comment, helperCapture, guardedReturn, fallbackReturn]);
 
   return ok({

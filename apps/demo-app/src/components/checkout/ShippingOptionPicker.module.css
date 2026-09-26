@@ -97,10 +97,10 @@
  *
  * The height floor is the pointer-target floor of WCAG 2.5.5 / 2.5.8, and it belongs on the label
  * rather than on `.option`: the label is the hit area, and the card's 12px of padding lies outside
- * it, so a row that measured 42.25px inside a 66px card was 1.75px short of the target while
- * looking comfortably over it. A `min-block-size` here raises only the label's own box - the three
- * tracks it repeats with `subgrid` are still the row's, the row's padding is untouched, and the
- * centred alignment keeps the control, the text block and the amount on the row's optical line. */
+ * it, so a card can look comfortably taller than the floor while the label inside it falls short.
+ * A `min-block-size` here raises only the label's own box - the three tracks it repeats with
+ * `subgrid` stay the row's, the row's padding is unaffected, and the centred alignment keeps the
+ * control, the text block and the amount on the row's optical line. */
 .option > label {
   display: grid;
   grid-column: 1 / -1;
@@ -120,13 +120,8 @@
 }
 
 /* Selected. The tint and border show the chosen row at a glance; the cue that does not depend on
- * colour is the checked radio itself, which the browser draws and announces.
- *
- * BLITZY [A11Y]: the accent border measures 2.15:1 against --ls-surface, below the 3:1 non-text
- * recommendation. Implemented with the shared token the specification names - the brand amber
- * that `app/globals.css` fixes and already flags - rather than silently darkened, and it is never
- * the only carrier of the state: the radio's own filled circle and its announced checked state
- * carry it. Flagged for design review. */
+ * colour is the checked radio itself, whose filled circle the browser draws and whose checked state
+ * it announces. */
 .option:has(:checked) {
   border-color: var(--ls-accent, #f59e0b);
   background-color: color-mix(in srgb, var(--ls-accent, #f59e0b) 10%, var(--ls-surface, #ffffff));
@@ -178,13 +173,9 @@
  * The brand accent dresses the selected row above; the control keeps the interaction colour that
  * `app/globals.css` gives every radio and checkbox, which is also this row's ring colour.
  *
- * BLITZY [A11Y]: the circle is 1.125rem (18px at the default root size), below the 44x44px
- * touch-target recommendation. Sized from the type scale as the specification requires; the hit
- * area is the wrapping label, which spans the whole row and carries the 44px floor by declaration
- * (`--ls-target-min` on `.option > label` above), so no pointer has to find the circle itself.
- * That floor is stated rather than assumed: measured at 1440px the label stood 42.25px tall, so
- * the height the padding and type steps happen to produce was 1.75px short of the target and this
- * note previously claimed a size the row did not have. Flagged for design review. */
+ * The circle is 1.125rem (18px at the default root size). The pointer target is the wrapping
+ * label, which spans the whole row and carries the `--ls-target-min` floor declared on
+ * `.option > label` above, so no pointer has to find the circle itself. */
 .control {
   inline-size: var(--ls-text-lg, 1.125rem);
   block-size: var(--ls-text-lg, 1.125rem);

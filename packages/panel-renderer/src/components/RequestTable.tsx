@@ -2,26 +2,25 @@
  * `RequestTable` — the component behind the node catalog's `requestTable` type:
  * network calls grouped so that repeats collide, each group badged with its
  * duplicate evidence and expandable to every occurrence with the code that
- * issued it (AAP 0.6.2).
+ * issued it.
  *
  * This is the body of the product's third demonstrated question — "why are
- * these requests duplicated?" (AAP 0.6.5) — and the view an end-to-end
- * assertion about a duplicate group reads. Everything it needs to answer that
- * question arrives in the rows: how many times one logical request occurred,
- * how many of those were redundant, how tightly they clustered, and which
- * distinct callers issued them.
+ * these requests duplicated?" — and the view an end-to-end assertion about a
+ * duplicate group reads. Everything it needs to answer that question arrives in
+ * the rows: how many times one logical request occurred, how many of those were
+ * redundant, how tightly they clustered, and which distinct callers issued them.
  *
  * ## Grouping is upstream, and that is the whole design
  *
  * **Nothing in this file groups, de-duplicates, counts duplicates or compares
  * one URL with another.** The reason is a privacy constraint rather than a
- * division of labour (AAP 0.5.2): a URL's query-parameter *values* are replaced
- * per key before anything is stored, broadcast or shown, so two requests that
- * differ only in a parameter arrive here with byte-identical display text. The
+ * division of labour: a URL's query-parameter *values* are replaced per key
+ * before anything is stored, broadcast or shown, so two requests that differ
+ * only in a parameter arrive here with byte-identical display text. The
  * distinction is preserved instead by a key the service computes from the
  * request *as it was actually made* — an HMAC over the method, the path and the
  * sorted query pairs of the unredacted URL — and the telemetry aggregate groups
- * by that key.
+ * by that key (`docs/SECURITY.md`, "The pre-redaction request key").
  *
  * A client-side grouping pass therefore could not reproduce the answer: it
  * would merge two differently parameterized calls into one "duplicate" group
@@ -58,17 +57,17 @@
  * Data arrives only through the node's `DataQuery`, resolved by `useQuery`
  * against the ambient `DataProvider`; interactions leave only through
  * `PanelActions`. There is no socket, no `fetch` and no message name in this
- * file (AAP 0.1.2), and no transport detail reaches a column.
+ * file, and no transport detail reaches a column.
  *
- * Ordering and paging belong to the side that owns the capture (AAP 0.4.2): a
- * sort change is a **re-query** in the closed `DataQuerySort` vocabulary, never
- * a local re-order, and "load more" advances `offset` to exactly the
- * `nextOffset` the response reported, keeping the pages already received. It is
- * offered only when that offset moves forward from the page it answered, and
- * never for a count-only `limit: 0` query, whose every page is empty by
- * request. An authored `limit: 0` is sent as zero, never raised to one row, so
- * the view states the query's total without drawing a group. Two things are local
- * and are labelled as such wherever they are visible: the disclosure state of a
+ * Ordering and paging belong to the side that owns the capture: a sort change
+ * is a **re-query** in the closed `DataQuerySort` vocabulary, never a local
+ * re-order, and "load more" advances `offset` to exactly the `nextOffset` the
+ * response reported, keeping the pages already received. It is offered only
+ * when that offset moves forward from the page it answered, and never for a
+ * count-only `limit: 0` query, whose every page is empty by request. An
+ * authored `limit: 0` is sent as zero, never raised to one row, so the view
+ * states the query's total without drawing a group. Two things are local and
+ * are labelled as such wherever they are visible: the disclosure state of a
  * row, and the "duplicates only" toggle, which can only filter the groups
  * loaded so far because the query contract cannot express "duplicates only".
  * With no group loaded it is disabled (`disabled` and `aria-disabled`), and a
@@ -80,7 +79,7 @@
  * tones resolve through `Badge` tones and the `.dg-request-table__status--*`
  * rules committed in `../styles/components.css`; duration emphasis is
  * `DurationCell`'s `severity="auto"`; every gap comes from `Stack` or
- * `Toolbar`; and there is no inline `style` at all (AAP 0.6.4).
+ * `Toolbar`; and there is no inline `style` at all.
  *
  * The pending state adds no class name of its own. A request still in flight
  * when the capture ended is drawn as the base status chip with the `Badge`'s
@@ -203,7 +202,7 @@ const DEFAULT_SORT: DataQuerySort = 'count_desc';
 
 /**
  * The smallest `limit` the paging contract accepts, and the one value of it
- * that asks for a count without rows (AAP 0.4.2).
+ * that asks for a count without rows.
  *
  * Zero is a legitimate request, never "unset": the query schema preserves it
  * exactly and the page echo reports it, so a node that authored it receives the
@@ -296,9 +295,9 @@ const STATUS_CLASS_FLOORS = Object.freeze({
  * Four classes rather than three: the committed `.dg-request-table__status--*`
  * rules in `../styles/components.css` distinguish a client error from a server
  * error, and the design system's own stylesheet is the authority on the tone a
- * status badge carries (AAP 0.6.4). A code outside every class — which the
- * producer would have to have reported as a non-integer or out-of-range value —
- * is neutral, exactly as an absent code is.
+ * status badge carries. A code outside every class — which the producer would
+ * have to have reported as a non-integer or out-of-range value — is neutral,
+ * exactly as an absent code is.
  */
 const STATUS_CLASS_TONES: Readonly<Record<StatusClass, BadgeTone>> = {
   ok: 'success',
@@ -426,9 +425,9 @@ const COLUMN_SORTS: Readonly<Record<string, DataQuerySort | undefined>> = {
  * each one through `DATA_TABLE_COLUMN_TRACKS` to a grid track built from the
  * `--dg-column-min-*` floor and `--dg-column-share-*` share tokens, so this
  * table agrees with every other table on both extension surfaces about how wide
- * a count or a duration is, and no length is chosen here (AAP 0.6.4). Each
- * column takes the smallest role whose floor keeps its content readable, in the
- * vocabulary every table shares:
+ * a count or a duration is, and no length is chosen here. Each column takes the
+ * smallest role whose floor keeps its content readable, in the vocabulary every
+ * table shares:
  *
  *   - `request` is `text`: the identity column holds the disclosure toggle, the
  *     method badge, the grouping chip and a readable run of the URL, which
@@ -447,8 +446,6 @@ const COLUMN_SORTS: Readonly<Record<string, DataQuerySort | undefined>> = {
  * against: `DataTable` sums the floors into the grid's own minimum width, so a
  * panel narrower than their sum scrolls horizontally with every column still
  * readable instead of squeezing the tracks until one cell paints over the next.
- * The unsized fallback used to be nine equal `minmax(0, 1fr)` tracks, in which
- * the grouping chip ran across the Status column and read as "Requ200key".
  * Spare width goes mostly to the two columns whose values are text of
  * unbounded length — the request and its callers — so a wide panel shows URLs
  * and caller chips in full rather than widening columns of figures. A token
@@ -484,8 +481,8 @@ const EMPTY_STATUSES: readonly ToolbarStatus[] = Object.freeze([]);
  * Copy
  *
  * Generic throughout: no route, no URL, no component name and no framework
- * term appears in this file's wording (AAP 0.5.4). Every path, method and
- * caller a reader sees comes from the data.
+ * term appears in this file's wording. Every path, method and caller a reader
+ * sees comes from the data.
  * ---------------------------------------------------------------------------
  */
 
@@ -545,11 +542,11 @@ const SORT_CONTROL_LABEL = 'Order requests';
  *
  * The control keeps its own element while the page it asked for is in flight
  * (see the footer in {@link RequestTable}), so focus normally never leaves it.
- * The key is the fallback for the one path that does replace it — a failure
- * that swaps the body for the error state, then a retry that brings the rows
- * back — so the host's node frame can hand focus to the equivalent control
- * rather than to `<body>` (B2-F12). Keyed by the error state's exported
- * attribute name, so both halves of that contract spell it once.
+ * The key is the fallback for the one path that does replace it — a failure,
+ * which withdraws the control while the error state reports it, then a retry
+ * that brings the control back — so the host's node frame can hand focus to the
+ * equivalent control rather than to `<body>`. Keyed by the error state's
+ * exported attribute name, so both halves of that contract spell it once.
  */
 const LOAD_MORE_FOCUS_ATTRIBUTES = {
   [FOCUS_KEY_ATTRIBUTE]: 'request-table-load-more',
@@ -568,7 +565,7 @@ const LOAD_MORE_FOCUS_ATTRIBUTES = {
 /**
  * Classify one response status code.
  *
- * @param code - The status code an occurrence reported.
+ * @param code The status code an occurrence reported.
  * @returns The class whose tone and stylesheet modifier the badge carries.
  */
 function classifyStatusCode(code: number): StatusClass {
@@ -603,7 +600,7 @@ function classifyStatusCode(code: number): StatusClass {
  * case is explicit under `noUncheckedIndexedAccess` instead of relying on
  * `reduce`'s runtime throw.
  *
- * @param windows - The group's duplicate windows, in time order.
+ * @param windows The group's duplicate windows, in time order.
  * @returns The largest window, with the earliest winning a tie.
  */
 function largestDuplicateWindow(windows: readonly DuplicateWindow[]): DuplicateWindow | undefined {
@@ -627,7 +624,7 @@ function largestDuplicateWindow(windows: readonly DuplicateWindow[]): DuplicateW
  * cluster, which is what makes the sentence a statement about this capture
  * rather than about the detector's configuration.
  *
- * @param group - The group whose duplicates are being described.
+ * @param group The group whose duplicates are being described.
  * @returns One or more sentences, safe to show as plain text.
  */
 function describeDuplicates(group: RequestGroup): string {
@@ -659,7 +656,7 @@ function describeDuplicates(group: RequestGroup): string {
  * request is pending only when the producer's own count says so, never because
  * a status code happens to be missing.
  *
- * @param group - The group whose pending occurrences are counted.
+ * @param group The group whose pending occurrences are counted.
  * @returns The pending count, or `0` when none was reported.
  */
 function pendingCountOf(group: RequestGroup): number {
@@ -680,8 +677,8 @@ function pendingCountOf(group: RequestGroup): number {
  * shows codes or a failure count, a last sentence says those describe the
  * settled occurrences only.
  *
- * @param group - The group whose pending occurrences are described.
- * @param pendingCount - Its {@link pendingCountOf}, already computed and above zero.
+ * @param group The group whose pending occurrences are described.
+ * @param pendingCount Its {@link pendingCountOf}, already computed and above zero.
  * @returns One or more sentences, safe to show as plain text.
  */
 function describePending(group: RequestGroup, pendingCount: number): string {
@@ -716,8 +713,8 @@ function describePending(group: RequestGroup, pendingCount: number): string {
  * including when the occurrence list was truncated below the one that did — and
  * the caller then renders the label as plain text rather than a dead link.
  *
- * @param group - The group whose occurrences are searched.
- * @param initiator - One entry of that group's `initiators`.
+ * @param group The group whose occurrences are searched.
+ * @param initiator One entry of that group's `initiators`.
  * @returns The first location found for the label, or `undefined`.
  */
 function locationForInitiator(group: RequestGroup, initiator: string): SourceLocation | undefined {
@@ -746,7 +743,7 @@ function locationForInitiator(group: RequestGroup, initiator: string): SourceLoc
  * still shows its own caller in the detail row (see
  * {@link renderOccurrenceInitiator}).
  *
- * @param group - The group whose callers are listed.
+ * @param group The group whose callers are listed.
  * @returns The callers to show, first one first.
  */
 function distinctInitiators(group: RequestGroup): readonly string[] {
@@ -787,8 +784,8 @@ function distinctInitiators(group: RequestGroup): readonly string[] {
  * labelNamesLocation('src/example/widget.tsx:84:9', location); // true
  * labelNamesLocation('src/example/elsewhere.ts:1:1', location); // false
  *
- * @param label - The caller label the occurrence recorded.
- * @param location - The location the same occurrence resolved to.
+ * @param label The caller label the occurrence recorded.
+ * @param location The location the same occurrence resolved to.
  * @returns `true` when the label names that location and nothing else.
  */
 function labelNamesLocation(label: string, location: SourceLocation): boolean {
@@ -824,7 +821,7 @@ function labelNamesLocation(label: string, location: SourceLocation): boolean {
  * clampAuthoredLimit(0); // 0 — a count without rows
  * clampAuthoredLimit(9000); // DATA_QUERY_MAX_LIMIT
  *
- * @param limit - The node's authored limit, if any.
+ * @param limit The node's authored limit, if any.
  * @returns A whole-number limit within `[0, DATA_QUERY_MAX_LIMIT]`, or `undefined`.
  */
 function clampAuthoredLimit(limit: number | undefined): number | undefined {
@@ -839,7 +836,7 @@ function clampAuthoredLimit(limit: number | undefined): number | undefined {
  * The offset "load more" may request next, or `undefined` when no further page
  * can be asked for.
  *
- * Paging only ever moves forward, and only on the service's word (AAP 0.4.2).
+ * Paging only ever moves forward, and only on the service's word.
  * A next page exists when all of the following hold:
  *
  *   - the page settled successfully — a page still resolving or a failure
@@ -856,10 +853,10 @@ function clampAuthoredLimit(limit: number | undefined): number | undefined {
  * The value is returned as reported and never derived from the rows in hand,
  * which would drift the moment a limit was clamped.
  *
- * @param status - The settled status of the current page.
- * @param limit - The effective limit sent with the query, `undefined` when omitted.
- * @param offset - The offset of the page the service answered.
- * @param nextOffset - The next offset the service reported, if any.
+ * @param status The settled status of the current page.
+ * @param limit The effective limit sent with the query, `undefined` when omitted.
+ * @param offset The offset of the page the service answered.
+ * @param nextOffset The next offset the service reported, if any.
  * @returns The offset to request next, or `undefined` when there is no next page.
  */
 function forwardNextOffsetOf(
@@ -910,7 +907,7 @@ interface EmptyPageFacts {
 /**
  * The noun for a number of request groups, agreeing with that number.
  *
- * @param count - How many groups the sentence is about.
+ * @param count How many groups the sentence is about.
  * @returns `request group` for exactly one, `request groups` otherwise.
  */
 function groupNounFor(count: number): string {
@@ -926,7 +923,7 @@ function groupNounFor(count: number): string {
  * authored offset past the end of the result, a page inside a positive total
  * that still came back empty, and a later page of a source that reported no
  * total — and each of them has rows or a count the reader should not be told
- * are absent (AAP 0.4.2). So the copy is chosen, first match wins:
+ * are absent. So the copy is chosen, first match wins:
  *
  *   1. **Count only** — the query asked for no rows. It states the total when
  *      one was reported and says that none was otherwise.
@@ -945,14 +942,14 @@ function groupNounFor(count: number): string {
  * of items skipped. A total that is not a non-negative safe whole number cannot
  * come from the page contract and is read as unreported rather than printed.
  * Every count goes through `formatCount`, and no wording names a route, a
- * component or a framework (AAP 0.5.4).
+ * component or a framework.
  *
  * @example
  * describeEmptyPage({ limit: 0, offset: 0, total: 42, hasNextPage: false });
  * // { title: 'Count only',
  * //   message: 'This view requests a count without rows: 42 request groups matched its query.' }
  *
- * @param facts - The page's limit, offset, reported total and paging state.
+ * @param facts The page's limit, offset, reported total and paging state.
  * @returns The empty state's title and message.
  */
 function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
@@ -1040,13 +1037,13 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
  * by itself: without it a keyboard reader could never reach the full URL, the
  * complete status list, the failure and duplicate explanations, the grouping
  * note, the unavailable-size reason, what "Pending" means, the full label of a
- * caller without a location or the callers a row counts rather than shows
- * (AAP 0.6.2). Such a trigger is focusable and nothing more: no `role="button"`
- * and no click handler, because nothing happens on activation, and no
- * `aria-label`, because the visible text is the name and the tooltip merges its
- * bubble into the trigger's `aria-describedby`. The first Escape on an open
- * trigger closes the bubble and the second returns to the row. The focus
- * indicator is the global `:focus-visible` ring from `../styles/base.css`.
+ * caller without a location or the callers a row counts rather than shows. Such
+ * a trigger is focusable and nothing more: no `role="button"` and no click
+ * handler, because nothing happens on activation, and no `aria-label`, because
+ * the visible text is the name and the tooltip merges its bubble into the
+ * trigger's `aria-describedby`. The first Escape on an open trigger closes the
+ * bubble and the second returns to the row. The focus indicator is the global
+ * `:focus-visible` ring from `../styles/base.css`.
  *
  * Typed as the literal `-1`, which is what `SourceLink`'s `tabIndex` accepts.
  */
@@ -1062,8 +1059,8 @@ const GRID_CONTROL_TAB_INDEX = -1;
  * from assistive technology). The tooltip says what "pending" means for the
  * figures beside it.
  *
- * @param label - The visible text: the word "Pending", with a count when useful.
- * @param note - The tooltip's explanation, safe to show as plain text.
+ * @param label The visible text: the word "Pending", with a count when useful.
+ * @param note The tooltip's explanation, safe to show as plain text.
  * @returns The badge in its tooltip.
  */
 function renderPendingBadge(label: string, note: string): ReactNode {
@@ -1098,7 +1095,7 @@ function renderPendingBadge(label: string, note: string): ReactNode {
  * The Pending badge shows the pending count when the group holds more than one
  * occurrence, so "Pending 2" on a row of five reads without the tooltip.
  *
- * @param group - The group whose statuses are shown.
+ * @param group The group whose statuses are shown.
  * @returns The cell's content.
  */
 function renderStatusCell(group: RequestGroup): ReactNode {
@@ -1181,7 +1178,7 @@ function renderStatusCell(group: RequestGroup): ReactNode {
  * Both numbers come from the group as received. The badge's tooltip describes
  * the clusters the detector found, in that capture's own measurements.
  *
- * @param group - The group whose duplicate evidence is shown.
+ * @param group The group whose duplicate evidence is shown.
  * @returns The cell's content.
  */
 function renderDuplicatesCell(group: RequestGroup): ReactNode {
@@ -1217,12 +1214,13 @@ function renderDuplicatesCell(group: RequestGroup): ReactNode {
 /**
  * The transferred-bytes cell.
  *
- * A same-origin response is the only kind whose size the browser exposes
- * (AAP 0.6.6 records the gap), so an absent figure is the ordinary case and is
- * shown as the unavailable label with the reason in a tooltip — never as `0`,
- * which would read as a response that carried nothing.
+ * A same-origin response is the only kind whose size the browser exposes, so an
+ * absent figure is the ordinary case (the "Computed metrics" section of
+ * `docs/ARCHITECTURE.md` records the limit). It is shown as the unavailable
+ * label with the reason in a tooltip — never as `0`, which would read as a
+ * response that carried nothing.
  *
- * @param group - The group whose transfer size is shown.
+ * @param group The group whose transfer size is shown.
  * @returns The cell's content.
  */
 function renderTransferredCell(group: RequestGroup): ReactNode {
@@ -1258,8 +1256,8 @@ function renderTransferredCell(group: RequestGroup): ReactNode {
  * for the link beside it, and it is never the chip's caption (see
  * {@link renderInitiatorSlot}).
  *
- * @param label - The caller label, already reduced to one line.
- * @param chip - The source chip for the caller's location.
+ * @param label The caller label, already reduced to one line.
+ * @param chip The source chip for the caller's location.
  * @returns The slot.
  */
 function renderCallerBesideChip(label: string, chip: ReactNode): ReactNode {
@@ -1295,7 +1293,7 @@ function renderCallerBesideChip(label: string, chip: ReactNode): ReactNode {
  *     caption followed by the full `file:line:column` it opens
  *     (`sourceLinkAccessibleName`). The location is handed to the chip exactly
  *     as the occurrence carried it — the same object, unmodified — because it
- *     is what the click-to-source chain forwards (AAP 0.4.2).
+ *     is what the click-to-source chain forwards.
  *   - A caller without one → its label as a tooltip trigger disclosing the
  *     caller's full text. The cell truncates it with CSS, which no string
  *     comparison can detect, so the tooltip is always attached rather than
@@ -1304,8 +1302,8 @@ function renderCallerBesideChip(label: string, chip: ReactNode): ReactNode {
  * The chip and the trigger are `tabIndex={-1}`: the grid's arrow keys reach
  * them (see {@link GRID_CONTROL_TAB_INDEX}).
  *
- * @param group - The group the caller belongs to, searched for its location.
- * @param initiator - One entry of that group's `initiators`.
+ * @param group The group the caller belongs to, searched for its location.
+ * @param initiator One entry of that group's `initiators`.
  * @returns The caller's slot.
  */
 function renderInitiatorSlot(group: RequestGroup, initiator: string): ReactNode {
@@ -1341,8 +1339,8 @@ function renderInitiatorSlot(group: RequestGroup, initiator: string): ReactNode 
  * location, says where that location can be opened: a tooltip holds text only,
  * and each of those callers is a source chip in the occurrence list.
  *
- * @param group - The group whose callers are described.
- * @param others - The callers after the first, as received.
+ * @param group The group whose callers are described.
+ * @param others The callers after the first, as received.
  * @returns One or two sentences, safe to show as plain text.
  */
 function describeOtherInitiators(group: RequestGroup, others: readonly string[]): string {
@@ -1376,7 +1374,7 @@ function describeOtherInitiators(group: RequestGroup, others: readonly string[])
  * location an earlier caller already names are folded into it first
  * ({@link distinctInitiators}), so no location is shown or counted twice.
  *
- * @param group - The group whose callers are shown.
+ * @param group The group whose callers are shown.
  * @returns The cell's content.
  */
 function renderInitiatorsCell(group: RequestGroup): ReactNode {
@@ -1419,7 +1417,7 @@ function renderInitiatorsCell(group: RequestGroup): ReactNode {
  * from any other view that draws the same event — carries the design system's
  * one selected-state class, `dg-is-selected`, on the whole line, and its select
  * control reports `aria-pressed="true"`, so the mark is an attribute as well as
- * a colour (AAP 0.6.4). Every other select control reports `false`.
+ * a colour. Every other select control reports `false`.
  *
  * The status slot has three forms. An occurrence the producer flagged as
  * pending shows the Pending badge — the flag is the producer's explicit
@@ -1432,15 +1430,15 @@ function renderInitiatorsCell(group: RequestGroup): ReactNode {
  * The row renders EXACTLY FOUR slots, always in this order — the offset, the
  * duration, the status and the initiator — because the occurrence list is one
  * grid of four columns that every occurrence adopts as a subgrid (see
- * `.dg-request-table__occurrences` in `../styles/components.css`). A slot that
- * was simply left out, as a missing initiator once was, shifted every later
- * slot one column to the left and made the list ragged. The initiator slot is
- * therefore always filled, by {@link renderOccurrenceInitiator}.
+ * `.dg-request-table__occurrences` in `../styles/components.css`). A slot left
+ * out would shift every later slot one column to the left and make the list
+ * ragged, so the initiator slot is always filled, by
+ * {@link renderOccurrenceInitiator}.
  *
- * @param group - The group the occurrence belongs to, for its time origin.
- * @param occurrence - The occurrence to render.
- * @param onSelect - Selection handler, or `undefined` for the inert form.
- * @param selected - Whether this occurrence is the panel's selected event.
+ * @param group The group the occurrence belongs to, for its time origin.
+ * @param occurrence The occurrence to render.
+ * @param onSelect Selection handler, or `undefined` for the inert form.
+ * @param selected Whether this occurrence is the panel's selected event.
  * @returns One occurrence row.
  */
 function renderOccurrence(
@@ -1535,7 +1533,7 @@ function renderOccurrence(
  * occurrence list's four columns (see {@link renderOccurrence}). The chip is
  * `tabIndex={-1}` (see {@link GRID_CONTROL_TAB_INDEX}).
  *
- * @param occurrence - The occurrence whose initiator is shown.
+ * @param occurrence The occurrence whose initiator is shown.
  * @returns The slot's single element.
  */
 function renderOccurrenceInitiator(occurrence: RequestOccurrence): ReactNode {
@@ -1583,8 +1581,8 @@ function renderOccurrenceInitiator(occurrence: RequestOccurrence): ReactNode {
  *
  * Five of the six members change what is requested or what is shown, and the
  * sixth — `identity` — is what makes a stale set detectable: a node whose query
- * changed under the same node id gets a fresh view rather than an offset into a
- * result that no longer exists.
+ * changed under the same node id gets a fresh view rather than an offset into
+ * the result of the query it replaced.
  */
 interface RequestTableView {
   /** The identity of the node query this state belongs to. */
@@ -1633,7 +1631,7 @@ interface RequestTableView {
  * every render, and a host that mutates a stored spec in place would never
  * reset it.
  *
- * @param node - The node being rendered.
+ * @param node The node being rendered.
  * @returns A string that is equal for equal node queries.
  */
 function viewIdentityOf(node: RequestTableNode): string {
@@ -1653,8 +1651,8 @@ function viewIdentityOf(node: RequestTableNode): string {
  * The view state a node opens with: the authored ordering and offset, nothing
  * carried, nothing expanded and no filter.
  *
- * @param node - The node being rendered.
- * @param identity - Its {@link viewIdentityOf}, already computed by the caller.
+ * @param node The node being rendered.
+ * @param identity Its {@link viewIdentityOf}, already computed by the caller.
  * @returns The initial state for that node.
  */
 function initialView(node: RequestTableNode, identity: string): RequestTableView {
@@ -1680,7 +1678,7 @@ function initialView(node: RequestTableNode, identity: string): RequestTableView
  *
  * Two members, and no data prop: a query-backed view is configured by its node
  * and fed by the ambient provider, so handing it rows would let a caller draw
- * something the capture never said (AAP 0.6.2).
+ * something the capture never said.
  */
 export interface RequestTableProps {
   /**
@@ -1712,7 +1710,7 @@ export interface RequestTableProps {
  * footer says how many of the source they cover — and keeps the paging control
  * in place, busy and inert, so the focus the reader pressed it with stays on it.
  *
- * @param props - See {@link RequestTableProps}.
+ * @param props See {@link RequestTableProps}.
  * @returns The node's rendering.
  */
 export function RequestTable(props: RequestTableProps): ReactElement {
@@ -1856,10 +1854,9 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   const handleLoadMore = useCallback((): void => {
     // Only the forward offset the service reported is ever requested, exactly
     // as reported; an offset derived from the number of rows on screen would
-    // drift the moment a limit was clamped (AAP 0.4.2). While the page it asked
-    // for is in flight the control is still pressable — it stays enabled so it
-    // keeps focus — and a press then asks for nothing, so no page is requested
-    // twice.
+    // drift the moment a limit was clamped. While the page it asked for is in
+    // flight the control is still pressable — it stays enabled so it keeps
+    // focus — and a press then asks for nothing, so no page is requested twice.
     if (loadingMore || forwardNextOffset === undefined) {
       return;
     }
@@ -2206,8 +2203,8 @@ export function RequestTable(props: RequestTableProps): ReactElement {
       </Text>
       {/* Kept mounted, as the same element, while the page it asked for is in
           flight: a focused control that leaves the document, or turns
-          `disabled`, hands focus to `<body>` (B2-F12). So it is never disabled;
-          it reports the flight through `aria-busy` and its label, and a press
+          `disabled`, hands focus to `<body>`. So it is never disabled; it
+          reports the flight through `aria-busy` and its label, and a press
           meanwhile is a no-op (see `handleLoadMore`). When the page lands it
           stays for a further page, or leaves after the last one. */}
       {forwardNextOffset === undefined && !loadingMore ? null : (
@@ -2249,9 +2246,9 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   } else if (status === 'error' && !nextPageFailed) {
     // The package's one failure contract: title, the generic lead plus the
     // provider's own cause, its hint and code, the query as `formatDataQuery`
-    // prints it, the settled announcement and the retry (B2-F14, B1-F16). With
-    // nothing carried this failure replaces the whole body, so it is the view's
-    // own; a failed further page is reported below its groups instead.
+    // prints it, the settled announcement and the retry. With nothing carried
+    // this failure replaces the whole body, so it is the view's own; a failed
+    // further page is reported below its groups instead.
     body = (
       <ErrorState
         {...queryFailureProps({ error, announcement, retry }, query)}

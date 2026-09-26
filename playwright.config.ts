@@ -297,11 +297,11 @@ export default defineConfig<DebuggenTestOptions>({
   // a 2xx, 3xx, 400, 401, 402 or 403 counts as ready - and never its body, so it cannot
   // tell which build or which protocol version is answering. The body of `GET /health`
   // is `{ version, protocolVersion, pairingAvailable }`, defined once as
-  // `healthResponseSchema` in `@debuggen/protocol` and answered by
-  // apps/local-service/src/main.ts. A helper that must know whether the service it was
-  // handed speaks this build's protocol calls `HttpClient.health()` from that package and
-  // compares the returned `protocolVersion` with `isCompatibleProtocolVersion`, rather
-  // than parsing the body itself.
+  // `healthResponseSchema` in `@debuggen/protocol` and built by `buildHealthResponse` in
+  // apps/local-service/src/server/routes/health.ts. A helper that must know whether the
+  // service it was handed speaks this build's protocol calls `HttpClient.health()` from
+  // that package and compares the returned `protocolVersion` with
+  // `isCompatibleProtocolVersion`, rather than parsing the body itself.
   webServer: {
     name: 'debuggen local service',
     command: 'node apps/local-service/dist/main.js',
@@ -314,7 +314,7 @@ export default defineConfig<DebuggenTestOptions>({
     // SIGTERM rather than SIGKILL: on SIGTERM the service ends every live session -
     // restoring its patched files, disarming the page agent and the dev-server preload -
     // stops the dev servers it launched, revokes their credentials and closes the session
-    // store (AAP 0.5.1); a killed service would leave patched files behind for the next
+    // store; a killed service would leave patched files behind for the next
     // run's reconciliation. The grace must outlast that whole sequence: the service bounds
     // it to `SHUTDOWN_BUDGET.totalMs` (8 s) plus its `EXIT_BACKSTOP_MS` (0.5 s), both in
     // apps/local-service/src/main.ts, and 12 s leaves headroom for a loaded CI runner.

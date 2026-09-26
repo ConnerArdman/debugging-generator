@@ -4,13 +4,15 @@
  *
  * ## What this suite is protecting
  *
- * AAP 0.4.2 attributes a React commit, a state transition or a further request
- * that lands after a response settled to that request's span, through a
- * *continuation window*, and records the attribution in `attributes.lineage`.
- * When more than one settled request had an open window at that moment the
- * attribution is a choice among candidates: it is flagged `lineageAmbiguous`
- * and the other candidates are listed, as span ids, in `lineageCandidates`.
- * The timeline must render the two outcomes as what they are:
+ * A React commit, a state transition or a further request that lands after a
+ * response settled is attributed to that request's span through a
+ * *continuation window*, and the attribution is recorded in
+ * `attributes.lineage`; `docs/ARCHITECTURE.md` describes the mechanism under
+ * "Async-continuation lineage". When more than one settled request had an open
+ * window at that moment the attribution is a choice among candidates: it is
+ * flagged `lineageAmbiguous` and the other candidates are listed, as span ids,
+ * in `lineageCandidates`. The timeline must render the two outcomes as what
+ * they are:
  *
  *   - **Ambiguous.** The connector to the chosen parent is dashed in the
  *     warning tone, the bar itself carries the same state, and the description
@@ -35,10 +37,10 @@
  *   - Test API imported explicitly from `vitest`, with `afterEach(cleanup)`
  *     registered explicitly.
  *   - Stub providers built with the library's own `createDataProvider`.
- *   - In-file synthetic builders and hand-built trees: `@debuggen/telemetry` is
- *     a type-only dependency of this package (AAP 0.2.2).
- *   - Generic fixture vocabulary only (AAP 0.5.4): no name, route or symbol of
- *     any inspected application.
+ *   - In-file synthetic builders and hand-built trees: this package depends on
+ *     `@debuggen/telemetry` for types only.
+ *   - Generic fixture vocabulary only: no name, route or symbol of any
+ *     inspected application.
  *   - Queries by role and accessible name; a class is read only off an element
  *     already obtained semantically, or off the canvas the role query returned.
  *   - A description is read while it is OPEN, opened the way a pointer opens

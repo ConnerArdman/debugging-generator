@@ -2,7 +2,7 @@
 /**
  * Tests for `./span-helper.ts` — `globalThis.__DEBUGGEN__.span` in the
  * developer's dev-server process, the runtime half of the reversible AST patch
- * contract (AAP §0.5.1).
+ * contract (`docs/ARCHITECTURE.md` §7.2).
  *
  * ## What is on trial
  *
@@ -1096,7 +1096,7 @@ describe('span() nesting', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Names and metadata (AAP §0.5.2 bounds)
+ * Names and metadata (the telemetry privacy bounds in `docs/SECURITY.md`)
  * ---------------------------------------------------------------------------
  */
 

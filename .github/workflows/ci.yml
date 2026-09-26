@@ -1,8 +1,8 @@
-# The repository's only workflow (AAP 0.7.1 Group 0). Every gate runs through a root
-# package.json script except the dependency audit, which is pnpm's built-in
-# `pnpm audit` and deliberately not a root script (see the advisory ledger in
-# pnpm-workspace.yaml). Every action is pinned by commit SHA, no secret is consumed (all
-# tests use the deterministic provider), and no step caches, archives or uploads `.git`.
+# Every gate runs through a root package.json script except the `pnpm audit` layer,
+# which is pnpm's built-in command. Every action is pinned by commit SHA. No repository
+# secret is consumed: the advisory step reads public advisories with the job's read-only
+# token, and every test uses the deterministic provider. No step caches, archives or
+# uploads `.git`.
 name: CI
 
 on:
@@ -18,9 +18,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# The two jobs are deliberately independent so the e2e acceptance evidence is not
-# queued behind the aggregate gate. A reviewer may add `needs: verify` to save
-# runner minutes without changing behaviour.
 jobs:
   verify:
     name: Verify
@@ -53,6 +50,15 @@ jobs:
       # `pnpm verify`, which must stay runnable offline.
       - name: Audit dependencies
         run: pnpm audit --audit-level=low
+
+      # Blocking, and independent of the feed `pnpm audit` reads: matches every locked
+      # version and every exact manifest pin against the committed ledger, the vendor
+      # advisory feeds it names and OSV, and warns when OSV lags a vendor advisory. The
+      # job's read-only token authenticates the reads of public advisories.
+      - name: Check vendor advisories
+        run: pnpm check:advisories --online
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Aggregate quality gate
         run: pnpm verify

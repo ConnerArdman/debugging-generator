@@ -61,6 +61,34 @@
  * this product's answer, and a host that sets `timeoutMs` or `maxRetries`
  * overrides them per setting.
  *
+ * ## The transport's destination and diagnostics are never taken from the environment
+ *
+ * The vendor's client reads two process-environment variables this product
+ * never documents, and each would be a control nobody set if the service
+ * inherited it:
+ *
+ * - `ANTHROPIC_BASE_URL` is the client's default `baseURL`. Inherited, it
+ *   routes the credential and every prompt to whatever host it names
+ *   (CWE-200, CWE-918), contrary to the documented egress path — the
+ *   Anthropic API over HTTPS.
+ * - `ANTHROPIC_LOG` is the client's default log level, printed through
+ *   `console` unless a logger is supplied. At `info` or `debug` its records
+ *   describe each request and response, and they would reach the service's
+ *   standard output — which the VS Code extension streams into its "Debug
+ *   Generator Service" output channel — outside the service's own pino
+ *   redaction (CWE-532).
+ *
+ * So the client this file constructs is always given all three of `baseURL`
+ * (the validated host override, else {@link ANTHROPIC_API_BASE_URL}),
+ * `logLevel: 'off'` and a silent logger, and neither variable is ever
+ * consulted. The product's own records, through the injected logger and
+ * limited to provenance and outcome labels, are the diagnostics. A base URL is
+ * accepted only as an explicit host override — `config.baseUrl`, which
+ * `../factory.ts` never reads from the environment — and only under the policy
+ * {@link validateBaseUrl} states: `https`, or `http` to a loopback address, with
+ * no user information, query or fragment. A refused override names no part of
+ * itself anywhere, since a pasted URL can carry a credential.
+ *
  * ## Sampling temperature is validated and never sent
  *
  * The messages API deprecated `temperature`: models released after the
@@ -110,6 +138,7 @@
  * | Outcome                                            | Code                   |
  * | -------------------------------------------------- | ---------------------- |
  * | no credential, no model, unusable request budget   | `CONFIG_INVALID`       |
+ * | a base URL override outside the endpoint policy    | `CONFIG_INVALID`       |
  * | credential rejected, quota exhausted, server error | `MODEL_UNAVAILABLE`    |
  * | unreachable, timed out, cancelled, closed provider | `MODEL_UNAVAILABLE`    |
  * | a text answer with no text in it                   | `MODEL_OUTPUT_INVALID` |
@@ -153,6 +182,7 @@
  */
 
 import Anthropic, { APIUserAbortError } from '@anthropic-ai/sdk';
+import type { ClientOptions } from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import type {
   MessageCreateParamsNonStreaming,
@@ -271,6 +301,70 @@ export const ANTHROPIC_DEFAULT_TIMEOUT_MS = 300_000;
 export const ANTHROPIC_DEFAULT_MAX_RETRIES = 2;
 
 /**
+ * The approved endpoint: the Anthropic API, over HTTPS.
+ *
+ * `docs/SECURITY.md` documents the egress path as this API over HTTPS, and this
+ * constant is what makes that true for every client this file constructs. It is
+ * passed as `baseURL` whenever the host configured no override, rather than
+ * leaving the field absent: an absent `baseURL` makes the vendor's client read
+ * `ANTHROPIC_BASE_URL` from the process environment, so an inherited variable
+ * nobody set would decide where the credential and every prompt are sent.
+ *
+ * An explicit, validated `ModelProviderConfig.baseUrl` is the one way to route
+ * elsewhere (see {@link validateBaseUrl}).
+ */
+export const ANTHROPIC_API_BASE_URL = 'https://api.anthropic.com';
+
+/**
+ * The vendor client's log level: nothing at all.
+ *
+ * Passed explicitly because the client's own default is read from
+ * `ANTHROPIC_LOG`, and at `info` or `debug` its records describe each request
+ * and response. Typed from the client's own options so a vocabulary change in
+ * the dependency fails `pnpm typecheck` rather than this setting.
+ */
+const TRANSPORT_LOG_LEVEL: NonNullable<ClientOptions['logLevel']> = 'off';
+
+/** The body of every {@link SILENT_TRANSPORT_LOGGER} method. */
+function discardTransportRecord(): void {
+  /* Intentionally empty: the vendor client's records never reach an output. */
+}
+
+/**
+ * The logger handed to the vendor client: every level discards its record.
+ *
+ * The level alone would already silence the client; the logger is passed as
+ * well because a client given none falls back to `console`, whose output is the
+ * service's standard output and, when the VS Code extension started the
+ * service, its "Debug Generator Service" output channel — a sink the service's
+ * pino redaction never sees. Frozen and stateless, so one instance serves every
+ * client. Diagnostics come from this file's own records through the injected
+ * {@link AnthropicProviderOptions.logger}, which carry provenance and outcome
+ * labels and never a payload.
+ */
+const SILENT_TRANSPORT_LOGGER: NonNullable<ClientOptions['logger']> = Object.freeze({
+  error: discardTransportRecord,
+  warn: discardTransportRecord,
+  info: discardTransportRecord,
+  debug: discardTransportRecord,
+});
+
+/**
+ * The host names a plain-`http` base URL override may use: this machine's
+ * loopback interface, by name or as the IPv6 loopback address.
+ *
+ * The WHATWG parser lower-cases a host name and brackets an IPv6 address, so
+ * `[::1]` is the form a parsed URL reports; the bare `::1` is listed so the set
+ * states the whole of the rule. IPv4 loopback (`127.0.0.0/8`) is matched by
+ * {@link IPV4_LOOPBACK_PATTERN}, because the parser canonicalises every numeric
+ * spelling of an IPv4 address (`127.1`, `0x7f.0.0.1`) to dotted-quad first.
+ */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(['localhost', '[::1]', '::1']);
+
+/** A canonical dotted-quad address inside `127.0.0.0/8`. */
+const IPV4_LOOPBACK_PATTERN = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/u;
+
+/**
  * Prefix of the tool the fallback route declares.
  *
  * The full name is this prefix plus the calling stage, which is where the name
@@ -309,6 +403,14 @@ const MISSING_MODEL_HINT =
 /** Remediation for a request budget that the messages API cannot accept. */
 const INVALID_BUDGET_HINT =
   'Correct the value where the request is assembled, or in the service configuration it came from. A response-length bound must be a positive integer, a request timeout a positive integer number of milliseconds and a transport retry bound a non-negative integer.';
+
+/**
+ * Remediation for a base URL override outside the endpoint policy.
+ *
+ * Names the approved endpoint — a repository constant — and never the refused
+ * value, which can carry a credential in its user information or its query.
+ */
+const INVALID_BASE_URL_HINT = `Supply the model API base URL override as an https endpoint, or as an http proxy on this machine's loopback interface (localhost, 127.0.0.0/8 or [::1]), with no user name, password, query or fragment; or omit the override to use the approved endpoint, ${ANTHROPIC_API_BASE_URL}.`;
 
 /**
  * Remediation for a sampling temperature the messages API no longer accepts.
@@ -937,7 +1039,7 @@ const OUTPUT_FORMAT_REFUSAL_FRAGMENTS: readonly string[] = Object.freeze([
  * that the schema could not be compiled into a constrained-decoding grammar
  * ({@link OUTPUT_FORMAT_REFUSAL_FRAGMENTS}), is the signal that the
  * schema-constrained route cannot serve this schema, which is exactly the case
- * AAP §0.5.3's forced-`tool_use` fallback exists for. Anything else — a
+ * the forced-`tool_use` fallback exists for. Anything else — a
  * credential, a quota, a server failure, any other malformed request — is a
  * failure rather than a reason to try the other route.
  *
@@ -2264,6 +2366,86 @@ function validateBudget(
 }
 
 /**
+ * Whether a parsed URL's host is this machine's loopback interface.
+ *
+ * @param hostname A WHATWG-parsed `URL.hostname`: lower-cased, with an IPv4
+ * address in canonical dotted-quad form and an IPv6 address bracketed.
+ * @returns `true` for `localhost`, `127.0.0.0/8` and `[::1]`.
+ */
+function isLoopbackHostname(hostname: string): boolean {
+  return LOOPBACK_HOSTNAMES.has(hostname) || IPV4_LOOPBACK_PATTERN.test(hostname);
+}
+
+/**
+ * Checks an explicit base URL override against the endpoint policy.
+ *
+ * The override is the only way this provider sends anything anywhere but
+ * {@link ANTHROPIC_API_BASE_URL}, so it is held to a rule rather than trusted:
+ *
+ * - **It parses as an absolute URL**, once surrounding whitespace is trimmed.
+ * - **Its scheme is `https:`** for any host, **or `http:` only to a loopback
+ *   host** (see {@link isLoopbackHostname}) — a local proxy or a test double on
+ *   this machine. Plain `http` to any other host would put the credential and
+ *   every prompt on the network in clear text.
+ * - **It carries no user name or password.** A credential in the URL would
+ *   travel with every request and reach whatever logs the URL; the client
+ *   authenticates with the configured key.
+ * - **It carries no query and no fragment.** The client appends each API path
+ *   to the base URL as text, so a `?` or `#` in it would move that path out of
+ *   the path and send the request somewhere other than the route it names.
+ *   A raw `?` or `#` is refused even when the parser reports it as empty.
+ * - **A path prefix is allowed**, which is how a gateway mounts the API under
+ *   a route of its own.
+ *
+ * A refusal says which rule failed, in a fixed phrase, and never names the
+ * value, its host or any other part of it: the message, hint and `details`
+ * are logged, persisted and rendered, and a pasted URL can carry a credential.
+ *
+ * @param value The configured override, or `undefined` when the host set none.
+ * @returns `Ok(undefined)` when there is no override; `Ok` with the parsed,
+ * normalised URL otherwise — handed to the client as it is, so the value
+ * checked is the value used; or the coded `CONFIG_INVALID` refusal.
+ *
+ * @example
+ * ```ts
+ * validateBaseUrl('https://gateway.example.test/anthropic'); // Ok('https://gateway.example.test/anthropic')
+ * validateBaseUrl('http://127.0.0.1:8080');                  // Ok('http://127.0.0.1:8080/')
+ * validateBaseUrl('http://gateway.example.test');            // Err: http to a host that is not loopback
+ * ```
+ */
+function validateBaseUrl(value: string | undefined): Result<string | undefined, DebuggenError> {
+  if (value === undefined) {
+    return ok(undefined);
+  }
+  const refuse = (reason: string): Result<string | undefined, DebuggenError> =>
+    err(
+      codedFailure('CONFIG_INVALID', `The model API base URL override cannot be used: ${reason}.`, {
+        condition: 'base-url-invalid',
+        hint: INVALID_BASE_URL_HINT,
+      }),
+    );
+
+  const trimmed = value.trim();
+  const parsed = tryCatch<URL>(() => new URL(trimmed), 'CONFIG_INVALID');
+  if (!parsed.ok) {
+    return refuse('it does not parse as an absolute URL');
+  }
+  const url = parsed.value;
+  const secure = url.protocol === 'https:';
+  const loopbackHttp = url.protocol === 'http:' && isLoopbackHostname(url.hostname);
+  if (!secure && !loopbackHttp) {
+    return refuse('it must use https, or http only to a loopback address on this machine');
+  }
+  if (url.username !== '' || url.password !== '') {
+    return refuse('it carries a user name or a password');
+  }
+  if (url.search !== '' || url.hash !== '' || /[?#]/u.test(trimmed)) {
+    return refuse('it carries a query or a fragment');
+  }
+  return ok(url.href);
+}
+
+/**
  * Builds the one provider in this repository that talks to a real model.
  *
  * `../factory.ts` is its caller and has already resolved the configuration from
@@ -2288,6 +2470,23 @@ function validateBudget(
  *   `maxRetries` are each optional and each checked when present. An
  *   unsupported sampling temperature is refused here for the deprecation
  *   {@link checkTemperature} documents.
+ * - **A usable base URL, when one is set.** `config.baseUrl` is checked
+ *   against {@link validateBaseUrl}'s policy before the injected-client branch
+ *   — an unusable endpoint makes the configuration invalid whoever supplies the
+ *   client — and a refusal constructs no transport and names no part of the
+ *   value.
+ *
+ * ## The transport's destination and diagnostics are never taken from the environment
+ *
+ * The client is always constructed with an explicit `baseURL` — the validated
+ * override, else {@link ANTHROPIC_API_BASE_URL} — with `logLevel: 'off'` and
+ * with a silent logger. Left absent, the vendor's client would read
+ * `ANTHROPIC_BASE_URL` and `ANTHROPIC_LOG` from the process environment and
+ * fall back to `console`, so an inherited variable could redirect the
+ * credential and every prompt to another host, or print request and response
+ * records into the service's standard output — the VS Code extension's "Debug
+ * Generator Service" output channel — outside the service's pino redaction.
+ * This file's own records, through `options.logger`, are the diagnostics.
  *
  * ## Both transport budgets are set, never defaulted by the dependency
  *
@@ -2376,6 +2575,14 @@ export function createAnthropicProvider(
     }
   }
 
+  // Checked before the injected-client branch, like the budgets: an endpoint
+  // outside the policy makes the configuration invalid whoever supplies the
+  // client, so the verdict must not depend on how the provider is built.
+  const endpoint = validateBaseUrl(config.baseUrl);
+  if (!endpoint.ok) {
+    return endpoint;
+  }
+
   // The model is the one field normalised on its way in: a configured value
   // with surrounding whitespace is a typo rather than a different model, and
   // sending it unchanged would produce an opaque refusal from the provider.
@@ -2410,12 +2617,20 @@ export function createAnthropicProvider(
     );
   }
 
-  const baseUrl = config.baseUrl;
   const constructed = tryCatch<AnthropicClientLike>(
     () =>
       new Anthropic({
         apiKey,
-        ...(baseUrl === undefined ? {} : { baseURL: baseUrl }),
+        // The destination, always. A client built without one reads
+        // `ANTHROPIC_BASE_URL` from the process environment, so an inherited
+        // variable would decide where the credential and every prompt go.
+        baseURL: endpoint.value ?? ANTHROPIC_API_BASE_URL,
+        // The client's diagnostics, always off and never on `console`. Its
+        // default level comes from `ANTHROPIC_LOG`, and its `info` and `debug`
+        // records describe requests and responses on standard output, outside
+        // the service's redaction.
+        logLevel: TRANSPORT_LOG_LEVEL,
+        logger: SILENT_TRANSPORT_LOGGER,
         // Both budgets, always. A client built without them applies the
         // vendor's own bounds instead, which are not this product's decision
         // and change with a version bump.
@@ -2434,6 +2649,11 @@ export function createAnthropicProvider(
     );
   }
 
-  logger.debug('Constructed the model transport', { providerId: PROVIDER_ID });
+  // Whether an override is in effect, as a closed label: the endpoint itself is
+  // never logged, since a configured URL is the host's and not this file's.
+  logger.debug('Constructed the model transport', {
+    providerId: PROVIDER_ID,
+    endpoint: endpoint.value === undefined ? 'approved' : 'override',
+  });
   return ok(new AnthropicProvider(constructed.value, resolved, logger, structuredOutputMode));
 }

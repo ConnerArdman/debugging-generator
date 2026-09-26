@@ -263,10 +263,22 @@ export const dataQuerySourceSchema = z
  * service would have to interpret; a closed vocabulary is one the resolver can
  * implement exhaustively for every source it supports.
  *
+ * The service applies every sort to every array-valued source, to the whole
+ * filtered source before it is paged and with a stable `id` tie-break, and
+ * never answers a requested sort in another order. For the grouped sources a
+ * count is a group's own occurrence count and a duration its total time. For
+ * the flat record lists a count is how many records share the record's
+ * operation name, and a duration the record's own measured duration. For the
+ * hook state transitions a count is how many transitions share the
+ * transition's hook (its component and hook index), and a duration the measured
+ * duration of the state record it was built from. For the metric values a
+ * count or a duration is a measured value in that unit, which ranks ahead of
+ * every other value; every value describes the same capture window, so under
+ * `start_asc` they keep the metric vocabulary's order.
+ *
  * The scalar sources — the correlated tree and the component tree, whose order
- * is their structure, and the metric values, whose order is the order they were
- * asked for — ignore this field. The node catalog records which node types can
- * meaningfully use it.
+ * is their structure — and the dependency graph ignore this field. The node
+ * catalog records which node types can meaningfully use it.
  *
  * Frozen: a read-only vocabulary.
  */
@@ -276,8 +288,8 @@ export const DATA_QUERY_SORTS = Object.freeze([
   /** Earliest first, by start time. Chronological order, for a log or a timeline. */
   'start_asc',
   /**
-   * Largest group first, by occurrence count. Only meaningful for the grouped
-   * sources, where a count exists to sort by.
+   * Largest first, by occurrence count: a grouped source's own count; what the
+   * other array-valued sources count by is stated above.
    */
   'count_desc',
 ] as const);

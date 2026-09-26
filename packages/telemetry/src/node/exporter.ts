@@ -45,13 +45,13 @@
  * addition, the schema's optional `clockOffsetMs` (next section), and nothing
  * else.
  *
- * ## The clock offset (AAP 0.2.3)
+ * ## The clock offset
  *
- * AAP 0.2.3 applies no clock alignment to event times "beyond a recorded
- * per-producer `clockOffsetMs` (server `Date` header versus local clock,
- * informational)". This process is the producer, and this processor — which
- * lives as long as the process — holds its one `ClockOffsetEstimator` from
- * `../schema/clock-offset.ts`:
+ * No clock alignment is applied to event times beyond a recorded per-producer
+ * `clockOffsetMs` (server `Date` header versus local clock, informational; see
+ * `docs/ARCHITECTURE.md` §5.2). This process is the producer, and this
+ * processor — which lives as long as the process — holds its one
+ * `ClockOffsetEstimator` from `../schema/clock-offset.ts`:
  *
  * - **Measured** against the local service's own `Date` header on the answer
  *   to every ingest `POST`, whatever its status (a `401` or a `503` is still

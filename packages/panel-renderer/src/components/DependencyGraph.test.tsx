@@ -10,11 +10,11 @@
  * than a picture that happens to be current. Three of its promises are
  * mechanical, and each has cases here:
  *
- *   - **The layout is reproducible.** AAP 0.6.6 records "interactive graph
- *     layout (drag, zoom) — not in v1; layered static layout with hover and
- *     click; annotated as a follow-up", so the geometry is arithmetic over a
- *     column index and a row index and nothing else. `determinism` renders one
- *     payload twice and then renders it with its participants **shuffled**,
+ *   - **The layout is reproducible.** Interactive graph layout (drag, zoom) is
+ *     a recorded gap of this version — the graph is a layered static layout
+ *     with hover and click — so the geometry is arithmetic over a column index
+ *     and a row index and nothing else. `determinism` renders one payload
+ *     twice and then renders it with its participants **shuffled**,
  *     asserting the columns and the reading order do not move: layering must
  *     come from the relationships and a total tie-break, never from array
  *     order. A graph that reshuffled between two readings of one capture would
@@ -41,11 +41,12 @@
  *     trace id) reports nothing and is counted under the grid — and `aggregate
  *     contract` proves the same end to end, over a graph the real aggregate
  *     built. A control claiming to select an event that does not exist would
- *     be an unevidenced claim of precisely the kind AAP 0.8.4 rules out.
+ *     be an unevidenced claim, and what the view presents as observed must
+ *     exist in the capture.
  *
- * Alongside those, AAP 0.8.3 asks every component suite in this folder for the
- * three states of a query-backed view — loading, empty and error — and for the
- * click-to-source payload, and AAP 0.6.4 asks for the graph's second
+ * Alongside those, this suite covers what every component suite in this folder
+ * is held to — the three states of a query-backed view (loading, empty and
+ * error) and the click-to-source payload — and the graph's second
  * representation: a picture of a graph is unreadable to a keyboard or a
  * screen-reader user, so the `accessibility` cases assert the canvas carries
  * `role="img"` with a text alternative **and** that the participants grid
@@ -77,13 +78,13 @@
  *     runs the real `buildDependencyGraph` over hand-built events, so the
  *     fields this component reads are proven to be fields the aggregate
  *     produces rather than fields only this suite supplies.
- *   - **Generic fixture vocabulary only** (AAP 0.5.4). Participant classes come
- *     from the closed telemetry domain, and every label, path and symbol
- *     belongs to no application, demonstration or otherwise:
+ *   - **Generic fixture vocabulary only.** Participant classes come from the
+ *     closed telemetry domain, and every label, path and symbol belongs to no
+ *     application, demonstration or otherwise:
  *     `example.interaction`, `example.handler`, `/example/resource`,
  *     `example.route`, `example.datastore`, `src/example/service.ts`.
- *     `scripts/check-no-hardcoding.mjs` scans `packages/**`, and a route or a
- *     component name of an inspected project here would fail that gate.
+ *     `scripts/check-no-hardcoding.mjs` skips test files, so this suite keeps
+ *     the product's neutral vocabulary by convention.
  *   - **Queries by role and accessible name.** The grid, its rows, its cells,
  *     the canvas (`role="img"`) and the chips are all reached that way; a class
  *     is read only off an element already obtained semantically, since no
@@ -238,9 +239,9 @@ function resetScaleCalls(): void {
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
  *
- * Application-neutral throughout (AAP 0.5.4), and shaped as the capture shapes
- * it: a 32-hex trace id, 16-hex span ids, millisecond durations, a
- * project-relative POSIX source path.
+ * Application-neutral throughout, and shaped as the capture shapes it: a 32-hex
+ * trace id, 16-hex span ids, millisecond durations, a project-relative POSIX
+ * source path.
  * ---------------------------------------------------------------------------
  */
 
@@ -327,7 +328,7 @@ const RETRY_NAME = 'Retry';
 /*
  * The shared error-state contract, spelled out rather than read back from
  * `../host/useQuery`, so this suite pins the words a reader sees on this node
- * instead of restating whatever the contract currently holds (B1-F16, B2-F14).
+ * instead of restating whatever the contract currently holds.
  */
 
 /** The first line of a node whose own data could not be loaded. */
@@ -471,11 +472,10 @@ function makeParticipant(overrides: ParticipantOverrides = {}): DependencyGraphN
  * Overrides accepted by {@link makeEdge}, with the same `undefined` policy.
  *
  * `inferredCount` and `ambiguousCount` are the authoritative edge's own
- * optional lineage counts (AAP 0.4.2): how many of its records joined their
- * caller through an asynchronous-continuation attribution rather than by
- * nesting, and how many of those attributions were ambiguous. The component
- * reads them and derives neither, so a guessed relationship can never read as a
- * measured one.
+ * optional lineage counts: how many of its records joined their caller through
+ * an asynchronous-continuation attribution rather than by nesting, and how many
+ * of those attributions were ambiguous. The component reads them and derives
+ * neither, so a guessed relationship can never read as a measured one.
  */
 type EdgeOverrides = {
   readonly id?: string | undefined;
@@ -851,7 +851,7 @@ function pendingProvider(): StubProvider {
  *
  * Rejects with a `DebuggenError` because that is what the interface asks an
  * implementation for: the code and the hint it carries are what the error state
- * renders (AAP 0.5.5).
+ * renders.
  *
  * @param error The failure to reject with.
  * @returns The stub provider.
@@ -1320,7 +1320,7 @@ describe('DependencyGraph states', () => {
     expect(busy.textContent).toContain('dependency graph');
 
     // Nothing is drawn yet: no canvas, no grid, and above all no empty state —
-    // an unsettled query is not an answer (AAP 0.5.5).
+    // an unsettled query is not an answer.
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
@@ -1337,8 +1337,7 @@ describe('DependencyGraph states', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     // Queried by a generic substring of the product's own copy and then checked
-    // to be exactly that: product vocabulary, naming no inspected project
-    // (AAP 0.5.4).
+    // to be exactly that: product vocabulary, naming no inspected project.
     const message = await screen.findByText(/no dependency relationships were captured/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
     expect(message.closest('.dg-dependency-graph__empty')).not.toBeNull();
@@ -1554,10 +1553,10 @@ describe('DependencyGraph rendering', () => {
     ];
     expect(tracks).toEqual(roles.map((role) => DATA_TABLE_COLUMN_TRACKS[role].track));
 
-    // None of them is the floorless `minmax(0, …)` that let the participant
-    // label collapse to a few characters per line in a narrow panel: every
-    // track opens on a column-floor token, and no track carries a number of its
-    // own (AAP 0.6.4).
+    // None of them is a floorless `minmax(0, …)`, which would let the
+    // participant label collapse to a few characters per line in a narrow
+    // panel: every track opens on a column-floor token, and no track carries a
+    // number of its own.
     for (const track of tracks) {
       expect(track).toMatch(/^(?:minmax\()?var\(--dg-column-min-[a-z]+\)/u);
       expect(track).not.toMatch(/\d/u);
@@ -1602,7 +1601,7 @@ describe('DependencyGraph rendering', () => {
     }
 
     // Every participant states its class in text, so the class colour is never
-    // the only thing distinguishing two of them (AAP 0.6.4).
+    // the only thing distinguishing two of them.
     expect(dataRows().map((row) => cellOf(row, CLASS_COLUMN).textContent)).toEqual([
       'UI event',
       'Function',
@@ -1626,7 +1625,7 @@ describe('DependencyGraph rendering', () => {
 
     // The only inline value a shape carries is the custom property, and its
     // value is a `var(--dg-*)` reference from the shared class scale: no colour
-    // literal reaches this component (AAP 0.6.4).
+    // literal reaches this component.
     const style = shape.getAttribute('style') ?? '';
     expect(style).toContain(dependencyNodeColorVar('database'));
     expect(style).not.toContain('#');
@@ -1667,7 +1666,7 @@ describe('DependencyGraph rendering', () => {
     await screen.findByRole('grid');
 
     // The canvas is one image with a text alternative that says what it holds
-    // and where the keyboard-reachable equivalent is (AAP 0.6.4).
+    // and where the keyboard-reachable equivalent is.
     const alternative = canvas().getAttribute('aria-label') ?? '';
     expect(alternative).toContain('5 participants');
     expect(alternative).toContain('5 layers');
@@ -1759,8 +1758,8 @@ describe('DependencyGraph rendering', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
     await screen.findByRole('grid');
 
-    // AAP 0.6.6 records the gap; this sentence is how a reader learns it
-    // without trying to drag the picture first.
+    // The layout is static by design; this sentence is how a reader learns
+    // that without trying to drag the picture first.
     const note = await screen.findByText(/this layout is static in this version/i);
     expect(note.textContent).toContain('Dragging, panning and zooming are not available.');
     expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
@@ -2529,7 +2528,7 @@ describe('DependencyGraph static layout', () => {
     fireEvent.mouseUp(picture, { clientX: 320, clientY: 40 });
 
     // Byte-identical geometry: not one shape moved, the logical viewport did
-    // not scale, and no transform appeared to carry a gesture (AAP 0.6.6).
+    // not scale, and no transform appeared to carry a gesture.
     expect(shapeGeometry()).toEqual(geometryBefore);
     expect(canvas().getAttribute('viewBox')).toBe(viewBoxBefore);
     expect([canvas().getAttribute('width'), canvas().getAttribute('height')]).toEqual(sizeBefore);
@@ -2788,7 +2787,7 @@ describe('DependencyGraph interactions', () => {
 
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2).
+    // this one acts on the object it is handed.
     expect(received).toEqual(BASE_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -2832,8 +2831,7 @@ describe('DependencyGraph interactions', () => {
     // span sample and nothing else — so there is no coordinate a details
     // drawer could resolve. The activation is therefore local — the row and
     // its shape both show where the reader aimed — and the host is told
-    // nothing rather than being handed a span id masquerading as an event id
-    // (AAP 0.8.4).
+    // nothing rather than being handed a span id masquerading as an event id.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
     expect(spies.onOpenSource).not.toHaveBeenCalled();
     expect(rowNamed(HANDLER_LABEL).getAttribute('aria-selected')).toBe('true');
@@ -3130,7 +3128,7 @@ describe('DependencyGraph legend', () => {
 
     // The whole closed vocabulary, in the reading order of the layout, and no
     // seventh entry: the key is generic product vocabulary describing what kind
-    // of thing took part (AAP 0.5.4).
+    // of thing took part.
     expect(chips.map((chip) => chip.getAttribute('data-kind'))).toEqual(KINDS);
     expect(chips.map((chip) => chip.textContent)).toEqual(KIND_LABELS);
 
@@ -3176,10 +3174,10 @@ describe('DependencyGraph relationships', () => {
     }
 
     // The distinction survives in text as well as in the tone: a guessed
-    // relationship must never read as a measured one (AAP 0.4.2, 0.6.4). But
-    // an attribution with one candidate was not in doubt, so it is inferred —
-    // the info tone, a solid curve — and never marked ambiguous, which is the
-    // one state the stylesheet dashes.
+    // relationship must never read as a measured one. But an attribution with
+    // one candidate was not in doubt, so it is inferred — the info tone, a
+    // solid curve — and never marked ambiguous, which is the one state the
+    // stylesheet dashes.
     expect(chip.getAttribute('data-edge-id')).toBe(inferred.id);
     expect(chip.classList.contains('dg-is-inferred')).toBe(true);
     expect(chip.classList.contains('dg-is-ambiguous')).toBe(false);
@@ -3505,7 +3503,7 @@ describe('DependencyGraph aggregate contract', () => {
   it('selects, withholds and marks exactly what the real aggregate produced', async () => {
     // A page event that issued one request and reached one function twice; a
     // view update attributed to the settled request through an asynchronous
-    // continuation (AAP 0.4.2) rather than nested inside it.
+    // continuation rather than nested inside it.
     const press = capturedEvent({ kind: 'interaction', name: 'example.press' });
     const request = capturedEvent({
       kind: 'fetch',
@@ -3598,7 +3596,8 @@ describe('DependencyGraph aggregate contract', () => {
     // Two parallel requests from one page event, and a view update attributed
     // to the second through an asynchronous continuation while the first still
     // had an open window: the producer flags the attribution ambiguous and
-    // names the other candidate (AAP 0.4.2).
+    // names the other candidate (see docs/ARCHITECTURE.md, "Async-continuation
+    // lineage").
     const press = capturedEvent({ kind: 'interaction', name: 'example.press' });
     const first = capturedEvent({
       kind: 'fetch',

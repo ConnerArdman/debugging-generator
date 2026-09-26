@@ -29,12 +29,12 @@
  * Configuration arrives through the environment the host sets (every name is
  * required; a missing one rejects `run()` so VS Code exits at once with code 1):
  *
- * | Variable                                      | Meaning                                   |
- * | --------------------------------------------- | ----------------------------------------- |
- * | `DEBUGGEN_E2E_EDITOR_PROBE_OUTPUT`            | the JSON-lines file records are appended to |
- * | `DEBUGGEN_E2E_EDITOR_PROBE_STOP`              | the file whose appearance ends the run    |
- * | `DEBUGGEN_E2E_EDITOR_PROBE_EXTENSION_ID`      | `<publisher>.<name>` of the extension     |
- * | `DEBUGGEN_E2E_EDITOR_PROBE_MAX_LIFETIME_MS`   | the safety net should no stop file appear |
+ * | Variable                                      | Meaning                                                |
+ * | --------------------------------------------- | ------------------------------------------------------ |
+ * | `DEBUGGEN_E2E_EDITOR_PROBE_OUTPUT`            | the JSON-lines file records are appended to            |
+ * | `DEBUGGEN_E2E_EDITOR_PROBE_STOP`              | the file whose appearance ends the run                 |
+ * | `DEBUGGEN_E2E_EDITOR_PROBE_EXTENSION_ID`      | `<publisher>.<name>` of the extension                  |
+ * | `DEBUGGEN_E2E_EDITOR_PROBE_MAX_LIFETIME_MS`   | maximum probe lifetime, in ms, if no stop file appears |
  *
  * Plain CommonJS with no dependency beyond `vscode` and Node built-ins: VS Code
  * `require`s it directly, so it is never compiled, bundled or type-checked, and

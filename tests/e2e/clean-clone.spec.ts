@@ -1,10 +1,10 @@
 /**
- * `clean-clone` — the clean-checkout ordering proof (AAP §0.7.1 Group 5, §0.8.5).
+ * `clean-clone` — the clean-checkout ordering proof.
  *
- * AAP §0.7.1 Group 5 requires this spec by name: it "clones the repository into a temp
- * directory and runs `pnpm install --frozen-lockfile && pnpm build` and, in a second fresh
- * clone, `pnpm install --frozen-lockfile && pnpm typecheck`, proving both orderings work
- * standalone". Both orderings rest on the same prerequisite — the demo's generated Prisma
+ * The spec clones the repository into a temp directory and runs
+ * `pnpm install --frozen-lockfile && pnpm build` and, in a second fresh clone,
+ * `pnpm install --frozen-lockfile && pnpm typecheck`, proving both orderings work standalone.
+ * Both orderings rest on the same prerequisite — the demo's generated Prisma
  * client, which the root `build` (`pnpm demo:generate && pnpm -r build`) and `typecheck`
  * (`pnpm demo:generate && tsc -b`) scripts each produce first — and the second clone is what
  * proves `typecheck` does not secretly depend on `build` having run. One clone run twice would
@@ -21,8 +21,8 @@
  * checkout can neither break nor rescue it, and a checkout with uncommitted changes is
  * reported by an annotation saying the clones test the commit, not the working tree.
  *
- * The checkout's `.git/config` carries a live access token in its `origin` URL (AAP §0.2.1),
- * and it cannot reach a clone: a clone never copies its source's configuration, the clone's own
+ * The checkout's `.git/config` may carry a live access token in its `origin` URL, and such a
+ * token cannot reach a clone: a clone never copies its source's configuration, the clone's own
  * `origin` (which names only the local path) is removed, and no git output is echoed. Each
  * clone is then asserted to be self-contained and pristine — `HEAD` is the target commit, `git
  * ls-files` equals the commit's `git ls-tree`, the root manifests and every workspace are
@@ -38,13 +38,16 @@
  *   and is non-empty: the service bundle, the unpacked Chrome extension, the browser agent and
  *   Node preload, the prebuild copy of the agent (so `@debuggen/telemetry` built before the
  *   extension), every `dist/` target the workspaces' `exports`/`main` fields name, the Next.js
- *   build of the demo, and the generated Prisma client (so `demo:generate` ran first).
+ *   build of the demo, and the generated Prisma client (so `demo:generate` ran first). Then every
+ *   `dist/**.d.ts` an `exports` map names is overwritten with a module that exports nothing, and
+ *   `pnpm typecheck` still exits 0 and leaves those files as it found them: on a built tree too,
+ *   no consumer type-checks against the built (and possibly stale) declarations.
  * - **clone-2 — install, then typecheck, and nothing else.** `pnpm typecheck` exits 0 while no
  *   workspace has a `dist/`, no `.next/` and no copied agent exist — so it needed only `prisma
  *   generate`, whose client it produced — and the solution build wrote its `.tsbuild/`
- *   declarations. Cross-package types resolve on such a tree through the second entry of each
- *   package's `types` fallback array (`["./dist/…d.ts", "./src/…ts"]`), which `tsc -b` redirects
- *   to the referenced project's own declarations.
+ *   declarations. On this tree as on every checkout, cross-package types resolve through the
+ *   first entry of each package's `types` array (`["./src/…ts", "./dist/…d.ts"]`), which `tsc -b`
+ *   redirects to the referenced project's own `.tsbuild` declarations.
  * - **both** — `--frozen-lockfile` was honoured and nothing rewrote the tree: each clone's
  *   `pnpm-lock.yaml` is the committed blob (`git hash-object` in the clone equals `git rev-parse
  *   <commit>:pnpm-lock.yaml`) and byte-identical to the other clone's, it is unchanged after
@@ -63,8 +66,8 @@
  *
  * ## Cost and environment
  *
- * Two local clones (seconds each, no network), two installs, a full monorepo build and a
- * solution-wide typecheck. The installs need registry access; with a warm pnpm
+ * Two local clones (seconds each, no network), two installs, a full monorepo build and two
+ * solution-wide typechecks. The installs need registry access; with a warm pnpm
  * content-addressable store (CI's cache, or a developer machine that has installed this
  * lockfile before) packages are linked rather than downloaded, which turns tens of minutes
  * into a few. Every command streams its output line by line, prefixed with the clone and the
@@ -87,7 +90,7 @@
  * unaffected.
  */
 import { createHash } from 'node:crypto';
-import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -121,10 +124,11 @@ import type { CommandResult } from './helpers/repo';
 const CLONE_DIR_PREFIX = 'debuggen-clean-clone-';
 
 /**
- * The credential-free placeholder CI's `verify` job exports (AAP §0.7.1 Group 0). It carries no
- * user and no password, so `pnpm check:secrets` has nothing to find, and it is only ever passed
- * in a child's environment — never written to a file. `prisma generate` and `next build` read
- * the variable's presence; neither opens a connection (every demo page is `force-dynamic`).
+ * The credential-free placeholder CI's `verify` job exports (`.github/workflows/ci.yml`). It
+ * carries no user and no password, so `pnpm check:secrets` has nothing to find, and it is only
+ * ever passed in a child's environment — never written to a file. `prisma generate` and `next
+ * build` read the variable's presence; neither opens a connection (every demo page is
+ * `force-dynamic`).
  */
 const DATABASE_URL_PLACEHOLDER = 'postgresql://localhost:5432/placeholder';
 
@@ -146,8 +150,12 @@ const CLONE_COMMAND_ENV: Readonly<Record<string, string>> = Object.freeze({
  */
 const SETUP_ALLOWANCE_MS = 2 * CLONE_TIMEOUT_MS + 5 * 60_000;
 
-/** clone-1's whole budget: the two command budgets of `./helpers/repo` plus setup. */
-const BUILD_ORDERING_TIMEOUT_MS = INSTALL_TIMEOUT_MS + BUILD_TIMEOUT_MS + SETUP_ALLOWANCE_MS;
+/**
+ * clone-1's whole budget: the three command budgets of `./helpers/repo` — install, build, then
+ * the typecheck over the blanked declarations — plus setup.
+ */
+const BUILD_ORDERING_TIMEOUT_MS =
+  INSTALL_TIMEOUT_MS + BUILD_TIMEOUT_MS + TYPECHECK_TIMEOUT_MS + SETUP_ALLOWANCE_MS;
 
 /** clone-2's whole budget: the two command budgets of `./helpers/repo` plus setup. */
 const TYPECHECK_ORDERING_TIMEOUT_MS =
@@ -182,9 +190,10 @@ const REQUIRED_ROOT_FILES = Object.freeze([
 ]);
 
 /**
- * The twelve workspaces of AAP §0.2.2. The spec also derives the workspace list from the
- * tracked manifests (`apps/*` and `packages/*`, the globs of `pnpm-workspace.yaml`), so a
- * workspace added later is covered without editing this list; this list is the floor.
+ * The twelve workspaces of the repository layout (`docs/ARCHITECTURE.md`, "Workspace layout and
+ * dependency layering"). The spec also derives the workspace list from the tracked manifests
+ * (`apps/*` and `packages/*`, the globs of `pnpm-workspace.yaml`), so a workspace added later is
+ * covered without editing this list; this list is the floor.
  */
 const EXPECTED_WORKSPACES = Object.freeze([
   'apps/chrome-extension',
@@ -204,7 +213,10 @@ const EXPECTED_WORKSPACES = Object.freeze([
 /** A tracked workspace manifest, matched against a POSIX, repository-relative path. */
 const WORKSPACE_MANIFEST_PATTERN = /^((?:apps|packages)\/[^/]+)\/package\.json$/;
 
-/** The only `.env*` files a clone may contain: the two committed examples (AAP §0.3.4). */
+/**
+ * The only `.env*` files a clone may contain: the two committed examples, which `.gitignore`
+ * re-includes and `pnpm check:secrets` allows.
+ */
 const ALLOWED_ENV_FILES = Object.freeze(['.env.example', 'apps/demo-app/.env.example']);
 
 /** The lockfile `--frozen-lockfile` must leave untouched, relative to the clone root. */
@@ -230,6 +242,13 @@ const AGENT_COPY = 'apps/chrome-extension/public/agent.iife.js';
 
 /** The unpacked Manifest V3 extension both Playwright projects load. */
 const CHROME_MANIFEST = 'apps/chrome-extension/dist/manifest.json';
+
+/**
+ * What clone-1 writes over every built declaration file its manifests' `exports` maps name: a
+ * module that exports nothing, so a consumer whose `types` resolution still reached one fails
+ * its first named import with TS2305 ("Module has no exported member").
+ */
+const BLANK_DECLARATION = 'export {};\n';
 
 /** A build output that must exist after clone-1's build, and why it matters. */
 interface BuildArtifact {
@@ -425,11 +444,17 @@ test.describe('clean clone: install → build and install → typecheck each wor
     await test.step(`${clone.name}: every build artefact exists`, async () => {
       await expectBuildArtifacts(clone, facts);
     });
+    await test.step(`${clone.name}: pnpm typecheck ignores the built declarations`, async () => {
+      const blanked = await blankBuiltDeclarations(clone, facts);
+      await runInClone(clone, ['typecheck'], TYPECHECK_TIMEOUT_MS);
+      await expectLockfileUnchanged(clone, 'after pnpm typecheck');
+      await expectDeclarationsStillBlank(clone, blanked);
+    });
     await test.step(`${clone.name}: every tracked file is unmodified`, async () => {
       await expectTrackedFilesUnmodified(
         clone,
         facts,
-        'pnpm install --frozen-lockfile && pnpm build',
+        'pnpm install --frozen-lockfile && pnpm build && pnpm typecheck',
       );
     });
   });
@@ -514,7 +539,7 @@ async function materialiseClone(clone: CloneRoot, facts: SourceFacts): Promise<v
   expect(missingRootFiles, `${clone.name} lacks required root files`).toEqual([]);
 
   const missingWorkspaces = EXPECTED_WORKSPACES.filter((dir) => !facts.workspaces.includes(dir));
-  expect(missingWorkspaces, 'workspaces of AAP §0.2.2 absent from the commit').toEqual([]);
+  expect(missingWorkspaces, 'required workspaces absent from the commit').toEqual([]);
   const incompleteWorkspaces = facts.workspaces.filter(
     (dir) =>
       !tracked.has(`${dir}/package.json`) ||
@@ -891,6 +916,49 @@ async function expectBuildArtifacts(clone: CloneRoot, facts: SourceFacts): Promi
 }
 
 /**
+ * clone-1, once the build artefacts are proven: overwrite every `dist/**.d.ts` a workspace
+ * manifest's `exports` map names with {@link BLANK_DECLARATION}, so the `pnpm typecheck` that
+ * follows passes only if every consumer resolves the `src/` entry of each `types` array (which
+ * `tsc -b` redirects to the referenced project's `.tsbuild` declarations) and never the built
+ * output. `dist/` is git-ignored, so the tracked-tree check afterwards is unaffected. Returns
+ * the overwritten paths, clone-relative.
+ */
+async function blankBuiltDeclarations(clone: CloneRoot, facts: SourceFacts): Promise<string[]> {
+  const declarations = (await declaredDistTargets(clone.dir, facts.workspaces))
+    .map((artifact) => artifact.path)
+    .filter((relative) => relative.endsWith('.d.ts'));
+  expect(
+    declarations.length,
+    `${clone.name}: no workspace manifest's exports map names a dist/**.d.ts, so nothing proves typecheck ignores the built declarations`,
+  ).toBeGreaterThan(0);
+  for (const relative of declarations) {
+    await writeFile(inClone(clone, relative), BLANK_DECLARATION, 'utf8');
+  }
+  return declarations;
+}
+
+/**
+ * The typecheck left every blanked declaration as {@link blankBuiltDeclarations} wrote it: a
+ * project emitting into `dist/` would otherwise restore the declarations its consumers then
+ * read, and the pass would prove nothing.
+ */
+async function expectDeclarationsStillBlank(
+  clone: CloneRoot,
+  declarations: readonly string[],
+): Promise<void> {
+  const rewritten: string[] = [];
+  for (const relative of declarations) {
+    if ((await readFile(inClone(clone, relative), 'utf8')) !== BLANK_DECLARATION) {
+      rewritten.push(relative);
+    }
+  }
+  expect(
+    listed(rewritten),
+    `${clone.name}: pnpm typecheck rewrote built declarations, so it may have read them`,
+  ).toEqual([]);
+}
+
+/**
  * clone-2: `pnpm typecheck` built nothing — no workspace has a `dist/`, the demo has no
  * `.next/` and the extension has no copied agent — yet it ran `prisma generate` (the client
  * exists) and the solution build walked the references (its `.tsbuild/` declarations exist).
@@ -941,7 +1009,7 @@ async function expectTypecheckStoodAlone(clone: CloneRoot, facts: SourceFacts): 
 /**
  * The `dist/` files the workspaces themselves promise, read from each cloned manifest's
  * `exports` map and `main` field rather than guessed: a manifest naming a file its build does
- * not write fails here. Targets outside `dist/` (the `src/` fallback of a `types` array) and
+ * not write fails here. Targets outside `dist/` (the `src/` entries of each `types` array) and
  * pattern targets are not build outputs and are skipped.
  */
 async function declaredDistTargets(

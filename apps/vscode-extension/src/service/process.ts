@@ -104,7 +104,10 @@
  * ## Credential hygiene (AAP §0.5.2, §0.5.6)
  *
  * The child's environment is assembled from a copy of `process.env` (the parent
- * object is never mutated) and is never logged. Every line of the child's
+ * object is never mutated) and is never logged. Of the model vendor kit's own
+ * `ANTHROPIC_*` variables only `ANTHROPIC_API_KEY` is passed through, so an
+ * inherited base URL cannot redirect the credential and an inherited log level
+ * cannot print model traffic into the output channel. Every line of the child's
  * output passes {@link createOutputScrubber} before it reaches the output
  * channel or a failure message: the editor credential's exact value, the values
  * of secret-named environment variables, bearer and key-value credentials,
@@ -289,6 +292,58 @@ const FOREIGN_CREDENTIAL_VARIABLES = Object.freeze([
   'DEBUGGEN_INGEST_URL',
   'DEBUGGEN_PROJECT_ROOT',
 ]);
+
+/**
+ * The prefix of the model vendor kit's own environment variables, which the
+ * service's model client reads from its process environment whenever it is not
+ * told otherwise. Every inherited variable in this family is withheld from the
+ * service except {@link SERVICE_MODEL_CREDENTIAL_VARIABLE}:
+ *
+ * - `ANTHROPIC_BASE_URL` would redirect the provider credential and every
+ *   prompt to whatever host it names (CWE-200, CWE-918);
+ * - `ANTHROPIC_LOG=debug` would print the client's request and response
+ *   diagnostics on the service's standard output, which this module streams
+ *   into the {@link SERVICE_OUTPUT_CHANNEL_NAME} output channel, outside the
+ *   service's own redaction (CWE-532);
+ * - the rest — custom headers, an auth token, profiles, workload federation —
+ *   are vendor knobs outside the service's documented configuration contract.
+ *
+ * `packages/model-provider` already constructs its client with an explicit
+ * base URL, log level and logger, so this is defence in depth at the process
+ * boundary: nothing the editor happened to inherit reaches the service as an
+ * undocumented model setting.
+ */
+const MODEL_SDK_VARIABLE_PREFIX = 'ANTHROPIC_';
+
+/**
+ * The one {@link MODEL_SDK_VARIABLE_PREFIX} variable the service reads — its
+ * model credential, the only name of the family in
+ * `apps/local-service/src/config.ts` — and so the one an inherited copy of is
+ * passed through.
+ */
+const SERVICE_MODEL_CREDENTIAL_VARIABLE = 'ANTHROPIC_API_KEY';
+
+/**
+ * Whether an inherited variable is a model-SDK knob the service must not
+ * inherit: in the {@link MODEL_SDK_VARIABLE_PREFIX} family and not
+ * {@link SERVICE_MODEL_CREDENTIAL_VARIABLE}.
+ *
+ * Compared through `fold`, the platform's own name comparison, so on Windows
+ * (where environment names are case-insensitive) `Anthropic_Base_Url` is
+ * withheld and `anthropic_api_key` passed through, exactly as the service's
+ * runtime would resolve them.
+ *
+ * @param name The inherited variable's name, as the parent spelled it.
+ * @param fold The platform's name folding: upper-casing on Windows, identity elsewhere.
+ * @returns `true` when the variable is withheld from the service.
+ */
+function isWithheldModelSdkVariable(name: string, fold: (name: string) => string): boolean {
+  const folded = fold(name);
+  return (
+    folded.startsWith(fold(MODEL_SDK_VARIABLE_PREFIX)) &&
+    folded !== fold(SERVICE_MODEL_CREDENTIAL_VARIABLE)
+  );
+}
 
 /** The variable that makes an Electron binary behave as plain Node. */
 const ELECTRON_RUN_AS_NODE = 'ELECTRON_RUN_AS_NODE';
@@ -1354,6 +1409,14 @@ export interface ServiceEnvironmentInput {
  * are removed: they are minted by the service's own launcher for a target
  * project's dev server and are never the service's to hold.
  *
+ * Every inherited `ANTHROPIC_*` variable except `ANTHROPIC_API_KEY` is removed
+ * too (see {@link MODEL_SDK_VARIABLE_PREFIX}): `ANTHROPIC_BASE_URL` would
+ * redirect the credential and the prompts, `ANTHROPIC_LOG` would print the
+ * model client's request and response diagnostics into the service output
+ * channel, and the rest are vendor settings outside the service's contract.
+ * Names compare case-insensitively on Windows, for this family as for the
+ * variables above.
+ *
  * Built through `Object.fromEntries`, so an inherited variable named like an
  * object-prototype key becomes an own property instead of rewriting the
  * prototype. The result must never be logged: it carries the parent's
@@ -1384,7 +1447,11 @@ export function buildServiceEnvironment(input: ServiceEnvironmentInput): Record<
   );
   const entries: [string, string][] = [];
   for (const [name, value] of Object.entries(input.base)) {
-    if (value !== undefined && !replaced.has(fold(name))) {
+    if (
+      value !== undefined &&
+      !replaced.has(fold(name)) &&
+      !isWithheldModelSdkVariable(name, fold)
+    ) {
       entries.push([name, value]);
     }
   }

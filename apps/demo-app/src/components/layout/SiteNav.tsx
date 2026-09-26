@@ -19,12 +19,8 @@ import styles from './SiteNav.module.css';
  * reader opens with a single control. That is the whole of its job.
  *
  * WHAT IT SUBSCRIBES TO: THE ROUTE, AND NOTHING ELSE
- * The only ambient value this component reads is the current pathname. It consumes no cart, no
- * dispatch countdown and no notification context, holds no timer and never reads the clock, so it
- * re-renders when the reader navigates and on no other occasion. That restraint is deliberate and
- * worth stating, because the header above it is a heavy consumer of shared state: keeping the nav
- * out of those subscriptions is what makes this row's render behaviour uninteresting and the
- * header's own behaviour legible on its own.
+ * The only ambient value this component reads is the current pathname. It holds no timer and never
+ * reads the clock, so it re-renders when the reader navigates and on no other occasion.
  *
  * A CLIENT COMPONENT, FOR TWO REASONS AND NO MORE
  * `usePathname` is a client hook, and the disclosure holds one boolean of local state; either
@@ -145,9 +141,6 @@ const CATALOG_SECTION = '/products';
  * The separator is part of the comparison, and that is the whole point of writing the test here
  * rather than as a bare `startsWith` at each call: `/orders/AB-1024` is beneath `/orders`, while
  * `/orders-archive` - a different route that merely starts with the same letters - is not.
- *
- * A single-token name, like the locals further down: the guard described above `Props` harvests
- * every multi-token name this workspace declares.
  */
 function within(pathname: string, base: string): boolean {
   return pathname === base || pathname.startsWith(`${base}/`);
@@ -180,10 +173,8 @@ function isActiveRoute(pathname: string, href: string): boolean {
 }
 
 /**
- * Props of this component, kept local to it: nothing outside needs to name this shape, and the
- * repository's hardcoding guard harvests this workspace's exported names into a policy the
- * debugging product may not then use - so a second, exported name for "an optional class" would
- * spend that vocabulary for nothing.
+ * Props of this component, kept local to it: nothing outside this file names this shape, and a
+ * second, exported name for "an optional class" would buy nothing.
  */
 interface Props {
   /** Extra class for the `<nav>` element, composed after the module's own `root` class. */
@@ -215,10 +206,8 @@ export function SiteNav(props: Props): ReactElement {
   const [open, setOpen] = useState(false);
   const listId = useId();
 
-  // The disclosure control, so Escape can put focus back on it. A single-token name: the guard
-  // described above `Props` harvests every multi-token name this workspace declares, and "the
-  // control" is what this file calls the toggle throughout. The node it holds is read inside the
-  // key handler and nowhere else.
+  // The disclosure control, so Escape can put focus back on it - named for what this file calls
+  // the toggle throughout. The node it holds is read inside the key handler and nowhere else.
   const control = useRef<HTMLButtonElement | null>(null);
 
   return (
@@ -268,9 +257,8 @@ export function SiteNav(props: Props): ReactElement {
             rather than left off so the closed state is as explicit in the markup as the open one. */}
         <ul id={listId} className={styles.list} data-open={open ? 'true' : 'false'}>
           {ROUTES.map((route) => {
-            // A single-token local: the guard mentioned above harvests every multi-token name this
-            // workspace declares, and "the route we are on" is a phrase any navigation code would
-            // want, so the short form keeps that vocabulary free.
+            // Whether this entry is the route the reader is on, decided once and read by both
+            // the active class and `aria-current` below.
             const current = isActiveRoute(pathname, route.href);
 
             return (

@@ -18,7 +18,7 @@
  * the browser's hydration pass. The two answers differ across a year boundary, and in this
  * workspace they differ generally, because the storefront formats dates in a fixed store time zone
  * while the browser sits in the reader's local one. React reports such a difference as a hydration
- * mismatch - console noise in an application whose whole purpose is to be captured cleanly. The
+ * error and regenerates that tree on the client, discarding the markup the server sent. The
  * year is therefore an input and never an observation: `copyrightYear` is optional, and when a
  * caller omits it (as the layout does) the closing line simply carries no year. Nothing here falls
  * back to a computed or a hardcoded one.
@@ -26,10 +26,8 @@
  * NAVIGATION
  * The two link columns are secondary navigation - `SiteNav` owns the primary row under the header,
  * and every destination below is reachable from there as well. Each `href` is an in-app route this
- * application actually serves, so no link can 404 and none leaves the origin: an outbound link
- * would navigate away from the application mid-capture and cut short the very interaction a
- * debugging session is recording. There are consequently no external links, no `mailto:` and no
- * `#` placeholders.
+ * application actually serves, so no link can 404 and none takes a shopper off the storefront.
+ * There are consequently no external links, no `mailto:` and no `#` placeholders.
  *
  * STRUCTURE AND LANDMARKS
  * Column titles are `<h2>` elements, because the page's single `<h1>` belongs to the page itself,

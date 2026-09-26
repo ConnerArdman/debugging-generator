@@ -61,13 +61,10 @@
 /* The chip, shared by a page link and by an inert Previous/Next <span> so an unavailable
  * direction keeps its place in the row instead of collapsing it.
  *
- * BLITZY [A11Y]: --pager-chip-min resolves to 36px, below the 44x44px touch-target
- * recommendation. A compact chip is what this strip specifies - space-1 block padding on a 13px
- * monospace label - so the specified geometry is implemented rather than silently enlarged, and
- * the minimum is expressed through a token so a roomier control size can be adopted for the whole
- * storefront in one place. Below the narrow-viewport breakpoint at the end of this file the
- * numbered list stands down altogether, leaving the two wide Previous/Next targets and the
- * summary line. Flagged for design review. */
+ * The chip's minimum box reads --ls-control-min, 36px by fallback, so the storefront's control size
+ * is set in one place by declaring that token. Below the narrow-viewport breakpoint at the end of
+ * this file the numbered list is hidden, leaving the wider Previous/Next targets and the summary
+ * line. */
 .link,
 .disabled {
   --pager-hairline: var(--ls-border-width, 1px);
@@ -108,8 +105,8 @@
  * The offset is wider than the gap between two chips, so the focused chip is lifted for the
  * duration of the focus: without it the next chip's opaque fill paints over the ring's inner edge
  * and the reader gets a three-sided bracket instead of a closed ring. Lifting the chip rather
- * than narrowing the offset or widening the gap keeps both of those measurements as specified,
- * and it changes no geometry - `position: relative` carries no offset of its own. */
+ * than narrowing the offset or widening the gap keeps both of those measurements at their token
+ * values, and it changes no geometry - `position: relative` carries no offset of its own. */
 .link:focus-visible {
   --pager-focus-ring-width: var(--ls-focus-width, 2px);
   --pager-focus-layer: var(--ls-z-sticky, 1);
@@ -125,12 +122,9 @@
  * the weight, so emphasising this chip moves no neighbour and the numbers hold still from page to
  * page.
  *
- * BLITZY [COLOR]: this file's brief specified var(--ls-paper) for the label, against an accent
- * whose stated fallback was #0f766e. app/globals.css declares --ls-accent as the brand amber
- * (#f59e0b) that public/favicon.svg fixes, and the declared value is what the browser paints -
- * paper on that amber measures 2.05:1. The label therefore takes --ls-ink, which measures 8.31:1
- * on the accent and is the pairing globals.css documents for an accent fill and uses in its own
- * ::selection rule; the fallbacks here mirror the declared amber. */
+ * The label takes --ls-ink because it is the legible pairing on the amber --ls-accent fill,
+ * measuring 8.31:1 - the same pairing app/globals.css uses in its ::selection rule. The fallbacks
+ * mirror the declared amber. */
 .current {
   --pager-current-weight: var(--ls-font-weight-strong, 600);
 
@@ -149,20 +143,16 @@
  * deficiency and a forced-colours mode that discards this palette outright - the cursor reports
  * the same thing on the way to a click that would do nothing, and the label is muted. The
  * `border-style` here overrides the shared chip's `solid` while the colour below keeps the muted
- * hairline, so the box and its width stay exactly as specified and only the stroke changes.
- *
- * `pointer-events: none` used to stand here and was removed deliberately: it made the chip
- * unhoverable, which is precisely what suppressed the `not-allowed` cursor and left text colour as
- * the only cue. It was never what made the control inert.
+ * hairline, so the box and its width match the shared chip and only the stroke changes. The chip
+ * stays hoverable, which is what lets the `not-allowed` cursor show.
  *
  * NO `opacity` REDUCTION, ON PURPOSE. The muted ink measures ~7.6:1 on the chip's surface fill;
  * blending the same ink at 0.6 opacity over that fill drops it to about 3.0:1, under the 4.5:1
  * minimum for body-sized text. A dimmed chip would therefore trade one accessibility defect for a
  * worse one, so the cue is carried by shape and cursor and the label is left at full strength.
  *
- * `cursor`, `border-style` and `pointer-events` take keywords rather than tokens: there is no
- * palette or scale for them to read, and the file's token contract covers colours, lengths and
- * type values. */
+ * `cursor` and `border-style` take keywords rather than tokens: there is no palette or scale for
+ * them to read, and the file's token contract covers colours, lengths and type values. */
 .disabled {
   border-style: dashed;
   border-color: var(--ls-mist, #cbd5e1);

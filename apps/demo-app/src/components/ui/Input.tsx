@@ -38,11 +38,8 @@ import styles from './Input.module.css';
  * component below is the only route by which it is applied: the caller's classes are merged after
  * the module's `.root`, so a caller adds to the field's appearance instead of replacing it.
  *
- * Kept local and unexported on purpose. `packages/panel-renderer` publishes an `Input` primitive of
- * its own, and the repository's hardcoding guard harvests this workspace's multi-token identifiers
- * into a policy no product file may then contain, so this workspace must not put an `InputProps`
- * name into circulation. A consumer that needs the type writes `React.ComponentProps<typeof Input>`
- * and stays correct no matter what is added here.
+ * Kept local and unexported on purpose: a consumer that needs the type writes
+ * `React.ComponentProps<typeof Input>` and stays correct no matter what is added here.
  */
 interface Props extends Omit<ComponentPropsWithRef<'input'>, 'className'> {
   /**

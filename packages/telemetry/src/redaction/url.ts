@@ -243,7 +243,7 @@ function findPortColon(hostAndPort: string): number {
  * Total: every string decomposes, and a value with no recognisable structure
  * becomes a bare {@link UrlParts.path}. Nothing throws.
  *
- * @param value - Any string, including an empty one.
+ * @param value Any string, including an empty one.
  * @returns The decomposition; `formatUrlParts(parseUrlParts(v)) === v` holds
  * for every `v`.
  */
@@ -321,7 +321,7 @@ export function parseUrlParts(value: string): UrlParts {
  * present, which is what makes a protocol-relative value (host but no scheme)
  * and an authority-less relative value (neither) both come back unchanged.
  *
- * @param parts - Components to serialise; only `path` is required.
+ * @param parts Components to serialise; only `path` is required.
  */
 export function formatUrlParts(parts: UrlParts): string {
   const hasAuthority =
@@ -418,7 +418,7 @@ function splitQueryPairs(query: string): QuerySegments {
  * reported to callers inside this module and marked in
  * {@link redactQueryString}'s output.
  *
- * @param query - Query string **without** the leading `?`.
+ * @param query Query string **without** the leading `?`.
  * @returns Pairs in arrival order; empty for an empty query.
  */
 export function parseQueryPairs(query: string): Array<[string, string | undefined]> {
@@ -440,7 +440,7 @@ export function parseQueryPairs(query: string): Array<[string, string | undefine
  * policy: `a%20b`, `a+b` and `a b` must canonicalise identically for duplicate
  * detection, and that is only true while a single implementation decides it.
  *
- * @param raw - Raw key or value slice, as {@link parseQueryPairs} returned it.
+ * @param raw Raw key or value slice, as {@link parseQueryPairs} returned it.
  */
 export function decodeQueryComponent(raw: string): string {
   const spaced = raw.includes('+') ? raw.replaceAll('+', ' ') : raw;
@@ -544,7 +544,7 @@ function buildMaskedQuery(query: string): MaskedQuery {
  * rejected — see the module documentation for why the parsers do not do the
  * same.
  *
- * @param query - Query string **without** the leading `?`. A number, bigint or
+ * @param query Query string **without** the leading `?`. A number, bigint or
  * boolean is rendered by its canonical text; anything else that is not a string
  * becomes {@link REDACTION_MARKER}, per `asScannableText`.
  * @returns The masked query, without a leading `?`; `""` for an empty query.
@@ -677,7 +677,7 @@ function withOverflowSegment(query: string | undefined): string {
  * invented here, so a non-string URL, header value and SQL statement all come
  * back in the same vocabulary.
  *
- * @param value - Absolute, origin-relative, protocol-relative, bare-relative
+ * @param value Absolute, origin-relative, protocol-relative, bare-relative
  * or malformed URL text, as captured from a fetch, XHR or span attribute. A
  * value of any other type is normalised by `asScannableText` first: a number,
  * bigint or boolean keeps its canonical text as evidence, and anything else
@@ -756,20 +756,24 @@ export function redactUrl(value: unknown): string {
  * The run stops at whitespace, at a quote and at an angle bracket, none of
  * which can appear in a URL a runtime prints, and deliberately *not* at a
  * closing parenthesis: `(` and `)` are legal path characters and a V8 frame
- * wraps its URL in parentheses, so the bracket is peeled afterwards by
- * {@link FRAME_TRAILING_PATTERN} rather than guessed at here.
+ * wraps its URL in parentheses, so {@link maskFrameUrl} decides afterwards
+ * whether a closing bracket can be told apart from the URL (see
+ * {@link FRAME_TRAILING_PATTERN}) rather than guessing at it here.
  *
- * Only `http` and `https` are matched. Every other scheme a bundler emits —
- * `webpack-internal:///`, `turbopack:///`, `file://`, `node:` — is either a
- * module identifier with no query string or a path this module has nothing to
- * mask in, and `packages/code-analysis/src/source-map/resolver.ts` restricts
- * its own frame grammar to `http`/`https` for the same reason. Leaving them
- * untouched keeps a frame that resolves to source byte-identical.
+ * Only `http` and `https` are matched, in any letter case — a scheme is
+ * case-insensitive, so `HTTP://` and `Https://` are the same URL and must not
+ * keep their parameter values for being spelled differently. Every other
+ * scheme a bundler emits — `webpack-internal:///`, `turbopack:///`, `file://`,
+ * `node:` — is either a module identifier with no query string or a path this
+ * module has nothing to mask in, and
+ * `packages/code-analysis/src/source-map/resolver.ts` restricts its own frame
+ * grammar to `http`/`https` for the same reason. Leaving them untouched keeps
+ * a frame that resolves to source byte-identical.
  *
  * Global, and therefore used only with `replace`, which resets `lastIndex`
  * around every call.
  */
-const STACK_URL_PATTERN = /https?:\/\/[^\s"'<>`]+/g;
+const STACK_URL_PATTERN = /https?:\/\/[^\s"'<>`]+/gi;
 
 /**
  * The `:line` or `:line:column` position a runtime appends directly to a
@@ -780,8 +784,16 @@ const STACK_URL_PATTERN = /https?:\/\/[^\s"'<>`]+/g;
 const FRAME_POSITION_PATTERN = /(?::\d{1,9}){1,2}$/;
 
 /**
- * Characters that follow a URL in stack text rather than belonging to it: the
+ * Characters that may follow a URL in stack text rather than belong to it: the
  * closing bracket of a V8 frame, a quote, and ordinary sentence punctuation.
+ *
+ * "May", because every one of them is also a legal query-value character:
+ * `/reset?code=);` is a value of `);`, not a value of nothing followed by a
+ * sentence ending. {@link maskFrameUrl} therefore peels this run off only
+ * where doing so cannot keep data — a URL with no query and no fragment, whose
+ * path is kept anyway, and a stack frame whose runtime-appended position sits
+ * between the URL and the bracket — and otherwise masks it with the last value
+ * or fragment it may belong to.
  *
  * `?` is **not** in the set. A trailing `?` is a query delimiter, and peeling
  * it would hand {@link redactUrl} a URL whose query it can no longer see.
@@ -835,36 +847,43 @@ function truncatedStack(masked: string): string {
 }
 
 /**
- * Masks one URL run found in stack text, keeping the frame's position when it
- * can be told apart from the URL's own data.
+ * Masks one URL run found in stack text, keeping the frame's position and
+ * closing bracket when they can be told apart from the URL's own data.
  *
  * A frame is `at fn (‹url›:‹line›:‹column›)`, appended by the runtime with no
- * delimiter, so the position is only recoverable by shape. It is detached
- * before masking and re-attached after it in two cases:
+ * delimiter, so the position and the bracket after it are only recoverable by
+ * shape. Both are detached before masking and re-attached after it in two
+ * cases:
  *
- * 1. **The URL carries no query and no fragment.** Nothing else could have
- *    produced a trailing `:digits:digits`, and the whole run comes back
- *    byte-identical.
+ * 1. **The URL carries no query and no fragment.** Nothing after the path is
+ *    masked, so detaching cannot keep data: a trailing `:digits:digits` and
+ *    any punctuation after it come back as they were, and so does the whole
+ *    run.
  * 2. **The run sits in a recognised stack frame**
- *    ({@link FRAME_CONTEXT_PATTERN}) — then the runtime appended the position,
- *    which is exactly how `packages/code-analysis/src/source-map/resolver.ts`
- *    reads the same text, and AAP 0.4.2 requires that route to map a
- *    generated-chunk frame back to TypeScript. A dev-server chunk URL almost
- *    always carries a cache-busting query, so dropping the position here would
- *    disable source resolution for the common case. The residual risk is a
- *    query value that itself ends in `:digits:digits`, of which at most two
- *    short numeric groups would be kept — digits only, never an identifier —
- *    and only inside text a runtime wrote as a frame.
+ *    ({@link FRAME_CONTEXT_PATTERN}) **and ends in a position** — then the
+ *    runtime appended the position, which is exactly how
+ *    `packages/code-analysis/src/source-map/resolver.ts` reads the same text,
+ *    and AAP 0.4.2 requires that route to map a generated-chunk frame back to
+ *    TypeScript. A dev-server chunk URL almost always carries a
+ *    cache-busting query, so dropping the position here would disable source
+ *    resolution for the common case. The brackets after the position are the
+ *    frame's own (`at fn (‹url›?v=?:10:5)` keeps `:10:5)`). The residual risk
+ *    is a query value that itself ends in `:digits:digits`, of which at most
+ *    two short numeric groups would be kept — digits only, never an
+ *    identifier — and only inside text a runtime wrote as a frame.
  *
- * Otherwise — a URL in prose, a log line, anything not shaped like a frame —
- * the position is *inside* the query or fragment as far as any parser can tell
- * (`?v=1:10:5` is both "the chunk `?v=1` at 10:5" and "the value `1:10:5`"),
- * so the whole run goes through {@link redactUrl} and the position is masked
- * along with the value it might be part of.
+ * Otherwise — a URL with a query or a fragment in prose, in a log line, in a
+ * frame with no position — nothing separates the last value from what follows
+ * it: `/reset?code=);` is the value `);`, and `?v=1:10:5` is both "the chunk
+ * `?v=1` at 10:5" and "the value `1:10:5`". So the whole run, trailing
+ * punctuation and any position included, goes through {@link redactUrl}, and
+ * whatever might be part of the last value or fragment is masked with it. A
+ * bracket or a full stop lost that way costs the text one character; one kept
+ * that way would have been a value.
  *
- * @param candidate - The matched URL run.
- * @param offset - Where the run starts in `whole`, supplied by `replace`.
- * @param whole - The stack text being masked, used only to read the frame
+ * @param candidate The matched URL run.
+ * @param offset Where the run starts in `whole`, supplied by `replace`.
+ * @param whole The stack text being masked, used only to read the frame
  * context on the run's own line.
  */
 function maskFrameUrl(candidate: string, offset: number, whole: string): string {
@@ -880,23 +899,21 @@ function maskFrameUrl(candidate: string, offset: number, whole: string): string 
   const trailing = FRAME_TRAILING_PATTERN.exec(body)?.[0] ?? '';
   const url = trailing.length === 0 ? body : body.slice(0, body.length - trailing.length);
   const position = FRAME_POSITION_PATTERN.exec(url)?.[0] ?? '';
-  if (position.length === 0) {
-    return redactUrl(url) + trailing + suffix;
-  }
-
   const head = url.slice(0, url.length - position.length);
   const parts = parseUrlParts(head);
   if (parts.query === undefined && parts.fragment === undefined) {
     return redactUrl(head) + position + trailing + suffix;
   }
 
-  // The URL carries a query or a fragment, so the position is only
-  // distinguishable from that text by the frame it sits in.
-  const lineStart = whole.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
-  if (FRAME_CONTEXT_PATTERN.test(whole.slice(lineStart, offset))) {
-    return redactUrl(head) + position + trailing + suffix;
+  if (position.length > 0) {
+    // The URL carries a query or a fragment, so the position is only
+    // distinguishable from that text by the frame it sits in.
+    const lineStart = whole.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
+    if (FRAME_CONTEXT_PATTERN.test(whole.slice(lineStart, offset))) {
+      return redactUrl(head) + position + trailing + suffix;
+    }
   }
-  return redactUrl(url) + trailing + suffix;
+  return redactUrl(body) + suffix;
 }
 
 /**
@@ -919,7 +936,11 @@ function maskFrameUrl(candidate: string, offset: number, whole: string): string 
  * indentation, the parentheses, the frame order, and each frame's file and
  * position. What changes is inside the URLs, and by exactly the rules
  * {@link redactUrl} applies to a request URL — query values masked, path and
- * authority kept.
+ * authority kept. Punctuation directly after a URL that carries a query or a
+ * fragment is masked with its last value unless a frame position separates
+ * the two (see {@link maskFrameUrl}): `https://x.test/a?b=1).` becomes
+ * `https://x.test/a?b=?`, while `at fn (https://x.test/a.js?v=1:10:5)` becomes
+ * `at fn (https://x.test/a.js?v=?:10:5)`.
  *
  * Content scrubbing is **not** performed here: the caller in `redactor.ts`
  * runs `scrub` first (and must, since cutting before scrubbing can split a
@@ -928,15 +949,16 @@ function maskFrameUrl(candidate: string, offset: number, whole: string): string 
  *
  * **Idempotent.** Every component of the output is a fixed point of its own
  * treatment: `redactUrl` is idempotent, a masked query re-parses to itself, a
- * re-attached position re-detaches to the same place, and peeled punctuation
- * is re-appended verbatim. The result is bounded, so a second pass takes the
- * same path as the first.
+ * re-attached position re-detaches to the same place, punctuation peeled off a
+ * URL is re-appended verbatim and punctuation masked with a value stays
+ * masked. The result is bounded, so a second pass takes the same path as the
+ * first.
  *
  * **Never throws**, for any input of any type, like every other entry point
  * here: a stack reaches this function from a parsed JSON event body, where
  * nothing has checked that it is a string.
  *
- * @param value - Stack text, as captured by `../browser/fetch.ts` or
+ * @param value Stack text, as captured by `../browser/fetch.ts` or
  * `../browser/errors.ts`. A non-string value is normalised by
  * `asScannableText` first.
  * @returns The stack with every embedded `http`/`https` URL redacted.
@@ -973,32 +995,168 @@ export function redactStackUrls(value: unknown): string {
  * anchor the match at the `?` that actually opens the pairs. A `?` with no pair
  * after it — `Why?`, `?flag` — carries no value and is not matched.
  *
+ * The whole run is the query. Nothing at its end is set aside as sentence
+ * punctuation: `)`, `]`, `,`, `;`, `.` and `!` are all legal in a query value,
+ * so `/reset?code=!!!!` carries the value `!!!!` and a run that ends in them
+ * may end in data. {@link maskTextQuery} masks them with the value they may
+ * belong to.
+ *
  * Global, and therefore used only with `replace`, which resets `lastIndex`
  * around every call.
  */
 const TEXT_QUERY_PATTERN = /\?[^\s"'<>`?#=]*=[^\s"'<>`#]*(?:#[^\s"'<>`]*)?/g;
 
 /**
- * Punctuation that closes the sentence or the construct around an embedded
- * query rather than belonging to its last value: brackets, a comma, a
- * semicolon, a full stop, an exclamation mark.
+ * Masks the text that follows a query's `?`: every value becomes
+ * {@link REDACTION_MASK} through {@link redactQueryString}, and a fragment
+ * after the first `#` becomes the mask too when it is non-empty (an empty one
+ * is kept, as {@link redactUrl} keeps it). Keys, their order and the
+ * delimiters survive; nothing of the text is returned unexamined.
+ *
+ * Idempotent: every piece of its output re-masks to itself.
  */
-const TEXT_QUERY_TRAILING_PATTERN = /[)\]},;.!]+$/;
-
-/**
- * Masks one query run found by {@link TEXT_QUERY_PATTERN}: every value becomes
- * {@link REDACTION_MASK} through {@link redactQueryString}, a non-empty fragment
- * becomes the mask too, and trailing sentence punctuation is kept verbatim.
- */
-function maskTextQuery(run: string): string {
-  const trailing = TEXT_QUERY_TRAILING_PATTERN.exec(run)?.[0] ?? '';
-  const body = run.slice(1, run.length - trailing.length);
-  const hash = body.indexOf('#');
-  const query = hash === -1 ? body : body.slice(0, hash);
-  const fragment = hash === -1 ? undefined : body.slice(hash + 1);
+function maskQueryAndFragment(text: string): string {
+  const hash = text.indexOf('#');
+  const query = hash === -1 ? text : text.slice(0, hash);
+  const fragment = hash === -1 ? undefined : text.slice(hash + 1);
   const maskedFragment =
     fragment === undefined ? '' : fragment.length === 0 ? '#' : `#${REDACTION_MASK}`;
-  return `?${redactQueryString(query)}${maskedFragment}${trailing}`;
+  return `${redactQueryString(query)}${maskedFragment}`;
+}
+
+/**
+ * Masks one query run found by {@link TEXT_QUERY_PATTERN}, the whole of it:
+ * `?code=!!!!` becomes `?code=?`, and `?id=7).` becomes `?id=?`.
+ */
+function maskTextQuery(run: string): string {
+  return `?${maskQueryAndFragment(run.slice(1))}`;
+}
+
+/**
+ * An origin-relative reference carrying a query, embedded in text that may be
+ * source code: a `/` that is not the start of `//`, at the start of the text
+ * or directly after whitespace, a written whitespace escape or an opening
+ * parenthesis (group 1); then path
+ * characters, then the `?`, then everything up to the first whitespace,
+ * quote, angle bracket or backtick — the delimiters of
+ * {@link TEXT_QUERY_PATTERN} (group 2).
+ *
+ * The anchoring is what makes this safe to run over code. A regular expression
+ * literal (`/^(?=\S+$)…/`) has no path character before its `?`; a ternary has
+ * no `/`; a comment's `//` is excluded; and a path inside a string or template
+ * literal (`'/api/x?a=1'`, `` `/x?a=${v}` ``) follows a quote, which is not an
+ * anchor. A bare-relative `p?id=1` or a query-only `?id=1` is not matched
+ * either: in code, both are far more often an optional-chaining or ternary
+ * expression than a URL.
+ *
+ * A written whitespace escape — `\n`, `\r`, `\t`, `\f` or `\u000b`, as
+ * `JSON.stringify` and string literals write a line break or a tab — anchors a
+ * run as the whitespace it stands for does. The outbound guard reads the
+ * JSON-rendered sections of a prompt that way, so a run that starts a line
+ * there must be masked here too, including in a code excerpt whose string
+ * literal writes `"…\n/api/x?id=1"`; the masked literal loses nothing a model
+ * reasons about.
+ *
+ * The path class is RFC 3986's `pchar` set without the percent-escape's
+ * structure, plus `/`; it excludes `?` and `#`, so the first `?` after the
+ * path opens the query. Group 1 is re-emitted, because this module uses no
+ * lookbehind.
+ *
+ * Global, and therefore used only with `replace`, which resets `lastIndex`
+ * around every call.
+ */
+const ORIGIN_RELATIVE_PATTERN =
+  /(^|[\s(]|\\(?:[nrtf]|u000[bB]))(\/(?!\/)[A-Za-z0-9._~!$&*+,;=:@%/-]*\?[^\s"'<>`]*)/g;
+
+/**
+ * Masks one run found by {@link ORIGIN_RELATIVE_PATTERN}: the anchor and the
+ * path are kept, and everything after the `?` goes through
+ * {@link maskQueryAndFragment} — punctuation at the end of the run included.
+ */
+function maskOriginRelativeRun(_match: string, anchor: string, run: string): string {
+  const question = run.indexOf('?');
+  return `${anchor}${run.slice(0, question + 1)}${maskQueryAndFragment(run.slice(question + 1))}`;
+}
+
+/**
+ * Holds masked text to {@link MAX_SCAN_LENGTH}, reporting a cut on a line of
+ * its own exactly as {@link redactStackUrls} does.
+ *
+ * Masking replaces values with a single character, so a result longer than
+ * its input needs a query key that `redactQueryString` scrubbed into something
+ * longer; the bound is enforced anyway, because it is the guarantee both text
+ * maskers state and the reason their second pass never cuts again.
+ */
+function boundedMaskedText(masked: string): string {
+  return masked.length <= MAX_SCAN_LENGTH ? masked : truncatedStack(masked);
+}
+
+/**
+ * Redacts every URL embedded in text that may be **source code** or
+ * model-authored prose, masking only what is unambiguously a URL.
+ *
+ * The context builder runs this over every string of a stage's structured
+ * input — questions, summaries, code excerpts — before a prompt is rendered,
+ * and code is where {@link redactTextUrls}'s over-matching stops being free:
+ * it would rewrite `a?.b` guards, ternaries and regular expressions in an
+ * excerpt the model is asked to reason about. So two passes run, both
+ * anchored:
+ *
+ * 1. every absolute `http`/`https` URL, in any letter case, goes through
+ *    {@link redactStackUrls} — the {@link redactUrl} treatment a request URL
+ *    gets, with a stack frame's position kept;
+ * 2. every origin-relative run {@link ORIGIN_RELATIVE_PATTERN} finds — a
+ *    `/path?…` at the start of the text or after whitespace, a written
+ *    whitespace escape (`\n`) or `(` — has every
+ *    non-empty query value replaced by `?` (through {@link redactQueryString})
+ *    and a non-empty fragment replaced by `?`. The whole run is masked,
+ *    punctuation at its end included, so `(see /reset?code=ZIP42).` becomes
+ *    `(see /reset?code=?`.
+ *
+ * Left unchanged: a bare-relative `p?id=1`, a query-only `?id=1`, regular
+ * expression literals such as `/^(?=\S+$)(?:\S*[0-9]\S*|[^a-z]+)$/;`,
+ * ternaries, and paths that follow a quote or a backtick (`'/api/x?a=1'`,
+ * `` `/x?a=${v}` ``). Page text, where none of those readings exists, takes
+ * {@link redactTextUrls} instead, which masks all of them.
+ *
+ * **The outbound guard checks a subset of this.** The embedded-URL check in
+ * `packages/model-provider/src/redact-guard.ts` refuses a prompt in which a
+ * URL run anchored as above — an absolute `http(s)` run, or an origin-relative
+ * run at the start of the text or after whitespace, a written whitespace
+ * escape or `(` — still carries an
+ * unmasked query value. Every such value is one this function masks, so text
+ * that went through it passes that check. The two agree by convention — no
+ * import edge joins the packages — and each side's tests state the shared
+ * cases.
+ *
+ * Content scrubbing is **not** performed here: a caller runs `scrub` first,
+ * so a credential is replaced by pattern before its position in a URL is
+ * considered.
+ *
+ * **Bounded, idempotent and total.** The result is never longer than
+ * {@link MAX_SCAN_LENGTH} (input past the bound is reported as removed, on a
+ * line of its own, as {@link redactStackUrls} reports it); a masked run
+ * re-masks to itself, so a second pass returns its input; and nothing throws,
+ * for any input of any type (`asScannableText` normalises a non-string).
+ *
+ * @example
+ * ```ts
+ * redactEmbeddedUrls('GET /reset?code=ZIP42 then https://x.test/a?b=1#top');
+ * // → 'GET /reset?code=? then https://x.test/a?b=?#?'
+ * redactEmbeddedUrls("const url = '/api/x?a=1'; if (a?.b) {}");
+ * // → unchanged
+ * ```
+ *
+ * @param value Text that may be code or prose, already scrubbed by content.
+ * @returns The text with every anchored URL's query values and fragment
+ * masked.
+ */
+export function redactEmbeddedUrls(value: unknown): string {
+  const absolute = redactStackUrls(value);
+  if (!absolute.includes('?')) {
+    return absolute;
+  }
+  return boundedMaskedText(absolute.replace(ORIGIN_RELATIVE_PATTERN, maskOriginRelativeRun));
 }
 
 /**
@@ -1008,43 +1166,171 @@ function maskTextQuery(run: string): string {
  * Page-derived strings that are not URL-valued fields still carry URLs: a link
  * whose visible text is its own address, an attribute selector such as
  * `a[href="/reset?code=…"]`, a sentence quoting `/orders?id=…`. The privacy
- * model's URL rule applies to them all (AAP 0.5.2: query values become `?` per
- * key for display and storage), so two passes run:
+ * model's URL rule applies to them all (query values become `?` per key for
+ * display and storage), so two passes run:
  *
- * 1. every absolute `http`/`https` URL goes through {@link redactStackUrls} —
- *    the same {@link redactUrl} treatment a request URL gets: query values and
- *    a non-empty fragment masked, userinfo replaced, path scrubbed;
- * 2. every remaining query run — the query of an origin-relative or bare
- *    relative reference (`/p?id=7`, `p?id=7`, `?id=7`) — has its values masked
- *    with {@link redactQueryString}, and a non-empty fragment after it becomes
- *    `?`. Keys, their order, the path and the surrounding text are kept.
+ * 1. {@link redactEmbeddedUrls}, in full: every absolute `http`/`https` URL
+ *    gets the {@link redactUrl} treatment a request URL gets (query values and
+ *    a non-empty fragment masked, userinfo replaced, path scrubbed), and every
+ *    anchored origin-relative run has its query values and fragment masked;
+ * 2. every remaining query run holding a `name=value` pair
+ *    ({@link TEXT_QUERY_PATTERN}) — the query of a bare relative reference or
+ *    of a quoted path (`p?id=7`, `?id=7`, `href="/p?id=7"`) — has its values
+ *    masked with {@link redactQueryString}, and a non-empty fragment after it
+ *    becomes `?`. Keys, their order, the path and the text before the run are
+ *    kept.
+ *
+ * Every run is masked whole: punctuation at its end is part of what it may
+ * carry (`/reset?code=!!!!` is the value `!!!!`), so `See /p?id=7.` becomes
+ * `See /p?id=?` and `(open /p?id=7)` becomes `(open /p?id=?`.
  *
  * Over-matching is the safe direction, as for {@link isUrlAttributeKey}: prose
  * that merely looks like `a?b=c` is masked to `a?b=?`, which loses nothing a
  * debugging question needs.
  *
- * Content scrubbing is **not** performed here: a caller runs `scrub` first, as
- * `redactor.ts` does before {@link redactStackUrls}, so a credential is replaced
- * by pattern before its position in a query is considered.
+ * **A superset of the outbound guard's check, and of
+ * {@link redactEmbeddedUrls}.** Everything that function masks, this one masks
+ * too, so text that went through either passes the embedded-URL check of
+ * `packages/model-provider/src/redact-guard.ts` — by convention, with no import
+ * edge between the packages.
  *
- * **Idempotent** — a masked query re-masks to itself — and **never throws**,
- * for any input of any type (`asScannableText` normalises a non-string).
+ * Content scrubbing is **not** performed here: a caller runs `scrub` first, as
+ * `redactor.ts` does, so a credential is replaced by pattern before its
+ * position in a query is considered.
+ *
+ * **Idempotent** — a masked query re-masks to itself — **bounded** to
+ * {@link MAX_SCAN_LENGTH} as {@link redactEmbeddedUrls} is, and **never
+ * throws**, for any input of any type (`asScannableText` normalises a
+ * non-string).
  *
  * @example
  * ```ts
  * redactTextUrls('Visit /reset?coupon=SPRING and https://x.test/a?b=1#top');
  * // → 'Visit /reset?coupon=? and https://x.test/a?b=?#?'
+ * redactTextUrls('a[href="/reset?code=!!!!"]');
+ * // → 'a[href="/reset?code=?"]'
  * ```
  *
- * @param value - Free text, already scrubbed by content.
+ * @param value Free text, already scrubbed by content.
  * @returns The text with every embedded query value and fragment masked.
  */
 export function redactTextUrls(value: unknown): string {
-  const absolute = redactStackUrls(value);
-  if (!absolute.includes('?')) {
-    return absolute;
+  const embedded = redactEmbeddedUrls(value);
+  if (!embedded.includes('?')) {
+    return embedded;
   }
-  return absolute.replace(TEXT_QUERY_PATTERN, maskTextQuery);
+  return boundedMaskedText(embedded.replace(TEXT_QUERY_PATTERN, maskTextQuery));
+}
+
+/**
+ * A whole line of stack text that is a runtime-written frame: a V8 or
+ * JavaScriptCore frame, which opens with `at` after its indentation
+ * (`    at fn (‹url›:10:5)`), or a SpiderMonkey or WebKit frame, which is a
+ * function name, optionally followed by ` code` (`global code`), then `@` and
+ * the location, with no other whitespace on the line (`fn@‹url›:10:5`).
+ *
+ * The whole line is classified, never a fragment of it: a message line that
+ * merely contains `@https://…` has whitespace before its `@` and is not a
+ * frame. Every other line of a stack — the thrown error's message, which is
+ * how a stack begins, and any continuation of it — is text the page wrote.
+ */
+const STACK_FRAME_LINE_PATTERN = /^\s*at\s|^[^\s@]*(?: code)?@[A-Za-z][A-Za-z0-9+.-]*:\S*$/;
+
+/**
+ * The punctuation a frame closes its location with after the position: the
+ * `)` of `at fn (‹url›:10:5)`, and the brackets and separators an engine or a
+ * producer's own formatting may add.
+ */
+const FRAME_CLOSING_PATTERN = /[)\]}>,;'".]*$/;
+
+/**
+ * Masks one query run found on a frame line, keeping the frame's position.
+ *
+ * On a frame line, the `:line:column` directly after a URL was appended by the
+ * runtime, and the source-map route reads it; the free-text pass would take it
+ * as part of the last value (`?v=?:10:5)` is the value `?:10:5)` to it). So the
+ * closing punctuation and a trailing position are set aside, the query before
+ * them is masked by {@link maskTextQuery}, and the two are re-attached. What is
+ * kept is digits and closing punctuation only, never an identifier: a
+ * bare-relative frame `at h (src/a.ts?code=ZIP42:3:4)` becomes
+ * `at h (src/a.ts?code=?:3:4)`. The residual risk is the one
+ * {@link maskFrameUrl} states: a query value that itself ends in
+ * `:digits:digits`, of which at most two short numeric groups are kept, on a
+ * line the runtime wrote as a frame.
+ */
+function maskFrameLineQuery(run: string): string {
+  const closing = FRAME_CLOSING_PATTERN.exec(run)?.[0] ?? '';
+  const beforeClosing = run.slice(0, run.length - closing.length);
+  const position = FRAME_POSITION_PATTERN.exec(beforeClosing)?.[0] ?? '';
+  if (position.length === 0) {
+    return maskTextQuery(run);
+  }
+  const query = beforeClosing.slice(0, beforeClosing.length - position.length);
+  return `${maskTextQuery(query)}${position}${closing}`;
+}
+
+/**
+ * Applies the free-text query pass of {@link redactTextUrls} to one line of
+ * stack text: every query run holding a `name=value` pair has its values
+ * masked, on a frame line ({@link STACK_FRAME_LINE_PATTERN}) with the frame's
+ * position kept ({@link maskFrameLineQuery}).
+ */
+function maskStackLine(line: string): string {
+  return STACK_FRAME_LINE_PATTERN.test(line)
+    ? line.replace(TEXT_QUERY_PATTERN, maskFrameLineQuery)
+    : line.replace(TEXT_QUERY_PATTERN, maskTextQuery);
+}
+
+/**
+ * Redacts every URL embedded in stack text: the frames keep their positions,
+ * and the message lines are masked as free text.
+ *
+ * A stack attribute (`error.stack`, a fetch `initiator`, a React
+ * `componentStack`) is two kinds of text on separate lines. Its frames were
+ * written by the runtime, and the source-map route needs each frame's
+ * `:line:column`, which only {@link redactStackUrls}'s frame treatment keeps.
+ * Its first line, and any line that is not a frame, is the thrown error's
+ * message, which a page writes and which quotes URLs the way any page text
+ * does — `Error: failed '/reset?code=…'`, `reset?code=…`, `?code=…`. The same
+ * message under `error.message` is masked by {@link redactTextUrls}, so a
+ * stack must not carry it unmasked. Two passes run:
+ *
+ * 1. {@link redactEmbeddedUrls} over the whole text: every absolute URL is
+ *    masked with a frame's position kept, and every anchored origin-relative
+ *    run is masked;
+ * 2. on every line, the free-text query pass of {@link redactTextUrls}: every
+ *    remaining query run holding a `name=value` pair has its values masked,
+ *    quoted and bare-relative references included. On a frame line the
+ *    frame's trailing position survives the pass ({@link maskStackLine}); on
+ *    any other line nothing but the masked run does.
+ *
+ * **A superset of {@link redactEmbeddedUrls}**, and therefore of the outbound
+ * guard's check in `packages/model-provider/src/redact-guard.ts`, by
+ * convention with no import edge. **Idempotent** — both passes are, a kept
+ * position re-detaches to the same place, and neither pass changes whether a
+ * line is a frame — **bounded** to
+ * {@link MAX_SCAN_LENGTH} as {@link redactEmbeddedUrls} is, and **never
+ * throws**, for any input of any type.
+ *
+ * Content scrubbing is **not** performed here: the caller in `redactor.ts`
+ * runs `scrub` first.
+ *
+ * @example
+ * ```ts
+ * redactStackText("Error: failed '/reset?code=ZIP42'\n    at fn (http://x.test/a.js?v=1:10:5)");
+ * // → "Error: failed '/reset?code=?'\n    at fn (http://x.test/a.js?v=?:10:5)"
+ * ```
+ *
+ * @param value Stack text, already scrubbed by content.
+ * @returns The stack with every message-line query value and every frame
+ * URL's query values masked, and every frame's position kept.
+ */
+export function redactStackText(value: unknown): string {
+  const embedded = redactEmbeddedUrls(value);
+  if (!embedded.includes('?')) {
+    return embedded;
+  }
+  return boundedMaskedText(embedded.split('\n').map(maskStackLine).join('\n'));
 }
 
 /**
@@ -1061,7 +1347,7 @@ export function redactTextUrls(value: unknown): string {
  * {@link redactUrl} is scrubbed by content and returned, while a URL that
  * misses this test would keep its parameter values.
  *
- * @param key - Attribute key, exactly as captured.
+ * @param key Attribute key, exactly as captured.
  */
 export function isUrlAttributeKey(key: string): boolean {
   if ((URL_ATTRIBUTE_KEYS as readonly string[]).includes(key)) {

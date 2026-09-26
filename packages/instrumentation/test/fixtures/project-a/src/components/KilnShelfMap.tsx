@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2026 Northfield Clay Studio. All rights reserved.
+ * Copyright (c) 2026 Debug Generator contributors.
  *
- * Released under the MIT licence. See the LICENSE file at the root of this
- * project for the full terms.
+ * Released under the MIT License. See the LICENSE file at the root of the
+ * repository for the full terms.
  */
 
 import { Fragment } from 'react';
